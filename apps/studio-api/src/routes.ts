@@ -2,6 +2,7 @@ import type { FastifyInstance } from 'fastify';
 import { z } from 'zod';
 import { sendBadRequest, sendNotFound } from './http.js';
 import type { ForgeMindRepository } from '@forgemind/db';
+import { verifyGitHubWebhookSignature } from './webhook.js';
 
 const projectSchema = z.object({
   name: z.string().min(2),
@@ -27,6 +28,10 @@ const idParamsSchema = z.object({
 
 const commentSchema = z.object({
   comment: z.string().min(1)
+});
+
+const retrySchema = z.object({
+  start: z.boolean().default(true)
 });
 
 export function registerRoutes(app: FastifyInstance, repository: ForgeMindRepository) {
@@ -86,11 +91,36 @@ export function registerRoutes(app: FastifyInstance, repository: ForgeMindReposi
     }
   });
 
+  app.post('/api/tasks/:id/retry', async (request, reply) => {
+    try {
+      const { id } = idParamsSchema.parse(request.params);
+      const input = retrySchema.parse(request.body ?? {});
+      const task = await repository.retryTask(id, input.start);
+      return task ? task : sendNotFound(reply, `Task "${id}" not found`);
+    } catch (error) {
+      return sendBadRequest(reply, error);
+    }
+  });
+
   app.get('/api/tasks/:id/logs', async (request, reply) => {
     const { id } = idParamsSchema.parse(request.params);
     const task = await repository.getTask(id);
     if (!task) return sendNotFound(reply, `Task "${id}" not found`);
     return repository.listTaskAudit(id);
+  });
+
+  app.get('/api/tasks/:id/diff', async (request, reply) => {
+    const { id } = idParamsSchema.parse(request.params);
+    const task = await repository.getTask(id);
+    if (!task) return sendNotFound(reply, `Task "${id}" not found`);
+    return repository.getTaskDiff(id);
+  });
+
+  app.get('/api/tasks/:id/usage', async (request, reply) => {
+    const { id } = idParamsSchema.parse(request.params);
+    const task = await repository.getTask(id);
+    if (!task) return sendNotFound(reply, `Task "${id}" not found`);
+    return repository.getTaskUsage(id);
   });
 
   app.get('/api/approvals', async () => repository.listApprovals());
@@ -141,9 +171,34 @@ export function registerRoutes(app: FastifyInstance, repository: ForgeMindReposi
     }
   });
 
-  app.post('/api/webhooks/github', async (_request, reply) => {
-    return reply.code(501).send({
-      error: 'GitHub webhook receiver is reserved for the real GitHub App integration.'
+  app.post('/api/webhooks/github', { config: { rawBody: true } }, async (request, reply) => {
+    const secret = process.env.GITHUB_WEBHOOK_SECRET;
+    if (!secret) {
+      return reply.code(503).send({ error: 'GITHUB_WEBHOOK_SECRET is not configured.' });
+    }
+
+    const rawPayload = (request as unknown as { rawBody?: Buffer | string }).rawBody;
+    if (!rawPayload) {
+      return reply.code(400).send({ error: 'Raw webhook payload is not available.' });
+    }
+
+    const valid = verifyGitHubWebhookSignature({
+      payload: rawPayload,
+      signatureHeader: request.headers['x-hub-signature-256'],
+      secret
     });
+    if (!valid) {
+      return reply.code(401).send({ error: 'Invalid GitHub webhook signature.' });
+    }
+
+    const event = String(request.headers['x-github-event'] ?? 'unknown');
+    const delivery = String(request.headers['x-github-delivery'] ?? '');
+    const audit = await repository.writeAudit({
+      actorType: 'github',
+      eventType: `github_webhook_${event}`,
+      payload: { event, delivery }
+    });
+
+    return reply.code(202).send({ ok: true, event, delivery, auditId: audit.id });
   });
 }

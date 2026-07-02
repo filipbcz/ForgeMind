@@ -48,6 +48,18 @@ export interface ClaimedTask {
   taskRun: ReturnType<typeof toTaskRun>;
 }
 
+const ACTIVE_TASK_STATUSES: ReadonlySet<TaskStatus> = new Set([
+  'submitted',
+  'planning',
+  'creating_github_issue',
+  'creating_branch',
+  'running_ai',
+  'validating',
+  'reviewing',
+  'improving',
+  'creating_pr'
+]);
+
 export class ForgeMindRepository {
   constructor(private readonly prisma: PrismaClient) {}
 
@@ -200,6 +212,34 @@ export class ForgeMindRepository {
       projectId: updated.projectId,
       taskId: updated.id,
       payload: {}
+    });
+
+    return toTask(updated);
+  }
+
+  async retryTask(taskId: string, start = true): Promise<ForgeTask | undefined> {
+    const task = await this.getTask(taskId);
+    if (!task) return undefined;
+    if (ACTIVE_TASK_STATUSES.has(task.status)) {
+      throw new Error(`Task "${taskId}" is currently active and cannot be retried.`);
+    }
+
+    const updated = await this.prisma.task.update({
+      where: { id: taskId },
+      data: {
+        status: start ? 'submitted' : 'draft',
+        startedAt: start ? new Date() : null,
+        finishedAt: null
+      }
+    });
+
+    await this.writeAudit({
+      actorType: 'user',
+      actorId: LOCAL_USER_ID,
+      eventType: 'task_retried',
+      projectId: updated.projectId,
+      taskId: updated.id,
+      payload: { status: updated.status }
     });
 
     return toTask(updated);
@@ -433,6 +473,96 @@ export class ForgeMindRepository {
     return events.map(toAuditEvent);
   }
 
+  async getTaskDiff(taskId: string) {
+    const iterations = await this.prisma.taskIteration.findMany({
+      where: {
+        taskRun: {
+          taskId
+        }
+      },
+      orderBy: { createdAt: 'asc' }
+    });
+
+    const totals = iterations.reduce(
+      (summary, iteration) => {
+        const diff = parseDiffStat(iteration.diffStatJson);
+        summary.filesChanged = Math.max(summary.filesChanged, diff.filesChanged);
+        summary.insertions += diff.insertions;
+        summary.deletions += diff.deletions;
+        return summary;
+      },
+      { filesChanged: 0, insertions: 0, deletions: 0 }
+    );
+
+    return {
+      taskId,
+      ...totals,
+      iterations: iterations.map((iteration) => ({
+        id: iteration.id,
+        taskRunId: iteration.taskRunId,
+        iterationNumber: iteration.iterationNumber,
+        phase: iteration.phase,
+        resultSummary: iteration.resultSummary,
+        diffStat: iteration.diffStatJson,
+        validationResult: iteration.validationResultJson,
+        createdAt: iteration.createdAt.toISOString()
+      }))
+    };
+  }
+
+  async getTaskUsage(taskId: string) {
+    const [runs, usage] = await Promise.all([
+      this.prisma.taskRun.findMany({
+        where: { taskId },
+        orderBy: { startedAt: 'asc' }
+      }),
+      this.prisma.providerUsage.findMany({
+        where: { taskId },
+        orderBy: { createdAt: 'asc' }
+      })
+    ]);
+
+    const totals = usage.reduce(
+      (summary, item) => {
+        summary.inputTokens += item.inputTokens;
+        summary.outputTokens += item.outputTokens;
+        summary.cachedTokens += item.cachedTokens;
+        summary.estimatedCostUsd += Number(item.estimatedCostUsd);
+        return summary;
+      },
+      { inputTokens: 0, outputTokens: 0, cachedTokens: 0, estimatedCostUsd: 0 }
+    );
+
+    return {
+      taskId,
+      ...totals,
+      runs: runs.map((run) => ({
+        id: run.id,
+        provider: run.provider,
+        model: run.model,
+        status: run.status,
+        iterationCount: run.iterationCount,
+        inputTokens: run.inputTokens,
+        outputTokens: run.outputTokens,
+        estimatedCostUsd: Number(run.estimatedCostUsd),
+        startedAt: run.startedAt?.toISOString(),
+        finishedAt: run.finishedAt?.toISOString(),
+        summary: run.summary,
+        errorMessage: run.errorMessage
+      })),
+      records: usage.map((item) => ({
+        id: item.id,
+        provider: item.provider,
+        model: item.model,
+        inputTokens: item.inputTokens,
+        outputTokens: item.outputTokens,
+        cachedTokens: item.cachedTokens,
+        estimatedCostUsd: Number(item.estimatedCostUsd),
+        createdAt: item.createdAt.toISOString()
+      }))
+    };
+  }
+
   async writeAudit(input: Omit<AuditEvent, 'id' | 'createdAt'>): Promise<AuditEvent> {
     const event = await this.prisma.auditLog.create({
       data: {
@@ -483,3 +613,16 @@ export function isUniqueConstraintError(error: unknown): boolean {
 }
 
 export type PrismaJsonObject = Prisma.JsonObject;
+
+function parseDiffStat(value: Prisma.JsonValue): { filesChanged: number; insertions: number; deletions: number } {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    return { filesChanged: 0, insertions: 0, deletions: 0 };
+  }
+
+  const record = value as Record<string, unknown>;
+  return {
+    filesChanged: typeof record.filesChanged === 'number' ? record.filesChanged : 0,
+    insertions: typeof record.insertions === 'number' ? record.insertions : 0,
+    deletions: typeof record.deletions === 'number' ? record.deletions : 0
+  };
+}

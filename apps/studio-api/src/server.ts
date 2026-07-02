@@ -1,6 +1,7 @@
 import cors from '@fastify/cors';
 import { createRepository, getPrismaClient } from '@forgemind/db';
 import Fastify from 'fastify';
+import rawBody from 'fastify-raw-body';
 import { registerRoutes } from './routes.js';
 
 export async function createApp() {
@@ -12,6 +13,12 @@ export async function createApp() {
 
   await app.register(cors, {
     origin: true
+  });
+  await app.register(rawBody, {
+    field: 'rawBody',
+    global: false,
+    encoding: false,
+    runFirst: true
   });
 
   const repository = createRepository(getPrismaClient());

@@ -3,34 +3,77 @@ import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import {
   AlertTriangle,
   ArrowRight,
+  Ban,
   CheckCircle2,
   ClipboardCheck,
   Clock3,
+  FolderPlus,
   GitBranch,
   Github,
   LayoutList,
   Play,
   Plus,
   RefreshCw,
+  RotateCcw,
   Settings,
   ShieldCheck,
   Smartphone,
   XCircle
 } from 'lucide-react';
 import {
+  cancelTask as cancelTaskRequest,
+  createProject as createProjectRequest,
   createTask as createTaskRequest,
   fallbackApprovals,
   fallbackProjects,
   fallbackTasks,
   fetchApprovals,
   fetchProjects,
+  fetchTaskDiff,
+  fetchTaskLogs,
   fetchTasks,
+  fetchTaskUsage,
   resolveApproval as resolveApprovalRequest,
+  retryTask as retryTaskRequest,
   startTask as startTaskRequest
 } from './api.js';
-import type { ApprovalSummary, CreateTaskRequest, ProjectSummary, TaskSummary } from './types.js';
+import type {
+  ApprovalSummary,
+  AuditEventApi,
+  CreateProjectRequest,
+  CreateTaskRequest,
+  ProjectSummary,
+  TaskDiffApi,
+  TaskSummary,
+  TaskUsageApi
+} from './types.js';
 
 type View = 'tasks' | 'new-task' | 'approvals' | 'settings';
+
+const terminalStatuses = new Set<TaskSummary['status']>([
+  'completed',
+  'failed',
+  'cancelled',
+  'budget_exceeded',
+  'iteration_limit_reached',
+  'repeated_error_detected',
+  'approval_rejected',
+  'provider_failed',
+  'validation_failed'
+]);
+
+const activeStatuses = new Set<TaskSummary['status']>([
+  'submitted',
+  'planning',
+  'creating_github_issue',
+  'creating_branch',
+  'running_ai',
+  'validating',
+  'reviewing',
+  'improving',
+  'creating_pr',
+  'needs_approval'
+]);
 
 const statusLabels: Record<TaskSummary['status'], string> = {
   draft: 'Draft',
@@ -87,23 +130,9 @@ export function App() {
   const [view, setView] = useState<View>('tasks');
   const [selectedTaskId, setSelectedTaskId] = useState<string>('');
 
-  const projectsQuery = useQuery({
-    queryKey: ['projects'],
-    queryFn: fetchProjects,
-    retry: 1
-  });
-  const tasksQuery = useQuery({
-    queryKey: ['tasks'],
-    queryFn: fetchTasks,
-    refetchInterval: 5000,
-    retry: 1
-  });
-  const approvalsQuery = useQuery({
-    queryKey: ['approvals'],
-    queryFn: fetchApprovals,
-    refetchInterval: 5000,
-    retry: 1
-  });
+  const projectsQuery = useQuery({ queryKey: ['projects'], queryFn: fetchProjects, retry: 1 });
+  const tasksQuery = useQuery({ queryKey: ['tasks'], queryFn: fetchTasks, refetchInterval: 5000, retry: 1 });
+  const approvalsQuery = useQuery({ queryKey: ['approvals'], queryFn: fetchApprovals, refetchInterval: 5000, retry: 1 });
 
   const projects = projectsQuery.data ?? fallbackProjects;
   const tasks = tasksQuery.data ?? fallbackTasks;
@@ -116,34 +145,83 @@ export function App() {
   }, [selectedTaskId, tasks]);
 
   const selectedTask = useMemo(() => tasks.find((task) => task.id === selectedTaskId) ?? tasks[0], [selectedTaskId, tasks]);
+
+  const logsQuery = useQuery({
+    queryKey: ['tasks', selectedTask?.id, 'logs'],
+    queryFn: () => fetchTaskLogs(selectedTask?.id ?? ''),
+    enabled: Boolean(selectedTask?.id),
+    refetchInterval: activeStatuses.has(selectedTask?.status ?? 'draft') ? 5000 : false,
+    retry: 1
+  });
+  const diffQuery = useQuery({
+    queryKey: ['tasks', selectedTask?.id, 'diff'],
+    queryFn: () => fetchTaskDiff(selectedTask?.id ?? ''),
+    enabled: Boolean(selectedTask?.id),
+    refetchInterval: activeStatuses.has(selectedTask?.status ?? 'draft') ? 5000 : false,
+    retry: 1
+  });
+  const usageQuery = useQuery({
+    queryKey: ['tasks', selectedTask?.id, 'usage'],
+    queryFn: () => fetchTaskUsage(selectedTask?.id ?? ''),
+    enabled: Boolean(selectedTask?.id),
+    refetchInterval: activeStatuses.has(selectedTask?.status ?? 'draft') ? 5000 : false,
+    retry: 1
+  });
+
   const pendingApprovals = approvals.filter((approval) => approval.status === 'pending');
-  const activeTasks = tasks.filter((task) => task.status !== 'completed');
+  const activeTasks = tasks.filter((task) => !terminalStatuses.has(task.status));
   const hasApiError = Boolean(projectsQuery.error || tasksQuery.error || approvalsQuery.error);
+
+  function invalidateTaskData(taskId?: string) {
+    queryClient.invalidateQueries({ queryKey: ['tasks'] });
+    queryClient.invalidateQueries({ queryKey: ['projects'] });
+    queryClient.invalidateQueries({ queryKey: ['approvals'] });
+    if (taskId) {
+      queryClient.invalidateQueries({ queryKey: ['tasks', taskId] });
+    }
+  }
 
   const createTaskMutation = useMutation({
     mutationFn: createTaskRequest,
     onSuccess: (task) => {
-      queryClient.invalidateQueries({ queryKey: ['tasks'] });
-      queryClient.invalidateQueries({ queryKey: ['projects'] });
+      invalidateTaskData(task.id);
       setSelectedTaskId(task.id);
       setView('tasks');
+    }
+  });
+
+  const createProjectMutation = useMutation({
+    mutationFn: createProjectRequest,
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['projects'] });
+      setView('settings');
     }
   });
 
   const startTaskMutation = useMutation({
     mutationFn: startTaskRequest,
     onSuccess: (task) => {
-      queryClient.invalidateQueries({ queryKey: ['tasks'] });
+      invalidateTaskData(task.id);
+      setSelectedTaskId(task.id);
+    }
+  });
+
+  const cancelTaskMutation = useMutation({
+    mutationFn: cancelTaskRequest,
+    onSuccess: (task) => invalidateTaskData(task.id)
+  });
+
+  const retryTaskMutation = useMutation({
+    mutationFn: retryTaskRequest,
+    onSuccess: (task) => {
+      invalidateTaskData(task.id);
       setSelectedTaskId(task.id);
     }
   });
 
   const resolveApprovalMutation = useMutation({
     mutationFn: ({ id, status }: { id: string; status: 'approved' | 'rejected' }) => resolveApprovalRequest(id, status),
-    onSuccess: () => {
-      queryClient.invalidateQueries({ queryKey: ['approvals'] });
-      queryClient.invalidateQueries({ queryKey: ['tasks'] });
-    }
+    onSuccess: () => invalidateTaskData(selectedTask?.id)
   });
 
   function createTask(formData: FormData) {
@@ -158,6 +236,18 @@ export function App() {
     createTaskMutation.mutate(input);
   }
 
+  function createProject(formData: FormData) {
+    const input: CreateProjectRequest = {
+      name: String(formData.get('name')),
+      slug: String(formData.get('slug')),
+      githubOwner: String(formData.get('githubOwner')),
+      githubRepo: String(formData.get('githubRepo')),
+      defaultBranch: String(formData.get('defaultBranch') || 'main'),
+      configYaml: String(formData.get('configYaml') || '') || undefined
+    };
+    createProjectMutation.mutate(input);
+  }
+
   return (
     <div className="app-shell">
       <aside className="sidebar" aria-label="Navigace">
@@ -170,12 +260,7 @@ export function App() {
         </div>
         <NavButton active={view === 'tasks'} icon={LayoutList} label="Tasks" onClick={() => setView('tasks')} />
         <NavButton active={view === 'new-task'} icon={Plus} label="New task" onClick={() => setView('new-task')} />
-        <NavButton
-          active={view === 'approvals'}
-          icon={ShieldCheck}
-          label={`Approvals ${pendingApprovals.length}`}
-          onClick={() => setView('approvals')}
-        />
+        <NavButton active={view === 'approvals'} icon={ShieldCheck} label={`Approvals ${pendingApprovals.length}`} onClick={() => setView('approvals')} />
         <NavButton active={view === 'settings'} icon={Settings} label="Settings" onClick={() => setView('settings')} />
       </aside>
 
@@ -208,8 +293,13 @@ export function App() {
               <TaskDetail
                 projects={projects}
                 task={selectedTask}
+                logs={logsQuery.data ?? []}
+                diff={diffQuery.data}
+                usage={usageQuery.data}
+                busy={startTaskMutation.isPending || cancelTaskMutation.isPending || retryTaskMutation.isPending}
                 onStart={(taskId) => startTaskMutation.mutate(taskId)}
-                starting={startTaskMutation.isPending}
+                onCancel={(taskId) => cancelTaskMutation.mutate(taskId)}
+                onRetry={(taskId) => retryTaskMutation.mutate(taskId)}
               />
             ) : null}
           </section>
@@ -232,7 +322,9 @@ export function App() {
           </section>
         ) : null}
 
-        {view === 'settings' ? <SettingsPanel projects={projects} /> : null}
+        {view === 'settings' ? (
+          <SettingsPanel projects={projects} saving={createProjectMutation.isPending} onCreateProject={createProject} />
+        ) : null}
       </main>
 
       <nav className="bottom-nav" aria-label="Mobilní navigace">
@@ -252,13 +344,7 @@ function viewTitle(view: View) {
   return 'Přehled tasků';
 }
 
-function NavButton(props: {
-  active: boolean;
-  compact?: boolean;
-  icon: typeof LayoutList;
-  label: string;
-  onClick: () => void;
-}) {
+function NavButton(props: { active: boolean; compact?: boolean; icon: typeof LayoutList; label: string; onClick: () => void }) {
   const Icon = props.icon;
   return (
     <button className={props.active ? 'nav-button active' : 'nav-button'} type="button" onClick={props.onClick} title={props.label}>
@@ -305,61 +391,85 @@ function TaskButton(props: { task: TaskSummary; selected: boolean; onClick: () =
   );
 }
 
-function TaskDetail({
-  projects,
-  task,
-  starting,
-  onStart
-}: {
+function TaskDetail(props: {
   projects: ProjectSummary[];
   task: TaskSummary;
-  starting: boolean;
+  logs: AuditEventApi[];
+  diff?: TaskDiffApi;
+  usage?: TaskUsageApi;
+  busy: boolean;
   onStart: (taskId: string) => void;
+  onCancel: (taskId: string) => void;
+  onRetry: (taskId: string) => void;
 }) {
-  const project = projects.find((item) => item.id === task.projectId);
+  const project = props.projects.find((item) => item.id === props.task.projectId);
+  const canRetry = terminalStatuses.has(props.task.status) || props.task.status === 'ready_for_user_review';
+  const canCancel = !terminalStatuses.has(props.task.status) && props.task.status !== 'ready_for_user_review';
+
   return (
     <article className="detail">
       <div className="detail-heading">
         <div>
-          <span className={`badge ${task.status}`}>{statusLabels[task.status]}</span>
-          <h2>{task.title}</h2>
+          <span className={`badge ${props.task.status}`}>{statusLabels[props.task.status]}</span>
+          <h2>{props.task.title}</h2>
           <p>{project?.name ?? 'Neznámý projekt'}</p>
         </div>
         <div className="branch">
           <GitBranch size={18} />
-          <span>{task.branchName ?? 'branch zatím nevytvořena'}</span>
+          <span>{props.task.branchName ?? 'branch zatím nevytvořena'}</span>
         </div>
       </div>
 
       <div className="detail-grid">
-        <MetricBlock label="Iterace" value={`${task.iterations}/${task.maxIterations}`} />
-        <MetricBlock label="Rozpočet" value={`$${task.budgetUsd.toFixed(2)} / $${task.maxBudgetUsd.toFixed(2)}`} />
-        <MetricBlock label="Testy" value={task.testResult} />
-        <MetricBlock label="Diff" value={task.diffSummary} />
+        <MetricBlock label="Iterace" value={`${props.usage?.runs.at(-1)?.iterationCount ?? props.task.iterations}/${props.task.maxIterations}`} />
+        <MetricBlock label="Rozpočet" value={`$${(props.usage?.estimatedCostUsd ?? props.task.budgetUsd).toFixed(2)} / $${props.task.maxBudgetUsd.toFixed(2)}`} />
+        <MetricBlock label="Diff" value={`${props.diff?.filesChanged ?? 0} files, +${props.diff?.insertions ?? 0} -${props.diff?.deletions ?? 0}`} />
+        <MetricBlock label="Tokens" value={`${props.usage?.inputTokens ?? 0} in / ${props.usage?.outputTokens ?? 0} out`} />
       </div>
 
       <section className="plain-section">
         <h3>Plán</h3>
         <ol>
-          {task.plan.length ? task.plan.map((step) => <li key={step}>{step}</li>) : <li>Plán bude vytvořen po spuštění workeru.</li>}
+          {props.task.plan.length ? props.task.plan.map((step) => <li key={step}>{step}</li>) : <li>Plán bude vytvořen po spuštění workeru.</li>}
         </ol>
       </section>
 
       <section className="plain-section">
         <h3>Zadání</h3>
-        <p>{task.prompt}</p>
+        <p>{props.task.prompt}</p>
+      </section>
+
+      <section className="plain-section">
+        <h3>Log</h3>
+        <div className="timeline">
+          {props.logs.length === 0 ? <span>Bez záznamů.</span> : null}
+          {props.logs.slice(-8).map((event) => (
+            <div className="timeline-row" key={event.id}>
+              <span>{new Date(event.createdAt).toLocaleTimeString()}</span>
+              <strong>{event.eventType}</strong>
+            </div>
+          ))}
+        </div>
       </section>
 
       <div className="actions">
-        <button className="primary-action" type="button" disabled={task.status !== 'draft' || starting} onClick={() => onStart(task.id)}>
+        <button className="primary-action" type="button" disabled={props.task.status !== 'draft' || props.busy} onClick={() => props.onStart(props.task.id)}>
           <Play size={18} />
           Spustit
         </button>
-        <a className="secondary-action" href={task.issueUrl ?? '#'} aria-disabled={!task.issueUrl}>
+        <button className="secondary-action" type="button" disabled={!canRetry || props.busy} onClick={() => props.onRetry(props.task.id)}>
+          <RotateCcw size={18} />
+          Retry
+        </button>
+        <button className="danger-action" type="button" disabled={!canCancel || props.busy} onClick={() => props.onCancel(props.task.id)}>
+          <Ban size={18} />
+          Cancel
+        </button>
+        <a className="secondary-action" href={props.task.issueUrl ?? '#'} aria-disabled={!props.task.issueUrl}>
           <Github size={18} />
           Issue
         </a>
-        <a className="secondary-action" href={task.pullRequestUrl ?? '#'} aria-disabled={!task.pullRequestUrl}>
+        <a className="secondary-action" href={props.task.pullRequestUrl ?? '#'} aria-disabled={!props.task.pullRequestUrl}>
           <ClipboardCheck size={18} />
           Draft PR
         </a>
@@ -487,9 +597,55 @@ function ApprovalPanel(props: {
   );
 }
 
-function SettingsPanel({ projects }: { projects: ProjectSummary[] }) {
+function SettingsPanel({
+  projects,
+  saving,
+  onCreateProject
+}: {
+  projects: ProjectSummary[];
+  saving: boolean;
+  onCreateProject: (formData: FormData) => void;
+}) {
   return (
     <section className="settings-grid">
+      <form
+        className="task-form"
+        onSubmit={(event) => {
+          event.preventDefault();
+          onCreateProject(new FormData(event.currentTarget));
+          event.currentTarget.reset();
+        }}
+      >
+        <label>
+          Název projektu
+          <input name="name" placeholder="STARPANT Gallery" required minLength={2} />
+        </label>
+        <label>
+          Slug
+          <input name="slug" placeholder="starpant-gallery" required pattern="[a-z0-9-]+" />
+        </label>
+        <label>
+          GitHub owner
+          <input name="githubOwner" placeholder="company" required />
+        </label>
+        <label>
+          GitHub repo
+          <input name="githubRepo" placeholder="starpant-gallery" required />
+        </label>
+        <label>
+          Default branch
+          <input name="defaultBranch" defaultValue="main" required />
+        </label>
+        <label className="wide">
+          agent.config.yaml
+          <textarea name="configYaml" rows={6} placeholder="Volitelné YAML nastavení projektu." />
+        </label>
+        <button className="primary-action wide" type="submit" disabled={saving}>
+          <FolderPlus size={18} />
+          Přidat projekt
+        </button>
+      </form>
+
       {projects.map((project) => (
         <article className="project-row" key={project.id}>
           <div>

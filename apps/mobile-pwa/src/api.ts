@@ -1,4 +1,16 @@
-import type { ApprovalApi, ApprovalSummary, CreateTaskRequest, ProjectApi, ProjectSummary, TaskApi, TaskSummary } from './types.js';
+import type {
+  ApprovalApi,
+  ApprovalSummary,
+  AuditEventApi,
+  CreateProjectRequest,
+  CreateTaskRequest,
+  ProjectApi,
+  ProjectSummary,
+  TaskApi,
+  TaskDiffApi,
+  TaskSummary,
+  TaskUsageApi
+} from './types.js';
 
 const API_URL = import.meta.env.VITE_API_URL ?? 'http://localhost:4000';
 
@@ -44,9 +56,29 @@ export async function fetchProjects(): Promise<ProjectSummary[]> {
   return summarizeProjects(projects, tasks);
 }
 
+export async function createProject(input: CreateProjectRequest): Promise<ProjectSummary> {
+  const project = await request<ProjectApi>('/api/projects', {
+    method: 'POST',
+    body: JSON.stringify(input)
+  });
+  return { ...project, budgetUsd: 0, openPullRequests: 0 };
+}
+
 export async function fetchTasks(): Promise<TaskSummary[]> {
   const tasks = await request<TaskApi[]>('/api/tasks');
   return tasks.map(toTaskSummary);
+}
+
+export async function fetchTaskLogs(taskId: string): Promise<AuditEventApi[]> {
+  return request<AuditEventApi[]>(`/api/tasks/${taskId}/logs`);
+}
+
+export async function fetchTaskDiff(taskId: string): Promise<TaskDiffApi> {
+  return request<TaskDiffApi>(`/api/tasks/${taskId}/diff`);
+}
+
+export async function fetchTaskUsage(taskId: string): Promise<TaskUsageApi> {
+  return request<TaskUsageApi>(`/api/tasks/${taskId}/usage`);
 }
 
 export async function fetchApprovals(): Promise<ApprovalSummary[]> {
@@ -64,14 +96,32 @@ export async function createTask(input: CreateTaskRequest): Promise<TaskSummary>
 
 export async function startTask(taskId: string): Promise<TaskSummary> {
   const task = await request<TaskApi>(`/api/tasks/${taskId}/start`, {
-    method: 'POST'
+    method: 'POST',
+    body: '{}'
+  });
+  return toTaskSummary(task);
+}
+
+export async function cancelTask(taskId: string): Promise<TaskSummary> {
+  const task = await request<TaskApi>(`/api/tasks/${taskId}/cancel`, {
+    method: 'POST',
+    body: '{}'
+  });
+  return toTaskSummary(task);
+}
+
+export async function retryTask(taskId: string): Promise<TaskSummary> {
+  const task = await request<TaskApi>(`/api/tasks/${taskId}/retry`, {
+    method: 'POST',
+    body: JSON.stringify({ start: true })
   });
   return toTaskSummary(task);
 }
 
 export async function resolveApproval(id: string, status: 'approved' | 'rejected'): Promise<ApprovalSummary> {
   const approval = await request<ApprovalApi>(`/api/approvals/${id}/${status === 'approved' ? 'approve' : 'reject'}`, {
-    method: 'POST'
+    method: 'POST',
+    body: '{}'
   });
   return toApprovalSummary(approval);
 }
@@ -105,8 +155,8 @@ export function toTaskSummary(task: TaskApi): TaskSummary {
     issueUrl: task.githubIssueUrl,
     pullRequestUrl: task.pullRequestUrl,
     plan: task.status === 'draft' ? [] : ['Create issue and branch', 'Run provider', 'Validate result', 'Prepare draft PR'],
-    testResult: task.status === 'draft' ? 'Not started' : 'Waiting for worker result',
-    diffSummary: task.status === 'draft' ? 'No changes' : 'Waiting for worker diff'
+    testResult: task.status === 'draft' ? 'Not started' : 'See worker log',
+    diffSummary: task.status === 'draft' ? 'No changes' : 'See diff summary'
   };
 }
 

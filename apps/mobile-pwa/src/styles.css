@@ -149,6 +149,7 @@ a {
 
 .primary-action:disabled,
 .danger-action:disabled,
+.secondary-action:disabled,
 .secondary-action[aria-disabled="true"] {
   opacity: 0.52;
   cursor: not-allowed;
@@ -396,6 +397,35 @@ a {
 
 .plain-section li + li {
   margin-top: 6px;
+}
+
+.timeline {
+  border: 1px solid #dde5dd;
+  border-radius: 8px;
+  display: grid;
+  overflow: hidden;
+}
+
+.timeline-row {
+  min-height: 38px;
+  display: grid;
+  grid-template-columns: 86px minmax(0, 1fr);
+  gap: 10px;
+  align-items: center;
+  padding: 8px 10px;
+}
+
+.timeline-row + .timeline-row {
+  border-top: 1px solid #edf1ea;
+}
+
+.timeline-row span {
+  color: #69736c;
+  font-size: 0.82rem;
+}
+
+.timeline-row strong {
+  overflow-wrap: anywhere;
 }
 
 .actions {

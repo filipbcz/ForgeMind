@@ -1,6 +1,8 @@
-import { parseAgentConfigYaml } from '@forgemind/config';
+import { parseAgentConfigYaml, toCoreLimits } from '@forgemind/config';
+import { DEFAULT_LIMITS, evaluateLimits, type Limits, type LimitUsage } from '@forgemind/core';
 import { createRepository, getPrismaClient } from '@forgemind/db';
 import { createGitHubAdapterFromEnv } from '@forgemind/github';
+import { createProvider } from '@forgemind/providers';
 import type { ProviderKind, TaskStatus } from '@forgemind/core';
 import { toErrorMessage } from '@forgemind/shared';
 import { runWorkerTask } from './workflow.js';
@@ -18,14 +20,48 @@ export async function runDatabaseWorkerOnce() {
   }
 
   let iterationNumber = 0;
+  let changedFiles = 0;
+  let diffLines = 0;
   const verifyCommand = resolveVerifyCommand(claimed.project.configYaml);
   const github = await createGitHubAdapterFromEnv();
+  const provider = createProvider(providerKind);
+  const limits = resolveLimits(claimed.project.configYaml, claimed.task.maxIterations, claimed.task.maxBudgetUsd);
+  const costEstimate = await provider.estimateCost({ prompt: claimed.task.prompt, repositorySizeHint: 'small' });
+  const initialLimitEvaluation = evaluateLimits(createLimitUsage({ estimatedCostUsd: costEstimate.estimatedCostUsd }), limits);
+
+  await repository.recordProviderUsage({
+    taskId: claimed.task.id,
+    taskRunId: claimed.taskRun.id,
+    provider: providerKind,
+    model: providerKind,
+    inputTokens: costEstimate.inputTokens,
+    outputTokens: costEstimate.outputTokens,
+    estimatedCostUsd: costEstimate.estimatedCostUsd
+  });
+
+  if (initialLimitEvaluation.signals.includes('budget_exceeded')) {
+    await repository.failTask(claimed.task.id, 'Budget limit exceeded before provider run.', 'budget_exceeded');
+    await repository.finishTaskRun({
+      taskRunId: claimed.taskRun.id,
+      status: 'failed',
+      errorMessage: 'Budget limit exceeded before provider run.',
+      inputTokens: costEstimate.inputTokens,
+      outputTokens: costEstimate.outputTokens,
+      estimatedCostUsd: costEstimate.estimatedCostUsd
+    });
+    return {
+      claimed: true,
+      taskId: claimed.task.id,
+      status: 'budget_exceeded'
+    };
+  }
 
   try {
     const result = await runWorkerTask({
       project: claimed.project,
       task: claimed.task,
       providerKind,
+      provider,
       verifyCommand,
       github,
       hooks: {
@@ -49,11 +85,29 @@ export async function runDatabaseWorkerOnce() {
         },
         onIteration: async (iteration) => {
           iterationNumber += 1;
+          const diffStat = iteration.diffStat && typeof iteration.diffStat === 'object' && !Array.isArray(iteration.diffStat) ? iteration.diffStat : {};
+          changedFiles = Math.max(changedFiles, typeof diffStat.filesChanged === 'number' ? diffStat.filesChanged : 0);
+          diffLines += (typeof diffStat.insertions === 'number' ? diffStat.insertions : 0) + (typeof diffStat.deletions === 'number' ? diffStat.deletions : 0);
+
           await repository.createIteration({
             taskRunId: claimed.taskRun.id,
             iterationNumber,
             ...iteration
           });
+
+          const limitEvaluation = evaluateLimits(
+            createLimitUsage({
+              iterations: iterationNumber,
+              changedFiles,
+              diffLines,
+              estimatedCostUsd: costEstimate.estimatedCostUsd
+            }),
+            limits
+          );
+          const stopSignal = limitEvaluation.signals.find((signal) => signal !== 'budget_soft_limit_reached');
+          if (stopSignal) {
+            throw new WorkerLimitError(stopSignalToTaskStatus(stopSignal), `Worker stopped because limit signal "${stopSignal}" was reached.`);
+          }
         }
       }
     });
@@ -79,7 +133,10 @@ export async function runDatabaseWorkerOnce() {
         taskRunId: claimed.taskRun.id,
         status: 'succeeded',
         summary: result.summary,
-        iterationCount: iterationNumber
+        iterationCount: iterationNumber,
+        inputTokens: costEstimate.inputTokens,
+        outputTokens: costEstimate.outputTokens,
+        estimatedCostUsd: costEstimate.estimatedCostUsd
       });
     } else if (result.status === 'validation_failed') {
       await repository.transitionTask(claimed.task.id, 'validation_failed', {
@@ -96,7 +153,10 @@ export async function runDatabaseWorkerOnce() {
         status: 'failed',
         summary: result.summary,
         errorMessage: result.validation.stderr || 'Validation failed.',
-        iterationCount: iterationNumber
+        iterationCount: iterationNumber,
+        inputTokens: costEstimate.inputTokens,
+        outputTokens: costEstimate.outputTokens,
+        estimatedCostUsd: costEstimate.estimatedCostUsd
       });
     } else {
       await repository.transitionTask(claimed.task.id, 'ready_for_user_review', {
@@ -107,19 +167,12 @@ export async function runDatabaseWorkerOnce() {
         taskRunId: claimed.taskRun.id,
         status: 'succeeded',
         summary: result.summary,
-        iterationCount: iterationNumber
+        iterationCount: iterationNumber,
+        inputTokens: costEstimate.inputTokens,
+        outputTokens: costEstimate.outputTokens,
+        estimatedCostUsd: costEstimate.estimatedCostUsd
       });
     }
-
-    await repository.recordProviderUsage({
-      taskId: claimed.task.id,
-      taskRunId: claimed.taskRun.id,
-      provider: providerKind,
-      model: providerKind,
-      inputTokens: 0,
-      outputTokens: 0,
-      estimatedCostUsd: 0
-    });
 
     return {
       claimed: true,
@@ -128,13 +181,24 @@ export async function runDatabaseWorkerOnce() {
     };
   } catch (error) {
     const message = toErrorMessage(error);
-    await repository.failTask(claimed.task.id, message);
+    const status = error instanceof WorkerLimitError ? error.status : 'failed';
+    await repository.failTask(claimed.task.id, message, status);
     await repository.finishTaskRun({
       taskRunId: claimed.taskRun.id,
       status: 'failed',
       errorMessage: message,
-      iterationCount: iterationNumber
+      iterationCount: iterationNumber,
+      inputTokens: costEstimate.inputTokens,
+      outputTokens: costEstimate.outputTokens,
+      estimatedCostUsd: costEstimate.estimatedCostUsd
     });
+    if (error instanceof WorkerLimitError) {
+      return {
+        claimed: true,
+        taskId: claimed.task.id,
+        status
+      };
+    }
     throw error;
   }
 }
@@ -153,5 +217,51 @@ function resolveVerifyCommand(configYaml?: string): string {
     return config.commands.verify ?? config.commands.build ?? 'node --version';
   } catch {
     return 'node --version';
+  }
+}
+
+function resolveLimits(configYaml: string | undefined, maxIterations: number, maxBudgetUsd: number): Limits {
+  let limits = DEFAULT_LIMITS;
+  if (configYaml) {
+    try {
+      limits = toCoreLimits(parseAgentConfigYaml(configYaml));
+    } catch {
+      limits = DEFAULT_LIMITS;
+    }
+  }
+
+  return {
+    ...limits,
+    maxIterations,
+    maxBudgetUsd
+  };
+}
+
+function createLimitUsage(overrides: Partial<LimitUsage>): LimitUsage {
+  return {
+    iterations: 0,
+    runtimeMinutes: 0,
+    changedFiles: 0,
+    diffLines: 0,
+    repeatedErrorCount: 0,
+    estimatedCostUsd: 0,
+    ...overrides
+  };
+}
+
+function stopSignalToTaskStatus(signal: string): TaskStatus {
+  if (signal === 'iteration_limit_reached') return 'iteration_limit_reached';
+  if (signal === 'budget_exceeded') return 'budget_exceeded';
+  if (signal === 'repeated_error_detected') return 'repeated_error_detected';
+  return 'failed';
+}
+
+class WorkerLimitError extends Error {
+  constructor(
+    readonly status: TaskStatus,
+    message: string
+  ) {
+    super(message);
+    this.name = 'WorkerLimitError';
   }
 }

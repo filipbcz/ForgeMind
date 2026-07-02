@@ -71,6 +71,66 @@ export interface ApprovalApi {
   resolvedAt?: string;
 }
 
+export interface AuditEventApi {
+  id: string;
+  actorType: 'user' | 'agent' | 'system' | 'github';
+  actorId?: string;
+  eventType: string;
+  projectId?: string;
+  taskId?: string;
+  payload: unknown;
+  createdAt: string;
+}
+
+export interface TaskDiffApi {
+  taskId: string;
+  filesChanged: number;
+  insertions: number;
+  deletions: number;
+  iterations: Array<{
+    id: string;
+    taskRunId: string;
+    iterationNumber: number;
+    phase: string;
+    resultSummary: string;
+    diffStat: unknown;
+    validationResult: unknown;
+    createdAt: string;
+  }>;
+}
+
+export interface TaskUsageApi {
+  taskId: string;
+  inputTokens: number;
+  outputTokens: number;
+  cachedTokens: number;
+  estimatedCostUsd: number;
+  runs: Array<{
+    id: string;
+    provider: string;
+    model: string;
+    status: string;
+    iterationCount: number;
+    inputTokens: number;
+    outputTokens: number;
+    estimatedCostUsd: number;
+    startedAt?: string;
+    finishedAt?: string;
+    summary?: string | null;
+    errorMessage?: string | null;
+  }>;
+  records: Array<{
+    id: string;
+    provider: string;
+    model: string;
+    inputTokens: number;
+    outputTokens: number;
+    cachedTokens: number;
+    estimatedCostUsd: number;
+    createdAt: string;
+  }>;
+}
+
 export interface CreateTaskRequest {
   projectId: string;
   title: string;
@@ -78,6 +138,15 @@ export interface CreateTaskRequest {
   mode: TaskApi['mode'];
   maxIterations: number;
   maxBudgetUsd: number;
+}
+
+export interface CreateProjectRequest {
+  name: string;
+  slug: string;
+  githubOwner: string;
+  githubRepo: string;
+  defaultBranch: string;
+  configYaml?: string;
 }
 
 export interface ProjectSummary extends ProjectApi {
