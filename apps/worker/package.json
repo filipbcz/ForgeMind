@@ -1,0 +1,26 @@
+{
+  "name": "@forgemind/worker",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "scripts": {
+    "build": "tsup src/index.ts --format esm --target node22 --out-dir dist --clean --sourcemap",
+    "dev": "tsx --conditions=development src/index.ts",
+    "start": "node dist/index.js"
+  },
+  "dependencies": {
+    "@forgemind/core": "0.1.0",
+    "@forgemind/github": "0.1.0",
+    "@forgemind/providers": "0.1.0",
+    "@forgemind/shared": "0.1.0",
+    "execa": "^9.6.0",
+    "simple-git": "^3.27.0"
+  },
+  "devDependencies": {
+    "tsup": "^8.5.0",
+    "tsx": "^4.19.4"
+  }
+}
+

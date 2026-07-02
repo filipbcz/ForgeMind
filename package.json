@@ -1,0 +1,37 @@
+{
+  "name": "forgemind",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "workspaces": [
+    "apps/*",
+    "packages/*"
+  ],
+  "engines": {
+    "node": ">=22.0.0",
+    "npm": ">=10.0.0"
+  },
+  "scripts": {
+    "build": "npm run build:packages && npm run build:apps",
+    "build:packages": "npm run build -w @forgemind/shared && npm run build -w @forgemind/core && npm run build -w @forgemind/config && npm run build -w @forgemind/providers && npm run build -w @forgemind/github && npm run build -w @forgemind/db",
+    "build:apps": "npm run build -w @forgemind/studio-api && npm run build -w @forgemind/worker && npm run build -w @forgemind/mobile-pwa",
+    "dev:api": "npm run dev -w @forgemind/studio-api",
+    "dev:mobile": "npm run dev -w @forgemind/mobile-pwa --",
+    "dev:worker": "npm run dev -w @forgemind/worker",
+    "test": "npm run test --workspaces --if-present",
+    "typecheck": "tsc -b",
+    "db:generate": "prisma generate --schema packages/db/prisma/schema.prisma",
+    "db:migrate": "prisma migrate dev --schema packages/db/prisma/schema.prisma"
+  },
+  "devDependencies": {
+    "@types/node": "^22.15.29",
+    "prisma": "^6.9.0",
+    "tsup": "^8.5.0",
+    "tsx": "^4.19.4",
+    "typescript": "^5.8.3",
+    "vitest": "^3.2.1"
+  },
+  "overrides": {
+    "esbuild": "^0.28.1"
+  }
+}

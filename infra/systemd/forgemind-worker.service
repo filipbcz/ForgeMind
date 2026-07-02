@@ -1,0 +1,22 @@
+[Unit]
+Description=ForgeMind Agent Worker
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=forgemind-agent
+Group=forgemind-agent
+WorkingDirectory=/opt/forgemind/apps/worker
+ExecStart=/usr/bin/node dist/index.js
+Restart=on-failure
+RestartSec=5
+Environment=NODE_ENV=production
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/opt/forgemind/.forgemind /var/lib/forgemind /var/log/forgemind
+
+[Install]
+WantedBy=multi-user.target
+

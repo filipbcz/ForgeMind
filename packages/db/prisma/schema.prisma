@@ -1,0 +1,271 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum UserRole {
+  owner
+  operator
+}
+
+enum TaskMode {
+  safe
+  auto
+  full_auto
+}
+
+enum TaskStatus {
+  draft
+  submitted
+  planning
+  waiting_for_plan_approval
+  creating_github_issue
+  creating_branch
+  running_ai
+  validating
+  reviewing
+  improving
+  needs_approval
+  creating_pr
+  ready_for_user_review
+  completed
+  failed
+  cancelled
+  budget_exceeded
+  iteration_limit_reached
+  repeated_error_detected
+  approval_rejected
+  provider_failed
+  validation_failed
+}
+
+enum ProviderKind {
+  codex
+  github_copilot
+  openai
+  local
+  mock
+}
+
+enum RunStatus {
+  queued
+  running
+  succeeded
+  failed
+  cancelled
+}
+
+enum IterationPhase {
+  planning
+  implementation
+  validation
+  review
+  approval
+  pr_creation
+}
+
+enum ApprovalType {
+  budget_increase
+  continue_after_iteration_limit
+  new_dependency
+  risky_refactor
+  database_migration
+  config_change
+  deploy_staging
+  deploy_production
+  merge_pr
+  delete_files
+  github_workflow_change
+  systemd_change
+  nginx_config_change
+  write_outside_repo
+}
+
+enum ApprovalStatus {
+  pending
+  approved
+  rejected
+  cancelled
+}
+
+enum RiskLevel {
+  low
+  medium
+  high
+  critical
+}
+
+enum AuditActorType {
+  user
+  agent
+  system
+  github
+}
+
+model User {
+  id           String   @id @default(uuid())
+  email        String   @unique
+  name         String
+  githubUserId String?  @unique @map("github_user_id")
+  role         UserRole @default(owner)
+  createdAt    DateTime @default(now()) @map("created_at")
+  updatedAt    DateTime @updatedAt @map("updated_at")
+
+  tasks     Task[]
+  approvals Approval[]
+
+  @@map("users")
+}
+
+model Project {
+  id            String   @id @default(uuid())
+  name          String
+  slug          String   @unique
+  githubOwner   String   @map("github_owner")
+  githubRepo    String   @map("github_repo")
+  defaultBranch String   @default("main") @map("default_branch")
+  configYaml    String?  @map("config_yaml")
+  isActive      Boolean  @default(true) @map("is_active")
+  createdAt     DateTime @default(now()) @map("created_at")
+  updatedAt     DateTime @updatedAt @map("updated_at")
+
+  tasks    Task[]
+  auditLog AuditLog[]
+
+  @@map("projects")
+}
+
+model Task {
+  id                   String     @id @default(uuid())
+  projectId            String     @map("project_id")
+  createdByUserId      String     @map("created_by_user_id")
+  title                String
+  prompt               String
+  mode                 TaskMode   @default(safe)
+  status               TaskStatus @default(draft)
+  githubIssueNumber    Int?       @map("github_issue_number")
+  githubIssueUrl       String?    @map("github_issue_url")
+  branchName           String?    @map("branch_name")
+  pullRequestNumber    Int?       @map("pull_request_number")
+  pullRequestUrl       String?    @map("pull_request_url")
+  maxIterations        Int        @default(10) @map("max_iterations")
+  maxBudgetUsd         Decimal    @default(2.00) @map("max_budget_usd") @db.Decimal(10, 2)
+  createdAt            DateTime   @default(now()) @map("created_at")
+  updatedAt            DateTime   @updatedAt @map("updated_at")
+  startedAt            DateTime?  @map("started_at")
+  finishedAt           DateTime?  @map("finished_at")
+
+  project        Project         @relation(fields: [projectId], references: [id])
+  createdByUser  User            @relation(fields: [createdByUserId], references: [id])
+  taskRuns       TaskRun[]
+  approvals      Approval[]
+  providerUsage  ProviderUsage[]
+  auditLog       AuditLog[]
+
+  @@index([projectId, status])
+  @@map("tasks")
+}
+
+model TaskRun {
+  id               String       @id @default(uuid())
+  taskId           String       @map("task_id")
+  provider         ProviderKind
+  model            String
+  status           RunStatus    @default(queued)
+  iterationCount   Int          @default(0) @map("iteration_count")
+  inputTokens      Int          @default(0) @map("input_tokens")
+  outputTokens     Int          @default(0) @map("output_tokens")
+  estimatedCostUsd Decimal      @default(0.00) @map("estimated_cost_usd") @db.Decimal(10, 4)
+  startedAt        DateTime?    @map("started_at")
+  finishedAt       DateTime?    @map("finished_at")
+  summary          String?
+  errorMessage     String?      @map("error_message")
+
+  task           Task            @relation(fields: [taskId], references: [id])
+  iterations     TaskIteration[]
+  providerUsage  ProviderUsage[]
+
+  @@index([taskId, status])
+  @@map("task_runs")
+}
+
+model TaskIteration {
+  id                   String         @id @default(uuid())
+  taskRunId            String         @map("task_run_id")
+  iterationNumber      Int            @map("iteration_number")
+  phase                IterationPhase
+  prompt               String
+  resultSummary        String         @map("result_summary")
+  diffStatJson         Json           @map("diff_stat_json")
+  validationResultJson Json           @map("validation_result_json")
+  createdAt            DateTime       @default(now()) @map("created_at")
+
+  taskRun TaskRun @relation(fields: [taskRunId], references: [id])
+
+  @@unique([taskRunId, iterationNumber, phase])
+  @@map("task_iterations")
+}
+
+model Approval {
+  id               String         @id @default(uuid())
+  taskId           String         @map("task_id")
+  type             ApprovalType
+  status           ApprovalStatus @default(pending)
+  requestedBy      String         @map("requested_by")
+  approvedByUserId String?        @map("approved_by_user_id")
+  title            String
+  description      String
+  riskLevel        RiskLevel      @map("risk_level")
+  payloadJson      Json           @map("payload_json")
+  createdAt        DateTime       @default(now()) @map("created_at")
+  resolvedAt       DateTime?      @map("resolved_at")
+
+  task           Task  @relation(fields: [taskId], references: [id])
+  approvedByUser User? @relation(fields: [approvedByUserId], references: [id])
+
+  @@index([taskId, status])
+  @@map("approvals")
+}
+
+model ProviderUsage {
+  id               String       @id @default(uuid())
+  taskId           String       @map("task_id")
+  taskRunId        String       @map("task_run_id")
+  provider         ProviderKind
+  model            String
+  inputTokens      Int          @default(0) @map("input_tokens")
+  outputTokens     Int          @default(0) @map("output_tokens")
+  cachedTokens     Int          @default(0) @map("cached_tokens")
+  credits          Decimal      @default(0.00) @db.Decimal(12, 4)
+  estimatedCostUsd Decimal      @default(0.00) @map("estimated_cost_usd") @db.Decimal(10, 4)
+  createdAt        DateTime     @default(now()) @map("created_at")
+
+  task    Task    @relation(fields: [taskId], references: [id])
+  taskRun TaskRun @relation(fields: [taskRunId], references: [id])
+
+  @@index([provider, createdAt])
+  @@map("provider_usage")
+}
+
+model AuditLog {
+  id        String         @id @default(uuid())
+  actorType AuditActorType @map("actor_type")
+  actorId   String?        @map("actor_id")
+  eventType String         @map("event_type")
+  projectId String?        @map("project_id")
+  taskId    String?        @map("task_id")
+  payload   Json           @map("payload_json")
+  createdAt DateTime       @default(now()) @map("created_at")
+
+  project Project? @relation(fields: [projectId], references: [id])
+  task    Task?    @relation(fields: [taskId], references: [id])
+
+  @@index([eventType, createdAt])
+  @@index([taskId, createdAt])
+  @@map("audit_log")
+}
+
