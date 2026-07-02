@@ -1,3 +1,5 @@
+import { createSign } from 'node:crypto';
+import { readFile } from 'node:fs/promises';
 import type { ForgeTask, Project } from '@forgemind/core';
 
 export interface CreateIssueInput {
@@ -30,6 +32,183 @@ export interface GitHubAdapter {
   createDraftPullRequest(input: CreateDraftPullRequestInput): Promise<CreateDraftPullRequestResult>;
   commentOnIssue(project: Project, issueNumber: number, body: string): Promise<void>;
   readCheckStatus(project: Project, ref: string): Promise<'pending' | 'success' | 'failure'>;
+}
+
+export interface GitHubAppAdapterOptions {
+  token: string;
+  apiBaseUrl?: string;
+}
+
+interface GitHubRefResponse {
+  object: {
+    sha: string;
+  };
+}
+
+interface GitHubIssueResponse {
+  number: number;
+  html_url: string;
+}
+
+interface GitHubPullResponse {
+  number: number;
+  html_url: string;
+}
+
+interface GitHubStatusResponse {
+  state: 'error' | 'failure' | 'pending' | 'success';
+}
+
+export class GitHubAppAdapter implements GitHubAdapter {
+  private readonly apiBaseUrl: string;
+
+  constructor(private readonly options: GitHubAppAdapterOptions) {
+    this.apiBaseUrl = options.apiBaseUrl ?? 'https://api.github.com';
+  }
+
+  async createIssue(input: CreateIssueInput): Promise<CreateIssueResult> {
+    const issue = await this.request<GitHubIssueResponse>('POST', `/repos/${input.project.githubOwner}/${input.project.githubRepo}/issues`, {
+      title: `[AI] ${input.task.title}`,
+      body: renderIssueBody(input.task),
+      labels: input.labels
+    });
+
+    return {
+      issueNumber: issue.number,
+      issueUrl: issue.html_url
+    };
+  }
+
+  async createBranch(project: Project, branchName: string, fromBranch: string): Promise<void> {
+    const encodedBase = encodeURIComponent(`heads/${fromBranch}`);
+    const ref = await this.request<GitHubRefResponse>('GET', `/repos/${project.githubOwner}/${project.githubRepo}/git/ref/${encodedBase}`);
+    await this.request('POST', `/repos/${project.githubOwner}/${project.githubRepo}/git/refs`, {
+      ref: `refs/heads/${branchName}`,
+      sha: ref.object.sha
+    });
+  }
+
+  async commitAndPush(): Promise<void> {
+    // The GitHub App adapter owns GitHub API calls. Local git commit/push belongs to
+    // the future workspace transport because it needs a concrete worktree and diff.
+    return undefined;
+  }
+
+  async createDraftPullRequest(input: CreateDraftPullRequestInput): Promise<CreateDraftPullRequestResult> {
+    const pull = await this.request<GitHubPullResponse>('POST', `/repos/${input.project.githubOwner}/${input.project.githubRepo}/pulls`, {
+      title: input.title,
+      body: input.body,
+      head: input.task.branchName,
+      base: input.project.defaultBranch,
+      draft: true
+    });
+
+    return {
+      pullRequestNumber: pull.number,
+      pullRequestUrl: pull.html_url
+    };
+  }
+
+  async commentOnIssue(project: Project, issueNumber: number, body: string): Promise<void> {
+    await this.request('POST', `/repos/${project.githubOwner}/${project.githubRepo}/issues/${issueNumber}/comments`, {
+      body
+    });
+  }
+
+  async readCheckStatus(project: Project, ref: string): Promise<'pending' | 'success' | 'failure'> {
+    const status = await this.request<GitHubStatusResponse>('GET', `/repos/${project.githubOwner}/${project.githubRepo}/commits/${ref}/status`);
+    if (status.state === 'success') return 'success';
+    if (status.state === 'pending') return 'pending';
+    return 'failure';
+  }
+
+  private async request<T = unknown>(method: string, path: string, body?: unknown): Promise<T> {
+    const response = await fetch(`${this.apiBaseUrl}${path}`, {
+      method,
+      headers: {
+        Accept: 'application/vnd.github+json',
+        Authorization: `Bearer ${this.options.token}`,
+        'Content-Type': 'application/json',
+        'User-Agent': 'ForgeMind-GitHubAppAdapter',
+        'X-GitHub-Api-Version': '2022-11-28'
+      },
+      body: body === undefined ? undefined : JSON.stringify(body)
+    });
+
+    if (!response.ok) {
+      const text = await response.text();
+      throw new Error(`GitHub API ${method} ${path} failed with ${response.status}: ${text}`);
+    }
+
+    if (response.status === 204) {
+      return undefined as T;
+    }
+
+    return response.json() as Promise<T>;
+  }
+}
+
+export async function createGitHubAdapterFromEnv(): Promise<GitHubAdapter> {
+  if (process.env.FORGEMIND_GITHUB_ADAPTER !== 'app') {
+    return new MockGitHubAdapter();
+  }
+
+  if (process.env.GITHUB_TOKEN) {
+    return new GitHubAppAdapter({ token: process.env.GITHUB_TOKEN });
+  }
+
+  const appId = process.env.GITHUB_APP_ID;
+  const installationId = process.env.GITHUB_APP_INSTALLATION_ID;
+  const privateKeyPath = process.env.GITHUB_APP_PRIVATE_KEY_PATH;
+
+  if (!appId || !installationId || !privateKeyPath) {
+    throw new Error('GitHub App adapter requires GITHUB_APP_ID, GITHUB_APP_INSTALLATION_ID and GITHUB_APP_PRIVATE_KEY_PATH.');
+  }
+
+  const privateKey = await readFile(privateKeyPath, 'utf8');
+  const jwt = createGitHubAppJwt({ appId, privateKey });
+  const token = await createInstallationToken({ jwt, installationId });
+  return new GitHubAppAdapter({ token });
+}
+
+function createGitHubAppJwt(input: { appId: string; privateKey: string }): string {
+  const nowSeconds = Math.floor(Date.now() / 1000);
+  const header = base64Url(JSON.stringify({ alg: 'RS256', typ: 'JWT' }));
+  const payload = base64Url(
+    JSON.stringify({
+      iat: nowSeconds - 60,
+      exp: nowSeconds + 9 * 60,
+      iss: input.appId
+    })
+  );
+  const unsigned = `${header}.${payload}`;
+  const signature = createSign('RSA-SHA256').update(unsigned).sign(input.privateKey);
+  return `${unsigned}.${base64Url(signature)}`;
+}
+
+async function createInstallationToken(input: { jwt: string; installationId: string }): Promise<string> {
+  const response = await fetch(`https://api.github.com/app/installations/${input.installationId}/access_tokens`, {
+    method: 'POST',
+    headers: {
+      Accept: 'application/vnd.github+json',
+      Authorization: `Bearer ${input.jwt}`,
+      'User-Agent': 'ForgeMind-GitHubAppAdapter',
+      'X-GitHub-Api-Version': '2022-11-28'
+    }
+  });
+
+  if (!response.ok) {
+    const text = await response.text();
+    throw new Error(`GitHub App installation token request failed with ${response.status}: ${text}`);
+  }
+
+  const data = (await response.json()) as { token: string };
+  return data.token;
+}
+
+function base64Url(value: string | Buffer): string {
+  const buffer = typeof value === 'string' ? Buffer.from(value) : value;
+  return buffer.toString('base64url');
 }
 
 export function slugifyBranchSegment(value: string): string {
@@ -131,4 +310,3 @@ export class MockGitHubAdapter implements GitHubAdapter {
     return 'success';
   }
 }
-

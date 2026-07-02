@@ -148,9 +148,33 @@ a {
 }
 
 .primary-action:disabled,
-.danger-action:disabled {
+.danger-action:disabled,
+.secondary-action[aria-disabled="true"] {
   opacity: 0.52;
   cursor: not-allowed;
+}
+
+.error-banner,
+.loading-line,
+.empty-state {
+  background: #fffdfa;
+  border: 1px solid #dde5dd;
+  border-radius: 8px;
+  padding: 12px 14px;
+}
+
+.error-banner {
+  color: #92400e;
+  background: #fef3c7;
+  margin-bottom: 16px;
+}
+
+.empty-state {
+  min-height: 82px;
+  display: grid;
+  align-content: center;
+  justify-items: start;
+  gap: 10px;
 }
 
 .workspace {
@@ -567,4 +591,3 @@ a {
     grid-template-columns: 1fr;
   }
 }
-

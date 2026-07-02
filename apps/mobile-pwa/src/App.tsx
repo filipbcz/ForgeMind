@@ -1,4 +1,5 @@
-import { useMemo, useState } from 'react';
+import { useEffect, useMemo, useState } from 'react';
+import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import {
   AlertTriangle,
   ArrowRight,
@@ -8,26 +9,51 @@ import {
   GitBranch,
   Github,
   LayoutList,
+  Play,
   Plus,
+  RefreshCw,
   Settings,
   ShieldCheck,
   Smartphone,
   XCircle
 } from 'lucide-react';
-import { initialApprovals, initialTasks, projects } from './api.js';
-import type { ApprovalSummary, TaskSummary } from './types.js';
+import {
+  createTask as createTaskRequest,
+  fallbackApprovals,
+  fallbackProjects,
+  fallbackTasks,
+  fetchApprovals,
+  fetchProjects,
+  fetchTasks,
+  resolveApproval as resolveApprovalRequest,
+  startTask as startTaskRequest
+} from './api.js';
+import type { ApprovalSummary, CreateTaskRequest, ProjectSummary, TaskSummary } from './types.js';
 
 type View = 'tasks' | 'new-task' | 'approvals' | 'settings';
 
 const statusLabels: Record<TaskSummary['status'], string> = {
   draft: 'Draft',
-  submitted: 'Submitted',
+  submitted: 'Queued',
   planning: 'Planning',
+  waiting_for_plan_approval: 'Plan approval',
+  creating_github_issue: 'Creating issue',
+  creating_branch: 'Creating branch',
   running_ai: 'Running AI',
   validating: 'Validating',
+  reviewing: 'Reviewing',
+  improving: 'Improving',
   needs_approval: 'Needs approval',
+  creating_pr: 'Creating PR',
   ready_for_user_review: 'Ready for review',
   completed: 'Completed',
+  failed: 'Failed',
+  cancelled: 'Cancelled',
+  budget_exceeded: 'Budget exceeded',
+  iteration_limit_reached: 'Iteration limit',
+  repeated_error_detected: 'Repeated error',
+  approval_rejected: 'Approval rejected',
+  provider_failed: 'Provider failed',
   validation_failed: 'Validation failed'
 };
 
@@ -35,57 +61,101 @@ const statusIcons: Record<TaskSummary['status'], typeof Clock3> = {
   draft: Clock3,
   submitted: Clock3,
   planning: LayoutList,
+  waiting_for_plan_approval: ShieldCheck,
+  creating_github_issue: Github,
+  creating_branch: GitBranch,
   running_ai: GitBranch,
   validating: ClipboardCheck,
+  reviewing: ClipboardCheck,
+  improving: RefreshCw,
   needs_approval: AlertTriangle,
+  creating_pr: ClipboardCheck,
   ready_for_user_review: CheckCircle2,
   completed: CheckCircle2,
+  failed: XCircle,
+  cancelled: XCircle,
+  budget_exceeded: AlertTriangle,
+  iteration_limit_reached: AlertTriangle,
+  repeated_error_detected: AlertTriangle,
+  approval_rejected: XCircle,
+  provider_failed: XCircle,
   validation_failed: XCircle
 };
 
 export function App() {
+  const queryClient = useQueryClient();
   const [view, setView] = useState<View>('tasks');
-  const [tasks, setTasks] = useState<TaskSummary[]>(initialTasks);
-  const [approvals, setApprovals] = useState<ApprovalSummary[]>(initialApprovals);
-  const [selectedTaskId, setSelectedTaskId] = useState<string>(initialTasks[0]?.id ?? '');
+  const [selectedTaskId, setSelectedTaskId] = useState<string>('');
+
+  const projectsQuery = useQuery({
+    queryKey: ['projects'],
+    queryFn: fetchProjects,
+    retry: 1
+  });
+  const tasksQuery = useQuery({
+    queryKey: ['tasks'],
+    queryFn: fetchTasks,
+    refetchInterval: 5000,
+    retry: 1
+  });
+  const approvalsQuery = useQuery({
+    queryKey: ['approvals'],
+    queryFn: fetchApprovals,
+    refetchInterval: 5000,
+    retry: 1
+  });
+
+  const projects = projectsQuery.data ?? fallbackProjects;
+  const tasks = tasksQuery.data ?? fallbackTasks;
+  const approvals = approvalsQuery.data ?? fallbackApprovals;
+
+  useEffect(() => {
+    if (!selectedTaskId && tasks[0]) {
+      setSelectedTaskId(tasks[0].id);
+    }
+  }, [selectedTaskId, tasks]);
 
   const selectedTask = useMemo(() => tasks.find((task) => task.id === selectedTaskId) ?? tasks[0], [selectedTaskId, tasks]);
   const pendingApprovals = approvals.filter((approval) => approval.status === 'pending');
   const activeTasks = tasks.filter((task) => task.status !== 'completed');
+  const hasApiError = Boolean(projectsQuery.error || tasksQuery.error || approvalsQuery.error);
+
+  const createTaskMutation = useMutation({
+    mutationFn: createTaskRequest,
+    onSuccess: (task) => {
+      queryClient.invalidateQueries({ queryKey: ['tasks'] });
+      queryClient.invalidateQueries({ queryKey: ['projects'] });
+      setSelectedTaskId(task.id);
+      setView('tasks');
+    }
+  });
+
+  const startTaskMutation = useMutation({
+    mutationFn: startTaskRequest,
+    onSuccess: (task) => {
+      queryClient.invalidateQueries({ queryKey: ['tasks'] });
+      setSelectedTaskId(task.id);
+    }
+  });
+
+  const resolveApprovalMutation = useMutation({
+    mutationFn: ({ id, status }: { id: string; status: 'approved' | 'rejected' }) => resolveApprovalRequest(id, status),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['approvals'] });
+      queryClient.invalidateQueries({ queryKey: ['tasks'] });
+    }
+  });
 
   function createTask(formData: FormData) {
-    const projectId = String(formData.get('projectId'));
-    const title = String(formData.get('title'));
-    const prompt = String(formData.get('prompt'));
-    const mode = String(formData.get('mode')) as TaskSummary['mode'];
-    const maxBudgetUsd = Number(formData.get('maxBudgetUsd') || 2);
-    const maxIterations = Number(formData.get('maxIterations') || 10);
-
-    const task: TaskSummary = {
-      id: `task_${crypto.randomUUID()}`,
-      projectId,
-      title,
-      prompt,
-      status: 'draft',
-      currentStep: 'Připraveno ke spuštění',
-      mode,
-      iterations: 0,
-      maxIterations,
-      budgetUsd: 0,
-      maxBudgetUsd,
-      updatedAt: new Date().toISOString(),
-      plan: [],
-      testResult: 'Zatím nespouštěno',
-      diffSummary: 'Bez změn'
+    const input: CreateTaskRequest = {
+      projectId: String(formData.get('projectId')),
+      title: String(formData.get('title')),
+      prompt: String(formData.get('prompt')),
+      mode: String(formData.get('mode')) as CreateTaskRequest['mode'],
+      maxBudgetUsd: Number(formData.get('maxBudgetUsd') || 2),
+      maxIterations: Number(formData.get('maxIterations') || 10)
     };
-
-    setTasks((current) => [task, ...current]);
-    setSelectedTaskId(task.id);
-    setView('tasks');
-  }
-
-  function resolveApproval(id: string, status: 'approved' | 'rejected') {
-    setApprovals((current) => current.map((approval) => (approval.id === id ? { ...approval, status } : approval)));
+    createTaskMutation.mutate(input);
   }
 
   return (
@@ -121,30 +191,48 @@ export function App() {
           </button>
         </header>
 
-        {view === 'tasks' && selectedTask ? (
+        {hasApiError ? <div className="error-banner">API není dostupné, zobrazuji lokální fallback.</div> : null}
+
+        {view === 'tasks' ? (
           <section className="workspace">
             <div className="task-list" aria-label="Seznam tasků">
               <MetricRow label="Aktivní tasky" value={String(activeTasks.length)} />
               <MetricRow label="Čekající approvals" value={String(pendingApprovals.length)} tone={pendingApprovals.length ? 'warning' : 'ok'} />
+              {tasksQuery.isLoading ? <div className="loading-line">Načítám tasky...</div> : null}
+              {tasks.length === 0 ? <EmptyState onCreate={() => setView('new-task')} /> : null}
               {tasks.map((task) => (
-                <TaskButton key={task.id} task={task} selected={task.id === selectedTask.id} onClick={() => setSelectedTaskId(task.id)} />
+                <TaskButton key={task.id} task={task} selected={task.id === selectedTask?.id} onClick={() => setSelectedTaskId(task.id)} />
               ))}
             </div>
-            <TaskDetail task={selectedTask} />
+            {selectedTask ? (
+              <TaskDetail
+                projects={projects}
+                task={selectedTask}
+                onStart={(taskId) => startTaskMutation.mutate(taskId)}
+                starting={startTaskMutation.isPending}
+              />
+            ) : null}
           </section>
         ) : null}
 
-        {view === 'new-task' ? <NewTaskForm onSubmit={createTask} /> : null}
+        {view === 'new-task' ? <NewTaskForm projects={projects} saving={createTaskMutation.isPending} onSubmit={createTask} /> : null}
 
         {view === 'approvals' ? (
           <section className="approval-grid">
+            {approvals.length === 0 ? <div className="empty-state">Žádné schválení nečeká.</div> : null}
             {approvals.map((approval) => (
-              <ApprovalPanel key={approval.id} approval={approval} onResolve={resolveApproval} />
+              <ApprovalPanel
+                key={approval.id}
+                approval={approval}
+                tasks={tasks}
+                resolving={resolveApprovalMutation.isPending}
+                onResolve={(id, status) => resolveApprovalMutation.mutate({ id, status })}
+              />
             ))}
           </section>
         ) : null}
 
-        {view === 'settings' ? <SettingsPanel /> : null}
+        {view === 'settings' ? <SettingsPanel projects={projects} /> : null}
       </main>
 
       <nav className="bottom-nav" aria-label="Mobilní navigace">
@@ -189,6 +277,18 @@ function MetricRow(props: { label: string; value: string; tone?: 'ok' | 'warning
   );
 }
 
+function EmptyState({ onCreate }: { onCreate: () => void }) {
+  return (
+    <div className="empty-state">
+      <strong>Žádné tasky</strong>
+      <button className="secondary-action" type="button" onClick={onCreate}>
+        <Plus size={18} />
+        Vytvořit první
+      </button>
+    </div>
+  );
+}
+
 function TaskButton(props: { task: TaskSummary; selected: boolean; onClick: () => void }) {
   const Icon = statusIcons[props.task.status];
   return (
@@ -205,7 +305,17 @@ function TaskButton(props: { task: TaskSummary; selected: boolean; onClick: () =
   );
 }
 
-function TaskDetail({ task }: { task: TaskSummary }) {
+function TaskDetail({
+  projects,
+  task,
+  starting,
+  onStart
+}: {
+  projects: ProjectSummary[];
+  task: TaskSummary;
+  starting: boolean;
+  onStart: (taskId: string) => void;
+}) {
   const project = projects.find((item) => item.id === task.projectId);
   return (
     <article className="detail">
@@ -241,6 +351,10 @@ function TaskDetail({ task }: { task: TaskSummary }) {
       </section>
 
       <div className="actions">
+        <button className="primary-action" type="button" disabled={task.status !== 'draft' || starting} onClick={() => onStart(task.id)}>
+          <Play size={18} />
+          Spustit
+        </button>
         <a className="secondary-action" href={task.issueUrl ?? '#'} aria-disabled={!task.issueUrl}>
           <Github size={18} />
           Issue
@@ -263,7 +377,7 @@ function MetricBlock(props: { label: string; value: string }) {
   );
 }
 
-function NewTaskForm({ onSubmit }: { onSubmit: (formData: FormData) => void }) {
+function NewTaskForm({ projects, saving, onSubmit }: { projects: ProjectSummary[]; saving: boolean; onSubmit: (formData: FormData) => void }) {
   return (
     <form
       className="task-form"
@@ -307,7 +421,7 @@ function NewTaskForm({ onSubmit }: { onSubmit: (formData: FormData) => void }) {
         Max. iterací
         <input name="maxIterations" type="number" min="1" max="50" defaultValue="10" />
       </label>
-      <button className="primary-action wide" type="submit">
+      <button className="primary-action wide" type="submit" disabled={saving || projects.length === 0}>
         <Smartphone size={18} />
         Vytvořit task
       </button>
@@ -317,9 +431,11 @@ function NewTaskForm({ onSubmit }: { onSubmit: (formData: FormData) => void }) {
 
 function ApprovalPanel(props: {
   approval: ApprovalSummary;
+  tasks: TaskSummary[];
+  resolving: boolean;
   onResolve: (id: string, status: 'approved' | 'rejected') => void;
 }) {
-  const task = initialTasks.find((item) => item.id === props.approval.taskId);
+  const task = props.tasks.find((item) => item.id === props.approval.taskId);
   return (
     <article className="approval-panel">
       <div className="approval-heading">
@@ -348,11 +464,21 @@ function ApprovalPanel(props: {
         ))}
       </div>
       <div className="actions">
-        <button className="primary-action" type="button" disabled={props.approval.status !== 'pending'} onClick={() => props.onResolve(props.approval.id, 'approved')}>
+        <button
+          className="primary-action"
+          type="button"
+          disabled={props.approval.status !== 'pending' || props.resolving}
+          onClick={() => props.onResolve(props.approval.id, 'approved')}
+        >
           <CheckCircle2 size={18} />
           Schválit
         </button>
-        <button className="danger-action" type="button" disabled={props.approval.status !== 'pending'} onClick={() => props.onResolve(props.approval.id, 'rejected')}>
+        <button
+          className="danger-action"
+          type="button"
+          disabled={props.approval.status !== 'pending' || props.resolving}
+          onClick={() => props.onResolve(props.approval.id, 'rejected')}
+        >
           <XCircle size={18} />
           Zamítnout
         </button>
@@ -361,14 +487,16 @@ function ApprovalPanel(props: {
   );
 }
 
-function SettingsPanel() {
+function SettingsPanel({ projects }: { projects: ProjectSummary[] }) {
   return (
     <section className="settings-grid">
       {projects.map((project) => (
         <article className="project-row" key={project.id}>
           <div>
             <h2>{project.name}</h2>
-            <p>{project.slug}</p>
+            <p>
+              {project.githubOwner}/{project.githubRepo}
+            </p>
           </div>
           <MetricBlock label="Otevřené PR" value={String(project.openPullRequests)} />
           <MetricBlock label="AI rozpočet" value={`$${project.budgetUsd.toFixed(2)}`} />

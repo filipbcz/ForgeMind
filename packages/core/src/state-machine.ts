@@ -20,7 +20,7 @@ const transitions: Record<TaskStatus, TaskStatus[]> = {
   creating_github_issue: ['creating_branch', 'failed', 'cancelled'],
   creating_branch: ['running_ai', 'failed', 'cancelled'],
   running_ai: ['validating', 'needs_approval', 'provider_failed', 'budget_exceeded', 'iteration_limit_reached', 'cancelled'],
-  validating: ['reviewing', 'running_ai', 'validation_failed', 'repeated_error_detected', 'cancelled'],
+  validating: ['reviewing', 'running_ai', 'validation_failed', 'repeated_error_detected', 'failed', 'cancelled'],
   reviewing: ['improving', 'creating_pr', 'needs_approval', 'failed', 'cancelled'],
   improving: ['validating', 'needs_approval', 'failed', 'cancelled'],
   needs_approval: ['running_ai', 'creating_pr', 'approval_rejected', 'cancelled'],
@@ -46,4 +46,3 @@ export function assertTaskTransition(from: TaskStatus, to: TaskStatus): void {
     throw new Error(`Invalid task status transition from "${from}" to "${to}"`);
   }
 }
-

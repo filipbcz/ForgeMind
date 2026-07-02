@@ -1,6 +1,18 @@
 import type { ForgeTask, Project } from '@forgemind/core';
+import { disconnectPrisma } from '@forgemind/db';
 import { createId, nowIso } from '@forgemind/shared';
+import { runDatabaseWorkerOnce } from './db-worker.js';
 import { runWorkerTask } from './workflow.js';
+
+if (process.env.DATABASE_URL) {
+  try {
+    const result = await runDatabaseWorkerOnce();
+    console.log(JSON.stringify(result, null, 2));
+  } finally {
+    await disconnectPrisma();
+  }
+  process.exit(0);
+}
 
 const demoProject: Project = {
   id: 'project_demo_gallery',
@@ -37,4 +49,3 @@ const result = await runWorkerTask({
 });
 
 console.log(JSON.stringify(result, null, 2));
-

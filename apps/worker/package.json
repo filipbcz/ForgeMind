@@ -11,7 +11,9 @@
     "start": "node dist/index.js"
   },
   "dependencies": {
+    "@forgemind/config": "0.1.0",
     "@forgemind/core": "0.1.0",
+    "@forgemind/db": "0.1.0",
     "@forgemind/github": "0.1.0",
     "@forgemind/providers": "0.1.0",
     "@forgemind/shared": "0.1.0",
@@ -23,4 +25,3 @@
     "tsx": "^4.19.4"
   }
 }
-

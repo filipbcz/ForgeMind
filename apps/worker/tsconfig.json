@@ -9,9 +9,10 @@
   "references": [
     { "path": "../../packages/shared" },
     { "path": "../../packages/core" },
+    { "path": "../../packages/config" },
+    { "path": "../../packages/db" },
     { "path": "../../packages/providers" },
     { "path": "../../packages/github" }
   ],
   "include": ["src"]
 }
-

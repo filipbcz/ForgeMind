@@ -2,17 +2,85 @@ export type TaskStatus =
   | 'draft'
   | 'submitted'
   | 'planning'
+  | 'waiting_for_plan_approval'
+  | 'creating_github_issue'
+  | 'creating_branch'
   | 'running_ai'
   | 'validating'
+  | 'reviewing'
+  | 'improving'
   | 'needs_approval'
+  | 'creating_pr'
   | 'ready_for_user_review'
   | 'completed'
+  | 'failed'
+  | 'cancelled'
+  | 'budget_exceeded'
+  | 'iteration_limit_reached'
+  | 'repeated_error_detected'
+  | 'approval_rejected'
+  | 'provider_failed'
   | 'validation_failed';
 
-export interface ProjectSummary {
+export interface ProjectApi {
   id: string;
   name: string;
   slug: string;
+  githubOwner: string;
+  githubRepo: string;
+  defaultBranch: string;
+  configYaml?: string;
+  isActive: boolean;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface TaskApi {
+  id: string;
+  projectId: string;
+  createdByUserId: string;
+  title: string;
+  prompt: string;
+  mode: 'safe' | 'auto' | 'full_auto';
+  status: TaskStatus;
+  githubIssueNumber?: number;
+  githubIssueUrl?: string;
+  branchName?: string;
+  pullRequestNumber?: number;
+  pullRequestUrl?: string;
+  maxIterations: number;
+  maxBudgetUsd: number;
+  createdAt: string;
+  updatedAt: string;
+  startedAt?: string;
+  finishedAt?: string;
+}
+
+export interface ApprovalApi {
+  id: string;
+  taskId: string;
+  type: string;
+  status: 'pending' | 'approved' | 'rejected' | 'cancelled';
+  requestedBy: 'system' | 'agent' | 'user';
+  approvedByUserId?: string;
+  title: string;
+  description: string;
+  riskLevel: 'low' | 'medium' | 'high' | 'critical';
+  payload: unknown;
+  createdAt: string;
+  resolvedAt?: string;
+}
+
+export interface CreateTaskRequest {
+  projectId: string;
+  title: string;
+  prompt: string;
+  mode: TaskApi['mode'];
+  maxIterations: number;
+  maxBudgetUsd: number;
+}
+
+export interface ProjectSummary extends ProjectApi {
   openPullRequests: number;
   budgetUsd: number;
 }
@@ -24,7 +92,7 @@ export interface TaskSummary {
   prompt: string;
   status: TaskStatus;
   currentStep: string;
-  mode: 'safe' | 'auto' | 'full_auto';
+  mode: TaskApi['mode'];
   iterations: number;
   maxIterations: number;
   budgetUsd: number;
@@ -44,8 +112,8 @@ export interface ApprovalSummary {
   title: string;
   reason: string;
   risk: string;
-  status: 'pending' | 'approved' | 'rejected';
-  riskLevel: 'low' | 'medium' | 'high' | 'critical';
+  status: ApprovalApi['status'];
+  riskLevel: ApprovalApi['riskLevel'];
   touchedFiles: string[];
   recommendation: string;
 }

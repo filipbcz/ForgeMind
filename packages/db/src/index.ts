@@ -14,3 +14,5 @@ export async function disconnectPrisma(): Promise<void> {
   }
 }
 
+export * from './mappers.js';
+export * from './repository.js';

@@ -1,7 +1,7 @@
 import type { FastifyInstance } from 'fastify';
 import { z } from 'zod';
 import { sendBadRequest, sendNotFound } from './http.js';
-import type { AppStore } from './store.js';
+import type { ForgeMindRepository } from '@forgemind/db';
 
 const projectSchema = z.object({
   name: z.string().min(2),
@@ -29,31 +29,32 @@ const commentSchema = z.object({
   comment: z.string().min(1)
 });
 
-export function registerRoutes(app: FastifyInstance, store: AppStore) {
+export function registerRoutes(app: FastifyInstance, repository: ForgeMindRepository) {
   app.get('/health', async () => ({
     ok: true,
-    service: 'forgemind-studio-api'
+    service: 'forgemind-studio-api',
+    database: Boolean(process.env.DATABASE_URL)
   }));
 
-  app.get('/api/me', async () => store.currentUser);
+  app.get('/api/me', async () => repository.getCurrentUser());
 
-  app.get('/api/projects', async () => Array.from(store.projects.values()));
+  app.get('/api/projects', async () => repository.listProjects());
 
   app.post('/api/projects', async (request, reply) => {
     try {
       const input = projectSchema.parse(request.body);
-      return reply.code(201).send(store.createProject(input));
+      return reply.code(201).send(await repository.createProject(input));
     } catch (error) {
       return sendBadRequest(reply, error);
     }
   });
 
-  app.get('/api/tasks', async () => Array.from(store.tasks.values()));
+  app.get('/api/tasks', async () => repository.listTasks());
 
   app.post('/api/tasks', async (request, reply) => {
     try {
       const input = createTaskSchema.parse(request.body);
-      return reply.code(201).send(store.createTask(input));
+      return reply.code(201).send(await repository.createTask(input));
     } catch (error) {
       return sendBadRequest(reply, error);
     }
@@ -61,14 +62,14 @@ export function registerRoutes(app: FastifyInstance, store: AppStore) {
 
   app.get('/api/tasks/:id', async (request, reply) => {
     const { id } = idParamsSchema.parse(request.params);
-    const task = store.tasks.get(id);
+    const task = await repository.getTask(id);
     return task ? task : sendNotFound(reply, `Task "${id}" not found`);
   });
 
   app.post('/api/tasks/:id/start', async (request, reply) => {
     try {
       const { id } = idParamsSchema.parse(request.params);
-      const task = store.startTask(id);
+      const task = await repository.startTask(id);
       return task ? task : sendNotFound(reply, `Task "${id}" not found`);
     } catch (error) {
       return sendBadRequest(reply, error);
@@ -78,7 +79,7 @@ export function registerRoutes(app: FastifyInstance, store: AppStore) {
   app.post('/api/tasks/:id/cancel', async (request, reply) => {
     try {
       const { id } = idParamsSchema.parse(request.params);
-      const task = store.cancelTask(id);
+      const task = await repository.cancelTask(id);
       return task ? task : sendNotFound(reply, `Task "${id}" not found`);
     } catch (error) {
       return sendBadRequest(reply, error);
@@ -87,22 +88,23 @@ export function registerRoutes(app: FastifyInstance, store: AppStore) {
 
   app.get('/api/tasks/:id/logs', async (request, reply) => {
     const { id } = idParamsSchema.parse(request.params);
-    if (!store.tasks.has(id)) return sendNotFound(reply, `Task "${id}" not found`);
-    return store.auditLog.filter((event) => event.taskId === id);
+    const task = await repository.getTask(id);
+    if (!task) return sendNotFound(reply, `Task "${id}" not found`);
+    return repository.listTaskAudit(id);
   });
 
-  app.get('/api/approvals', async () => Array.from(store.approvals.values()));
+  app.get('/api/approvals', async () => repository.listApprovals());
 
   app.get('/api/approvals/:id', async (request, reply) => {
     const { id } = idParamsSchema.parse(request.params);
-    const approval = store.approvals.get(id);
+    const approval = await repository.getApproval(id);
     return approval ? approval : sendNotFound(reply, `Approval "${id}" not found`);
   });
 
   app.post('/api/approvals/:id/approve', async (request, reply) => {
     try {
       const { id } = idParamsSchema.parse(request.params);
-      const approval = store.resolveApproval(id, 'approved');
+      const approval = await repository.resolveApproval(id, 'approved');
       return approval ? approval : sendNotFound(reply, `Approval "${id}" not found`);
     } catch (error) {
       return sendBadRequest(reply, error);
@@ -112,7 +114,7 @@ export function registerRoutes(app: FastifyInstance, store: AppStore) {
   app.post('/api/approvals/:id/reject', async (request, reply) => {
     try {
       const { id } = idParamsSchema.parse(request.params);
-      const approval = store.resolveApproval(id, 'rejected');
+      const approval = await repository.resolveApproval(id, 'rejected');
       return approval ? approval : sendNotFound(reply, `Approval "${id}" not found`);
     } catch (error) {
       return sendBadRequest(reply, error);
@@ -122,12 +124,13 @@ export function registerRoutes(app: FastifyInstance, store: AppStore) {
   app.post('/api/approvals/:id/comment', async (request, reply) => {
     try {
       const { id } = idParamsSchema.parse(request.params);
-      const approval = store.approvals.get(id);
+      const approval = await repository.getApproval(id);
       if (!approval) return sendNotFound(reply, `Approval "${id}" not found`);
       const body = commentSchema.parse(request.body);
-      const audit = store.writeAudit({
+      const currentUser = await repository.getCurrentUser();
+      const audit = await repository.writeAudit({
         actorType: 'user',
-        actorId: store.currentUser.id,
+        actorId: currentUser.id,
         eventType: 'approval_commented',
         taskId: approval.taskId,
         payload: { approvalId: id, comment: body.comment }
@@ -144,4 +147,3 @@ export function registerRoutes(app: FastifyInstance, store: AppStore) {
     });
   });
 }
-

@@ -21,7 +21,8 @@
     "test": "npm run test --workspaces --if-present",
     "typecheck": "tsc -b",
     "db:generate": "prisma generate --schema packages/db/prisma/schema.prisma",
-    "db:migrate": "prisma migrate dev --schema packages/db/prisma/schema.prisma"
+    "db:migrate": "prisma migrate dev --schema packages/db/prisma/schema.prisma",
+    "db:seed": "tsx packages/db/prisma/seed.ts"
   },
   "devDependencies": {
     "@types/node": "^22.15.29",
