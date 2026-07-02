@@ -1,5 +1,7 @@
 import { PrismaClient } from '@prisma/client';
+import { ensureDatabaseUrl } from '../src/env.js';
 
+ensureDatabaseUrl();
 const prisma = new PrismaClient();
 
 const configYaml = `project:
@@ -122,4 +124,3 @@ main()
     await prisma.$disconnect();
     process.exit(1);
   });
-

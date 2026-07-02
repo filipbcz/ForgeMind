@@ -1,8 +1,10 @@
 import { PrismaClient } from '@prisma/client';
+import { ensureDatabaseUrl } from './env.js';
 
 let prisma: PrismaClient | undefined;
 
 export function getPrismaClient(): PrismaClient {
+  ensureDatabaseUrl();
   prisma ??= new PrismaClient();
   return prisma;
 }
@@ -14,5 +16,6 @@ export async function disconnectPrisma(): Promise<void> {
   }
 }
 
+export * from './env.js';
 export * from './mappers.js';
 export * from './repository.js';
