@@ -23,7 +23,7 @@ compose=(docker compose --env-file "${ENV_FILE}" -f "${COMPOSE_FILE}")
 docker network inspect shared-edge >/dev/null 2>&1 || docker network create shared-edge >/dev/null
 
 "${compose[@]}" up -d --build postgres
-"${compose[@]}" run --rm migrate
+"${compose[@]}" run --rm --build migrate
 "${compose[@]}" up -d --build --remove-orphans api worker web
 
 API_CONTAINER="$("${compose[@]}" ps -q api)"
