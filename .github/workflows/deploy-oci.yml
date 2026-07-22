@@ -47,7 +47,7 @@ jobs:
         run: |
           set -euo pipefail
           DEPLOY_PORT="${OCI_DEPLOY_PORT:-22}"
-          scp -P "${DEPLOY_PORT}" "${RELEASE_ARCHIVE}" "${OCI_DEPLOY_USER}@${OCI_DEPLOY_HOST}:/tmp/${RELEASE_ARCHIVE}"
+          scp -o ServerAliveInterval=30 -o ServerAliveCountMax=20 -P "${DEPLOY_PORT}" "${RELEASE_ARCHIVE}" "${OCI_DEPLOY_USER}@${OCI_DEPLOY_HOST}:/tmp/${RELEASE_ARCHIVE}"
 
       - name: Deploy release
         env:
@@ -57,7 +57,7 @@ jobs:
         run: |
           set -euo pipefail
           DEPLOY_PORT="${OCI_DEPLOY_PORT:-22}"
-          ssh -p "${DEPLOY_PORT}" "${OCI_DEPLOY_USER}@${OCI_DEPLOY_HOST}" "
+          ssh -o ServerAliveInterval=30 -o ServerAliveCountMax=20 -p "${DEPLOY_PORT}" "${OCI_DEPLOY_USER}@${OCI_DEPLOY_HOST}" "
             set -euo pipefail
             APP_ROOT='${APP_ROOT}'
             RELEASE_DIR=\"\${APP_ROOT}/releases/${{ github.sha }}\"
@@ -67,4 +67,3 @@ jobs:
             rm -f \"/tmp/${RELEASE_ARCHIVE}\"
             APP_ROOT=\"\${APP_ROOT}\" bash \"\${APP_ROOT}/app/infra/deploy/remote-deploy.sh\"
           "
-
