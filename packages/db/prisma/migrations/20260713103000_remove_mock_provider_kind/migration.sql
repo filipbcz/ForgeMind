@@ -1,14 +1,14 @@
 UPDATE "ai_provider_connections"
 SET "provider" = 'codex'
-WHERE "provider" IN ('mock', 'github_copilot', 'local');
+WHERE "provider"::text IN ('mock', 'github_copilot', 'local');
 
 UPDATE "task_runs"
 SET "provider" = 'codex'
-WHERE "provider" IN ('mock', 'github_copilot', 'local');
+WHERE "provider"::text IN ('mock', 'github_copilot', 'local');
 
 UPDATE "provider_usage"
 SET "provider" = 'codex'
-WHERE "provider" IN ('mock', 'github_copilot', 'local');
+WHERE "provider"::text IN ('mock', 'github_copilot', 'local');
 
 CREATE TYPE "ProviderKind_new" AS ENUM ('codex', 'openai');
 
