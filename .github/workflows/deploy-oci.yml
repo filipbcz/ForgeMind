@@ -1,0 +1,70 @@
+name: Deploy to OCI
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+concurrency:
+  group: forgemind-production
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment: production
+    env:
+      APP_ROOT: /opt/forgemind
+      RELEASE_ARCHIVE: forgemind-${{ github.sha }}.tar.gz
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build release archive
+        run: git archive --format=tar.gz --output "${RELEASE_ARCHIVE}" HEAD
+
+      - name: Configure SSH
+        env:
+          OCI_DEPLOY_SSH_KEY_B64: ${{ secrets.OCI_DEPLOY_SSH_KEY_B64 }}
+          OCI_DEPLOY_HOST: ${{ secrets.OCI_DEPLOY_HOST }}
+          OCI_DEPLOY_PORT: ${{ secrets.OCI_DEPLOY_PORT }}
+        run: |
+          set -euo pipefail
+          DEPLOY_PORT="${OCI_DEPLOY_PORT:-22}"
+          mkdir -p ~/.ssh
+          printf '%s' "${OCI_DEPLOY_SSH_KEY_B64}" | base64 -d | tr -d '\r' > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          ssh-keyscan -p "${DEPLOY_PORT}" -H "${OCI_DEPLOY_HOST}" >> ~/.ssh/known_hosts
+
+      - name: Upload release archive
+        env:
+          OCI_DEPLOY_HOST: ${{ secrets.OCI_DEPLOY_HOST }}
+          OCI_DEPLOY_USER: ${{ secrets.OCI_DEPLOY_USER }}
+          OCI_DEPLOY_PORT: ${{ secrets.OCI_DEPLOY_PORT }}
+        run: |
+          set -euo pipefail
+          DEPLOY_PORT="${OCI_DEPLOY_PORT:-22}"
+          scp -P "${DEPLOY_PORT}" "${RELEASE_ARCHIVE}" "${OCI_DEPLOY_USER}@${OCI_DEPLOY_HOST}:/tmp/${RELEASE_ARCHIVE}"
+
+      - name: Deploy release
+        env:
+          OCI_DEPLOY_HOST: ${{ secrets.OCI_DEPLOY_HOST }}
+          OCI_DEPLOY_USER: ${{ secrets.OCI_DEPLOY_USER }}
+          OCI_DEPLOY_PORT: ${{ secrets.OCI_DEPLOY_PORT }}
+        run: |
+          set -euo pipefail
+          DEPLOY_PORT="${OCI_DEPLOY_PORT:-22}"
+          ssh -p "${DEPLOY_PORT}" "${OCI_DEPLOY_USER}@${OCI_DEPLOY_HOST}" "
+            set -euo pipefail
+            APP_ROOT='${APP_ROOT}'
+            RELEASE_DIR=\"\${APP_ROOT}/releases/${{ github.sha }}\"
+            mkdir -p \"\${RELEASE_DIR}\" \"\${APP_ROOT}/app\"
+            tar -xzf \"/tmp/${RELEASE_ARCHIVE}\" -C \"\${RELEASE_DIR}\"
+            rsync -a --delete \"\${RELEASE_DIR}/\" \"\${APP_ROOT}/app/\"
+            rm -f \"/tmp/${RELEASE_ARCHIVE}\"
+            APP_ROOT=\"\${APP_ROOT}\" bash \"\${APP_ROOT}/app/infra/deploy/remote-deploy.sh\"
+          "
+

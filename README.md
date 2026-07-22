@@ -1558,3 +1558,11 @@ Finalni acceptance validace pro MVP delta:
 
 - `npm run build`
 - `npm test`
+
+## 31. Produkcni provoz ForgeMind
+
+Samotnou platformu ForgeMind lze nasadit na OCI/Ubuntu server pomoci Docker Compose a GitHub Actions. Produkcni stack izoluje API, worker, PostgreSQL, Codex data a pracovni adresare pod Compose projektem `forgemind`. Verejny HTTPS vstup lze sdilet s jinymi aplikacemi pres externi Docker sit `shared-edge` bez kolize host portu. Na spolecnem serveru s projektem Running je ForgeMind dostupny na `https://myrunning.duckdns.org:8443`.
+
+Kompletni priprava serveru, secrets a deployment workflow jsou popsane v `docs/deploy-oci.md`.
+
+Toto nasazeni platformy nemeni approval pravidla pro produkcni deploy projektu spravovanych ForgeMindem.

@@ -1,0 +1,93 @@
+name: forgemind
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    env_file:
+      - ${FORGEMIND_ENV_FILE:-/opt/forgemind/shared/server.env}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U \"$${POSTGRES_USER}\" -d \"$${POSTGRES_DB}\""]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 15s
+
+  migrate:
+    build:
+      context: ..
+      dockerfile: infra/Dockerfile
+      target: runtime
+    env_file:
+      - ${FORGEMIND_ENV_FILE:-/opt/forgemind/shared/server.env}
+    depends_on:
+      postgres:
+        condition: service_healthy
+    command: ["npx", "prisma", "migrate", "deploy", "--schema", "packages/db/prisma/schema.prisma"]
+    restart: "no"
+
+  api:
+    build:
+      context: ..
+      dockerfile: infra/Dockerfile
+      target: runtime
+    restart: unless-stopped
+    env_file:
+      - ${FORGEMIND_ENV_FILE:-/opt/forgemind/shared/server.env}
+    depends_on:
+      postgres:
+        condition: service_healthy
+    volumes:
+      - codex_home:/data/codex
+    command: ["node", "apps/studio-api/dist/index.js"]
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:4000/health').then((response) => process.exit(response.ok ? 0 : 1)).catch(() => process.exit(1))"]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
+
+  worker:
+    build:
+      context: ..
+      dockerfile: infra/Dockerfile
+      target: runtime
+    restart: unless-stopped
+    env_file:
+      - ${FORGEMIND_ENV_FILE:-/opt/forgemind/shared/server.env}
+    depends_on:
+      postgres:
+        condition: service_healthy
+    volumes:
+      - codex_home:/data/codex
+      - worker_workspaces:/data/workspaces
+    command: ["node", "apps/worker/dist/index.js"]
+
+  web:
+    build:
+      context: ..
+      dockerfile: infra/Dockerfile
+      target: web
+    restart: unless-stopped
+    env_file:
+      - ${FORGEMIND_ENV_FILE:-/opt/forgemind/shared/server.env}
+    depends_on:
+      api:
+        condition: service_healthy
+    networks:
+      default:
+      shared-edge:
+        aliases:
+          - forgemind-web
+
+volumes:
+  postgres_data:
+  codex_home:
+  worker_workspaces:
+
+networks:
+  shared-edge:
+    external: true
+    name: shared-edge

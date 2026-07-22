@@ -36,7 +36,7 @@ import type {
 const inferredApiUrl =
   typeof window === 'undefined' || window.location.hostname === 'localhost'
     ? 'http://localhost:4000'
-    : `${window.location.protocol}//${window.location.hostname}:4000`;
+    : window.location.origin;
 
 export const API_URL = import.meta.env.VITE_API_URL ?? inferredApiUrl;
 

@@ -7,7 +7,7 @@ const advanceRoadmapAfterTaskCompletionMock = vi.fn(async () => ({ advanced: fal
 const repositoryMock = {
   recoverStuckQueueJobs: vi.fn(async () => ({ recoveredCount: 0, queueJobIds: [] })),
   getGitHubConnectionSecret: vi.fn(async () => undefined),
-  claimNextSubmittedTask: vi.fn(async () => ({
+  claimNextSubmittedTask: vi.fn(async (): Promise<unknown> => ({
     task: {
       id: 'task_1',
       projectId: 'project_1',

@@ -1,0 +1,14 @@
+.git
+.github
+.forgemind
+.forgemind-logs
+.env
+.env.*
+!.env.example
+**/dist
+**/node_modules
+coverage
+node_modules
+*.log
+tmp-*
+

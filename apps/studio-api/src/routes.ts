@@ -1343,7 +1343,7 @@ export function findFirstPendingStepForLatestCycle<T extends {
 async function createAndStartRoadmapTask(
   repository: ForgeMindRepository,
   dispatcher: ReturnType<typeof createTaskDispatchService>,
-  project: { id: string; name: string },
+  project: { id: string; name: string; defaultTaskMode?: TaskMode },
   step: {
     id: string;
     cycleId: string;
