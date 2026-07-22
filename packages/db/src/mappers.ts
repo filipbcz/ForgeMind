@@ -2,24 +2,67 @@ import type {
   Approval as CoreApproval,
   AuditEvent,
   ForgeTask,
+  ProjectImplementationStep as CoreProjectImplementationStep,
+  ProjectRoadmapCycle as CoreProjectRoadmapCycle,
   Project as CoreProject,
   TaskRun as CoreTaskRun
 } from '@forgemind/core';
 import type { JsonValue } from '@forgemind/shared';
-import type { Approval, AuditLog, Prisma, Project, Task, TaskRun } from '@prisma/client';
+import type { Approval, AuditLog, Prisma, Project, ProjectImplementationStep, ProjectRoadmapCycle, Task, TaskRun } from '@prisma/client';
 
 export function toProject(project: Project): CoreProject {
   return {
     id: project.id,
     name: project.name,
     slug: project.slug,
-    githubOwner: project.githubOwner,
-    githubRepo: project.githubRepo,
+    githubOwner: project.githubOwner ?? undefined,
+    githubRepo: project.githubRepo ?? undefined,
     defaultBranch: project.defaultBranch,
     configYaml: project.configYaml ?? undefined,
+    brief: project.brief ?? undefined,
+    autoCreatePullRequest: project.autoCreatePullRequest,
+    autoMergePullRequest: project.autoMergePullRequest,
+    autoCompleteTask: project.autoCompleteTask,
+    allowSafeOperationsWithoutApproval: project.allowSafeOperationsWithoutApproval,
+    defaultTaskMode: project.defaultTaskMode,
     isActive: project.isActive,
     createdAt: project.createdAt.toISOString(),
     updatedAt: project.updatedAt.toISOString()
+  };
+}
+
+export function toProjectRoadmapCycle(cycle: ProjectRoadmapCycle): CoreProjectRoadmapCycle {
+  return {
+    id: cycle.id,
+    projectId: cycle.projectId,
+    cycleNumber: cycle.cycleNumber,
+    objective: cycle.objective,
+    extensionProposal: cycle.extensionProposal ?? undefined,
+    status: cycle.status,
+    createdAt: cycle.createdAt.toISOString(),
+    updatedAt: cycle.updatedAt.toISOString(),
+    completedAt: cycle.completedAt?.toISOString()
+  };
+}
+
+export function toProjectImplementationStep(step: ProjectImplementationStep): CoreProjectImplementationStep {
+  const acceptanceCriteria = Array.isArray(step.acceptanceCriteria)
+    ? step.acceptanceCriteria.filter((item): item is string => typeof item === 'string')
+    : [];
+
+  return {
+    id: step.id,
+    projectId: step.projectId,
+    cycleId: step.cycleId,
+    sequenceNumber: step.sequenceNumber,
+    title: step.title,
+    description: step.description,
+    acceptanceCriteria,
+    status: step.status,
+    taskId: step.taskId ?? undefined,
+    createdAt: step.createdAt.toISOString(),
+    updatedAt: step.updatedAt.toISOString(),
+    completedAt: step.completedAt?.toISOString()
   };
 }
 
@@ -97,4 +140,3 @@ export function toAuditEvent(event: AuditLog): AuditEvent {
 export function toPrismaJson(value: JsonValue): Prisma.InputJsonValue {
   return value as Prisma.InputJsonValue;
 }
-

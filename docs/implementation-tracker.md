@@ -1,0 +1,168 @@
+# ForgeMind - Implementacni tracker
+
+Posledni aktualizace: 2026-07-03
+Zdroj pozadavku: README.md
+
+## Kde jsme ted
+
+- Zaklad persistence a fronty je hotovy: PostgreSQL queue, claim/finalize, recovery zaseklych claimed jobu.
+- Mobil uz zobrazuje operativni stav (runs, queue, worker status/events).
+- Kroky 1-12 (README MVP jadro) jsou hotove vcetne root validace build/test.
+- Nejvetsi mezery proti README jsou ted: realny Codex provider, tvrde policy enforcement, plne webhook event flow, monitoring metriky a doplneni mobilnich/detailnich toku.
+
+## Pravidla postupu (abychom se neztraceli)
+
+1. Delame jen aktivni krok; nic navic mimo poradi.
+2. Kazdy krok ma tri casti: Cil, Zmena, Ověreni.
+3. Dokud neni hotovy krok 1-4, neotvirame novy UI scope.
+4. Po kazdem kroku zapiseme 1 vetu do tohoto trackeru: co je hotovo + jake testy prosly.
+
+## 12 jasnych kroku, podle kterych pojedeme
+
+1. [HOTOVO 2026-07-03] Webhook podpisy v API
+	Cil: Bezpecne overit, ze webhook prisel opravdu z GitHubu.
+	Zmena: Pridat utilitu pro validaci podpisu a zapojit ji do webhook endpointu.
+	Overeni: Jednotkove testy pro validni podpis, nevalidni podpis a chybejici hlavicky.
+
+2. [HOTOVO 2026-07-03] Testy GitHub adapteru - issue a branch
+	Cil: Mit stabilni kontrakt pro zalozeni issue a branche.
+	Zmena: Rozsirit testy adapteru pro createIssue a createBranch (vcetne fallbacku pri existujici branchi).
+	Overeni: Vitest v packages/github musi pokryt uspech i chybove vetve.
+
+3. [HOTOVO 2026-07-03] Testy GitHub adapteru - PR a check status
+	Cil: Overit, ze draft PR a cteni CI statusu funguje predvidatelne.
+	Zmena: Dopsat testy pro createDraftPullRequest a readCheckStatus vcetne mapovani stavovych kodu.
+	Overeni: Testy musi explicitne overit pending/success/failure mapovani.
+
+4. [HOTOVO 2026-07-03] Worker audit pro GitHub chyby
+	Cil: Kazde selhani GitHub operace musi byt dohledatelne v run/audit datech.
+	Zmena: V worker flow zapisovat strukturovane audit udalosti pro fail v issue/branch/push/PR kroku.
+	Overeni: Test, ktery simulaci chyby potvrdi zapis audit eventu.
+
+5. [HOTOVO 2026-07-03] Cancel semantika queue
+	Cil: Cancel task musi konzistentne ukoncit pending i claimed queue joby.
+	Zmena: Upravit API cancel cestu a repository tak, aby nedochazelo k pozdnimu claimu zruseneho tasku.
+	Overeni: Testy pro cancel pred claimem i behem claimnuteho jobu.
+
+6. [HOTOVO 2026-07-03] Retry/backoff metadata ve fronte
+	Cil: Mit riditelne opakovani po selhani bez nekonecnych smycek.
+	Zmena: Pridat metadata pokusu a backoff pravidla na queue job (napr. attemptCount, nextAttemptAt).
+	Overeni: Test opakovanych failu potvrdi, ze po limitu jde job do fail stavu.
+
+7. [HOTOVO 2026-07-03] Provider outcome -> policy enforcement
+	Cil: Provider vysledek musi vest na spravny stav tasku podle policy.
+	Zmena: Explicitne mapovat risky outcomes na approval-required, budget overrun na stop a review blockers na retry/fail.
+	Overeni: Testy v worker/core pro jednotlive policy scenare.
+
+8. [HOTOVO 2026-07-03] Approval stop-and-resume tok
+	Cil: Worker se pri potrebnem approval opravdu zastavi a umi pokracovat az po schvaleni.
+	Zmena: Dotahnout lifecycle prechody a perzistenci approval navaznosti.
+	Overeni: Integra test scenare "needs approval -> approved -> continue".
+
+9. [HOTOVO 2026-07-03] Limity a detekce opakovanych chyb
+	Cil: Chranit system pred zacyklenim a zbytecnym cerpanim kreditu.
+	Zmena: Konsolidovat iteration limit, repeated-error detection a budget stop pod jednim rozhodovacim tokem.
+	Overeni: Testy pro tri scenare: stejna chyba opakovane, prekroceny rozpocet, max iterace.
+
+10. [HOTOVO 2026-07-03] Dokumentace runtime bezpecnosti
+	 Cil: Mit jasne a provozne pouzitelne guardrails.
+	 Zmena: Aktualizovat docs/security.md o secrets handling, sandbox hranice, retention a systemd hardening.
+	 Overeni: Kontrola souladu s realnym chovanim workeru a API.
+
+11. [HOTOVO 2026-07-03] Dokumentace architektury a konfigurace
+	 Cil: Dokumentace musi odpovidat aktualni implementaci.
+	 Zmena: Aktualizovat docs/architecture.md a docs/project-config.md podle queue, worker flow a policy reality.
+	 Overeni: Rucni review bez rozporu proti README a kodu.
+
+12. [HOTOVO 2026-07-03] End-to-end MVP scenar + finalni validace
+	 Cil: Potvrdit hlavni README flow od zadani tasku az po draft PR.
+	 Zmena: Dopsat E2E test scenar a spustit root validaci.
+	 Overeni: `npm run build` a `npm test` v root musi projit bez chyb.
+
+## Aktivni krok
+
+Aktivne resime: Zadny - roadmap kroky 13-22 jsou uzavrene.
+
+## Navazujici kroky (README delta) - dalsi vlna
+
+13. [HOTOVO 2026-07-03] Realny Codex provider + fallback provider policy
+	Cil: Splnit README pozadavek na primarni Codex provider a kontrolovany fallback.
+	Zmena: Implementovat samostatny CodexProvider adapter (ne alias OpenAI), sjednotit provider kontrakt a fallback rozhodovani v worker toku.
+	Overeni: Testy provideru pokryji happy path, timeout/error mapovani a fallback scenar; `npm run build` musi projit.
+
+14. [HOTOVO 2026-07-03] Rezimy autonomie Safe/Auto/Full-auto jako runtime policy
+	Cil: Vynutit odlisne chovani agenta podle rezimu autonomie.
+	Zmena: Dodat explicitni policy gate vrstvu (co je allowed/approval-required/forbidden) napojenou na workflow kroky a approval subsystem.
+	Overeni: Testy pro kazdy rezim overi, ze rizikove operace konci ve `needs_approval` nebo `forbidden`, nikoliv tichym provedenim.
+
+15. [HOTOVO 2026-07-03] Tvrdy command/scope sandbox enforcement
+	Cil: Zastavit nepovolene prikazy a zapis mimo povolene cesty.
+	Zmena: Zavest centralni validator prikazu a scope kontrolu podle configu (`allowlist`, `forbidden paths`, `write-outside-repo`).
+	Overeni: Testy musi pokryt blokaci rizikovych prikazu, zapis mimo repo a korektni audit event pri blokaci.
+
+16. [HOTOVO 2026-07-03] GitHub webhook event pipeline (krome podpisu)
+	Cil: Zpracovavat relevantni GitHub eventy end-to-end, ne jen overit podpis.
+	Zmena: Rozsirit webhook handler na konkretni event typy (napr. issue_comment/pull_request/check_suite nebo check_run dle README scope), mapovat je na task/run udalosti.
+	Overeni: Testy webhook route + mapping logiky potvrdi spravne vetveni eventu a idempotentni zpracovani.
+
+17. [HOTOVO 2026-07-03] Monitoring metriky + endpoint
+	Cil: Mit operativni metriky vedle audit logu.
+	Zmena: Pridat metriky (task lifecycle, queue wait, run duration, approvals, provider failures, budget/limit stops) a export endpoint pro scraping.
+	Overeni: Integracni test endpointu a unit testy inkrementace metrik; dokumentace metrik v `docs/architecture.md`.
+
+18. [HOTOVO 2026-07-03] Mobilni formulare/task detail dle README field richness
+	Cil: Dorovnat mobilni UX/data model proti README pozadavkum.
+	Zmena: Doplnit task create/detail o chybejici pole (napr. priority, scope files, acceptance criteria, runtime summary), vcetne validace na API vrstve.
+	Overeni: UI testy (nebo komponentove testy) + route testy potvrdi serializaci a zobrazeni novych poli.
+
+19. [HOTOVO 2026-07-03] Push notifikace end-to-end
+	Cil: Zprovoznit realne push notifikace nad existujici SW registraci.
+	Zmena: Doplnit PushManager subscription flow v PWA, ulozeni subscription v API a trigger notifikaci na klicove udalosti (approval needed, task completed, failed).
+	Overeni: Testy API notifikaci + smoke scenar subscription lifecycle (subscribe/unsubscribe/send).
+
+20. [HOTOVO 2026-07-03] GitHub issue body sablona podle README
+	Cil: Generovat issue popis se vsemi povinnymi sekcemi.
+	Zmena: Rozsirit renderer issue body o Omezeni, Akceptacni kriteria, validacni kroky a rizika; sjednotit s project config.
+	Overeni: Snapshot testy v github package potvrdi kompletni markdown strukturu a odolnost na prazdne volitelne sekce.
+
+21. [HOTOVO 2026-07-03] End-to-end MVP+ test pres API -> worker -> GitHub adapter -> mobile read model
+	Cil: Mit jeden reprezentativni tok overujici cele pipeline komponenty.
+	Zmena: Dopsat e2e/integracni scenar, ktery projde od task submitu po ready-for-review/completed vcetne approval vetve.
+	Overeni: Cileny test suite pro scenario musi byt zeleny v CI i lokalne.
+
+22. [HOTOVO 2026-07-03] Finalni README parity pass + dokumentace acceptance
+	Cil: Uzavrit README gapy transparentnim checklistem.
+	Zmena: Aktualizovat tracker, README cross-reference a docs tak, aby kazdy README pozadavek mel implementacni odkaz nebo vedome odlozeni.
+	Overeni: `npm run build`, `npm test` a rucni parity review bez otevreneho kritickeho gapu.
+
+## Prubezny log
+
+- 2026-07-03: Krok 1 hotov. Doplneno overeni podpisu v webhook utilite i API route vrstve, testy prosly: `npx vitest run apps/studio-api/src/webhook.test.ts apps/studio-api/src/routes.test.ts`.
+- 2026-07-03: Krok 2 hotov. Doplneny testy createIssue a createBranch (vcetne fallbacku i chybove vetve), testy prosly: `npx vitest run packages/github/src/index.test.ts`.
+- 2026-07-03: Krok 3 hotov. Doplneny testy createDraftPullRequest a readCheckStatus mapovani (pending/success/failure), testy prosly: `npx vitest run packages/github/src/index.test.ts`.
+- 2026-07-03: Krok 4 hotov. Worker zapisuje `task_github_operation_failed` audit event pri selhani GitHub operace a udalost je ve worker event feedu, testy prosly: `npx vitest run apps/worker/src/workflow.test.ts apps/worker/src/db-worker.test.ts`.
+- 2026-07-03: Krok 5 hotov. `cancelTask` rusi aktivni queue joby (`pending` + `claimed`) a `finalizeQueueJob` uz meni jen aktivni queue job, testy prosly: `npx vitest run packages/db/src/repository.task-run.test.ts`.
+- 2026-07-03: Krok 6 hotov. Queue joby maji retry metadata (`attempt_count`, `next_attempt_at`) a `finalizeQueueJob` pouziva exponential backoff a finalni fail po limitu pokusu, testy prosly: `npx vitest run packages/db/src/repository.task-run.test.ts`.
+- 2026-07-03: Krok 7 hotov. Provider policy mapovani je explicitni: risky outcome -> `needs_approval`, budget overrun -> `budget_exceeded`, provider error -> `provider_failed`; testy prosly: `npx vitest run apps/worker/src/db-worker.test.ts apps/worker/src/workflow.test.ts`.
+- 2026-07-03: Krok 8 hotov. Schvaleni finalniho approval automaticky obnovi task (`needs_approval -> submitted`) a task se znovu enqueuje; testy prosly: `npx vitest run apps/studio-api/src/routes.test.ts apps/worker/src/db-worker.test.ts`.
+- 2026-07-03: Krok 9 hotov. Worker ma sjednocene rozhodovani limitu (budget, iteration, repeated-error) a aktivni detekci opakovane validation/review chyby, testy prosly: `npx vitest run apps/worker/src/db-worker.test.ts apps/worker/src/workflow.test.ts`.
+- 2026-07-03: Krok 10 hotov. Dokumentace bezpecnosti byla rozsirena na provozni standard (secrets, sandbox, retention, systemd hardening, API guardrails) a sladena s aktualnim worker/API stavem.
+- 2026-07-03: Krok 11 hotov. Dokumentace architektury a konfigurace byla prepsana na aktualni PostgreSQL queue + worker policy stav (approval resume, retry/backoff, provider fail mapovani, runtime limity).
+- 2026-07-03: Krok 12 hotov. Pridan MVP scenar test (`apps/worker/src/mvp-scenario.test.ts`) pro happy path i approval pause/resume a prosla finalni root validace: `npm run build` a `npm test`.
+- 2026-07-03: Krok 13 hotov. Codex provider je samostatna implementace (`CODEX_API_KEY`, `CODEX_API_BASE_URL`, `CODEX_MODEL`) a worker umi fallback na sekundarni provider pri selhani primarniho volani.
+- 2026-07-03: Krok 14 hotov. Workflow ma runtime mode-aware policy gate (safe/auto/full-auto) pro implementacni i review risky changes s prechodem do `needs_approval`.
+- 2026-07-03: Krok 15 hotov. Pridan sandbox enforcement pro verify command (`sudo`/network command guard) a path guard proti write-outside-repo, kryto testy policy scenaru.
+- 2026-07-03: Krok 16 hotov. Webhook route zpracovava strukturovane event payloady (issues/issue_comment/pull_request/check_run/check_suite), ma deduplikaci podle delivery id a testy mappingu/idempotence.
+- 2026-07-03: Krok 17 hotov. API endpoint `/api/metrics` vraci Prometheus-like operacni metriky (task lifecycle, queue wait, approvals, run durations, provider/budget/limit failure counters), kryto route testem a dokumentaci v `docs/architecture.md`.
+- 2026-07-03: Krok 18 hotov. API prijima rich task metadata (`priority`, `scopeFiles`, `acceptanceCriteria`, `runtimeSummary`) a serializuje je do strukturovaneho promptu; mobilni formulare tato pole odesilaji a route test overuje mapovani.
+- 2026-07-03: Krok 19 hotov. PWA ma PushManager subscription lifecycle (`subscribe/unsubscribe`) s API persistenci a SW push handlingem; Studio API triggeruje push pro `needs_approval`, `completed` a failure statusy pres worker event bridge, testy prosly: `npx vitest run apps/studio-api/src/notifications.test.ts apps/studio-api/src/routes.test.ts`, `npm run build`, `npm test`.
+- 2026-07-03: Krok 20 hotov. GitHub issue body renderer je README-compliant (`Cil/Kontext/Omezeni/Akceptacni kriteria/Rezim/Limity`), umi parsovat rich metadata ze structured promptu a ma snapshot testy pro rich i empty-optional scenar; overeno: `npx vitest run packages/github/src/index.test.ts`, `npm run build`, `npm test`.
+- 2026-07-03: Krok 21 hotov. Pridan integra test pipeline v `apps/studio-api/src/routes.test.ts` pokryvajici tok API create/start -> worker `runWorkerTask` -> GitHub issue/PR fields -> mobilni read-model projekce z `/api/tasks`; overeno: `npx vitest run apps/studio-api/src/routes.test.ts`, `npm run build`, `npm test`.
+- 2026-07-03: Krok 22 hotov. Pridan finalni parity checklist (`docs/readme-parity.md`) + README cross-reference sekce a acceptance valida prikazy; overeno: `npm run build`, `npm test`.
+
+## Definice hotovo pro nejblizsi milnik (kroky 17-20)
+
+1. API expose metriky task lifecycle/fronta/approvals/provider failures + dokumentace metrik.
+2. Mobilni task formulare/detail dorovnaji README field richness a validacni tok.
+3. Push notifikace budou fungovat end-to-end od subscription po trigger.
+4. GitHub issue body bude generovan podle README sablony vcetne omezeni a akceptacnich kriterii.

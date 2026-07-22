@@ -529,6 +529,8 @@ Agent musí zastavit, pokud:
 * chce přidat dependency bez schválení,
 * chce zapisovat mimo workspace.
 
+Diff a changed-files limity jsou review guardrails: při překročení se task přepne do schválení, ne do tvrdého selhání. Tvrdým stop signálem zůstává zacyklení, budget, runtime a opakované chyby.
+
 Při dosažení soft limitu například 75 % rozpočtu musí ForgeMind poslat notifikaci:
 
 ```text
@@ -1544,3 +1546,15 @@ ForgeMind Agent  – Linux worker pro autonomní práci
 ```
 
 První verze má být bezpečná, auditovatelná a prakticky použitelná. Automatizace se bude rozšiřovat postupně až po ověření, že workflow funguje spolehlivě.
+
+## 30. README parity a acceptance
+
+Aktualni parity status mezi README pozadavky a implementaci je veden v:
+
+- `docs/readme-parity.md` (mapovani pozadavek -> implementace/odlozeni)
+- `docs/implementation-tracker.md` (krokovy stav + prubezne overeni)
+
+Finalni acceptance validace pro MVP delta:
+
+- `npm run build`
+- `npm test`

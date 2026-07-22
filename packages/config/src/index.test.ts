@@ -16,8 +16,8 @@ workflow:
   auto_merge: false
   allow_ai_auto_improvements: true
 ai:
-  primary_provider: mock
-  reviewer_provider: mock
+  primary_provider: codex
+  reviewer_provider: codex
   model_profile: balanced
 limits:
   max_iterations: 7
@@ -53,8 +53,7 @@ describe('agent config parser', () => {
   it('parses YAML and converts limits to core shape', () => {
     const config = parseAgentConfigYaml(configYaml);
     expect(config.project.id).toBe('demo');
-    expect(config.ai.primary_provider).toBe('mock');
+    expect(config.ai.primary_provider).toBe('codex');
     expect(toCoreLimits(config).maxIterations).toBe(7);
   });
 });
-

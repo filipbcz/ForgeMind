@@ -6,14 +6,29 @@ import {
   type AuditEvent,
   type ForgeTask,
   type IterationPhase,
+  type ProjectImplementationStep,
+  type ProjectImplementationStepStatus,
+  type ProjectRoadmapCycle,
+  type ProjectRoadmapCycleStatus,
   type Project,
   type ProviderKind,
   type RiskLevel,
   type TaskStatus
 } from '@forgemind/core';
+import { parseAgentConfigYaml } from '@forgemind/config';
 import type { JsonValue } from '@forgemind/shared';
-import type { Prisma, PrismaClient, TaskMode } from '@prisma/client';
-import { toApproval, toAuditEvent, toPrismaJson, toProject, toTask, toTaskRun } from './mappers.js';
+import type { AiProviderConnection, AuditLog, GitHubConnection, Prisma, PrismaClient, QueueJobStatus, TaskMode } from '@prisma/client';
+import { decryptSecret, encryptSecret, fingerprintSecret } from './credentials.js';
+import {
+  toApproval,
+  toAuditEvent,
+  toPrismaJson,
+  toProject,
+  toProjectImplementationStep,
+  toProjectRoadmapCycle,
+  toTask,
+  toTaskRun
+} from './mappers.js';
 
 export const LOCAL_USER_ID = 'user_local_owner';
 
@@ -27,10 +42,109 @@ export interface UserSnapshot {
 export interface CreateProjectInput {
   name: string;
   slug: string;
-  githubOwner: string;
-  githubRepo: string;
+  githubOwner?: string;
+  githubRepo?: string;
   defaultBranch: string;
   configYaml?: string;
+  brief?: string;
+  autoCreatePullRequest?: boolean;
+  autoMergePullRequest?: boolean;
+  autoCompleteTask?: boolean;
+  allowSafeOperationsWithoutApproval?: boolean;
+  defaultTaskMode?: TaskMode;
+}
+
+export interface UpdateProjectInput {
+  name?: string;
+  slug?: string;
+  githubOwner?: string | null;
+  githubRepo?: string | null;
+  defaultBranch?: string;
+  configYaml?: string;
+  brief?: string | null;
+  autoCreatePullRequest?: boolean;
+  autoMergePullRequest?: boolean;
+  autoCompleteTask?: boolean;
+  allowSafeOperationsWithoutApproval?: boolean;
+  defaultTaskMode?: TaskMode;
+  isActive?: boolean;
+}
+
+export interface ProjectRoadmapSnapshot {
+  projectId: string;
+  cycles: ProjectRoadmapCycle[];
+  steps: ProjectImplementationStep[];
+}
+
+export interface CreateProjectRoadmapCycleInput {
+  projectId: string;
+  objective: string;
+  steps: Array<{
+    title: string;
+    description: string;
+    acceptanceCriteria: string[];
+  }>;
+}
+
+export interface GitHubConnectionSnapshot {
+  userId: string;
+  credentialSource: 'token';
+  apiBaseUrl: string;
+  tokenFingerprint: string;
+  connectedAt: string;
+  lastCheckedAt?: string;
+  updatedAt: string;
+}
+
+export interface GitHubConnectionSecret extends GitHubConnectionSnapshot {
+  token: string;
+}
+
+export type AIProviderConnectionKind = Extract<ProviderKind, 'openai' | 'codex'>;
+export type AIProviderAuthMode = 'api_key' | 'codex_oauth';
+
+export interface AIProviderConnectionSnapshot {
+  userId: string;
+  credentialSource: 'api_key' | 'codex_oauth';
+  provider: AIProviderConnectionKind;
+  authMode: AIProviderAuthMode;
+  model: string;
+  apiKeyFingerprint?: string;
+  codexHome?: string;
+  accountSummary?: string;
+  connectedAt: string;
+  lastCheckedAt?: string;
+  updatedAt: string;
+}
+
+export interface AIProviderConnectionSecret extends AIProviderConnectionSnapshot {
+  apiKey?: string;
+}
+
+export interface NotificationSettingsSnapshot {
+  userId: string;
+  settings: {
+    pushEnabled: boolean;
+    approvalRequests: boolean;
+    taskUpdates: boolean;
+    budgetAlerts: boolean;
+  };
+  subscriptions: NotificationSubscriptionSnapshot[];
+}
+
+export interface NotificationSubscriptionInput {
+  endpoint: string;
+  keys?: {
+    p256dh?: string;
+    auth?: string;
+  };
+  deviceName?: string;
+}
+
+export interface NotificationSubscriptionSnapshot extends NotificationSubscriptionInput {
+  id: string;
+  userId: string;
+  createdAt: string;
 }
 
 export interface CreateTaskInput {
@@ -46,7 +160,94 @@ export interface ClaimedTask {
   task: ForgeTask;
   project: Project;
   taskRun: ReturnType<typeof toTaskRun>;
+  queueJobId?: string;
 }
+
+export interface TaskQueuePosition {
+  queueDepth: number;
+  queuePosition: number | null;
+}
+
+export interface QueueRecoveryResult {
+  recoveredCount: number;
+  queueJobIds: string[];
+}
+
+export interface WorkerStatusSnapshot {
+  state: 'idle' | 'running';
+  queuedTaskCount: number;
+  activeTaskCount: number;
+  runningRun?: {
+    id: string;
+    taskId: string;
+    provider: ProviderKind;
+    model: string;
+    startedAt?: string;
+  };
+  activeIteration?: {
+    taskId: string;
+    taskRunId?: string;
+    phase: 'planning' | 'implementation' | 'validation' | 'review' | 'approval' | 'pr_creation';
+    attempt: number;
+    prompt: string;
+    providerPrompt?: string;
+    startedAt: string;
+  };
+  lastCompletedRun?: {
+    id: string;
+    taskId: string;
+    provider: ProviderKind;
+    model: string;
+    finishedAt?: string;
+    status: 'succeeded' | 'failed' | 'cancelled';
+    summary?: string;
+    errorMessage?: string;
+  };
+  updatedAt: string;
+}
+
+export interface OperationalMetricsSnapshot {
+  generatedAt: string;
+  tasks: {
+    total: number;
+    draft: number;
+    submitted: number;
+    active: number;
+    needsApproval: number;
+    completed: number;
+    failed: number;
+    cancelled: number;
+    providerFailed: number;
+    budgetExceeded: number;
+    iterationLimitReached: number;
+    repeatedErrorDetected: number;
+    validationFailed: number;
+  };
+  queue: {
+    pending: number;
+    claimed: number;
+    failed: number;
+    averagePendingWaitSeconds: number;
+    maxPendingWaitSeconds: number;
+  };
+  approvals: {
+    pending: number;
+    approved: number;
+    rejected: number;
+    cancelled: number;
+  };
+  runs: {
+    queued: number;
+    running: number;
+    succeeded: number;
+    failed: number;
+    cancelled: number;
+    averageDurationSeconds: number;
+    maxDurationSeconds: number;
+  };
+}
+
+const WORKER_EVENT_PREFIXES = ['task_enqueued', 'task_claimed', 'task_status_', 'task_github_', 'task_iteration_'] as const;
 
 const ACTIVE_TASK_STATUSES: ReadonlySet<TaskStatus> = new Set([
   'submitted',
@@ -59,6 +260,14 @@ const ACTIVE_TASK_STATUSES: ReadonlySet<TaskStatus> = new Set([
   'improving',
   'creating_pr'
 ]);
+
+const ACTIVE_QUEUE_STATUSES = ['pending', 'claimed'] as const;
+const DEFAULT_QUEUE_MAX_ATTEMPTS = 3;
+const DEFAULT_QUEUE_BACKOFF_SECONDS = 30;
+
+function isActiveQueueStatus(status: QueueJobStatus): status is (typeof ACTIVE_QUEUE_STATUSES)[number] {
+  return status === 'pending' || status === 'claimed';
+}
 
 export class ForgeMindRepository {
   constructor(private readonly prisma: PrismaClient) {}
@@ -87,6 +296,178 @@ export class ForgeMindRepository {
     return this.ensureLocalUser();
   }
 
+  async getGitHubConnection(userId = LOCAL_USER_ID): Promise<GitHubConnectionSnapshot | undefined> {
+    const connection = await this.prisma.gitHubConnection.findUnique({
+      where: { userId }
+    });
+
+    return connection ? toGitHubConnectionSnapshot(connection) : undefined;
+  }
+
+  async getGitHubConnectionSecret(userId = LOCAL_USER_ID): Promise<GitHubConnectionSecret | undefined> {
+    const connection = await this.prisma.gitHubConnection.findUnique({
+      where: { userId }
+    });
+
+    if (!connection) {
+      return undefined;
+    }
+
+    return {
+      ...toGitHubConnectionSnapshot(connection),
+      token: await decryptSecret(connection.tokenCiphertext)
+    };
+  }
+
+  async upsertGitHubConnection(input: { token: string; apiBaseUrl: string; userId?: string }): Promise<GitHubConnectionSnapshot> {
+    const userId = input.userId ?? LOCAL_USER_ID;
+    await this.ensureLocalUser();
+    const now = new Date();
+    const tokenCiphertext = await encryptSecret(input.token);
+    const tokenFingerprint = fingerprintSecret(input.token);
+    const connection = await this.prisma.gitHubConnection.upsert({
+      where: { userId },
+      update: {
+        tokenCiphertext,
+        tokenFingerprint,
+        apiBaseUrl: input.apiBaseUrl,
+        lastCheckedAt: now
+      },
+      create: {
+        userId,
+        tokenCiphertext,
+        tokenFingerprint,
+        apiBaseUrl: input.apiBaseUrl,
+        lastCheckedAt: now
+      }
+    });
+
+    await this.writeAudit({
+      actorType: 'user',
+      actorId: userId,
+      eventType: 'github_connection_saved',
+      payload: {
+        credentialSource: 'token',
+        apiBaseUrl: connection.apiBaseUrl,
+        tokenFingerprint: connection.tokenFingerprint
+      }
+    });
+
+    return toGitHubConnectionSnapshot(connection);
+  }
+
+  async deleteGitHubConnection(userId = LOCAL_USER_ID): Promise<boolean> {
+    const existing = await this.prisma.gitHubConnection.findUnique({
+      where: { userId },
+      select: { id: true, apiBaseUrl: true, tokenFingerprint: true }
+    });
+
+    if (!existing) {
+      return false;
+    }
+
+    await this.prisma.gitHubConnection.delete({
+      where: { userId }
+    });
+
+    await this.writeAudit({
+      actorType: 'user',
+      actorId: userId,
+      eventType: 'github_connection_deleted',
+      payload: {
+        apiBaseUrl: existing.apiBaseUrl,
+        tokenFingerprint: existing.tokenFingerprint
+      }
+    });
+
+    return true;
+  }
+
+  async getAIProviderConnection(userId = LOCAL_USER_ID): Promise<AIProviderConnectionSnapshot | undefined> {
+    const connection = await this.prisma.aiProviderConnection.findUnique({
+      where: { userId }
+    });
+
+    return connection ? toAIProviderConnectionSnapshot(connection) : undefined;
+  }
+
+  async getAIProviderConnectionSecret(userId = LOCAL_USER_ID): Promise<AIProviderConnectionSecret | undefined> {
+    const connection = await this.prisma.aiProviderConnection.findUnique({
+      where: { userId }
+    });
+
+    if (!connection) {
+      return undefined;
+    }
+
+    return {
+      ...toAIProviderConnectionSnapshot(connection),
+      apiKey: connection.apiKeyCiphertext ? await decryptSecret(connection.apiKeyCiphertext) : undefined
+    };
+  }
+
+  async upsertAIProviderConnection(input: {
+    provider: AIProviderConnectionKind;
+    authMode?: AIProviderAuthMode;
+    model: string;
+    apiKey?: string;
+    codexHome?: string;
+    accountSummary?: string;
+    userId?: string;
+  }): Promise<AIProviderConnectionSnapshot> {
+    const userId = input.userId ?? LOCAL_USER_ID;
+    await this.ensureLocalUser();
+    const now = new Date();
+    const authMode = input.authMode ?? 'api_key';
+    if (authMode === 'api_key' && !input.apiKey) {
+      throw new Error('AI provider API key is required for api_key auth mode.');
+    }
+
+    const apiKeyCiphertext = input.apiKey ? await encryptSecret(input.apiKey) : null;
+    const apiKeyFingerprint = input.apiKey ? fingerprintSecret(input.apiKey) : null;
+    const connection = await this.prisma.aiProviderConnection.upsert({
+      where: { userId },
+      update: {
+        provider: input.provider,
+        authMode,
+        model: input.model,
+        apiKeyCiphertext,
+        apiKeyFingerprint,
+        codexHome: input.codexHome,
+        accountSummary: input.accountSummary,
+        lastCheckedAt: now
+      },
+      create: {
+        userId,
+        provider: input.provider,
+        authMode,
+        model: input.model,
+        apiKeyCiphertext,
+        apiKeyFingerprint,
+        codexHome: input.codexHome,
+        accountSummary: input.accountSummary,
+        lastCheckedAt: now
+      }
+    });
+
+    await this.writeAudit({
+      actorType: 'user',
+      actorId: userId,
+      eventType: 'ai_provider_connection_saved',
+      payload: {
+        credentialSource: connection.authMode === 'codex_oauth' ? 'codex_oauth' : 'api_key',
+        provider: connection.provider,
+        authMode: connection.authMode,
+        model: connection.model,
+        apiKeyFingerprint: connection.apiKeyFingerprint ?? null,
+        codexHome: connection.codexHome ?? null,
+        accountSummary: connection.accountSummary ?? null
+      }
+    });
+
+    return toAIProviderConnectionSnapshot(connection);
+  }
+
   async listProjects(): Promise<Project[]> {
     const projects = await this.prisma.project.findMany({
       orderBy: { createdAt: 'asc' }
@@ -96,6 +477,15 @@ export class ForgeMindRepository {
 
   async createProject(input: CreateProjectInput): Promise<Project> {
     await this.ensureLocalUser();
+    const autoCreatePullRequest = input.autoCreatePullRequest ?? true;
+    const autoMergePullRequest = input.autoMergePullRequest ?? false;
+    const autoCompleteTask = input.autoCompleteTask ?? false;
+    if (autoMergePullRequest && !autoCreatePullRequest) {
+      throw new Error('Automatic pull request creation is required for automatic merge.');
+    }
+    if (autoCompleteTask && !autoMergePullRequest) {
+      throw new Error('Automatic merge is required for automatic task completion.');
+    }
     const project = await this.prisma.project.create({
       data: {
         name: input.name,
@@ -103,7 +493,13 @@ export class ForgeMindRepository {
         githubOwner: input.githubOwner,
         githubRepo: input.githubRepo,
         defaultBranch: input.defaultBranch,
-        configYaml: input.configYaml
+        configYaml: input.configYaml,
+        brief: input.brief,
+        autoCreatePullRequest,
+        autoMergePullRequest,
+        autoCompleteTask,
+        allowSafeOperationsWithoutApproval: input.allowSafeOperationsWithoutApproval,
+        defaultTaskMode: input.defaultTaskMode
       }
     });
 
@@ -123,6 +519,458 @@ export class ForgeMindRepository {
     return project ? toProject(project) : undefined;
   }
 
+  async updateProject(projectId: string, input: UpdateProjectInput): Promise<Project | undefined> {
+    const existing = await this.prisma.project.findUnique({ where: { id: projectId } });
+    if (!existing) return undefined;
+
+    const autoCreatePullRequest = input.autoCreatePullRequest ?? existing.autoCreatePullRequest;
+    const autoMergePullRequest = input.autoMergePullRequest ?? existing.autoMergePullRequest;
+    const autoCompleteTask = input.autoCompleteTask ?? existing.autoCompleteTask;
+    const allowSafeOperationsWithoutApproval = input.allowSafeOperationsWithoutApproval ?? existing.allowSafeOperationsWithoutApproval;
+    const defaultTaskMode = input.defaultTaskMode ?? existing.defaultTaskMode;
+    if (autoMergePullRequest && !autoCreatePullRequest) {
+      throw new Error('Automatic pull request creation is required for automatic merge.');
+    }
+    if (autoCompleteTask && !autoMergePullRequest) {
+      throw new Error('Automatic merge is required for automatic task completion.');
+    }
+
+    const updated = await this.prisma.project.update({
+      where: { id: projectId },
+      data: {
+        name: input.name,
+        slug: input.slug,
+        githubOwner: input.githubOwner,
+        githubRepo: input.githubRepo,
+        defaultBranch: input.defaultBranch,
+        configYaml: input.configYaml,
+        brief: input.brief,
+        autoCreatePullRequest,
+        autoMergePullRequest,
+        autoCompleteTask,
+        allowSafeOperationsWithoutApproval,
+        defaultTaskMode,
+        isActive: input.isActive
+      }
+    });
+
+    await this.writeAudit({
+      actorType: 'user',
+      actorId: LOCAL_USER_ID,
+      eventType: 'project_updated',
+      projectId: updated.id,
+      payload: {
+        name: updated.name,
+        slug: updated.slug,
+        githubOwner: updated.githubOwner,
+        githubRepo: updated.githubRepo,
+        defaultBranch: updated.defaultBranch,
+        autoCreatePullRequest: updated.autoCreatePullRequest,
+        autoMergePullRequest: updated.autoMergePullRequest,
+        autoCompleteTask: updated.autoCompleteTask,
+        allowSafeOperationsWithoutApproval: updated.allowSafeOperationsWithoutApproval,
+        defaultTaskMode: updated.defaultTaskMode,
+        isActive: updated.isActive,
+        hasConfigYaml: Boolean(updated.configYaml),
+        hasBrief: Boolean(updated.brief)
+      }
+    });
+
+    return toProject(updated);
+  }
+
+  async getProjectConfig(projectId: string): Promise<{ projectId: string; configYaml: string | null } | undefined> {
+    const project = await this.prisma.project.findUnique({
+      where: { id: projectId },
+      select: { id: true, configYaml: true }
+    });
+
+    if (!project) return undefined;
+
+    return {
+      projectId: project.id,
+      configYaml: project.configYaml
+    };
+  }
+
+  async updateProjectConfig(projectId: string, configYaml: string): Promise<{ projectId: string; configYaml: string | null } | undefined> {
+    const existing = await this.prisma.project.findUnique({ where: { id: projectId } });
+    if (!existing) return undefined;
+
+    const updated = await this.prisma.project.update({
+      where: { id: projectId },
+      data: { configYaml }
+    });
+
+    await this.writeAudit({
+      actorType: 'user',
+      actorId: LOCAL_USER_ID,
+      eventType: 'project_config_updated',
+      projectId: updated.id,
+      payload: { hasConfigYaml: Boolean(updated.configYaml) }
+    });
+
+    return {
+      projectId: updated.id,
+      configYaml: updated.configYaml
+    };
+  }
+
+  async getProjectRoadmap(projectId: string): Promise<ProjectRoadmapSnapshot | undefined> {
+    const project = await this.prisma.project.findUnique({
+      where: { id: projectId },
+      select: { id: true }
+    });
+    if (!project) return undefined;
+
+    const [cycles, steps] = await Promise.all([
+      this.prisma.projectRoadmapCycle.findMany({
+        where: { projectId },
+        orderBy: [{ cycleNumber: 'asc' }, { createdAt: 'asc' }]
+      }),
+      this.prisma.projectImplementationStep.findMany({
+        where: { projectId },
+        orderBy: [{ cycle: { cycleNumber: 'asc' } }, { sequenceNumber: 'asc' }, { createdAt: 'asc' }]
+      })
+    ]);
+
+    return {
+      projectId,
+      cycles: cycles.map(toProjectRoadmapCycle),
+      steps: steps.map(toProjectImplementationStep)
+    };
+  }
+
+  async createProjectRoadmapCycle(input: CreateProjectRoadmapCycleInput): Promise<ProjectRoadmapSnapshot> {
+    await this.ensureLocalUser();
+    const project = await this.prisma.project.findUnique({ where: { id: input.projectId } });
+    if (!project) {
+      throw new Error(`Project "${input.projectId}" does not exist`);
+    }
+
+    await this.prisma.$transaction(async (tx) => {
+      await tx.projectRoadmapCycle.updateMany({
+        where: {
+          projectId: input.projectId,
+          status: { in: ['active', 'awaiting_extension_approval'] }
+        },
+        data: {
+          status: 'completed',
+          completedAt: new Date()
+        }
+      });
+
+      const cycleAggregate = await tx.projectRoadmapCycle.aggregate({
+        where: { projectId: input.projectId },
+        _max: { cycleNumber: true }
+      });
+
+      const cycle = await tx.projectRoadmapCycle.create({
+        data: {
+          projectId: input.projectId,
+          cycleNumber: (cycleAggregate._max.cycleNumber ?? 0) + 1,
+          objective: input.objective,
+          status: 'active'
+        }
+      });
+
+      if (input.steps.length > 0) {
+        await tx.projectImplementationStep.createMany({
+          data: input.steps.map((step, index) => ({
+            projectId: input.projectId,
+            cycleId: cycle.id,
+            sequenceNumber: index + 1,
+            title: step.title,
+            description: step.description,
+            acceptanceCriteria: toPrismaJson(step.acceptanceCriteria),
+            status: 'pending'
+          }))
+        });
+      }
+
+      await this.writeAuditTx(tx, {
+        actorType: 'user',
+        actorId: LOCAL_USER_ID,
+        eventType: 'project_roadmap_cycle_created',
+        projectId: input.projectId,
+        payload: {
+          objective: input.objective,
+          stepCount: input.steps.length
+        }
+      });
+    });
+
+    return (await this.getProjectRoadmap(input.projectId))!;
+  }
+
+  async setProjectRoadmapCycleExtensionProposal(
+    cycleId: string,
+    input: { proposal: string; status?: ProjectRoadmapCycleStatus }
+  ): Promise<ProjectRoadmapCycle | undefined> {
+    const existing = await this.prisma.projectRoadmapCycle.findUnique({ where: { id: cycleId } });
+    if (!existing) return undefined;
+
+    const updated = await this.prisma.projectRoadmapCycle.update({
+      where: { id: cycleId },
+      data: {
+        extensionProposal: input.proposal,
+        status: input.status ?? 'awaiting_extension_approval'
+      }
+    });
+
+    await this.writeAudit({
+      actorType: 'system',
+      eventType: 'project_roadmap_extension_proposed',
+      projectId: updated.projectId,
+      payload: {
+        cycleId: updated.id,
+        status: updated.status
+      }
+    });
+
+    return toProjectRoadmapCycle(updated);
+  }
+
+  async updateProjectRoadmapCycleStatus(cycleId: string, status: ProjectRoadmapCycleStatus): Promise<ProjectRoadmapCycle | undefined> {
+    const existing = await this.prisma.projectRoadmapCycle.findUnique({ where: { id: cycleId } });
+    if (!existing) return undefined;
+
+    const updated = await this.prisma.projectRoadmapCycle.update({
+      where: { id: cycleId },
+      data: {
+        status,
+        completedAt: status === 'completed' ? new Date() : null
+      }
+    });
+
+    await this.writeAudit({
+      actorType: 'system',
+      eventType: 'project_roadmap_cycle_status_updated',
+      projectId: updated.projectId,
+      payload: {
+        cycleId: updated.id,
+        status: updated.status
+      }
+    });
+
+    return toProjectRoadmapCycle(updated);
+  }
+
+  async listProjectImplementationSteps(projectId: string): Promise<ProjectImplementationStep[]> {
+    const steps = await this.prisma.projectImplementationStep.findMany({
+      where: { projectId },
+      orderBy: [{ cycle: { cycleNumber: 'asc' } }, { sequenceNumber: 'asc' }, { createdAt: 'asc' }]
+    });
+    return steps.map(toProjectImplementationStep);
+  }
+
+  async getProjectImplementationStep(stepId: string): Promise<ProjectImplementationStep | undefined> {
+    const step = await this.prisma.projectImplementationStep.findUnique({ where: { id: stepId } });
+    return step ? toProjectImplementationStep(step) : undefined;
+  }
+
+  async getImplementationStepByTaskId(taskId: string): Promise<ProjectImplementationStep | undefined> {
+    const step = await this.prisma.projectImplementationStep.findUnique({ where: { taskId } });
+    return step ? toProjectImplementationStep(step) : undefined;
+  }
+
+  async getNextPendingImplementationStep(projectId: string, cycleId: string): Promise<ProjectImplementationStep | undefined> {
+    const step = await this.prisma.projectImplementationStep.findFirst({
+      where: {
+        projectId,
+        cycleId,
+        status: 'pending'
+      },
+      orderBy: [{ sequenceNumber: 'asc' }, { createdAt: 'asc' }]
+    });
+    return step ? toProjectImplementationStep(step) : undefined;
+  }
+
+  async assignTaskToImplementationStep(
+    stepId: string,
+    taskId: string,
+    status: ProjectImplementationStepStatus = 'running'
+  ): Promise<ProjectImplementationStep | undefined> {
+    const existing = await this.prisma.projectImplementationStep.findUnique({ where: { id: stepId } });
+    if (!existing) return undefined;
+
+    const updated = await this.prisma.projectImplementationStep.update({
+      where: { id: stepId },
+      data: {
+        taskId,
+        status,
+        completedAt: status === 'completed' ? new Date() : null
+      }
+    });
+
+    await this.writeAudit({
+      actorType: 'system',
+      eventType: 'project_implementation_step_task_assigned',
+      projectId: updated.projectId,
+      taskId,
+      payload: {
+        stepId: updated.id,
+        status: updated.status
+      }
+    });
+
+    return toProjectImplementationStep(updated);
+  }
+
+  async updateImplementationStepStatus(
+    stepId: string,
+    status: ProjectImplementationStepStatus
+  ): Promise<ProjectImplementationStep | undefined> {
+    const existing = await this.prisma.projectImplementationStep.findUnique({ where: { id: stepId } });
+    if (!existing) return undefined;
+
+    const updated = await this.prisma.projectImplementationStep.update({
+      where: { id: stepId },
+      data: {
+        status,
+        completedAt: status === 'completed' ? new Date() : null
+      }
+    });
+
+    await this.writeAudit({
+      actorType: 'system',
+      eventType: 'project_implementation_step_status_updated',
+      projectId: updated.projectId,
+      taskId: updated.taskId ?? undefined,
+      payload: {
+        stepId: updated.id,
+        status: updated.status
+      }
+    });
+
+    return toProjectImplementationStep(updated);
+  }
+
+  async getNotificationSettings(userId: string): Promise<NotificationSettingsSnapshot> {
+    const [settings, subscriptions] = await Promise.all([
+      this.prisma.notificationSettings.findUnique({ where: { userId } }),
+      this.prisma.notificationSubscription.findMany({ where: { userId }, orderBy: { createdAt: 'asc' } })
+    ]);
+
+    return {
+      userId,
+      settings: settings
+        ? {
+            pushEnabled: settings.pushEnabled,
+            approvalRequests: settings.approvalRequests,
+            taskUpdates: settings.taskUpdates,
+            budgetAlerts: settings.budgetAlerts
+          }
+        : {
+            pushEnabled: false,
+            approvalRequests: true,
+            taskUpdates: true,
+            budgetAlerts: true
+          },
+      subscriptions: subscriptions.map((item) => ({
+        id: item.id,
+        userId: item.userId,
+        endpoint: item.endpoint,
+        keys: item.keysJson && typeof item.keysJson === 'object' && !Array.isArray(item.keysJson)
+          ? (item.keysJson as { p256dh?: string; auth?: string })
+          : undefined,
+        deviceName: item.deviceName ?? undefined,
+        createdAt: item.createdAt.toISOString()
+      }))
+    };
+  }
+
+  async updateNotificationSettings(
+    userId: string,
+    input: Partial<NotificationSettingsSnapshot['settings']>
+  ): Promise<NotificationSettingsSnapshot> {
+    await this.ensureLocalUser();
+    await this.prisma.notificationSettings.upsert({
+      where: { userId },
+      update: input,
+      create: {
+        userId,
+        ...input
+      }
+    });
+
+    return this.getNotificationSettings(userId);
+  }
+
+  async subscribeNotification(userId: string, input: NotificationSubscriptionInput): Promise<NotificationSubscriptionSnapshot> {
+    await this.ensureLocalUser();
+
+    const subscription = await this.prisma.notificationSubscription.upsert({
+      where: {
+        userId_endpoint: {
+          userId,
+          endpoint: input.endpoint
+        }
+      },
+      update: {
+        keysJson: input.keys ? toPrismaJson(input.keys) : undefined,
+        deviceName: input.deviceName
+      },
+      create: {
+        userId,
+        endpoint: input.endpoint,
+        keysJson: input.keys ? toPrismaJson(input.keys) : undefined,
+        deviceName: input.deviceName
+      }
+    });
+
+    await this.prisma.notificationSettings.upsert({
+      where: { userId },
+      update: { pushEnabled: true },
+      create: {
+        userId,
+        pushEnabled: true
+      }
+    });
+
+    return {
+      id: subscription.id,
+      userId: subscription.userId,
+      endpoint: subscription.endpoint,
+      keys: subscription.keysJson && typeof subscription.keysJson === 'object' && !Array.isArray(subscription.keysJson)
+        ? (subscription.keysJson as { p256dh?: string; auth?: string })
+        : undefined,
+      deviceName: subscription.deviceName ?? undefined,
+      createdAt: subscription.createdAt.toISOString()
+    };
+  }
+
+  async unsubscribeNotification(userId: string, endpoint: string): Promise<{ userId: string; endpoint: string; removed: boolean }> {
+    const existing = await this.prisma.notificationSubscription.findFirst({
+      where: { userId, endpoint }
+    });
+
+    if (!existing) {
+      return { userId, endpoint, removed: false };
+    }
+
+    await this.prisma.notificationSubscription.delete({
+      where: {
+        userId_endpoint: {
+          userId,
+          endpoint
+        }
+      }
+    });
+
+    const remaining = await this.prisma.notificationSubscription.count({ where: { userId } });
+    await this.prisma.notificationSettings.upsert({
+      where: { userId },
+      update: { pushEnabled: remaining > 0 },
+      create: {
+        userId,
+        pushEnabled: remaining > 0
+      }
+    });
+
+    return { userId, endpoint, removed: true };
+  }
+
   async listTasks(): Promise<ForgeTask[]> {
     const tasks = await this.prisma.task.findMany({
       orderBy: { updatedAt: 'desc' }
@@ -133,6 +981,296 @@ export class ForgeMindRepository {
   async getTask(taskId: string): Promise<ForgeTask | undefined> {
     const task = await this.prisma.task.findUnique({ where: { id: taskId } });
     return task ? toTask(task) : undefined;
+  }
+
+  async getTaskQueuePosition(taskId: string): Promise<TaskQueuePosition> {
+    const pendingJobs = await this.prisma.taskQueueJob.findMany({
+      where: { status: 'pending' },
+      select: { taskId: true },
+      orderBy: { createdAt: 'asc' }
+    });
+
+    const queueDepth = pendingJobs.length;
+    const queuePosition = pendingJobs.findIndex((item) => item.taskId === taskId);
+
+    return {
+      queueDepth,
+      queuePosition: queuePosition >= 0 ? queuePosition + 1 : null
+    };
+  }
+
+  async enqueueTask(taskId: string, reason: string): Promise<{ enqueued: boolean }> {
+    const existing = await this.prisma.taskQueueJob.findFirst({
+      where: {
+        taskId,
+        status: {
+          in: [...ACTIVE_QUEUE_STATUSES]
+        }
+      }
+    });
+
+    if (existing) {
+      return { enqueued: false };
+    }
+
+    await this.prisma.taskQueueJob.create({
+      data: {
+        taskId,
+        reason,
+        status: 'pending',
+        nextAttemptAt: new Date()
+      }
+    });
+
+    return { enqueued: true };
+  }
+
+  async recoverStuckQueueJobs(claimTimeoutMinutes = 15): Promise<QueueRecoveryResult> {
+    const timeoutMinutes = Math.max(1, claimTimeoutMinutes);
+    const cutoff = new Date(Date.now() - timeoutMinutes * 60_000);
+
+    const stuckJobs = await this.prisma.taskQueueJob.findMany({
+      where: {
+        status: 'claimed',
+        claimedAt: { lt: cutoff }
+      },
+      select: {
+        id: true,
+        taskId: true
+      }
+    });
+
+    if (stuckJobs.length === 0) {
+      return {
+        recoveredCount: 0,
+        queueJobIds: []
+      };
+    }
+
+    const queueJobIds = stuckJobs.map((job) => job.id);
+
+    await this.prisma.taskQueueJob.updateMany({
+      where: {
+        id: { in: queueJobIds }
+      },
+      data: {
+        status: 'pending',
+        claimedAt: null,
+        errorMessage: null
+      }
+    });
+
+    for (const job of stuckJobs) {
+      await this.writeAudit({
+        actorType: 'system',
+        eventType: 'task_queue_job_recovered',
+        taskId: job.taskId,
+        payload: {
+          queueJobId: job.id,
+          claimTimeoutMinutes: timeoutMinutes
+        }
+      });
+    }
+
+    return {
+      recoveredCount: stuckJobs.length,
+      queueJobIds
+    };
+  }
+
+  async getWorkerStatus(): Promise<WorkerStatusSnapshot> {
+    const [queuedTaskCount, activeTaskCount, runningRun, lastCompletedRun] = await Promise.all([
+      this.prisma.taskQueueJob.count({ where: { status: 'pending' } }),
+      this.prisma.task.count({ where: { status: { in: [...ACTIVE_TASK_STATUSES] } } }),
+      this.prisma.taskRun.findFirst({
+        where: { status: 'running' },
+        orderBy: { startedAt: 'desc' }
+      }),
+      this.prisma.taskRun.findFirst({
+        where: { status: { in: ['succeeded', 'failed', 'cancelled'] } },
+        orderBy: { finishedAt: 'desc' }
+      })
+    ]);
+
+    const activeIterationAudit = runningRun
+      ? await this.prisma.auditLog.findFirst({
+          where: {
+            taskId: runningRun.taskId,
+            eventType: 'task_iteration_started'
+          },
+          orderBy: { createdAt: 'desc' }
+        })
+      : null;
+    const activeIteration = parseActiveIterationAudit(activeIterationAudit);
+
+    return {
+      state: runningRun ? 'running' : 'idle',
+      queuedTaskCount,
+      activeTaskCount,
+      runningRun: runningRun
+        ? {
+            id: runningRun.id,
+            taskId: runningRun.taskId,
+            provider: runningRun.provider,
+            model: runningRun.model,
+            startedAt: runningRun.startedAt?.toISOString()
+          }
+        : undefined,
+      activeIteration: activeIteration && runningRun ? { ...activeIteration, taskId: runningRun.taskId } : undefined,
+      lastCompletedRun: lastCompletedRun
+        ? {
+            id: lastCompletedRun.id,
+            taskId: lastCompletedRun.taskId,
+            provider: lastCompletedRun.provider,
+            model: lastCompletedRun.model,
+            finishedAt: lastCompletedRun.finishedAt?.toISOString(),
+            status: lastCompletedRun.status as 'succeeded' | 'failed' | 'cancelled',
+            summary: lastCompletedRun.summary ?? undefined,
+            errorMessage: lastCompletedRun.errorMessage ?? undefined
+          }
+        : undefined,
+      updatedAt: new Date().toISOString()
+    };
+  }
+
+  async getRecentWorkerEvents(limit = 20): Promise<AuditEvent[]> {
+    const events = await this.prisma.auditLog.findMany({
+      where: {
+        OR: [
+          { eventType: { startsWith: WORKER_EVENT_PREFIXES[0] } },
+          { eventType: { startsWith: WORKER_EVENT_PREFIXES[1] } },
+          { eventType: { startsWith: WORKER_EVENT_PREFIXES[2] } },
+          { eventType: { startsWith: WORKER_EVENT_PREFIXES[3] } },
+          { eventType: { startsWith: WORKER_EVENT_PREFIXES[4] } }
+        ]
+      },
+      orderBy: { createdAt: 'desc' },
+      take: Math.max(1, Math.min(100, limit))
+    });
+
+    return events.map(toAuditEvent);
+  }
+
+  async getOperationalMetrics(): Promise<OperationalMetricsSnapshot> {
+    const [
+      totalTasks,
+      draftTasks,
+      submittedTasks,
+      activeTasks,
+      needsApprovalTasks,
+      completedTasks,
+      failedTasks,
+      cancelledTasks,
+      providerFailedTasks,
+      budgetExceededTasks,
+      iterationLimitTasks,
+      repeatedErrorTasks,
+      validationFailedTasks,
+      pendingQueueJobs,
+      claimedQueueJobs,
+      failedQueueJobs,
+      pendingQueueWaitJobs,
+      pendingApprovals,
+      approvedApprovals,
+      rejectedApprovals,
+      cancelledApprovals,
+      queuedRuns,
+      runningRuns,
+      succeededRuns,
+      failedRuns,
+      cancelledRuns,
+      finishedRuns
+    ] = await Promise.all([
+      this.prisma.task.count(),
+      this.prisma.task.count({ where: { status: 'draft' } }),
+      this.prisma.task.count({ where: { status: 'submitted' } }),
+      this.prisma.task.count({ where: { status: { in: [...ACTIVE_TASK_STATUSES] } } }),
+      this.prisma.task.count({ where: { status: 'needs_approval' } }),
+      this.prisma.task.count({ where: { status: 'completed' } }),
+      this.prisma.task.count({ where: { status: 'failed' } }),
+      this.prisma.task.count({ where: { status: 'cancelled' } }),
+      this.prisma.task.count({ where: { status: 'provider_failed' } }),
+      this.prisma.task.count({ where: { status: 'budget_exceeded' } }),
+      this.prisma.task.count({ where: { status: 'iteration_limit_reached' } }),
+      this.prisma.task.count({ where: { status: 'repeated_error_detected' } }),
+      this.prisma.task.count({ where: { status: 'validation_failed' } }),
+      this.prisma.taskQueueJob.count({ where: { status: 'pending' } }),
+      this.prisma.taskQueueJob.count({ where: { status: 'claimed' } }),
+      this.prisma.taskQueueJob.count({ where: { status: 'failed' } }),
+      this.prisma.taskQueueJob.findMany({
+        where: { status: 'pending' },
+        select: { createdAt: true }
+      }),
+      this.prisma.approval.count({ where: { status: 'pending' } }),
+      this.prisma.approval.count({ where: { status: 'approved' } }),
+      this.prisma.approval.count({ where: { status: 'rejected' } }),
+      this.prisma.approval.count({ where: { status: 'cancelled' } }),
+      this.prisma.taskRun.count({ where: { status: 'queued' } }),
+      this.prisma.taskRun.count({ where: { status: 'running' } }),
+      this.prisma.taskRun.count({ where: { status: 'succeeded' } }),
+      this.prisma.taskRun.count({ where: { status: 'failed' } }),
+      this.prisma.taskRun.count({ where: { status: 'cancelled' } }),
+      this.prisma.taskRun.findMany({
+        where: {
+          status: { in: ['succeeded', 'failed', 'cancelled'] },
+          startedAt: { not: null },
+          finishedAt: { not: null }
+        },
+        select: { startedAt: true, finishedAt: true }
+      })
+    ]);
+
+    const now = Date.now();
+    const pendingWaitDurations = pendingQueueWaitJobs.map((job) => (now - job.createdAt.getTime()) / 1000);
+    const averagePendingWaitSeconds = pendingWaitDurations.length
+      ? pendingWaitDurations.reduce((sum, value) => sum + value, 0) / pendingWaitDurations.length
+      : 0;
+    const maxPendingWaitSeconds = pendingWaitDurations.length ? Math.max(...pendingWaitDurations) : 0;
+
+    const runDurations = finishedRuns.map((run) => (run.finishedAt!.getTime() - run.startedAt!.getTime()) / 1000);
+    const averageRunDurationSeconds = runDurations.length ? runDurations.reduce((sum, value) => sum + value, 0) / runDurations.length : 0;
+    const maxRunDurationSeconds = runDurations.length ? Math.max(...runDurations) : 0;
+
+    return {
+      generatedAt: new Date().toISOString(),
+      tasks: {
+        total: totalTasks,
+        draft: draftTasks,
+        submitted: submittedTasks,
+        active: activeTasks,
+        needsApproval: needsApprovalTasks,
+        completed: completedTasks,
+        failed: failedTasks,
+        cancelled: cancelledTasks,
+        providerFailed: providerFailedTasks,
+        budgetExceeded: budgetExceededTasks,
+        iterationLimitReached: iterationLimitTasks,
+        repeatedErrorDetected: repeatedErrorTasks,
+        validationFailed: validationFailedTasks
+      },
+      queue: {
+        pending: pendingQueueJobs,
+        claimed: claimedQueueJobs,
+        failed: failedQueueJobs,
+        averagePendingWaitSeconds,
+        maxPendingWaitSeconds
+      },
+      approvals: {
+        pending: pendingApprovals,
+        approved: approvedApprovals,
+        rejected: rejectedApprovals,
+        cancelled: cancelledApprovals
+      },
+      runs: {
+        queued: queuedRuns,
+        running: runningRuns,
+        succeeded: succeededRuns,
+        failed: failedRuns,
+        cancelled: cancelledRuns,
+        averageDurationSeconds: averageRunDurationSeconds,
+        maxDurationSeconds: maxRunDurationSeconds
+      }
+    };
   }
 
   async createTask(input: CreateTaskInput): Promise<ForgeTask> {
@@ -180,6 +1318,29 @@ export class ForgeMindRepository {
       }
     });
 
+    const queuedRun = await this.prisma.taskRun.findFirst({
+      where: {
+        taskId: updated.id,
+        status: 'queued'
+      },
+      orderBy: { id: 'asc' }
+    });
+
+    if (!queuedRun) {
+      const project = await this.prisma.project.findUnique({
+        where: { id: updated.projectId },
+        select: { configYaml: true }
+      });
+      await this.prisma.taskRun.create({
+        data: {
+          taskId: updated.id,
+          provider: resolveProjectProvider(project?.configYaml ?? undefined),
+          model: 'queued',
+          status: 'queued'
+        }
+      });
+    }
+
     await this.writeAudit({
       actorType: 'user',
       actorId: LOCAL_USER_ID,
@@ -189,6 +1350,14 @@ export class ForgeMindRepository {
       payload: { status: updated.status }
     });
 
+    await this.writeAudit({
+      actorType: 'system',
+      eventType: 'task_run_queued',
+      projectId: updated.projectId,
+      taskId: updated.id,
+      payload: { status: 'queued' }
+    });
+
     return toTask(updated);
   }
 
@@ -196,6 +1365,18 @@ export class ForgeMindRepository {
     const task = await this.getTask(taskId);
     if (!task) return undefined;
     assertTaskTransition(task.status, 'cancelled');
+
+    const queueCancellation = await this.prisma.taskQueueJob.updateMany({
+      where: {
+        taskId,
+        status: { in: [...ACTIVE_QUEUE_STATUSES] }
+      },
+      data: {
+        status: 'cancelled',
+        errorMessage: 'Task cancelled by user.',
+        finishedAt: new Date()
+      }
+    });
 
     const updated = await this.prisma.task.update({
       where: { id: taskId },
@@ -211,7 +1392,9 @@ export class ForgeMindRepository {
       eventType: 'task_cancelled',
       projectId: updated.projectId,
       taskId: updated.id,
-      payload: {}
+      payload: {
+        cancelledQueueJobs: queueCancellation.count
+      }
     });
 
     return toTask(updated);
@@ -287,14 +1470,62 @@ export class ForgeMindRepository {
     return toTask(updated);
   }
 
-  async claimNextSubmittedTask(provider: ProviderKind, model = 'mock'): Promise<ClaimedTask | undefined> {
+  async claimNextSubmittedTask(provider: ProviderKind, model = 'queued'): Promise<ClaimedTask | undefined> {
     return this.prisma.$transaction(async (tx) => {
-      const queued = await tx.task.findFirst({
-        where: { status: 'submitted' },
-        include: { project: true },
-        orderBy: { createdAt: 'asc' }
+      const queueJob = await tx.taskQueueJob.findFirst({
+        where: {
+          status: 'pending',
+          OR: [{ nextAttemptAt: null }, { nextAttemptAt: { lte: new Date() } }]
+        },
+        orderBy: [{ nextAttemptAt: 'asc' }, { createdAt: 'asc' }]
       });
-      if (!queued) return undefined;
+      if (!queueJob) return undefined;
+
+      const claimedQueueJob = await tx.taskQueueJob.update({
+        where: { id: queueJob.id },
+        data: {
+          status: 'claimed',
+          claimedAt: new Date(),
+          attemptCount: { increment: 1 }
+        }
+      });
+
+      const queued = await tx.task.findUnique({
+        where: { id: claimedQueueJob.taskId },
+        include: {
+          project: true,
+          taskRuns: {
+            where: { status: 'queued' },
+            orderBy: { id: 'asc' },
+            take: 1
+          }
+        }
+      });
+
+      if (!queued) {
+        await tx.taskQueueJob.update({
+          where: { id: claimedQueueJob.id },
+          data: {
+            status: 'failed',
+            errorMessage: `Task \"${claimedQueueJob.taskId}\" not found while claiming queue job.`,
+            finishedAt: new Date()
+          }
+        });
+        return undefined;
+      }
+
+      if (queued.status !== 'submitted') {
+        await tx.taskQueueJob.update({
+          where: { id: claimedQueueJob.id },
+          data: {
+            status: queued.status === 'cancelled' ? 'cancelled' : 'failed',
+            claimedAt: null,
+            errorMessage: `Task "${queued.id}" is ${queued.status}; queue job was not claimed.`,
+            finishedAt: new Date()
+          }
+        });
+        return undefined;
+      }
 
       const updated = await tx.task.update({
         where: { id: queued.id },
@@ -302,15 +1533,38 @@ export class ForgeMindRepository {
         include: { project: true }
       });
 
-      const taskRun = await tx.taskRun.create({
-        data: {
+      await tx.taskRun.updateMany({
+        where: {
           taskId: updated.id,
-          provider,
-          model,
-          status: 'running',
-          startedAt: new Date()
+          status: 'running'
+        },
+        data: {
+          status: 'failed',
+          finishedAt: new Date(),
+          errorMessage: 'Worker run was superseded by a later queue claim.'
         }
       });
+
+      const existingRun = queued.taskRuns[0];
+      const taskRun = existingRun
+        ? await tx.taskRun.update({
+            where: { id: existingRun.id },
+            data: {
+              provider,
+              model,
+              status: 'running',
+              startedAt: new Date()
+            }
+          })
+        : await tx.taskRun.create({
+            data: {
+              taskId: updated.id,
+              provider,
+              model,
+              status: 'running',
+              startedAt: new Date()
+            }
+          });
 
       await tx.auditLog.create({
         data: {
@@ -325,8 +1579,55 @@ export class ForgeMindRepository {
       return {
         task: toTask(updated),
         project: toProject(updated.project),
-        taskRun: toTaskRun(taskRun)
+        taskRun: toTaskRun(taskRun),
+        queueJobId: claimedQueueJob.id
       };
+    });
+  }
+
+  async finalizeQueueJob(queueJobId: string | undefined, status: 'succeeded' | 'failed' | 'cancelled', errorMessage?: string): Promise<void> {
+    if (!queueJobId) return;
+
+    const queueJob = await this.prisma.taskQueueJob.findUnique({
+      where: { id: queueJobId },
+      select: {
+        id: true,
+        status: true,
+        attemptCount: true
+      }
+    });
+    if (!queueJob) return;
+    if (!isActiveQueueStatus(queueJob.status)) return;
+
+    if (status === 'failed') {
+      const maxAttempts = Math.max(1, Number(process.env.FORGEMIND_QUEUE_MAX_ATTEMPTS ?? DEFAULT_QUEUE_MAX_ATTEMPTS));
+      const backoffSeconds = Math.max(1, Number(process.env.FORGEMIND_QUEUE_RETRY_BACKOFF_SECONDS ?? DEFAULT_QUEUE_BACKOFF_SECONDS));
+      const shouldRetry = queueJob.attemptCount < maxAttempts;
+
+      if (shouldRetry) {
+        const delaySeconds = backoffSeconds * Math.max(1, 2 ** Math.max(0, queueJob.attemptCount - 1));
+        await this.prisma.taskQueueJob.update({
+          where: { id: queueJobId },
+          data: {
+            status: 'pending',
+            claimedAt: null,
+            nextAttemptAt: new Date(Date.now() + delaySeconds * 1000),
+            errorMessage
+          }
+        });
+        return;
+      }
+    }
+
+    await this.prisma.taskQueueJob.update({
+      where: { id: queueJobId },
+      data: {
+        status,
+        claimedAt: null,
+        nextAttemptAt: null,
+        errorMessage,
+        finishedAt: new Date()
+      }
     });
   }
 
@@ -336,6 +1637,8 @@ export class ForgeMindRepository {
     phase: IterationPhase;
     prompt: string;
     resultSummary: string;
+    providerPrompt?: string;
+    providerResponse?: string;
     diffStat: JsonValue;
     validationResult: JsonValue;
   }): Promise<void> {
@@ -346,6 +1649,8 @@ export class ForgeMindRepository {
         phase: input.phase,
         prompt: input.prompt,
         resultSummary: input.resultSummary,
+        providerPrompt: input.providerPrompt,
+        providerResponse: input.providerResponse,
         diffStatJson: toPrismaJson(input.diffStat),
         validationResultJson: toPrismaJson(input.validationResult)
       }
@@ -502,7 +1807,10 @@ export class ForgeMindRepository {
         taskRunId: iteration.taskRunId,
         iterationNumber: iteration.iterationNumber,
         phase: iteration.phase,
+        prompt: iteration.prompt,
         resultSummary: iteration.resultSummary,
+        providerPrompt: iteration.providerPrompt ?? undefined,
+        providerResponse: iteration.providerResponse ?? undefined,
         diffStat: iteration.diffStatJson,
         validationResult: iteration.validationResultJson,
         createdAt: iteration.createdAt.toISOString()
@@ -577,6 +1885,23 @@ export class ForgeMindRepository {
     return toAuditEvent(event);
   }
 
+  private async writeAuditTx(
+    tx: Prisma.TransactionClient,
+    input: Omit<AuditEvent, 'id' | 'createdAt'>
+  ): Promise<AuditEvent> {
+    const event = await tx.auditLog.create({
+      data: {
+        actorType: input.actorType,
+        actorId: input.actorId,
+        eventType: input.eventType,
+        projectId: input.projectId,
+        taskId: input.taskId,
+        payload: toPrismaJson(input.payload)
+      }
+    });
+    return toAuditEvent(event);
+  }
+
   async recordProviderUsage(input: {
     taskId: string;
     taskRunId: string;
@@ -604,6 +1929,18 @@ export class ForgeMindRepository {
   }
 }
 
+function resolveProjectProvider(configYaml?: string): ProviderKind {
+  if (!configYaml) {
+    return 'codex';
+  }
+
+  try {
+    return parseAgentConfigYaml(configYaml).ai.primary_provider;
+  } catch {
+    return 'codex';
+  }
+}
+
 export function createRepository(prisma: PrismaClient): ForgeMindRepository {
   return new ForgeMindRepository(prisma);
 }
@@ -613,6 +1950,70 @@ export function isUniqueConstraintError(error: unknown): boolean {
 }
 
 export type PrismaJsonObject = Prisma.JsonObject;
+
+function parseActiveIterationAudit(event: AuditLog | null):
+  | {
+      taskRunId?: string;
+      phase: 'planning' | 'implementation' | 'validation' | 'review' | 'approval' | 'pr_creation';
+      attempt: number;
+      prompt: string;
+      providerPrompt?: string;
+      startedAt: string;
+    }
+  | undefined {
+  if (!event || !event.payload || typeof event.payload !== 'object' || Array.isArray(event.payload)) {
+    return undefined;
+  }
+
+  const payload = event.payload as Record<string, unknown>;
+  const phase = typeof payload.phase === 'string' ? payload.phase : '';
+  if (!['planning', 'implementation', 'validation', 'review', 'approval', 'pr_creation'].includes(phase)) {
+    return undefined;
+  }
+
+  const prompt = typeof payload.prompt === 'string' ? payload.prompt : '';
+  if (!prompt) {
+    return undefined;
+  }
+
+  return {
+    taskRunId: typeof payload.taskRunId === 'string' ? payload.taskRunId : undefined,
+    phase: phase as 'planning' | 'implementation' | 'validation' | 'review' | 'approval' | 'pr_creation',
+    attempt: typeof payload.attempt === 'number' && Number.isFinite(payload.attempt) ? payload.attempt : 0,
+    prompt,
+    providerPrompt: typeof payload.providerPrompt === 'string' && payload.providerPrompt.length > 0 ? payload.providerPrompt : undefined,
+    startedAt: event.createdAt.toISOString()
+  };
+}
+
+function toGitHubConnectionSnapshot(connection: GitHubConnection): GitHubConnectionSnapshot {
+  return {
+    userId: connection.userId,
+    credentialSource: 'token',
+    apiBaseUrl: connection.apiBaseUrl,
+    tokenFingerprint: connection.tokenFingerprint,
+    connectedAt: connection.connectedAt.toISOString(),
+    lastCheckedAt: connection.lastCheckedAt?.toISOString(),
+    updatedAt: connection.updatedAt.toISOString()
+  };
+}
+
+function toAIProviderConnectionSnapshot(connection: AiProviderConnection): AIProviderConnectionSnapshot {
+  const authMode = connection.authMode as AIProviderAuthMode;
+  return {
+    userId: connection.userId,
+    credentialSource: authMode === 'codex_oauth' ? 'codex_oauth' : 'api_key',
+    provider: connection.provider as AIProviderConnectionKind,
+    authMode,
+    model: connection.model,
+    apiKeyFingerprint: connection.apiKeyFingerprint ?? undefined,
+    codexHome: connection.codexHome ?? undefined,
+    accountSummary: connection.accountSummary ?? undefined,
+    connectedAt: connection.connectedAt.toISOString(),
+    lastCheckedAt: connection.lastCheckedAt?.toISOString(),
+    updatedAt: connection.updatedAt.toISOString()
+  };
+}
 
 function parseDiffStat(value: Prisma.JsonValue): { filesChanged: number; insertions: number; deletions: number } {
   if (!value || typeof value !== 'object' || Array.isArray(value)) {

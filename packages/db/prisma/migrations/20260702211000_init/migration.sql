@@ -11,10 +11,13 @@ CREATE TYPE "TaskMode" AS ENUM ('safe', 'auto', 'full_auto');
 CREATE TYPE "TaskStatus" AS ENUM ('draft', 'submitted', 'planning', 'waiting_for_plan_approval', 'creating_github_issue', 'creating_branch', 'running_ai', 'validating', 'reviewing', 'improving', 'needs_approval', 'creating_pr', 'ready_for_user_review', 'completed', 'failed', 'cancelled', 'budget_exceeded', 'iteration_limit_reached', 'repeated_error_detected', 'approval_rejected', 'provider_failed', 'validation_failed');
 
 -- CreateEnum
-CREATE TYPE "ProviderKind" AS ENUM ('codex', 'github_copilot', 'openai', 'local', 'mock');
+CREATE TYPE "ProviderKind" AS ENUM ('codex', 'openai');
 
 -- CreateEnum
 CREATE TYPE "RunStatus" AS ENUM ('queued', 'running', 'succeeded', 'failed', 'cancelled');
+
+-- CreateEnum
+CREATE TYPE "QueueJobStatus" AS ENUM ('pending', 'claimed', 'succeeded', 'failed', 'cancelled');
 
 -- CreateEnum
 CREATE TYPE "IterationPhase" AS ENUM ('planning', 'implementation', 'validation', 'review', 'approval', 'pr_creation');
@@ -79,6 +82,19 @@ CREATE TABLE "tasks" (
     "started_at" TIMESTAMP(3),
     "finished_at" TIMESTAMP(3),
     CONSTRAINT "tasks_pkey" PRIMARY KEY ("id")
+);
+
+-- CreateTable
+CREATE TABLE "task_queue_jobs" (
+    "id" TEXT NOT NULL,
+    "task_id" TEXT NOT NULL,
+    "status" "QueueJobStatus" NOT NULL DEFAULT 'pending',
+    "reason" TEXT NOT NULL,
+    "error_message" TEXT,
+    "created_at" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    "claimed_at" TIMESTAMP(3),
+    "finished_at" TIMESTAMP(3),
+    CONSTRAINT "task_queue_jobs_pkey" PRIMARY KEY ("id")
 );
 
 -- CreateTable
@@ -172,6 +188,9 @@ CREATE UNIQUE INDEX "projects_slug_key" ON "projects"("slug");
 CREATE INDEX "tasks_project_id_status_idx" ON "tasks"("project_id", "status");
 
 -- CreateIndex
+CREATE INDEX "task_queue_jobs_status_created_at_idx" ON "task_queue_jobs"("status", "created_at");
+
+-- CreateIndex
 CREATE INDEX "task_runs_task_id_status_idx" ON "task_runs"("task_id", "status");
 
 -- CreateIndex
@@ -196,6 +215,9 @@ ALTER TABLE "tasks" ADD CONSTRAINT "tasks_project_id_fkey" FOREIGN KEY ("project
 ALTER TABLE "tasks" ADD CONSTRAINT "tasks_created_by_user_id_fkey" FOREIGN KEY ("created_by_user_id") REFERENCES "users"("id") ON DELETE RESTRICT ON UPDATE CASCADE;
 
 -- AddForeignKey
+ALTER TABLE "task_queue_jobs" ADD CONSTRAINT "task_queue_jobs_task_id_fkey" FOREIGN KEY ("task_id") REFERENCES "tasks"("id") ON DELETE RESTRICT ON UPDATE CASCADE;
+
+-- AddForeignKey
 ALTER TABLE "task_runs" ADD CONSTRAINT "task_runs_task_id_fkey" FOREIGN KEY ("task_id") REFERENCES "tasks"("id") ON DELETE RESTRICT ON UPDATE CASCADE;
 
 -- AddForeignKey
@@ -218,4 +240,3 @@ ALTER TABLE "audit_log" ADD CONSTRAINT "audit_log_project_id_fkey" FOREIGN KEY (
 
 -- AddForeignKey
 ALTER TABLE "audit_log" ADD CONSTRAINT "audit_log_task_id_fkey" FOREIGN KEY ("task_id") REFERENCES "tasks"("id") ON DELETE SET NULL ON UPDATE CASCADE;
-

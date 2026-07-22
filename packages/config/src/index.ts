@@ -21,9 +21,9 @@ export const agentConfigSchema = z.object({
     allow_ai_auto_improvements: z.boolean().default(true)
   }),
   ai: z.object({
-    primary_provider: z.enum(['codex', 'github_copilot', 'openai', 'local', 'mock']).default('mock'),
-    fallback_provider: z.enum(['codex', 'github_copilot', 'openai', 'local', 'mock']).optional(),
-    reviewer_provider: z.enum(['codex', 'github_copilot', 'openai', 'local', 'mock']).default('mock'),
+    primary_provider: z.enum(['codex', 'openai']).default('codex'),
+    fallback_provider: z.enum(['codex', 'openai']).optional(),
+    reviewer_provider: z.enum(['codex', 'openai']).default('codex'),
     model_profile: z.enum(['fast', 'balanced', 'deep']).default('balanced')
   }),
   limits: z.object({
@@ -80,4 +80,3 @@ export function toCoreLimits(config: AgentConfig) {
     hardBudgetThresholdPercent: config.limits.hard_budget_threshold_percent
   };
 }
-

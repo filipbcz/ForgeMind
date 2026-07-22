@@ -26,13 +26,55 @@ export interface ProjectApi {
   id: string;
   name: string;
   slug: string;
-  githubOwner: string;
-  githubRepo: string;
+  githubOwner?: string;
+  githubRepo?: string;
   defaultBranch: string;
   configYaml?: string;
+  brief?: string;
+  autoCreatePullRequest: boolean;
+  autoMergePullRequest: boolean;
+  autoCompleteTask: boolean;
+  allowSafeOperationsWithoutApproval: boolean;
+  defaultTaskMode: 'safe' | 'auto' | 'full_auto';
   isActive: boolean;
   createdAt: string;
   updatedAt: string;
+}
+
+export type ProjectRoadmapCycleStatus = 'active' | 'awaiting_extension_approval' | 'completed';
+export type ProjectImplementationStepStatus = 'pending' | 'running' | 'completed' | 'cancelled';
+
+export interface ProjectRoadmapCycleApi {
+  id: string;
+  projectId: string;
+  cycleNumber: number;
+  objective: string;
+  extensionProposal?: string;
+  status: ProjectRoadmapCycleStatus;
+  createdAt: string;
+  updatedAt: string;
+  completedAt?: string;
+}
+
+export interface ProjectImplementationStepApi {
+  id: string;
+  projectId: string;
+  cycleId: string;
+  sequenceNumber: number;
+  title: string;
+  description: string;
+  acceptanceCriteria: string[];
+  status: ProjectImplementationStepStatus;
+  taskId?: string;
+  createdAt: string;
+  updatedAt: string;
+  completedAt?: string;
+}
+
+export interface ProjectRoadmapApi {
+  projectId: string;
+  cycles: ProjectRoadmapCycleApi[];
+  steps: ProjectImplementationStepApi[];
 }
 
 export interface TaskApi {
@@ -92,7 +134,10 @@ export interface TaskDiffApi {
     taskRunId: string;
     iterationNumber: number;
     phase: string;
+    prompt: string;
     resultSummary: string;
+    providerPrompt?: string;
+    providerResponse?: string;
     diffStat: unknown;
     validationResult: unknown;
     createdAt: string;
@@ -131,10 +176,242 @@ export interface TaskUsageApi {
   }>;
 }
 
+export interface TaskQueueApi {
+  taskId: string;
+  queueDepth: number;
+  queuePosition: number | null;
+}
+
+export interface WorkerStatusApi {
+  state: 'idle' | 'running';
+  queuedTaskCount: number;
+  activeTaskCount: number;
+  runningRun?: {
+    id: string;
+    taskId: string;
+    provider: string;
+    model: string;
+    startedAt?: string;
+  };
+  activeIteration?: {
+    taskId: string;
+    taskRunId?: string;
+    phase: string;
+    attempt: number;
+    prompt: string;
+    providerPrompt?: string;
+    startedAt: string;
+  };
+  lastCompletedRun?: {
+    id: string;
+    taskId: string;
+    provider: string;
+    model: string;
+    finishedAt?: string;
+    status: 'succeeded' | 'failed' | 'cancelled';
+    summary?: string;
+    errorMessage?: string;
+  };
+  updatedAt: string;
+}
+
+export interface WorkerEventApi {
+  id: string;
+  actorType: 'user' | 'agent' | 'system' | 'github';
+  eventType: string;
+  taskId?: string;
+  payload?: unknown;
+  createdAt: string;
+}
+
+export interface RealtimeAuditEventMessage {
+  type: 'audit_event';
+  event: AuditEventApi;
+}
+
+export interface RealtimeConnectedMessage {
+  type: 'connected';
+  taskId?: string;
+}
+
+export interface RealtimeHeartbeatMessage {
+  type: 'heartbeat';
+  sentAt: string;
+}
+
+export type RealtimeMessage = RealtimeConnectedMessage | RealtimeHeartbeatMessage | RealtimeAuditEventMessage;
+
+export interface NotificationSubscriptionApi {
+  id: string;
+  userId: string;
+  endpoint: string;
+  keys?: {
+    p256dh?: string;
+    auth?: string;
+  };
+  deviceName?: string;
+  createdAt: string;
+}
+
+export interface NotificationSettingsApi {
+  userId: string;
+  settings: {
+    pushEnabled: boolean;
+    approvalRequests: boolean;
+    taskUpdates: boolean;
+    budgetAlerts: boolean;
+  };
+  subscriptions: NotificationSubscriptionApi[];
+}
+
+export interface NotificationSubscriptionRequest {
+  endpoint: string;
+  keys?: {
+    p256dh?: string;
+    auth?: string;
+  };
+  deviceName?: string;
+}
+
+export interface GitHubAdapterStatusApi {
+  adapter: 'none' | 'app';
+  configured: boolean;
+  credentialSource: 'token' | 'github_app' | 'none';
+  apiBaseUrl: string;
+  missing: string[];
+  persistent?: boolean;
+  tokenFingerprint?: string;
+  connectedAt?: string;
+  lastCheckedAt?: string;
+}
+
+export interface GitHubAdapterConnectRequest {
+  token: string;
+  apiBaseUrl?: string;
+}
+
+export interface GitHubAdapterConnectResponse {
+  ok: boolean;
+  status: GitHubAdapterStatusApi;
+  check: {
+    ok: true;
+    apiBaseUrl: string;
+    credentialSource: 'token';
+    repository?: {
+      fullName: string;
+      owner: string;
+      repo: string;
+      defaultBranch: string;
+      private: boolean;
+      htmlUrl?: string;
+    };
+    rateLimit?: {
+      limit: number;
+      remaining: number;
+    };
+  };
+}
+
+export interface GitHubRepositoryApi {
+  fullName: string;
+  owner: string;
+  repo: string;
+  defaultBranch: string;
+  private: boolean;
+  htmlUrl?: string;
+}
+
+export interface GitHubRepositoryOwnerApi {
+  login: string;
+  kind: 'user' | 'organization';
+  avatarUrl?: string;
+  description?: string;
+}
+
+export interface GitHubBranchApi {
+  name: string;
+  sha: string;
+  protected: boolean;
+}
+
+export interface ProviderStatusApi {
+  currentProvider: 'openai' | 'codex' | string | null;
+  currentModel: string | null;
+  fallbackProvider: 'openai' | 'codex' | string | null;
+  githubAdapter: string;
+  availableProviders: string[];
+  persistent: boolean;
+  credentialSource: 'api_key' | 'codex_oauth' | 'env' | 'none' | string;
+  authMode: 'api_key' | 'codex_oauth' | null;
+  apiKeyFingerprint: string | null;
+  codexHome: string | null;
+  accountSummary: string | null;
+  connectedAt: string | null;
+  lastCheckedAt: string | null;
+  configured: {
+    openai: boolean;
+    codex: boolean;
+  };
+  models: {
+    openai: string | null;
+    codex: string | null;
+  };
+  apiBaseUrls: {
+    openai: string | null;
+    codex: string | null;
+  };
+}
+
+export interface ProviderConnectRequest {
+  provider: 'openai' | 'codex';
+  authMode?: 'api_key' | 'codex_oauth';
+  apiKey?: string;
+  model: string;
+}
+
+export interface ProviderConnectResponse {
+  ok: boolean;
+  provider: string;
+  model: string;
+  authMode: 'api_key' | 'codex_oauth';
+  persistent: boolean;
+  estimate: {
+    inputTokens: number;
+    outputTokens: number;
+    estimatedCostUsd: number;
+  };
+}
+
+export interface CodexOAuthStartResponse {
+  loginId: string;
+  authFlow: 'browser';
+  startedAt: string;
+  loginUrl?: string;
+  codexHome: string;
+}
+
+export interface CodexOAuthCompleteResponse {
+  ok: boolean;
+  completed: boolean;
+  provider?: string;
+  model?: string;
+  authMode?: 'codex_oauth';
+  persistent?: boolean;
+  loginId?: string;
+  authFlow?: 'browser';
+  startedAt?: string;
+  loginUrl?: string;
+  codexHome?: string;
+}
+
 export interface CreateTaskRequest {
   projectId: string;
   title: string;
   prompt: string;
+  priority?: 'low' | 'medium' | 'high';
+  scopeFiles?: string[];
+  acceptanceCriteria?: string[];
+  runtimeSummary?: string;
   mode: TaskApi['mode'];
   maxIterations: number;
   maxBudgetUsd: number;
@@ -143,10 +420,57 @@ export interface CreateTaskRequest {
 export interface CreateProjectRequest {
   name: string;
   slug: string;
-  githubOwner: string;
-  githubRepo: string;
+  githubOwner?: string;
+  githubRepo?: string;
   defaultBranch: string;
   configYaml?: string;
+  brief?: string;
+  autoCreatePullRequest?: boolean;
+  autoMergePullRequest?: boolean;
+  autoCompleteTask?: boolean;
+  allowSafeOperationsWithoutApproval?: boolean;
+  defaultTaskMode?: TaskApi['mode'];
+  repositoryMode?: 'existing' | 'create';
+  branchMode?: 'existing' | 'create';
+  branchName?: string;
+  repositoryPrivate?: boolean;
+  repositoryDescription?: string;
+}
+
+export interface UpdateProjectRequest {
+  name?: string;
+  slug?: string;
+  githubOwner?: string;
+  githubRepo?: string;
+  defaultBranch?: string;
+  configYaml?: string;
+  brief?: string | null;
+  autoCreatePullRequest?: boolean;
+  autoMergePullRequest?: boolean;
+  autoCompleteTask?: boolean;
+  allowSafeOperationsWithoutApproval?: boolean;
+  defaultTaskMode?: TaskApi['mode'];
+  isActive?: boolean;
+}
+
+export interface GenerateProjectRoadmapRequest {
+  objective?: string;
+}
+
+export interface DecideProjectRoadmapExtensionRequest {
+  approved: boolean;
+  objectiveOverride?: string;
+}
+
+export interface AssignProjectRepositoryRequest {
+  mode: 'existing' | 'create';
+  owner?: string;
+  repo: string;
+  defaultBranch?: string;
+  branchMode?: 'existing' | 'create';
+  branchName?: string;
+  private?: boolean;
+  description?: string;
 }
 
 export interface ProjectSummary extends ProjectApi {
@@ -186,4 +510,3 @@ export interface ApprovalSummary {
   touchedFiles: string[];
   recommendation: string;
 }
-

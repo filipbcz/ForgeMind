@@ -1,6 +1,6 @@
 import type { IsoDateString, JsonValue } from '@forgemind/shared';
 
-export type ProviderKind = 'codex' | 'github_copilot' | 'openai' | 'local' | 'mock';
+export type ProviderKind = 'codex' | 'openai';
 
 export type TaskMode = 'safe' | 'auto' | 'full_auto';
 
@@ -73,13 +73,50 @@ export interface Project {
   id: string;
   name: string;
   slug: string;
-  githubOwner: string;
-  githubRepo: string;
+  githubOwner?: string;
+  githubRepo?: string;
   defaultBranch: string;
   configYaml?: string;
+  brief?: string;
+  autoCreatePullRequest?: boolean;
+  autoMergePullRequest?: boolean;
+  autoCompleteTask?: boolean;
+  allowSafeOperationsWithoutApproval?: boolean;
+  defaultTaskMode?: TaskMode;
   isActive: boolean;
   createdAt: IsoDateString;
   updatedAt: IsoDateString;
+}
+
+export type ProjectRoadmapCycleStatus = 'active' | 'awaiting_extension_approval' | 'completed';
+
+export type ProjectImplementationStepStatus = 'pending' | 'running' | 'completed' | 'cancelled';
+
+export interface ProjectRoadmapCycle {
+  id: string;
+  projectId: string;
+  cycleNumber: number;
+  objective: string;
+  extensionProposal?: string;
+  status: ProjectRoadmapCycleStatus;
+  createdAt: IsoDateString;
+  updatedAt: IsoDateString;
+  completedAt?: IsoDateString;
+}
+
+export interface ProjectImplementationStep {
+  id: string;
+  projectId: string;
+  cycleId: string;
+  sequenceNumber: number;
+  title: string;
+  description: string;
+  acceptanceCriteria: string[];
+  status: ProjectImplementationStepStatus;
+  taskId?: string;
+  createdAt: IsoDateString;
+  updatedAt: IsoDateString;
+  completedAt?: IsoDateString;
 }
 
 export interface ForgeTask {
@@ -126,6 +163,8 @@ export interface TaskIteration {
   phase: IterationPhase;
   prompt: string;
   resultSummary: string;
+  providerPrompt?: string;
+  providerResponse?: string;
   diffStat: JsonValue;
   validationResult: JsonValue;
   createdAt: IsoDateString;
@@ -156,4 +195,3 @@ export interface AuditEvent {
   payload: JsonValue;
   createdAt: IsoDateString;
 }
-

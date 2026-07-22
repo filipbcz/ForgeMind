@@ -6,9 +6,12 @@ describe('task state machine', () => {
     expect(canTransitionTask('draft', 'submitted')).toBe(true);
   });
 
+  it('allows approval pauses from validating when guardrails trigger after validation starts', () => {
+    expect(canTransitionTask('validating', 'needs_approval')).toBe(true);
+  });
+
   it('does not allow reopening terminal statuses directly', () => {
     expect(TERMINAL_TASK_STATUSES.has('completed')).toBe(true);
     expect(canTransitionTask('completed', 'running_ai')).toBe(false);
   });
 });
-

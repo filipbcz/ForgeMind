@@ -1,51 +1,83 @@
-import type { ForgeTask, Project } from '@forgemind/core';
+import { readFile } from 'node:fs/promises';
+import { dirname, join, resolve } from 'node:path';
 import { disconnectPrisma } from '@forgemind/db';
-import { createId, nowIso } from '@forgemind/shared';
+import { runWorkerDaemon } from './daemon.js';
 import { runDatabaseWorkerOnce } from './db-worker.js';
-import { runWorkerTask } from './workflow.js';
 
-if (process.env.DATABASE_URL) {
-  try {
-    const result = await runDatabaseWorkerOnce();
-    console.log(JSON.stringify(result, null, 2));
-  } finally {
-    await disconnectPrisma();
-  }
-  process.exit(0);
+await loadLocalDatabaseUrl();
+
+if (!process.env.DATABASE_URL) {
+  throw new Error('DATABASE_URL is required for the worker runtime.');
 }
 
-const demoProject: Project = {
-  id: 'project_demo_gallery',
-  name: 'Demo Static Gallery',
-  slug: 'demo-static-gallery',
-  githubOwner: 'demo',
-  githubRepo: 'demo-static-gallery',
-  defaultBranch: 'main',
-  isActive: true,
-  createdAt: nowIso(),
-  updatedAt: nowIso()
-};
+try {
+  const result = process.env.FORGEMIND_WORKER_MODE === 'daemon'
+    ? await runWorkerDaemon({
+        pollDelayMs: Number(process.env.FORGEMIND_WORKER_POLL_MS ?? 2500),
+        stopWhenIdle: process.env.FORGEMIND_WORKER_STOP_WHEN_IDLE === 'true'
+      })
+    : await runDatabaseWorkerOnce();
+  console.log(JSON.stringify(result, null, 2));
+} finally {
+  await disconnectPrisma();
+}
 
-const demoTask: ForgeTask = {
-  id: createId('task'),
-  projectId: demoProject.id,
-  createdByUserId: 'user_local_owner',
-  title: 'Mock ForgeMind workflow',
-  prompt: 'Simulate a safe implementation and validate the worker lifecycle.',
-  mode: 'safe',
-  status: 'submitted',
-  maxIterations: 10,
-  maxBudgetUsd: 2,
-  createdAt: nowIso(),
-  updatedAt: nowIso()
-};
+async function loadLocalDatabaseUrl() {
+  if (process.env.DATABASE_URL) {
+    return;
+  }
 
-const result = await runWorkerTask({
-  project: demoProject,
-  task: demoTask,
-  providerKind: 'mock',
-  verifyCommand: process.env.FORGEMIND_VERIFY_COMMAND ?? 'node --version',
-  workspaceRoot: process.env.FORGEMIND_WORKSPACE_ROOT
-});
+  const root = await resolveWorkspaceRoot();
+  for (const fileName of ['.env', '.env.example']) {
+    const value = await readEnvValue(join(root, fileName), 'DATABASE_URL');
+    if (value) {
+      process.env.DATABASE_URL = value;
+      return;
+    }
+  }
+}
 
-console.log(JSON.stringify(result, null, 2));
+async function resolveWorkspaceRoot(): Promise<string> {
+  let current = resolve(process.cwd());
+
+  while (true) {
+    try {
+      const packageJson = JSON.parse(await readFile(join(current, 'package.json'), 'utf8')) as { workspaces?: unknown };
+      if (Array.isArray(packageJson.workspaces) || typeof packageJson.workspaces === 'object') {
+        return current;
+      }
+    } catch {
+      // Keep walking up until the filesystem root.
+    }
+
+    const parent = dirname(current);
+    if (parent === current) {
+      return resolve(process.cwd());
+    }
+    current = parent;
+  }
+}
+
+async function readEnvValue(path: string, key: string): Promise<string | undefined> {
+  try {
+    const content = await readFile(path, 'utf8');
+    for (const line of content.split(/\r?\n/)) {
+      const match = line.match(new RegExp(`^${key}=(.*)$`));
+      if (!match) {
+        continue;
+      }
+      return stripEnvQuotes(match[1]?.trim() ?? '');
+    }
+  } catch {
+    return undefined;
+  }
+
+  return undefined;
+}
+
+function stripEnvQuotes(value: string): string {
+  if ((value.startsWith('"') && value.endsWith('"')) || (value.startsWith("'") && value.endsWith("'"))) {
+    return value.slice(1, -1);
+  }
+  return value;
+}

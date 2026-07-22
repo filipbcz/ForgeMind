@@ -18,4 +18,5 @@ export async function disconnectPrisma(): Promise<void> {
 
 export * from './env.js';
 export * from './mappers.js';
+export * from './roadmap.js';
 export * from './repository.js';
