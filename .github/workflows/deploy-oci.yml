@@ -14,12 +14,78 @@ permissions:
   contents: read
 
 jobs:
-  deploy:
+  build_images:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      runtime_image: ${{ steps.image_names.outputs.runtime }}
+      web_image: ${{ steps.image_names.outputs.web }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Resolve image names
+        id: image_names
+        shell: bash
+        run: |
+          set -euo pipefail
+          repository="${GITHUB_REPOSITORY,,}"
+          echo "runtime=ghcr.io/${repository}-runtime:${GITHUB_SHA}" >> "${GITHUB_OUTPUT}"
+          echo "runtime_main=ghcr.io/${repository}-runtime:main" >> "${GITHUB_OUTPUT}"
+          echo "web=ghcr.io/${repository}-web:${GITHUB_SHA}" >> "${GITHUB_OUTPUT}"
+          echo "web_main=ghcr.io/${repository}-web:main" >> "${GITHUB_OUTPUT}"
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push runtime image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: infra/Dockerfile
+          target: runtime
+          push: true
+          tags: |
+            ${{ steps.image_names.outputs.runtime }}
+            ${{ steps.image_names.outputs.runtime_main }}
+          cache-from: type=gha,scope=forgemind-production
+          cache-to: type=gha,mode=max,scope=forgemind-production
+          provenance: false
+          sbom: false
+
+      - name: Build and push web image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: infra/Dockerfile
+          target: web
+          push: true
+          tags: |
+            ${{ steps.image_names.outputs.web }}
+            ${{ steps.image_names.outputs.web_main }}
+          cache-from: type=gha,scope=forgemind-production
+          cache-to: type=gha,mode=max,scope=forgemind-production
+          provenance: false
+          sbom: false
+
+  deploy:
+    needs: build_images
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: read
     environment: production
     env:
       APP_ROOT: /opt/forgemind
       RELEASE_ARCHIVE: forgemind-${{ github.sha }}.tar.gz
+      FORGEMIND_RUNTIME_IMAGE: ${{ needs.build_images.outputs.runtime_image }}
+      FORGEMIND_WEB_IMAGE: ${{ needs.build_images.outputs.web_image }}
     steps:
       - uses: actions/checkout@v4
 
@@ -49,6 +115,19 @@ jobs:
           DEPLOY_PORT="${OCI_DEPLOY_PORT:-22}"
           scp -o ServerAliveInterval=30 -o ServerAliveCountMax=20 -P "${DEPLOY_PORT}" "${RELEASE_ARCHIVE}" "${OCI_DEPLOY_USER}@${OCI_DEPLOY_HOST}:/tmp/${RELEASE_ARCHIVE}"
 
+      - name: Authenticate OCI host to GHCR
+        env:
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          OCI_DEPLOY_HOST: ${{ secrets.OCI_DEPLOY_HOST }}
+          OCI_DEPLOY_USER: ${{ secrets.OCI_DEPLOY_USER }}
+          OCI_DEPLOY_PORT: ${{ secrets.OCI_DEPLOY_PORT }}
+        run: |
+          set -euo pipefail
+          DEPLOY_PORT="${OCI_DEPLOY_PORT:-22}"
+          printf '%s' "${GHCR_TOKEN}" | ssh -o ServerAliveInterval=30 -o ServerAliveCountMax=20 -p "${DEPLOY_PORT}" \
+            "${OCI_DEPLOY_USER}@${OCI_DEPLOY_HOST}" \
+            "docker login ghcr.io --username '${GITHUB_ACTOR}' --password-stdin"
+
       - name: Deploy release
         env:
           OCI_DEPLOY_HOST: ${{ secrets.OCI_DEPLOY_HOST }}
@@ -65,5 +144,21 @@ jobs:
             tar -xzf \"/tmp/${RELEASE_ARCHIVE}\" -C \"\${RELEASE_DIR}\"
             rsync -a --delete \"\${RELEASE_DIR}/\" \"\${APP_ROOT}/app/\"
             rm -f \"/tmp/${RELEASE_ARCHIVE}\"
-            APP_ROOT=\"\${APP_ROOT}\" bash \"\${APP_ROOT}/app/infra/deploy/remote-deploy.sh\"
+            APP_ROOT=\"\${APP_ROOT}\" \
+            FORGEMIND_RUNTIME_IMAGE='${FORGEMIND_RUNTIME_IMAGE}' \
+            FORGEMIND_WEB_IMAGE='${FORGEMIND_WEB_IMAGE}' \
+            bash \"\${APP_ROOT}/app/infra/deploy/remote-deploy.sh\"
           "
+
+      - name: Remove temporary GHCR credentials
+        if: always()
+        continue-on-error: true
+        env:
+          OCI_DEPLOY_HOST: ${{ secrets.OCI_DEPLOY_HOST }}
+          OCI_DEPLOY_USER: ${{ secrets.OCI_DEPLOY_USER }}
+          OCI_DEPLOY_PORT: ${{ secrets.OCI_DEPLOY_PORT }}
+        run: |
+          DEPLOY_PORT="${OCI_DEPLOY_PORT:-22}"
+          ssh -o ServerAliveInterval=30 -o ServerAliveCountMax=20 -p "${DEPLOY_PORT}" \
+            "${OCI_DEPLOY_USER}@${OCI_DEPLOY_HOST}" \
+            "docker logout ghcr.io"

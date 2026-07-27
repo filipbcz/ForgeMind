@@ -16,10 +16,7 @@ services:
       start_period: 15s
 
   migrate:
-    build:
-      context: ..
-      dockerfile: infra/Dockerfile
-      target: runtime
+    image: ${FORGEMIND_RUNTIME_IMAGE:-ghcr.io/filipbcz/forgemind-runtime:main}
     env_file:
       - ${FORGEMIND_ENV_FILE:-/opt/forgemind/shared/server.env}
     depends_on:
@@ -29,10 +26,7 @@ services:
     restart: "no"
 
   api:
-    build:
-      context: ..
-      dockerfile: infra/Dockerfile
-      target: runtime
+    image: ${FORGEMIND_RUNTIME_IMAGE:-ghcr.io/filipbcz/forgemind-runtime:main}
     restart: unless-stopped
     env_file:
       - ${FORGEMIND_ENV_FILE:-/opt/forgemind/shared/server.env}
@@ -50,10 +44,7 @@ services:
       start_period: 20s
 
   worker:
-    build:
-      context: ..
-      dockerfile: infra/Dockerfile
-      target: runtime
+    image: ${FORGEMIND_RUNTIME_IMAGE:-ghcr.io/filipbcz/forgemind-runtime:main}
     restart: unless-stopped
     env_file:
       - ${FORGEMIND_ENV_FILE:-/opt/forgemind/shared/server.env}
@@ -66,10 +57,7 @@ services:
     command: ["node", "apps/worker/dist/index.js"]
 
   web:
-    build:
-      context: ..
-      dockerfile: infra/Dockerfile
-      target: web
+    image: ${FORGEMIND_WEB_IMAGE:-ghcr.io/filipbcz/forgemind-web:main}
     restart: unless-stopped
     env_file:
       - ${FORGEMIND_ENV_FILE:-/opt/forgemind/shared/server.env}

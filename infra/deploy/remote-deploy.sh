@@ -6,6 +6,9 @@ APP_DIR="${APP_ROOT}/app"
 ENV_FILE="${APP_ROOT}/shared/server.env"
 COMPOSE_FILE="${APP_DIR}/infra/docker-compose.prod.yml"
 
+: "${FORGEMIND_RUNTIME_IMAGE:?FORGEMIND_RUNTIME_IMAGE is required}"
+: "${FORGEMIND_WEB_IMAGE:?FORGEMIND_WEB_IMAGE is required}"
+
 if [ ! -s "${ENV_FILE}" ]; then
   echo "Missing or empty environment file: ${ENV_FILE}" >&2
   exit 1
@@ -22,9 +25,11 @@ compose=(docker compose --env-file "${ENV_FILE}" -f "${COMPOSE_FILE}")
 
 docker network inspect shared-edge >/dev/null 2>&1 || docker network create shared-edge >/dev/null
 
-"${compose[@]}" up -d --build postgres
-"${compose[@]}" run --rm --build migrate
-"${compose[@]}" up -d --build --remove-orphans api worker web
+"${compose[@]}" up -d postgres
+docker pull "${FORGEMIND_RUNTIME_IMAGE}"
+docker pull "${FORGEMIND_WEB_IMAGE}"
+"${compose[@]}" run --rm migrate
+"${compose[@]}" up -d --remove-orphans api worker web
 
 API_CONTAINER="$("${compose[@]}" ps -q api)"
 

@@ -1,6 +1,6 @@
 # OCI Deployment
 
-ForgeMind uses the same deployment pattern as the `Running` repository: GitHub Actions uploads a release archive over SSH and a remote script updates a Docker Compose stack.
+GitHub Actions builds immutable ForgeMind container images, publishes them to GitHub Container Registry (GHCR), uploads a release archive over SSH and asks the remote script to update the Docker Compose stack.
 
 ## Production services
 
@@ -105,16 +105,22 @@ The secret names intentionally match the `Running` repository, but personal repo
 
 Add the corresponding public key to `~/.ssh/authorized_keys` for the deploy user on the server.
 
+The workflow uses its short-lived `GITHUB_TOKEN` to publish images and authenticate the OCI host to GHCR for the duration of the deployment. No persistent registry password or additional repository secret is required.
+
 ## Deployment
 
 Deployment runs automatically after a push to `main` or manually through the `Deploy to OCI` workflow. The workflow:
 
-1. uploads an immutable Git archive,
-2. synchronizes it to `/opt/forgemind/app`,
-3. builds the production images,
-4. applies Prisma migrations,
-5. starts the API, worker and web proxy,
-6. waits for the API health check.
+1. builds the `runtime` and `web` images on the GitHub-hosted runner,
+2. publishes immutable commit-SHA tags and moving `main` tags to GHCR,
+3. uploads an immutable Git archive,
+4. synchronizes it to `/opt/forgemind/app`,
+5. pulls the exact commit-SHA images on the OCI host,
+6. applies Prisma migrations,
+7. starts the API, worker and web proxy,
+8. waits for the API health check.
+
+The OCI host does not run `npm ci` or compile the monorepo during deployment. The `main` image tags are defaults for manual Compose inspection; automated deployment always passes immutable SHA tags.
 
 ## Provider configuration
 
