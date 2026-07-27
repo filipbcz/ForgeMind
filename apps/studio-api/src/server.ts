@@ -29,7 +29,7 @@ export async function createApp() {
 
   await app.register(cors, {
     origin: true,
-    methods: ['GET', 'HEAD', 'POST', 'PUT', 'PATCH', 'OPTIONS']
+    methods: ['GET', 'HEAD', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS']
   });
   await app.register(rawBody, {
     field: 'rawBody',

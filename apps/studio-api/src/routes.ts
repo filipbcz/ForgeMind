@@ -6,6 +6,7 @@ import {
   checkGitHubConnection,
   createGitHubBranch,
   createGitHubRepository,
+  deleteGitHubRepository,
   getGitHubAdapterEnvStatus,
   listGitHubBranches,
   listGitHubRepositoryOwners,
@@ -51,6 +52,11 @@ const updateProjectSchema = projectSchema.partial().extend({
   allowSafeOperationsWithoutApproval: z.boolean().optional(),
   defaultTaskMode: z.enum(['safe', 'auto', 'full_auto']).optional(),
   isActive: z.boolean().optional()
+});
+
+const deleteProjectSchema = z.object({
+  confirmation: z.string().min(1),
+  deleteGitHubRepository: z.boolean().optional().default(false)
 });
 
 const projectConfigSchema = z.object({
@@ -669,6 +675,58 @@ export function registerRoutes(app: FastifyInstance, repository: ForgeMindReposi
       const input = updateProjectSchema.parse(request.body);
       const project = await repository.updateProject(id, input);
       return project ? project : sendNotFound(reply, `Project "${id}" not found`);
+    } catch (error) {
+      return sendBadRequest(reply, error);
+    }
+  });
+
+  app.delete('/api/projects/:id', async (request, reply) => {
+    try {
+      const { id } = idParamsSchema.parse(request.params);
+      const input = deleteProjectSchema.parse(request.body ?? {});
+      const project = await repository.getProject(id);
+      if (!project) {
+        return sendNotFound(reply, `Project "${id}" not found`);
+      }
+      if (input.confirmation !== project.name) {
+        throw new Error(`Type the exact project name "${project.name}" to confirm deletion.`);
+      }
+
+      await repository.assertProjectDeletable(id);
+
+      let deletedGitHubRepository = false;
+      let githubRepository: string | undefined;
+      if (input.deleteGitHubRepository) {
+        if (!project.githubOwner || !project.githubRepo) {
+          throw new Error('This project does not have an assigned GitHub repository.');
+        }
+        const connection = await readGitHubConnectionSecret(repository);
+        if (!connection) {
+          throw new Error('Connect GitHub with a persistent token before deleting a repository.');
+        }
+
+        await deleteGitHubRepository({
+          token: connection.token,
+          apiBaseUrl: connection.apiBaseUrl,
+          owner: project.githubOwner,
+          repo: project.githubRepo
+        });
+        deletedGitHubRepository = true;
+        githubRepository = `${project.githubOwner}/${project.githubRepo}`;
+      }
+
+      const result = await repository.deleteProject(id, {
+        githubRepositoryDeleted: deletedGitHubRepository
+      });
+      if (!result) {
+        return sendNotFound(reply, `Project "${id}" not found`);
+      }
+
+      return {
+        ...result,
+        deletedGitHubRepository,
+        githubRepository
+      };
     } catch (error) {
       return sendBadRequest(reply, error);
     }

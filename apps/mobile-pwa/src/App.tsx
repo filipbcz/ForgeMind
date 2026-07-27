@@ -21,6 +21,7 @@ import {
   Settings,
   ShieldCheck,
   Smartphone,
+  Trash2,
   XCircle
 } from 'lucide-react';
 import {
@@ -33,6 +34,7 @@ import {
   decideProjectRoadmapExtension as decideProjectRoadmapExtensionRequest,
   createProject as createProjectRequest,
   createTask as createTaskRequest,
+  deleteProject as deleteProjectRequest,
   disconnectGitHubAdapter,
   fetchGitHubAdapterStatus,
   fetchGitHubBranches,
@@ -70,6 +72,7 @@ import type {
   CreateProjectRequest,
   CreateTaskRequest,
   DecideProjectRoadmapExtensionRequest,
+  DeleteProjectRequest,
   GenerateProjectRoadmapRequest,
   GitHubAdapterConnectRequest,
   GitHubAdapterStatusApi,
@@ -464,6 +467,23 @@ export function App() {
     }
   });
 
+  const deleteProjectMutation = useMutation({
+    mutationFn: ({ projectId, input }: { projectId: string; input: DeleteProjectRequest }) =>
+      deleteProjectRequest(projectId, input),
+    onSuccess: (result) => {
+      queryClient.setQueryData<ProjectSummary[]>(['projects'], (currentProjects) =>
+        currentProjects?.filter((project) => project.id !== result.projectId)
+      );
+      queryClient.setQueryData<TaskSummary[]>(['tasks'], (currentTasks) =>
+        currentTasks?.filter((task) => task.projectId !== result.projectId)
+      );
+      queryClient.removeQueries({ queryKey: ['projects', result.projectId] });
+      setSelectedProjectId('');
+      invalidateProjectData();
+      queryClient.invalidateQueries({ queryKey: ['tasks'] });
+    }
+  });
+
   const updateProjectAutomationMutation = useMutation({
     mutationFn: ({ projectId, input }: { projectId: string; input: UpdateProjectRequest }) => updateProjectRequest(projectId, input),
     onSuccess: (project) => {
@@ -835,6 +855,8 @@ export function App() {
             assigningRepository={assignProjectRepositoryMutation.isPending}
             generatingRoadmap={generateProjectRoadmapMutation.isPending}
             decidingExtension={decideProjectRoadmapExtensionMutation.isPending}
+            deletingProject={deleteProjectMutation.isPending}
+            deleteProjectError={deleteProjectMutation.error ? formatUiError(deleteProjectMutation.error) : undefined}
             onCreateProject={createProject}
             onAssignProjectRepository={assignProjectRepository}
             onUpdateProjectBrief={updateProjectBrief}
@@ -844,6 +866,10 @@ export function App() {
             }}
             onGenerateRoadmap={(projectId, input) => generateProjectRoadmapMutation.mutate({ projectId, input })}
             onDecideExtension={(projectId, input) => decideProjectRoadmapExtensionMutation.mutate({ projectId, input })}
+            onDeleteProject={(projectId, input) => {
+              deleteProjectMutation.reset();
+              deleteProjectMutation.mutate({ projectId, input });
+            }}
             githubRepositories={githubRepositories}
             githubRepositoriesLoading={githubRepositoriesQuery.isLoading}
             githubRepositoriesError={githubRepositoriesQuery.error ? formatUiError(githubRepositoriesQuery.error) : undefined}
@@ -2000,12 +2026,15 @@ function ProjectsPanel(props: {
   assigningRepository: boolean;
   generatingRoadmap: boolean;
   decidingExtension: boolean;
+  deletingProject: boolean;
+  deleteProjectError?: string;
   onCreateProject: (formData: FormData) => void;
   onAssignProjectRepository: (projectId: string, formData: FormData) => void;
   onUpdateProjectBrief: (projectId: string, formData: FormData) => void;
   onUpdateProjectAutomation: (projectId: string, input: UpdateProjectRequest) => void;
   onGenerateRoadmap: (projectId: string, input?: GenerateProjectRoadmapRequest) => void;
   onDecideExtension: (projectId: string, input: DecideProjectRoadmapExtensionRequest) => void;
+  onDeleteProject: (projectId: string, input: DeleteProjectRequest) => void;
   githubRepositories: GitHubRepositoryApi[];
   githubRepositoriesLoading: boolean;
   githubRepositoriesError?: string;
@@ -2022,6 +2051,8 @@ function ProjectsPanel(props: {
     selectedProject?.allowSafeOperationsWithoutApproval ?? false
   );
   const [defaultTaskMode, setDefaultTaskMode] = useState<CreateTaskRequest['mode']>(selectedProject?.defaultTaskMode ?? 'safe');
+  const [deleteConfirmation, setDeleteConfirmation] = useState('');
+  const [deleteGitHubRepository, setDeleteGitHubRepository] = useState(false);
   const latestCycle = props.roadmap?.cycles.at(-1);
   const cycleSteps = latestCycle ? props.roadmap?.steps.filter((step) => step.cycleId === latestCycle.id) ?? [] : [];
   const roadmapUsesOlderBrief = Boolean(
@@ -2048,6 +2079,11 @@ function ProjectsPanel(props: {
     selectedProject?.allowSafeOperationsWithoutApproval,
     selectedProject?.defaultTaskMode
   ]);
+
+  useEffect(() => {
+    setDeleteConfirmation('');
+    setDeleteGitHubRepository(false);
+  }, [selectedProject?.id]);
 
   return (
     <section className="workspace">
@@ -2339,6 +2375,58 @@ function ProjectsPanel(props: {
                 ) : null}
               </>
             ) : null}
+          </section>
+          <section className="plain-section danger-zone">
+            <div className="section-heading">
+              <div>
+                <h3>Nebezpecna zona</h3>
+                <p>Smazani projektu je trvale a odstrani jeho tasky, behy, roadmapu i auditni zaznamy.</p>
+              </div>
+            </div>
+            <form
+              className="task-form"
+              onSubmit={(event) => {
+                event.preventDefault();
+                props.onDeleteProject(selectedProject.id, {
+                  confirmation: deleteConfirmation,
+                  deleteGitHubRepository
+                });
+              }}
+            >
+              {selectedProject.githubOwner && selectedProject.githubRepo ? (
+                <label className="toggle-row wide destructive-toggle">
+                  <input
+                    type="checkbox"
+                    checked={deleteGitHubRepository}
+                    onChange={(event) => setDeleteGitHubRepository(event.target.checked)}
+                  />
+                  <span>
+                    <strong>Smazat take GitHub repozitar {selectedProject.githubOwner}/{selectedProject.githubRepo}</strong>
+                    <small>Repozitar, jeho branche, issues a pull requesty budou na GitHubu nenavratne odstraneny.</small>
+                  </span>
+                </label>
+              ) : null}
+              <label className="wide">
+                Pro potvrzeni napiste presny nazev projektu: <strong>{selectedProject.name}</strong>
+                <input
+                  value={deleteConfirmation}
+                  onChange={(event) => setDeleteConfirmation(event.target.value)}
+                  autoComplete="off"
+                  spellCheck={false}
+                />
+              </label>
+              {props.deleteProjectError ? <div className="error-banner wide">{props.deleteProjectError}</div> : null}
+              <div className="actions wide">
+                <button
+                  className="danger-action"
+                  type="submit"
+                  disabled={props.deletingProject || deleteConfirmation !== selectedProject.name}
+                >
+                  <Trash2 size={18} />
+                  {deleteGitHubRepository ? 'Smazat projekt i repozitar' : 'Smazat projekt'}
+                </button>
+              </div>
+            </form>
           </section>
         </article>
       ) : (

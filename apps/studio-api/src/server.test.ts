@@ -10,7 +10,7 @@ describe('Studio API server', () => {
     app = undefined;
   });
 
-  it.each(['PATCH', 'PUT'])('allows %s requests from the mobile development origin', async (method) => {
+  it.each(['PATCH', 'PUT', 'DELETE'])('allows %s requests from the mobile development origin', async (method) => {
     app = await createApp();
 
     const response = await app.inject({

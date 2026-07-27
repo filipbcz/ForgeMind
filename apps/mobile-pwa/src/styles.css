@@ -622,6 +622,21 @@ a {
   margin-top: 6px;
 }
 
+.danger-zone {
+  border-top: 1px solid #fecaca;
+  padding-top: 20px;
+}
+
+.danger-zone h3,
+.destructive-toggle strong {
+  color: #991b1b;
+}
+
+.danger-zone .task-form {
+  border-color: #fecaca;
+  background: #fffafa;
+}
+
 .section-heading {
   display: flex;
   align-items: flex-end;

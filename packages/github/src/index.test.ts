@@ -5,6 +5,7 @@ import {
   createAiBranchName,
   createGitHubBranch,
   createGitHubRepository,
+  deleteGitHubRepository,
   getGitHubAdapterEnvStatus,
   listGitHubBranches,
   listGitHubRepositoryOwners,
@@ -223,6 +224,31 @@ describe('GitHub helpers', () => {
       private: true,
       htmlUrl: 'https://github.com/demo/new-repo'
     });
+
+    fetchSpy.mockRestore();
+  });
+
+  it('deletes a repository and accepts GitHub 204 response without a JSON body', async () => {
+    const fetchSpy = vi.spyOn(globalThis, 'fetch').mockResolvedValueOnce({
+      ok: true,
+      status: 204
+    } as Response);
+
+    await expect(deleteGitHubRepository({
+      token: 'Bearer test-token',
+      owner: 'demo',
+      repo: 'obsolete-repo'
+    })).resolves.toBeUndefined();
+
+    expect(fetchSpy).toHaveBeenCalledWith(
+      'https://api.github.com/repos/demo/obsolete-repo',
+      expect.objectContaining({
+        method: 'DELETE',
+        headers: expect.objectContaining({
+          Authorization: 'Bearer test-token'
+        })
+      })
+    );
 
     fetchSpy.mockRestore();
   });

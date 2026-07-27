@@ -98,6 +98,13 @@ export interface CreateGitHubRepositoryInput {
   description?: string;
 }
 
+export interface DeleteGitHubRepositoryInput {
+  token: string;
+  apiBaseUrl?: string;
+  owner: string;
+  repo: string;
+}
+
 export interface ListGitHubRepositoriesInput {
   token: string;
   apiBaseUrl?: string;
@@ -467,6 +474,26 @@ export async function createGitHubRepository(input: CreateGitHubRepositoryInput)
   return toGitHubRepositoryInfo(created);
 }
 
+export async function deleteGitHubRepository(input: DeleteGitHubRepositoryInput): Promise<void> {
+  const apiBaseUrl = normalizeApiBaseUrl(input.apiBaseUrl);
+  const token = normalizeGitHubToken(input.token);
+  if (!token) {
+    throw new Error('GitHub token is empty after removing common prefixes. Paste the raw token value.');
+  }
+
+  const repository = normalizeGitHubRepositoryInput(input.owner, input.repo);
+  if (!repository) {
+    throw new Error('GitHub repository owner and name are required.');
+  }
+
+  await githubRequest({
+    apiBaseUrl,
+    token,
+    method: 'DELETE',
+    path: `/repos/${encodeURIComponent(repository.owner)}/${encodeURIComponent(repository.repo)}`
+  });
+}
+
 export async function listGitHubRepositories(input: ListGitHubRepositoriesInput): Promise<GitHubRepositoryInfo[]> {
   const apiBaseUrl = normalizeApiBaseUrl(input.apiBaseUrl);
   const token = normalizeGitHubToken(input.token);
@@ -754,6 +781,17 @@ async function githubJsonRequest<T>(input: {
   path: string;
   body?: unknown;
 }): Promise<T> {
+  const response = await githubRequest(input);
+  return response.json() as Promise<T>;
+}
+
+async function githubRequest(input: {
+  apiBaseUrl: string;
+  token: string;
+  method: string;
+  path: string;
+  body?: unknown;
+}): Promise<Response> {
   const response = await fetch(`${input.apiBaseUrl}${input.path}`, {
     method: input.method,
     headers: {
@@ -771,7 +809,7 @@ async function githubJsonRequest<T>(input: {
     throw new Error(`GitHub API ${input.method} ${input.path} failed with ${response.status}: ${parseGitHubErrorMessage(text)}`);
   }
 
-  return response.json() as Promise<T>;
+  return response;
 }
 
 function toGitHubRepositoryInfo(repository: GitHubRepositoryResponse): GitHubRepositoryInfo {

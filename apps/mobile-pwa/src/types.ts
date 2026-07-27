@@ -453,6 +453,22 @@ export interface UpdateProjectRequest {
   isActive?: boolean;
 }
 
+export interface DeleteProjectRequest {
+  confirmation: string;
+  deleteGitHubRepository: boolean;
+}
+
+export interface DeleteProjectResponse {
+  projectId: string;
+  projectName: string;
+  deletedTasks: number;
+  deletedRuns: number;
+  deletedRoadmapCycles: number;
+  deletedRoadmapSteps: number;
+  deletedGitHubRepository: boolean;
+  githubRepository?: string;
+}
+
 export interface GenerateProjectRoadmapRequest {
   objective?: string;
 }

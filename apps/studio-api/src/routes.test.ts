@@ -178,6 +178,20 @@ describe('Studio API routes', () => {
         createdAt: new Date().toISOString(),
         updatedAt: new Date().toISOString()
       })),
+      assertProjectDeletable: vi.fn(async () => undefined),
+      getGitHubConnectionSecret: vi.fn(async () => ({
+        token: 'test-token',
+        apiBaseUrl: 'https://api.github.com'
+      })),
+      deleteProject: vi.fn(async (id: string, input?: { githubRepositoryDeleted?: boolean }) => ({
+        projectId: id,
+        projectName: 'Demo',
+        deletedTasks: 2,
+        deletedRuns: 3,
+        deletedRoadmapCycles: 1,
+        deletedRoadmapSteps: 4,
+        githubRepositoryDeleted: input?.githubRepositoryDeleted ?? false
+      })),
       getProjectConfig: vi.fn(async (id: string) => ({ projectId: id, configYaml: 'project:\n  id: demo' })),
       updateProjectConfig: vi.fn(async (id: string, configYaml: string) => ({ projectId: id, configYaml })),
       listTasks: vi.fn(async () => []),
@@ -263,6 +277,61 @@ describe('Studio API routes', () => {
       payload: { brief: 'Too short' }
     });
     expect(shortProjectBriefResponse.statusCode).toBe(400);
+
+    const invalidDeleteResponse = await app.inject({
+      method: 'DELETE',
+      url: '/api/projects/project_1',
+      payload: {
+        confirmation: 'Wrong name',
+        deleteGitHubRepository: false
+      }
+    });
+    expect(invalidDeleteResponse.statusCode).toBe(400);
+    expect(repository.deleteProject).not.toHaveBeenCalled();
+
+    const deleteProjectResponse = await app.inject({
+      method: 'DELETE',
+      url: '/api/projects/project_1',
+      payload: {
+        confirmation: 'Demo',
+        deleteGitHubRepository: false
+      }
+    });
+    expect(deleteProjectResponse.statusCode).toBe(200);
+    expect(repository.assertProjectDeletable).toHaveBeenCalledWith('project_1');
+    expect(repository.deleteProject).toHaveBeenCalledWith('project_1', {
+      githubRepositoryDeleted: false
+    });
+    expect(deleteProjectResponse.json()).toEqual(expect.objectContaining({
+      projectId: 'project_1',
+      deletedGitHubRepository: false
+    }));
+
+    const fetchSpy = vi.spyOn(globalThis, 'fetch').mockResolvedValueOnce({
+      ok: true,
+      status: 204
+    } as Response);
+    const deleteProjectWithRepositoryResponse = await app.inject({
+      method: 'DELETE',
+      url: '/api/projects/project_1',
+      payload: {
+        confirmation: 'Demo',
+        deleteGitHubRepository: true
+      }
+    });
+    expect(deleteProjectWithRepositoryResponse.statusCode).toBe(200);
+    expect(fetchSpy).toHaveBeenCalledWith(
+      'https://api.github.com/repos/demo/repo',
+      expect.objectContaining({ method: 'DELETE' })
+    );
+    expect(repository.deleteProject).toHaveBeenLastCalledWith('project_1', {
+      githubRepositoryDeleted: true
+    });
+    expect(deleteProjectWithRepositoryResponse.json()).toEqual(expect.objectContaining({
+      deletedGitHubRepository: true,
+      githubRepository: 'demo/repo'
+    }));
+    fetchSpy.mockRestore();
 
     const getConfigResponse = await app.inject({
       method: 'GET',

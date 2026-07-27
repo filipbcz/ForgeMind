@@ -8,6 +8,8 @@ import type {
   CodexOAuthCompleteResponse,
   CodexOAuthStartResponse,
   DecideProjectRoadmapExtensionRequest,
+  DeleteProjectRequest,
+  DeleteProjectResponse,
   GenerateProjectRoadmapRequest,
   GitHubAdapterConnectRequest,
   GitHubAdapterConnectResponse,
@@ -114,6 +116,13 @@ export async function updateProject(projectId: string, input: UpdateProjectReque
     body: JSON.stringify(input)
   });
   return { ...project, budgetUsd: 0, openPullRequests: 0 };
+}
+
+export async function deleteProject(projectId: string, input: DeleteProjectRequest): Promise<DeleteProjectResponse> {
+  return request<DeleteProjectResponse>(`/api/projects/${projectId}`, {
+    method: 'DELETE',
+    body: JSON.stringify(input)
+  });
 }
 
 export async function assignProjectRepository(projectId: string, input: AssignProjectRepositoryRequest): Promise<ProjectSummary> {

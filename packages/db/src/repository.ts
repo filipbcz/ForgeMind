@@ -70,6 +70,15 @@ export interface UpdateProjectInput {
   isActive?: boolean;
 }
 
+export interface DeleteProjectResult {
+  projectId: string;
+  projectName: string;
+  deletedTasks: number;
+  deletedRuns: number;
+  deletedRoadmapCycles: number;
+  deletedRoadmapSteps: number;
+}
+
 export interface ProjectRoadmapSnapshot {
   projectId: string;
   cycles: ProjectRoadmapCycle[];
@@ -577,6 +586,121 @@ export class ForgeMindRepository {
     });
 
     return toProject(updated);
+  }
+
+  async assertProjectDeletable(projectId: string): Promise<void> {
+    const [activeTaskCount, activeQueueJobCount] = await Promise.all([
+      this.prisma.task.count({
+        where: {
+          projectId,
+          status: { in: [...ACTIVE_TASK_STATUSES] }
+        }
+      }),
+      this.prisma.taskQueueJob.count({
+        where: {
+          task: { projectId },
+          status: { in: [...ACTIVE_QUEUE_STATUSES] }
+        }
+      })
+    ]);
+    if (activeTaskCount > 0 || activeQueueJobCount > 0) {
+      throw new Error('Project has active or queued tasks. Cancel them before deleting the project.');
+    }
+  }
+
+  async deleteProject(
+    projectId: string,
+    input: { githubRepositoryDeleted?: boolean } = {}
+  ): Promise<DeleteProjectResult | undefined> {
+    return this.prisma.$transaction(async (tx) => {
+      const project = await tx.project.findUnique({
+        where: { id: projectId },
+        select: { id: true, name: true, slug: true, githubOwner: true, githubRepo: true }
+      });
+      if (!project) return undefined;
+
+      const [activeTaskCount, activeQueueJobCount] = await Promise.all([
+        tx.task.count({
+          where: {
+            projectId,
+            status: { in: [...ACTIVE_TASK_STATUSES] }
+          }
+        }),
+        tx.taskQueueJob.count({
+          where: {
+            task: { projectId },
+            status: { in: [...ACTIVE_QUEUE_STATUSES] }
+          }
+        })
+      ]);
+      if (activeTaskCount > 0 || activeQueueJobCount > 0) {
+        throw new Error('Project has active or queued tasks. Cancel them before deleting the project.');
+      }
+
+      const taskIds = (await tx.task.findMany({
+        where: { projectId },
+        select: { id: true }
+      })).map((task) => task.id);
+      const runIds = taskIds.length > 0
+        ? (await tx.taskRun.findMany({
+            where: { taskId: { in: taskIds } },
+            select: { id: true }
+          })).map((run) => run.id)
+        : [];
+
+      await tx.auditLog.deleteMany({
+        where: {
+          OR: [
+            { projectId },
+            ...(taskIds.length > 0 ? [{ taskId: { in: taskIds } }] : [])
+          ]
+        }
+      });
+      if (taskIds.length > 0) {
+        await tx.providerUsage.deleteMany({ where: { taskId: { in: taskIds } } });
+        await tx.approval.deleteMany({ where: { taskId: { in: taskIds } } });
+        await tx.taskQueueJob.deleteMany({ where: { taskId: { in: taskIds } } });
+      }
+      if (runIds.length > 0) {
+        await tx.taskIteration.deleteMany({ where: { taskRunId: { in: runIds } } });
+      }
+
+      const roadmapSteps = await tx.projectImplementationStep.deleteMany({ where: { projectId } });
+      const runs = taskIds.length > 0
+        ? await tx.taskRun.deleteMany({ where: { taskId: { in: taskIds } } })
+        : { count: 0 };
+      const tasks = await tx.task.deleteMany({ where: { projectId } });
+      const roadmapCycles = await tx.projectRoadmapCycle.deleteMany({ where: { projectId } });
+      await tx.project.delete({ where: { id: projectId } });
+
+      await this.writeAuditTx(tx, {
+        actorType: 'user',
+        actorId: LOCAL_USER_ID,
+        eventType: 'project_deleted',
+        payload: {
+          projectId: project.id,
+          projectName: project.name,
+          slug: project.slug,
+          githubRepository: project.githubOwner && project.githubRepo
+            ? `${project.githubOwner}/${project.githubRepo}`
+            : null,
+          githubRepositoryDeleted: input.githubRepositoryDeleted ?? false,
+          deletedTasks: tasks.count,
+          deletedRuns: runs.count,
+          deletedRoadmapCycles: roadmapCycles.count,
+          deletedRoadmapSteps: roadmapSteps.count
+        }
+      });
+
+      return {
+        projectId: project.id,
+        projectName: project.name,
+        deletedTasks: tasks.count,
+        deletedRuns: runs.count,
+        deletedRoadmapCycles: roadmapCycles.count,
+        deletedRoadmapSteps: roadmapSteps.count
+      };
+    }, { timeout: 30_000 });
   }
 
   async getProjectConfig(projectId: string): Promise<{ projectId: string; configYaml: string | null } | undefined> {
