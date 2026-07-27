@@ -48,6 +48,8 @@ services:
     restart: unless-stopped
     env_file:
       - ${FORGEMIND_ENV_FILE:-/opt/forgemind/shared/server.env}
+    environment:
+      FORGEMIND_CODEX_BYPASS_READ_ONLY_SANDBOX: "true"
     depends_on:
       postgres:
         condition: service_healthy

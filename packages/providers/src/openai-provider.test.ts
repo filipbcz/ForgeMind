@@ -101,6 +101,19 @@ describe('Codex provider', () => {
     expect(args).not.toContain('--dangerously-bypass-approvals-and-sandbox');
   });
 
+  it('can bypass the read-only sandbox inside an isolated worker container', () => {
+    const args = buildCodexExecArgs({
+      sandbox: 'read-only',
+      bypassSandbox: true,
+      model: 'gpt-5.5',
+      schemaPath: 'schema.json',
+      outputPath: 'last-message.json'
+    });
+
+    expect(args).toContain('--dangerously-bypass-approvals-and-sandbox');
+    expect(args).not.toContain('--sandbox');
+  });
+
   it('prefers explicit Codex CLI path when configured', () => {
     expect(resolveCodexBinary({ FORGEMIND_CODEX_CLI_PATH: 'C:/tools/codex.exe' })).toBe('C:/tools/codex.exe');
   });

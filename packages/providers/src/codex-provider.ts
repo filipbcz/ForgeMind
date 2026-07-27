@@ -506,6 +506,7 @@ export class CodexProvider implements AIProvider {
 
     const args = buildCodexExecArgs({
       sandbox: input.sandbox,
+      bypassSandbox: input.sandbox === 'read-only' && process.env.FORGEMIND_CODEX_BYPASS_READ_ONLY_SANDBOX === 'true',
       model: process.env.CODEX_MODEL ?? DEFAULT_CODEX_MODEL,
       schemaPath,
       outputPath,
@@ -585,6 +586,7 @@ function serializeMessages(messages: Array<{ role: 'system' | 'user' | 'assistan
 
 export function buildCodexExecArgs(input: {
   sandbox: 'read-only' | 'workspace-write';
+  bypassSandbox?: boolean;
   model: string;
   schemaPath: string;
   outputPath: string;
@@ -592,7 +594,7 @@ export function buildCodexExecArgs(input: {
 }): string[] {
   const args = ['exec', '--color', 'never'];
 
-  if (input.sandbox === 'workspace-write') {
+  if (input.sandbox === 'workspace-write' || input.bypassSandbox) {
     args.push('--dangerously-bypass-approvals-and-sandbox');
   } else {
     args.push('--sandbox', input.sandbox);

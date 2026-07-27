@@ -1302,7 +1302,8 @@ describe('worker workflow', () => {
     const review = vi.fn(async (): Promise<ReviewResult> => ({
       summary: 'Review completed with one non-actionable blocker.',
       blockers: [
-        'Unable to verify the acceptance criterion that the build passes: node execution was blocked by the current read-only review environment policy, so I could not run npm/Vite build commands.'
+        'Unable to verify the acceptance criterion that the build passes: node execution was blocked by the current read-only review environment policy, so I could not run npm/Vite build commands.',
+        'The sandbox cannot create a namespace: bwrap has no permissions. With approval policy never, I cannot bypass this to read index.html or inspect the diff.'
       ],
       safeImprovements: [],
       riskyChanges: []

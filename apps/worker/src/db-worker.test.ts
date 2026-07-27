@@ -472,6 +472,65 @@ describe('db-worker policy enforcement', () => {
     expect(repositoryMock.failTask).not.toHaveBeenCalled();
   });
 
+  it('allows a completed review phase to finish after the runtime limit', async () => {
+    const startedAt = Date.now();
+    const dateNow = vi.spyOn(Date, 'now').mockReturnValue(startedAt);
+
+    runWorkerTaskMock.mockImplementationOnce(async (input: {
+      hooks?: {
+        onIteration?: (iteration: {
+          phase: 'review';
+          prompt: string;
+          resultSummary: string;
+          diffStat: { filesChanged: number; insertions: number; deletions: number };
+          validationResult: { blockers: string[]; riskyChanges: string[]; attempt: number };
+        }) => Promise<void>;
+      };
+    }) => {
+      dateNow.mockReturnValue(startedAt + 91 * 60_000);
+      await input.hooks?.onIteration?.({
+        phase: 'review',
+        prompt: 'Review status.txt',
+        resultSummary: 'Review passed.',
+        diffStat: { filesChanged: 1, insertions: 1, deletions: 0 },
+        validationResult: { blockers: [], riskyChanges: [], attempt: 1 }
+      });
+
+      return {
+        taskId: 'task_1',
+        status: 'ready_for_user_review',
+        issueUrl: 'https://github.com/demo/repo/issues/1',
+        branchName: 'ai/1-task',
+        workspacePath: 'C:/tmp/worker',
+        validation: {
+          command: 'npm test',
+          exitCode: 0,
+          stdout: 'passed',
+          stderr: '',
+          passed: true
+        },
+        summary: 'Review passed.',
+        approvals: [],
+        completedAt: new Date().toISOString()
+      };
+    });
+
+    try {
+      const { runDatabaseWorkerOnce } = await import('./db-worker.js');
+      const result = await runDatabaseWorkerOnce();
+
+      expect(result).toEqual(expect.objectContaining({ claimed: true, taskId: 'task_1' }));
+      expect(repositoryMock.failTask).not.toHaveBeenCalled();
+      expect(repositoryMock.transitionTask).toHaveBeenCalledWith(
+        'task_1',
+        'ready_for_user_review',
+        expect.objectContaining({ branchName: 'ai/1-task' })
+      );
+    } finally {
+      dateNow.mockRestore();
+    }
+  });
+
   it('reuses approved large-diff resume context and ignores the same guardrail on retry', async () => {
     repositoryMock.listApprovals.mockResolvedValueOnce([
       {

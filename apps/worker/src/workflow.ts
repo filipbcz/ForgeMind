@@ -1157,10 +1157,11 @@ function isValidationExecutionLimitationBlocker(blocker: string): boolean {
   const normalized = blocker.toLowerCase();
   const mentionsVerificationGap =
     /\b(unable to verify|could not verify|cannot verify|can't verify|failed to verify)\b/.test(normalized)
-    || /\b(could not run|cannot run|can't run|was blocked)\b/.test(normalized);
+    || /\b(could not run|cannot run|can't run|was blocked)\b/.test(normalized)
+    || /\b(could not|cannot|can't|unable to)\b.*\b(inspect|read|access)\b/.test(normalized);
   const mentionsExecutionConstraint =
     /\b(read-only|readonly|sandbox|policy|environment)\b/.test(normalized)
-    || /\b(node|npm|pnpm|yarn|vite|build commands?)\b/.test(normalized);
+    || /\b(node|npm|pnpm|yarn|vite|build commands?|bwrap|namespace|permissions?)\b/.test(normalized);
 
   return mentionsVerificationGap && mentionsExecutionConstraint;
 }

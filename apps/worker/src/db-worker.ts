@@ -251,7 +251,8 @@ export async function runDatabaseWorkerOnce() {
             resumeContext?.ignoredLimitSignals ?? [],
             claimed.task.mode,
             new Set((projectConfig?.approval.required_for ?? []).filter(isApprovalType)),
-            claimed.project.allowSafeOperationsWithoutApproval ?? false
+            claimed.project.allowSafeOperationsWithoutApproval ?? false,
+            iteration.phase === 'review'
           );
         }
       }
@@ -660,11 +661,17 @@ async function handleWorkerLimitsOrThrow(
   ignoredLimitSignals: ApprovedLimitSignal[] = [],
   taskMode: 'safe' | 'auto' | 'full_auto' = 'safe',
   approvalRequiredFor: ReadonlySet<ApprovalType> = new Set(),
-  allowSafeOperationsWithoutApproval = false
+  allowSafeOperationsWithoutApproval = false,
+  allowRuntimeGrace = false
 ): Promise<void> {
   const limitEvaluation = evaluateLimits(usage, limits);
   const ignoredSignals = new Set(ignoredLimitSignals);
-  const stopSignal = limitEvaluation.signals.find((signal) => signal !== 'budget_soft_limit_reached' && !ignoredSignals.has(signal as ApprovedLimitSignal));
+  const stopSignal = limitEvaluation.signals.find(
+    (signal) =>
+      signal !== 'budget_soft_limit_reached'
+      && !(allowRuntimeGrace && signal === 'runtime_limit_reached')
+      && !ignoredSignals.has(signal as ApprovedLimitSignal)
+  );
   if (!stopSignal) return;
 
   if (stopSignal === 'diff_lines_limit_reached' || stopSignal === 'changed_files_limit_reached') {
