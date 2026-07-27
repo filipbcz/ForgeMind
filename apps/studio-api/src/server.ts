@@ -58,7 +58,7 @@ function startTaskNotificationBridge(
   const seenEvents = new Set<string>();
   let initialized = false;
 
-  const timer = setInterval(async () => {
+  const stopPolling = startNonOverlappingPolling(async () => {
     try {
       const events = await repository.getRecentWorkerEvents(50);
       const ordered = [...events].sort((a, b) => new Date(a.createdAt).getTime() - new Date(b.createdAt).getTime());
@@ -85,8 +85,30 @@ function startTaskNotificationBridge(
   }, 4_000);
 
   app.addHook('onClose', async () => {
-    clearInterval(timer);
+    stopPolling();
   });
+}
+
+export function startNonOverlappingPolling(poll: () => Promise<void>, intervalMs: number): () => void {
+  let pollInProgress = false;
+
+  const timer = setInterval(() => {
+    if (pollInProgress) {
+      return;
+    }
+
+    pollInProgress = true;
+    void poll().then(
+      () => {
+        pollInProgress = false;
+      },
+      () => {
+        pollInProgress = false;
+      }
+    );
+  }, intervalMs);
+
+  return () => clearInterval(timer);
 }
 
 async function notifyFromAuditEvent(

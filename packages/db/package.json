@@ -14,7 +14,8 @@
   },
   "scripts": {
     "build": "tsc -p tsconfig.json",
-    "generate": "prisma generate --schema prisma/schema.prisma"
+    "generate": "prisma generate --schema prisma/schema.prisma",
+    "test": "vitest run"
   },
   "dependencies": {
     "@forgemind/core": "0.1.0",

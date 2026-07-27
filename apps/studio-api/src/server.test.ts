@@ -1,6 +1,6 @@
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import type { FastifyInstance } from 'fastify';
-import { createApp } from './server.js';
+import { createApp, startNonOverlappingPolling } from './server.js';
 
 describe('Studio API server', () => {
   let app: FastifyInstance | undefined;
@@ -26,5 +26,31 @@ describe('Studio API server', () => {
     expect(response.statusCode).toBe(204);
     expect(response.headers['access-control-allow-origin']).toBe('http://localhost:5173');
     expect(response.headers['access-control-allow-methods']).toContain(method);
+  });
+
+  it('does not overlap notification polling while a database query is still running', async () => {
+    vi.useFakeTimers();
+    let finishPoll: (() => void) | undefined;
+    const poll = vi.fn(
+      async () =>
+        await new Promise<void>((resolve) => {
+          finishPoll = resolve;
+        })
+    );
+    const stop = startNonOverlappingPolling(poll, 100);
+
+    try {
+      await vi.advanceTimersByTimeAsync(350);
+      expect(poll).toHaveBeenCalledOnce();
+
+      finishPoll?.();
+      await Promise.resolve();
+      await vi.advanceTimersByTimeAsync(100);
+      expect(poll).toHaveBeenCalledTimes(2);
+    } finally {
+      stop();
+      finishPoll?.();
+      vi.useRealTimers();
+    }
   });
 });
