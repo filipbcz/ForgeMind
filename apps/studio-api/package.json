@@ -6,7 +6,7 @@
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
   "scripts": {
-    "build": "tsup src/index.ts --format esm --target node22 --out-dir dist --clean --sourcemap",
+    "build": "tsup src/index.ts --format esm --target node22 --out-dir dist --clean --sourcemap --external simple-git",
     "dev": "tsx watch --conditions=development src/index.ts",
     "start": "node dist/index.js",
     "test": "vitest run"
