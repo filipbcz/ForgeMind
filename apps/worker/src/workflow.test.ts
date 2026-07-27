@@ -199,6 +199,14 @@ describe('worker workflow', () => {
     expect(result.validation.passed).toBe(true);
     expect(result.summary).toContain('Review passed');
     expect(result.workspacePath).toContain(workspaceRoot);
+
+    const workspaceGit = simpleGit({ baseDir: result.workspacePath });
+    await expect(workspaceGit.raw(['config', '--local', '--get', 'user.name'])).resolves.toBe(
+      'ForgeMind Worker\n'
+    );
+    await expect(workspaceGit.raw(['config', '--local', '--get', 'user.email'])).resolves.toBe(
+      'forgemind-worker@users.noreply.github.com\n'
+    );
   }, 15000);
 
   it('initializes ignored local workspaces as standalone git repositories', async () => {

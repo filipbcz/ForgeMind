@@ -1357,9 +1357,19 @@ async function prepareWorkspaceGit(
     }
   }
 
+  await configureWorkspaceGitIdentity(git);
   await removeStaleGeneratedInstructionsBeforeCheckout(git, workspacePath);
   await checkoutWorkspaceBranch(git, branchName, Boolean(remoteUrl));
   return git;
+}
+
+async function configureWorkspaceGitIdentity(git: SimpleGit) {
+  const authorName = process.env.FORGEMIND_GIT_AUTHOR_NAME?.trim() || 'ForgeMind Worker';
+  const authorEmail =
+    process.env.FORGEMIND_GIT_AUTHOR_EMAIL?.trim() || 'forgemind-worker@users.noreply.github.com';
+
+  await git.addConfig('user.name', authorName, false, 'local');
+  await git.addConfig('user.email', authorEmail, false, 'local');
 }
 
 async function removeStaleGeneratedInstructionsBeforeCheckout(git: SimpleGit, workspacePath: string) {
