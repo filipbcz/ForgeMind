@@ -154,6 +154,24 @@ export async function runDatabaseWorkerOnce() {
       resume: resumeContext?.workflowResume,
       github,
       hooks: {
+        onActivity: async (activity) => {
+          await repository.writeAudit({
+            actorType: activity.phase === 'github' ? 'github' : 'agent',
+            eventType: 'task_activity',
+            taskId: claimed.task.id,
+            payload: {
+              taskRunId: claimed.taskRun.id,
+              phase: activity.phase,
+              state: activity.state,
+              title: activity.title,
+              detail: activity.detail ?? null,
+              operation: activity.operation ?? null,
+              attempt: activity.attempt ?? null,
+              elapsedMs: activity.elapsedMs ?? null,
+              exitCode: activity.exitCode ?? null
+            }
+          });
+        },
         onStatus: async (status, payload = {}) => {
           await repository.transitionTask(claimed.task.id, status, payload);
         },

@@ -1,6 +1,9 @@
 import { execaCommand } from 'execa';
 import type { ValidationCheck } from '@forgemind/providers';
 
+const VALIDATION_OUTPUT_FLUSH_MS = 350;
+const MAX_ACTIVITY_CHUNK_CHARS = 8_000;
+
 const forbiddenCommandPatterns = [
   /\bsudo\b/i,
   /\brm\s+-rf\b/i,
@@ -16,6 +19,19 @@ export interface ValidationResult {
   stderr: string;
   passed: boolean;
 }
+
+export interface ValidationActivity {
+  state: 'started' | 'output' | 'completed';
+  command: string;
+  checkIndex: number;
+  checkCount: number;
+  elapsedMs: number;
+  stream?: 'stdout' | 'stderr';
+  message?: string;
+  exitCode?: number;
+}
+
+export type ValidationActivityHandler = (activity: ValidationActivity) => Promise<void> | void;
 
 export function assertAllowedValidationCommand(command: string): void {
   for (const pattern of forbiddenCommandPatterns) {
@@ -97,22 +113,59 @@ function shouldUsePowerShell(command: string): boolean {
   ].some((pattern) => pattern.test(command));
 }
 
-export async function runValidationCommand(command: string, cwd: string): Promise<ValidationResult> {
+export async function runValidationCommand(
+  command: string,
+  cwd: string,
+  onOutput?: (stream: 'stdout' | 'stderr', message: string) => Promise<void> | void
+): Promise<ValidationResult> {
   assertAllowedValidationCommand(command);
 
   try {
-    const result = await execaCommand(command, {
+    const subprocess = execaCommand(command, {
       cwd,
       shell: shouldUsePowerShell(command) ? 'powershell.exe' : true,
       timeout: 10 * 60 * 1000,
       reject: false
     });
+    const pendingOutput: Record<'stdout' | 'stderr', string> = { stdout: '', stderr: '' };
+    let flushTimer: NodeJS.Timeout | undefined;
+    let outputQueue = Promise.resolve();
+
+    const enqueueOutput = (stream: 'stdout' | 'stderr', message: string) => {
+      const sanitized = sanitizeValidationOutput(message);
+      if (!sanitized) return;
+      pendingOutput[stream] = `${pendingOutput[stream]}${sanitized}`.slice(-MAX_ACTIVITY_CHUNK_CHARS);
+      if (!flushTimer) {
+        flushTimer = setTimeout(() => flushOutput(), VALIDATION_OUTPUT_FLUSH_MS);
+      }
+    };
+    const flushOutput = () => {
+      if (flushTimer) {
+        clearTimeout(flushTimer);
+        flushTimer = undefined;
+      }
+      for (const stream of ['stdout', 'stderr'] as const) {
+        const message = pendingOutput[stream];
+        pendingOutput[stream] = '';
+        if (!message || !onOutput) continue;
+        outputQueue = outputQueue.then(async () => {
+          await onOutput(stream, message);
+        });
+      }
+    };
+
+    subprocess.stdout?.on('data', (chunk: Buffer | string) => enqueueOutput('stdout', String(chunk)));
+    subprocess.stderr?.on('data', (chunk: Buffer | string) => enqueueOutput('stderr', String(chunk)));
+
+    const result = await subprocess;
+    flushOutput();
+    await outputQueue;
 
     return {
       command,
       exitCode: result.exitCode ?? 0,
-      stdout: result.stdout,
-      stderr: result.stderr,
+      stdout: sanitizeValidationOutput(result.stdout),
+      stderr: sanitizeValidationOutput(result.stderr),
       passed: result.exitCode === 0
     };
   } catch (error) {
@@ -126,7 +179,11 @@ export async function runValidationCommand(command: string, cwd: string): Promis
   }
 }
 
-export async function runValidationChecks(checks: ValidationCheck[], cwd: string): Promise<ValidationResult> {
+export async function runValidationChecks(
+  checks: ValidationCheck[],
+  cwd: string,
+  onActivity?: ValidationActivityHandler
+): Promise<ValidationResult> {
   const commandChecks = checks.filter((check): check is Extract<ValidationCheck, { kind: 'command' }> => check.kind === 'command');
   if (commandChecks.length === 0) {
     return {
@@ -141,8 +198,34 @@ export async function runValidationChecks(checks: ValidationCheck[], cwd: string
   const outputs: string[] = [];
   let failingResult: ValidationResult | undefined;
 
-  for (const check of commandChecks) {
-    const result = await runValidationCommand(check.command, cwd);
+  for (const [index, check] of commandChecks.entries()) {
+    const startedAt = Date.now();
+    await onActivity?.({
+      state: 'started',
+      command: check.command,
+      checkIndex: index + 1,
+      checkCount: commandChecks.length,
+      elapsedMs: 0
+    });
+    const result = await runValidationCommand(check.command, cwd, async (stream, message) => {
+      await onActivity?.({
+        state: 'output',
+        command: check.command,
+        checkIndex: index + 1,
+        checkCount: commandChecks.length,
+        elapsedMs: Date.now() - startedAt,
+        stream,
+        message
+      });
+    });
+    await onActivity?.({
+      state: 'completed',
+      command: check.command,
+      checkIndex: index + 1,
+      checkCount: commandChecks.length,
+      elapsedMs: Date.now() - startedAt,
+      exitCode: result.exitCode
+    });
     outputs.push(`[command] ${check.command}`);
     if (check.criterion) {
       outputs.push(`[criterion] ${check.criterion}`);
@@ -172,4 +255,15 @@ export async function runValidationChecks(checks: ValidationCheck[], cwd: string
     stderr: failingResult?.stderr ?? '',
     passed: !failingResult
   };
+}
+
+function sanitizeValidationOutput(value: string): string {
+  let sanitized = value.replace(/\u001B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])/g, '');
+  for (const [name, secret] of Object.entries(process.env)) {
+    if (!secret || secret.length < 6 || !/(?:TOKEN|KEY|SECRET|PASSWORD|DATABASE_URL|AUTH)/i.test(name)) {
+      continue;
+    }
+    sanitized = sanitized.split(secret).join('[redacted]');
+  }
+  return sanitized;
 }

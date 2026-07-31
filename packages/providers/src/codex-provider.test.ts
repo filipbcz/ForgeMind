@@ -18,13 +18,30 @@ describe('Codex process activity timeouts', () => {
       '',
       {
         binary: process.execPath,
-        inactivityTimeoutMs: 500,
-        maxRuntimeMs: 3_000,
+        inactivityTimeoutMs: 1_500,
+        maxRuntimeMs: 4_000,
         onActivity
       }
     );
 
     expect(onActivity).toHaveBeenCalledWith(expect.objectContaining({ kind: 'stderr' }));
+  });
+
+  it('flushes queued activity handlers before resolving the process', async () => {
+    const received: string[] = [];
+
+    await runCodexProcess(['-e', "process.stdout.write('live\\n')"], '', {
+      binary: process.execPath,
+      inactivityTimeoutMs: 1_500,
+      maxRuntimeMs: 3_000,
+      onActivity: async (activity) => {
+        await new Promise((resolve) => setTimeout(resolve, 20));
+        received.push(activity.message);
+      }
+    });
+
+    expect(received.some((message) => message.includes('live'))).toBe(true);
+    expect(received.at(-1)).toContain('completed');
   });
 
   it('stops a process after sustained inactivity', async () => {

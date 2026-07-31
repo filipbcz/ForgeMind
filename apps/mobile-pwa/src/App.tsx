@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import {
   AlertTriangle,
@@ -13,7 +13,6 @@ import {
   GitBranch,
   Github,
   LayoutList,
-  Pause,
   Play,
   Plus,
   RefreshCw,
@@ -250,7 +249,6 @@ export function App() {
   const selectedTask = useMemo(() => tasks.find((task) => task.id === selectedTaskId) ?? tasks[0], [selectedTaskId, tasks]);
   const selectedTaskIsActive = activeStatuses.has(selectedTask?.status ?? 'draft');
   const selectedTaskPollInterval = selectedTaskIsActive ? (taskRealtimeState === 'connected' ? false : 15000) : false;
-  const [liveTaskEvent, setLiveTaskEvent] = useState<AuditEventApi | undefined>();
 
   const logsQuery = useQuery({
     queryKey: ['tasks', selectedTask?.id, 'logs'],
@@ -296,7 +294,10 @@ export function App() {
         queryClient.invalidateQueries({ queryKey: ['worker-events'] });
 
         if (event.taskId) {
-          queryClient.invalidateQueries({ queryKey: ['tasks', event.taskId, 'logs'] });
+          queryClient.setQueryData<AuditEventApi[]>(
+            ['tasks', event.taskId, 'logs'],
+            (current) => appendAuditEvent(current, event)
+          );
           if (
             event.eventType === 'task_iteration_started'
             || event.eventType.startsWith('task_status_')
@@ -339,7 +340,6 @@ export function App() {
 
   useEffect(() => {
     if (!selectedTask?.id) {
-      setLiveTaskEvent(undefined);
       return;
     }
 
@@ -366,11 +366,8 @@ export function App() {
           return;
         }
 
-        setLiveTaskEvent(message.event);
-
         if (message.event.eventType === 'task_iteration_started' || message.event.eventType.startsWith('task_status_')) {
           queryClient.invalidateQueries({ queryKey: ['tasks'] });
-          queryClient.invalidateQueries({ queryKey: ['tasks', selectedTask.id, 'logs'] });
           queryClient.invalidateQueries({ queryKey: ['tasks', selectedTask.id, 'diff'] });
           queryClient.invalidateQueries({ queryKey: ['tasks', selectedTask.id, 'usage'] });
           queryClient.invalidateQueries({ queryKey: ['tasks', selectedTask.id, 'queue'] });
@@ -785,7 +782,6 @@ export function App() {
                 usage={usageQuery.data}
                 queue={queueQuery.data}
                 workerStatus={workerStatusQuery.data}
-                liveTaskEvent={liveTaskEvent}
                 realtimeState={taskRealtimeState}
                 realtimeMeta={taskRealtimeMeta}
                 busy={
@@ -1244,129 +1240,96 @@ function TaskButton(props: { task: TaskSummary; selected: boolean; onClick: () =
   );
 }
 
-type ProviderActivityFilter = 'all' | 'output' | 'workspace' | 'lifecycle';
-
-interface ProviderActivityEntry {
+interface TaskActivityEntry {
   id: string;
   createdAt: string;
   phase: string;
   attempt: number;
-  kind: 'lifecycle' | 'stdout' | 'stderr' | 'workspace';
-  message: string;
+  state: 'started' | 'progress' | 'completed' | 'failed';
+  title: string;
+  detail?: string;
+  operation?: string;
+  kind: 'activity' | 'lifecycle' | 'stdout' | 'stderr' | 'workspace';
   elapsedMs: number;
 }
 
-function ProviderActivityPanel(props: {
+function TaskActivityPanel(props: {
+  task: TaskSummary;
   taskId: string;
   logs: AuditEventApi[];
-  liveTaskEvent?: AuditEventApi;
   realtimeState: RealtimeUiState;
 }) {
-  const incomingEntries = useMemo(
-    () => collectProviderActivityEntries(props.logs, props.liveTaskEvent, props.taskId),
-    [props.liveTaskEvent, props.logs, props.taskId]
-  );
-  const [entries, setEntries] = useState<ProviderActivityEntry[]>(incomingEntries);
-  const [paused, setPaused] = useState(false);
-  const [filter, setFilter] = useState<ProviderActivityFilter>('all');
-  const outputRef = useRef<HTMLDivElement>(null);
-
+  const entries = useMemo(() => collectTaskActivityEntries(props.logs, props.taskId), [props.logs, props.taskId]);
+  const latest = entries.at(-1);
+  const taskIsActive = activeStatuses.has(props.task.status);
+  const [now, setNow] = useState(Date.now());
   useEffect(() => {
-    setPaused(false);
-    setFilter('all');
-    setEntries(incomingEntries);
-  }, [props.taskId]);
+    if (!taskIsActive) return;
+    const timer = window.setInterval(() => setNow(Date.now()), 1_000);
+    return () => window.clearInterval(timer);
+  }, [taskIsActive]);
 
-  useEffect(() => {
-    if (!paused) {
-      setEntries(incomingEntries);
-    }
-  }, [incomingEntries, paused]);
-
-  const visibleEntries = entries.filter((entry) => {
-    if (filter === 'all') return true;
-    if (filter === 'output') return entry.kind === 'stdout' || entry.kind === 'stderr';
-    return entry.kind === filter;
-  });
-
-  const scrollToLatest = () => {
-    const output = outputRef.current;
-    if (output) {
-      output.scrollTop = output.scrollHeight;
-    }
-  };
-
-  useEffect(() => {
-    if (!paused) {
-      scrollToLatest();
-    }
-  }, [paused, visibleEntries.length]);
+  const latestAt = latest ? Date.parse(latest.createdAt) : Date.parse(props.task.updatedAt);
+  const silenceSeconds = Number.isNaN(latestAt) ? undefined : Math.max(0, Math.floor((now - latestAt) / 1_000));
+  const currentTitle = latest?.title ?? statusLabels[props.task.status];
+  const currentDetail = latest?.detail ?? props.task.currentStep;
+  const activityState = latest?.state === 'failed'
+    ? 'failed'
+    : taskIsActive
+      ? 'active'
+      : props.task.status === 'completed' || props.task.status === 'ready_for_user_review'
+        ? 'completed'
+        : 'idle';
+  const technicalEntries = entries.slice(-120);
 
   return (
-    <div className="provider-activity-panel">
-      <div className="provider-activity-header">
-        <div className="provider-activity-title">
-          <Activity size={18} />
-          <div>
-            <strong>AI activity</strong>
-            <span>{paused ? 'Sledovani pozastaveno' : `${formatRealtimeState(props.realtimeState)} | ${entries.length} udalosti`}</span>
+    <div className="task-activity-panel">
+      <div className={`current-activity ${activityState}`} aria-live="polite">
+        <span className="activity-indicator" aria-hidden="true" />
+        <div className="current-activity-content">
+          <div className="current-activity-meta">
+            <span>{formatPhase(latest?.phase ?? props.task.status)}</span>
+            <span>{formatRealtimeState(props.realtimeState)}</span>
           </div>
-        </div>
-        <div className="provider-activity-controls">
-          <div className="segmented-control" role="tablist" aria-label="Filtr AI aktivity">
-            {([
-              ['all', 'Vse'],
-              ['output', 'Vystup'],
-              ['workspace', 'Soubory'],
-              ['lifecycle', 'System']
-            ] as const).map(([value, label]) => (
-              <button
-                className={filter === value ? 'segment active' : 'segment'}
-                key={value}
-                type="button"
-                onClick={() => setFilter(value)}
-              >
-                {label}
-              </button>
-            ))}
-          </div>
-          <button
-            className="icon-action"
-            type="button"
-            title={paused ? 'Obnovit zive sledovani' : 'Pozastavit zive sledovani'}
-            aria-label={paused ? 'Obnovit zive sledovani' : 'Pozastavit zive sledovani'}
-            onClick={() => setPaused((value) => !value)}
-          >
-            {paused ? <Play size={17} /> : <Pause size={17} />}
-          </button>
-          <button
-            className="icon-action"
-            type="button"
-            title="Prejit na nejnovejsi udalost"
-            aria-label="Prejit na nejnovejsi udalost"
-            onClick={scrollToLatest}
-          >
-            <ArrowDown size={17} />
-          </button>
+          <strong>{currentTitle}</strong>
+          {currentDetail ? <p>{truncateText(currentDetail, 320)}</p> : null}
+          <small>
+            {taskIsActive
+              ? silenceSeconds !== undefined && silenceSeconds > 10
+                ? `Proces stále běží · poslední aktivita před ${formatDurationSeconds(silenceSeconds)}`
+                : `Poslední aktivita před ${formatDurationSeconds(silenceSeconds ?? 0)}`
+              : latest?.elapsedMs
+                ? `Dokončeno za ${formatElapsedTime(latest.elapsedMs)}`
+                : statusLabels[props.task.status]}
+          </small>
         </div>
       </div>
-      <div className="provider-activity-output" ref={outputRef} aria-live={paused ? 'off' : 'polite'}>
-        {visibleEntries.length === 0 ? (
-          <div className="provider-activity-empty">Zatim bez prubezne aktivity provideru.</div>
-        ) : null}
-        {visibleEntries.map((entry) => (
-          <div className={`provider-activity-entry ${entry.kind}`} key={entry.id}>
-            <div className="provider-activity-meta">
-              <time>{formatProgressTime(entry.createdAt)}</time>
-              <span>{formatPhase(entry.phase)}</span>
-              <span>pokus {entry.attempt}</span>
-              <span>{entry.kind}</span>
-              <span>{formatElapsedTime(entry.elapsedMs)}</span>
+
+      <details className="activity-output-disclosure">
+        <summary>
+          <span>Technický výstup</span>
+          <small>{entries.length} událostí</small>
+          <ArrowDown size={17} />
+        </summary>
+        <div className="provider-activity-output">
+          {technicalEntries.length === 0 ? (
+            <div className="provider-activity-empty">Zatím bez průběžné aktivity.</div>
+          ) : null}
+          {technicalEntries.map((entry) => (
+            <div className={`provider-activity-entry ${entry.kind} ${entry.state}`} key={entry.id}>
+              <div className="provider-activity-meta">
+                <time>{formatProgressTime(entry.createdAt)}</time>
+                <span>{formatPhase(entry.phase)}</span>
+                {entry.attempt > 0 ? <span>pokus {entry.attempt}</span> : null}
+                <span>{entry.state}</span>
+                {entry.elapsedMs > 0 ? <span>{formatElapsedTime(entry.elapsedMs)}</span> : null}
+              </div>
+              <strong>{entry.title}</strong>
+              {entry.detail ? <pre>{entry.detail}</pre> : null}
             </div>
-            <pre>{entry.message}</pre>
-          </div>
-        ))}
-      </div>
+          ))}
+        </div>
+      </details>
     </div>
   );
 }
@@ -1379,7 +1342,6 @@ function TaskDetail(props: {
   usage?: TaskUsageApi;
   queue?: TaskQueueApi;
   workerStatus?: WorkerStatusApi;
-  liveTaskEvent?: AuditEventApi;
   realtimeState: RealtimeUiState;
   realtimeMeta: RealtimeConnectionMeta;
   busy: boolean;
@@ -1393,7 +1355,6 @@ function TaskDetail(props: {
   const canCancel = !terminalStatuses.has(props.task.status) && props.task.status !== 'ready_for_user_review';
   const canComplete = props.task.status === 'ready_for_user_review';
   const latestRun = props.usage?.runs.at(-1);
-  const activeRun = props.workerStatus?.runningRun?.taskId === props.task.id ? props.workerStatus.runningRun : undefined;
   const latestError = resolveLatestTaskError(props.logs, latestRun);
   const queueLabel = formatQueueLabel(props.task, props.queue);
   const workflowItems = buildTaskWorkflow(props.task, props.logs);
@@ -1437,11 +1398,17 @@ function TaskDetail(props: {
       <section className="plain-section">
         <div className="section-heading">
           <div>
-            <h3>Prubeh tasku</h3>
-            <p>Stav hlavnich kroku od pripravy po predani vysledku.</p>
+            <h3>Průběh tasku</h3>
+            <p>Aktuální činnost a stav kroků od přípravy po předání výsledku.</p>
           </div>
           {props.task.status === 'submitted' ? <span className="queue-label">Fronta {queueLabel}</span> : null}
         </div>
+        <TaskActivityPanel
+          task={props.task}
+          taskId={props.task.id}
+          logs={props.logs}
+          realtimeState={props.realtimeState}
+        />
         <ol className="workflow-steps">
           {workflowItems.map((item) => {
             const StepIcon = item.state === 'completed' ? CheckCircle2 : item.state === 'failed' ? XCircle : item.icon;
@@ -1456,16 +1423,6 @@ function TaskDetail(props: {
             );
           })}
         </ol>
-      </section>
-
-      <section className="plain-section">
-        <div className="section-heading">
-          <div>
-            <h3>AI aktivita</h3>
-            <p>{activeRun ? `${activeRun.provider}/${activeRun.model} prave pracuje.` : latestRun ? `Posledni beh: ${latestRun.provider}/${latestRun.model} | ${latestRun.status}.` : 'Task zatim nema AI beh.'}</p>
-          </div>
-        </div>
-        <ProviderActivityPanel taskId={props.task.id} logs={props.logs} liveTaskEvent={props.liveTaskEvent} realtimeState={props.realtimeState} />
       </section>
 
       <details className="task-disclosure">
@@ -1544,12 +1501,12 @@ interface TaskWorkflowItem {
 
 function buildTaskWorkflow(task: TaskSummary, logs: AuditEventApi[]): TaskWorkflowItem[] {
   const stages = [
-    { id: 'prepare', label: 'Priprava', detail: 'Zarazeni tasku a vytvoreni planu', icon: LayoutList },
-    { id: 'github', label: 'GitHub', detail: 'Issue a pracovni branch', icon: GitBranch },
-    { id: 'implementation', label: 'Implementace', detail: 'Zmeny provadene AI providerem', icon: Activity },
-    { id: 'validation', label: 'Validace', detail: 'Overeni akceptacnich kriterii', icon: ClipboardCheck },
-    { id: 'review', label: 'Review', detail: 'Kontrola vysledku a rizik', icon: ShieldCheck },
-    { id: 'handoff', label: 'Predani', detail: 'Pull request a kontrola uzivatelem', icon: CheckCircle2 }
+    { id: 'prepare', label: 'Příprava', detail: 'Zařazení tasku a vytvoření plánu', icon: LayoutList },
+    { id: 'github', label: 'GitHub', detail: 'Issue a pracovní branch', icon: GitBranch },
+    { id: 'implementation', label: 'Implementace', detail: 'Změny prováděné AI providerem', icon: Activity },
+    { id: 'validation', label: 'Validace', detail: 'Ověření akceptačních kritérií', icon: ClipboardCheck },
+    { id: 'review', label: 'Review', detail: 'Kontrola výsledku a rizik', icon: ShieldCheck },
+    { id: 'handoff', label: 'Předání', detail: 'Pull request a kontrola uživatelem', icon: CheckCircle2 }
   ] as const;
   const statusStage: Partial<Record<TaskSummary['status'], number>> = {
     draft: 0,
@@ -1576,19 +1533,36 @@ function buildTaskWorkflow(task: TaskSummary, logs: AuditEventApi[]): TaskWorkfl
   const inferredStage = inferWorkflowStageFromLogs(logs);
   const currentStage = statusStage[task.status] ?? inferredStage;
   const failed = terminalStatuses.has(task.status) && task.status !== 'completed' && task.status !== 'cancelled';
+  const activities = collectTaskActivityEntries(logs, task.id);
 
   return stages.map((stage, index) => {
     let state: WorkflowStepState = index < currentStage ? 'completed' : index === currentStage ? 'active' : 'pending';
     if (task.status === 'completed') state = 'completed';
     if (failed && index === currentStage) state = 'failed';
     if (task.status === 'cancelled' && index === currentStage) state = 'failed';
+    const latestStageActivity = [...activities].reverse().find((activity) => activityWorkflowStage(activity) === index);
+    const activityDetail = latestStageActivity
+      ? `${latestStageActivity.title}${latestStageActivity.elapsedMs > 0 ? ` · ${formatElapsedTime(latestStageActivity.elapsedMs)}` : ''}`
+      : undefined;
 
     return {
       ...stage,
       state,
-      detail: index === currentStage ? statusLabels[task.status] : stage.detail
+      detail: activityDetail ?? (index === currentStage ? statusLabels[task.status] : stage.detail)
     };
   });
+}
+
+function activityWorkflowStage(activity: TaskActivityEntry): number {
+  if (activity.phase === 'workspace' || activity.phase === 'planning') return 0;
+  if (
+    activity.phase === 'github'
+    && (activity.operation === 'create_issue' || activity.operation === 'create_branch')
+  ) return 1;
+  if (activity.phase === 'implementation') return 2;
+  if (activity.phase === 'validation') return 3;
+  if (activity.phase === 'review') return 4;
+  return 5;
 }
 
 function inferWorkflowStageFromLogs(logs: AuditEventApi[]): number {
@@ -1754,27 +1728,95 @@ function formatPayloadValue(value: unknown): string {
   return value === undefined || value === null ? '' : String(value);
 }
 
-function collectProviderActivityEntries(
+function collectTaskActivityEntries(
   logs: AuditEventApi[],
-  liveTaskEvent: AuditEventApi | undefined,
   taskId: string
-): ProviderActivityEntry[] {
-  const events = [...logs];
-  if (liveTaskEvent?.taskId === taskId && !events.some((event) => event.id === liveTaskEvent.id)) {
-    events.push(liveTaskEvent);
-  }
-
-  return events
-    .map(toProviderActivityEntry)
-    .filter((entry): entry is ProviderActivityEntry => Boolean(entry))
+): TaskActivityEntry[] {
+  return logs
+    .filter((event) => event.taskId === taskId)
+    .map(toTaskActivityEntry)
+    .filter((entry): entry is TaskActivityEntry => Boolean(entry))
     .sort((left, right) => Date.parse(left.createdAt) - Date.parse(right.createdAt));
 }
 
-function toProviderActivityEntry(event: AuditEventApi): ProviderActivityEntry | undefined {
-  if (event.eventType !== 'task_provider_activity' || !isRecord(event.payload)) {
+function appendAuditEvent(current: AuditEventApi[] | undefined, event: AuditEventApi): AuditEventApi[] {
+  if (!current) {
+    return [event];
+  }
+  if (current.some((item) => item.id === event.id)) {
+    return current;
+  }
+  return [...current, event].sort((left, right) => Date.parse(left.createdAt) - Date.parse(right.createdAt));
+}
+
+function toTaskActivityEntry(event: AuditEventApi): TaskActivityEntry | undefined {
+  if (!isRecord(event.payload)) {
     return undefined;
   }
 
+  if (event.eventType === 'task_failed') {
+    return {
+      id: event.id,
+      createdAt: event.createdAt,
+      phase: 'completion',
+      attempt: 0,
+      state: 'failed',
+      title: 'Task skončil chybou',
+      detail: typeof event.payload.errorMessage === 'string' ? event.payload.errorMessage : undefined,
+      kind: 'activity',
+      elapsedMs: 0
+    };
+  }
+
+  if (event.eventType.startsWith('task_status_')) {
+    const status = event.eventType.slice('task_status_'.length) as TaskSummary['status'];
+    if (!Object.prototype.hasOwnProperty.call(statusLabels, status)) {
+      return undefined;
+    }
+    const failedStatus = terminalStatuses.has(status) && status !== 'completed' && status !== 'cancelled';
+    return {
+      id: event.id,
+      createdAt: event.createdAt,
+      phase: statusActivityPhase(status),
+      attempt: typeof event.payload.attempt === 'number' ? event.payload.attempt : 0,
+      state: failedStatus ? 'failed' : status === 'completed' || status === 'ready_for_user_review' ? 'completed' : 'progress',
+      title: statusLabels[status],
+      detail: typeof event.payload.errorMessage === 'string'
+        ? event.payload.errorMessage
+        : typeof event.payload.retryReason === 'string'
+          ? event.payload.retryReason
+          : undefined,
+      kind: 'activity',
+      elapsedMs: 0
+    };
+  }
+
+  if (event.eventType === 'task_activity') {
+    const state = event.payload.state;
+    const title = event.payload.title;
+    if (
+      (state !== 'started' && state !== 'progress' && state !== 'completed' && state !== 'failed')
+      || typeof title !== 'string'
+    ) {
+      return undefined;
+    }
+    return {
+      id: event.id,
+      createdAt: event.createdAt,
+      phase: typeof event.payload.phase === 'string' ? event.payload.phase : 'task',
+      attempt: typeof event.payload.attempt === 'number' ? event.payload.attempt : 0,
+      state,
+      title,
+      detail: typeof event.payload.detail === 'string' ? event.payload.detail : undefined,
+      operation: typeof event.payload.operation === 'string' ? event.payload.operation : undefined,
+      kind: 'activity',
+      elapsedMs: typeof event.payload.elapsedMs === 'number' ? event.payload.elapsedMs : 0
+    };
+  }
+
+  if (event.eventType !== 'task_provider_activity') {
+    return undefined;
+  }
   const kind = event.payload.kind;
   const message = event.payload.message;
   if (
@@ -1783,24 +1825,70 @@ function toProviderActivityEntry(event: AuditEventApi): ProviderActivityEntry | 
   ) {
     return undefined;
   }
+  const summary = summarizeProviderActivity(kind, message);
 
   return {
     id: event.id,
     createdAt: event.createdAt,
     phase: typeof event.payload.phase === 'string' ? event.payload.phase : 'provider',
     attempt: typeof event.payload.attempt === 'number' ? event.payload.attempt : 0,
+    state: summary.state,
+    title: summary.title,
+    detail: summary.detail,
     kind,
-    message: summarizeProviderActivityMessage(kind, message),
     elapsedMs: typeof event.payload.elapsedMs === 'number' ? event.payload.elapsedMs : 0
   };
 }
 
-function summarizeProviderActivityMessage(kind: ProviderActivityEntry['kind'], message: string): string {
-  if (kind === 'lifecycle' && /^Prompt sent to\b/i.test(message.trim())) {
-    return 'Prompt odeslan AI provideru.';
-  }
+function statusActivityPhase(status: TaskSummary['status']): string {
+  if (status === 'creating_github_issue' || status === 'creating_branch') return 'github';
+  if (status === 'validating' || status === 'validation_failed') return 'validation';
+  if (status === 'reviewing') return 'review';
+  if (status === 'creating_pr' || status === 'ready_for_user_review') return 'git';
+  if (status === 'running_ai' || status === 'improving') return 'implementation';
+  if (terminalStatuses.has(status)) return 'completion';
+  return 'planning';
+}
 
-  return message;
+function summarizeProviderActivity(
+  kind: Exclude<TaskActivityEntry['kind'], 'activity'>,
+  message: string
+): Pick<TaskActivityEntry, 'state' | 'title' | 'detail'> {
+  const normalized = message.trim();
+  if (kind === 'workspace') {
+    return {
+      state: 'progress',
+      title: 'AI upravuje soubory',
+      detail: normalized.replace(/^Workspace changed:\s*/i, '')
+    };
+  }
+  if (kind === 'lifecycle') {
+    if (/completed/i.test(normalized)) {
+      return { state: 'completed', title: 'AI dokončila zpracování', detail: normalized };
+    }
+    if (/stopping|timeout/i.test(normalized)) {
+      return { state: 'failed', title: 'AI zpracování se zastavuje', detail: normalized };
+    }
+    return {
+      state: 'started',
+      title: /^Prompt sent to\b/i.test(normalized) ? 'Zadání bylo odesláno AI' : 'AI proces byl spuštěn',
+      detail: normalized
+    };
+  }
+  if (/^exec\b/i.test(normalized)) {
+    return { state: 'progress', title: 'AI spouští příkaz', detail: normalized };
+  }
+  if (/^succeeded in\b/i.test(normalized)) {
+    return { state: 'progress', title: 'Příkaz AI skončil', detail: normalized };
+  }
+  if (/tokens used/i.test(normalized)) {
+    return { state: 'progress', title: 'AI dokončuje odpověď', detail: normalized };
+  }
+  return {
+    state: 'progress',
+    title: kind === 'stderr' ? 'AI pracuje v repozitáři' : 'AI posílá průběžný výstup',
+    detail: normalized
+  };
 }
 
 function formatElapsedTime(elapsedMs: number): string {
@@ -1814,12 +1902,28 @@ function formatElapsedTime(elapsedMs: number): string {
   return minutes > 0 ? `${minutes}m ${seconds}s` : `${seconds}s`;
 }
 
+function formatDurationSeconds(totalSeconds: number): string {
+  if (totalSeconds <= 1) {
+    return 'právě teď';
+  }
+  if (totalSeconds < 60) {
+    return `${totalSeconds} s`;
+  }
+  const minutes = Math.floor(totalSeconds / 60);
+  const seconds = totalSeconds % 60;
+  return seconds > 0 ? `${minutes} min ${seconds} s` : `${minutes} min`;
+}
+
 function formatPhase(phase: string): string {
   const labels: Record<string, string> = {
+    workspace: 'Příprava',
     planning: 'Planning',
     implementation: 'Implementation',
     validation: 'Validation',
-    review: 'Review'
+    review: 'Review',
+    git: 'Git',
+    github: 'GitHub',
+    completion: 'Dokončení'
   };
 
   return labels[phase] ?? formatEventType(phase);

@@ -1,7 +1,16 @@
 import { mkdir, readFile, readdir, unlink, writeFile } from 'node:fs/promises';
 import { dirname, isAbsolute, join, resolve } from 'node:path';
 import { simpleGit, type SimpleGit, type StatusResult } from 'simple-git';
-import type { ApprovalType, ForgeTask, IterationPhase, Project, ProviderKind, TaskMode, TaskStatus } from '@forgemind/core';
+import type {
+  ApprovalType,
+  ForgeTask,
+  IterationPhase,
+  Project,
+  ProviderKind,
+  TaskActivity,
+  TaskMode,
+  TaskStatus
+} from '@forgemind/core';
 import {
   createAiBranchName,
   renderIssueBody,
@@ -41,6 +50,7 @@ export interface WorkerTaskResume {
 
 export interface WorkerTaskHooks {
   onStatus?: (status: TaskStatus, payload?: JsonValue) => Promise<void>;
+  onActivity?: (activity: TaskActivity) => Promise<void>;
   onIssue?: (issue: { issueNumber: number; issueUrl: string }) => Promise<void>;
   onBranch?: (branchName: string) => Promise<void>;
   onPullRequest?: (pullRequest: { pullRequestNumber: number; pullRequestUrl: string }) => Promise<void>;
@@ -92,6 +102,14 @@ export async function runWorkerTask(input: WorkerTaskInput): Promise<WorkerTaskR
   }
   const workspacePath = join(input.workspaceRoot ?? join(process.cwd(), '.forgemind', 'workspaces'), input.task.id);
 
+  const workspaceStartedAt = Date.now();
+  await emitTaskActivity(input.hooks, {
+    phase: 'workspace',
+    state: 'started',
+    title: 'Připravuji pracovní adresář',
+    detail: workspacePath,
+    operation: 'prepare_workspace'
+  });
   await mkdir(workspacePath, { recursive: true });
 
   const usageSummary = input.usageSummary ?? formatUsageSummary(await provider.estimateCost({ prompt: input.task.prompt, repositorySizeHint: 'small' }));
@@ -136,6 +154,14 @@ export async function runWorkerTask(input: WorkerTaskInput): Promise<WorkerTaskR
   const git = await prepareWorkspaceGit(workspacePath, branchName, input.project.defaultBranch, reuseExistingWorkspaceRepo ? undefined : remoteUrl, {
     skipRemoteFetchForExistingRepo: Boolean(input.resume)
   });
+  await emitTaskActivity(input.hooks, {
+    phase: 'workspace',
+    state: 'completed',
+    title: 'Pracovní adresář je připravený',
+    detail: branchName,
+    operation: 'prepare_workspace',
+    elapsedMs: Date.now() - workspaceStartedAt
+  });
   await input.hooks?.onBranch?.(branchName);
 
   const isResumeRun = Boolean(input.resume);
@@ -144,18 +170,36 @@ export async function runWorkerTask(input: WorkerTaskInput): Promise<WorkerTaskR
   let plan = input.resume
     ? createResumePlan(input.resume)
     : await (async () => {
+        const startedAt = Date.now();
+        await emitTaskActivity(input.hooks, {
+          phase: 'planning',
+          state: 'started',
+          title: 'AI připravuje plán',
+          operation: 'provider_plan',
+          attempt: 0
+        });
         await input.hooks?.onIterationStarted?.({
           phase: 'planning',
           prompt: input.task.prompt,
           attempt: 0
         });
-        return provider.plan({
+        const result = await provider.plan({
           taskId: input.task.id,
           title: input.task.title,
           prompt: input.task.prompt,
           repositoryPath: workspacePath,
           onActivity: (activity) => input.hooks?.onProviderActivity?.({ phase: 'planning', attempt: 0, ...activity })
         });
+        await emitTaskActivity(input.hooks, {
+          phase: 'planning',
+          state: 'completed',
+          title: 'Implementační plán je připravený',
+          detail: result.summary,
+          operation: 'provider_plan',
+          attempt: 0,
+          elapsedMs: Date.now() - startedAt
+        });
+        return result;
       })();
   let validationChecks = await resolveValidationChecks({
     plan,
@@ -223,6 +267,15 @@ export async function runWorkerTask(input: WorkerTaskInput): Promise<WorkerTaskR
 
   for (let attempt = 1; attempt <= input.task.maxIterations; attempt += 1) {
     completedAttempts = attempt;
+    const implementationStartedAt = Date.now();
+    await emitTaskActivity(input.hooks, {
+      phase: 'implementation',
+      state: 'started',
+      title: 'AI implementuje změny',
+      detail: `Pokus ${attempt}`,
+      operation: 'provider_implement',
+      attempt
+    });
     await input.hooks?.onIterationStarted?.({
       phase: 'implementation',
       prompt: input.task.prompt,
@@ -244,6 +297,15 @@ export async function runWorkerTask(input: WorkerTaskInput): Promise<WorkerTaskR
     resumedImplementation = undefined;
 
     implementation = applyImplementationPolicy(implementation, workspacePath, config.sandbox);
+    await emitTaskActivity(input.hooks, {
+      phase: 'implementation',
+      state: 'completed',
+      title: 'Implementace AI skončila',
+      detail: implementation.summary,
+      operation: 'provider_implement',
+      attempt,
+      elapsedMs: Date.now() - implementationStartedAt
+    });
 
     const implementationApprovals = filterApprovedApprovals(
       evaluateRuntimeApprovals(implementation.requestedApprovals, config.mode, config.approvalRequiredFor, config.allowSafeOperationsWithoutApproval),
@@ -378,7 +440,43 @@ export async function runWorkerTask(input: WorkerTaskInput): Promise<WorkerTaskR
       prompt: summarizeValidationChecks(validationChecks),
       attempt
     });
-      validation = await runValidationChecks(validationChecks, workspacePath);
+      validation = await runValidationChecks(validationChecks, workspacePath, async (activity) => {
+        const checkLabel = `${activity.checkIndex}/${activity.checkCount}`;
+        if (activity.state === 'started') {
+          await emitTaskActivity(input.hooks, {
+            phase: 'validation',
+            state: 'started',
+            title: `Spouštím validaci ${checkLabel}`,
+            detail: activity.command,
+            operation: 'validation_command',
+            attempt,
+            elapsedMs: activity.elapsedMs
+          });
+          return;
+        }
+        if (activity.state === 'output') {
+          await emitTaskActivity(input.hooks, {
+            phase: 'validation',
+            state: 'progress',
+            title: `Validace ${checkLabel} stále běží`,
+            detail: activity.message,
+            operation: activity.stream ?? 'validation_output',
+            attempt,
+            elapsedMs: activity.elapsedMs
+          });
+          return;
+        }
+        await emitTaskActivity(input.hooks, {
+          phase: 'validation',
+          state: activity.exitCode === 0 ? 'completed' : 'failed',
+          title: activity.exitCode === 0 ? `Validace ${checkLabel} prošla` : `Validace ${checkLabel} selhala`,
+          detail: activity.command,
+          operation: 'validation_command',
+          attempt,
+          elapsedMs: activity.elapsedMs,
+          exitCode: activity.exitCode
+        });
+      });
     await input.hooks?.onIteration?.({
       phase: 'validation',
       prompt: validation.command,
@@ -407,6 +505,14 @@ export async function runWorkerTask(input: WorkerTaskInput): Promise<WorkerTaskR
       }
 
       await input.hooks?.onStatus?.('reviewing', { attempt });
+      const reviewStartedAt = Date.now();
+      await emitTaskActivity(input.hooks, {
+        phase: 'review',
+        state: 'started',
+        title: 'AI kontroluje výsledné změny',
+        operation: 'provider_review',
+        attempt
+      });
       await input.hooks?.onIterationStarted?.({
         phase: 'review',
         prompt: `Review ${implementation.changedFiles.join(', ')}`,
@@ -448,6 +554,15 @@ export async function runWorkerTask(input: WorkerTaskInput): Promise<WorkerTaskR
       review = normalizeReviewAfterValidation({
         ...providerReview,
         riskyChanges: normalizeRuntimeApprovals(providerReview.riskyChanges)
+      });
+      await emitTaskActivity(input.hooks, {
+        phase: 'review',
+        state: review.blockers.length > 0 ? 'failed' : 'completed',
+        title: review.blockers.length > 0 ? 'Review našlo blokující problém' : 'Review je dokončené',
+        detail: review.summary,
+        operation: 'provider_review',
+        attempt,
+        elapsedMs: Date.now() - reviewStartedAt
       });
       await input.hooks?.onIteration?.({
         phase: 'review',
@@ -573,7 +688,22 @@ export async function runWorkerTask(input: WorkerTaskInput): Promise<WorkerTaskR
   }
 
   if (git) {
+    const commitStartedAt = Date.now();
+    await emitTaskActivity(input.hooks, {
+      phase: 'git',
+      state: 'started',
+      title: 'Vytvářím Git commit',
+      detail: `AI: ${input.task.title}`,
+      operation: 'commit'
+    });
     await stageAndCommitChanges(git, `AI: ${input.task.title}`);
+    await emitTaskActivity(input.hooks, {
+      phase: 'git',
+      state: 'completed',
+      title: 'Git commit je připravený',
+      operation: 'commit',
+      elapsedMs: Date.now() - commitStartedAt
+    });
     if (config.autoPush) {
       await runGitHubOperation(
         input.hooks,
@@ -648,6 +778,13 @@ export async function runWorkerTask(input: WorkerTaskInput): Promise<WorkerTaskR
     }
   }
 
+  await emitTaskActivity(input.hooks, {
+    phase: 'completion',
+    state: 'completed',
+    title: config.autoCompleteTask && mergeConfirmed ? 'Task je dokončený' : 'Výsledek je připravený k převzetí',
+    detail: pr?.pullRequestUrl,
+    operation: 'finish_task'
+  });
   return {
     taskId: input.task.id,
     status: config.autoCompleteTask && mergeConfirmed ? 'completed' : 'ready_for_user_review',
@@ -867,9 +1004,33 @@ async function runGitHubOperation<T>(
   context: JsonValue | undefined,
   action: () => Promise<T>
 ): Promise<T> {
+  const startedAt = Date.now();
+  const label = describeGitHubOperation(operation);
+  await emitTaskActivity(hooks, {
+    phase: operation === 'commit_and_push' ? 'git' : 'github',
+    state: 'started',
+    title: label.started,
+    operation
+  });
   try {
-    return await action();
+    const result = await action();
+    await emitTaskActivity(hooks, {
+      phase: operation === 'commit_and_push' ? 'git' : 'github',
+      state: 'completed',
+      title: label.completed,
+      operation,
+      elapsedMs: Date.now() - startedAt
+    });
+    return result;
   } catch (error) {
+    await emitTaskActivity(hooks, {
+      phase: operation === 'commit_and_push' ? 'git' : 'github',
+      state: 'failed',
+      title: label.failed,
+      detail: toErrorMessage(error),
+      operation,
+      elapsedMs: Date.now() - startedAt
+    });
     await hooks?.onGitHubOperationFailed?.({
       operation,
       errorMessage: toErrorMessage(error),
@@ -877,6 +1038,51 @@ async function runGitHubOperation<T>(
     });
     throw error;
   }
+}
+
+async function emitTaskActivity(hooks: WorkerTaskHooks | undefined, activity: TaskActivity): Promise<void> {
+  await hooks?.onActivity?.(activity);
+}
+
+function describeGitHubOperation(operation: GitHubOperation) {
+  const labels: Record<GitHubOperation, { started: string; completed: string; failed: string }> = {
+    create_issue: {
+      started: 'Vytvářím GitHub issue',
+      completed: 'GitHub issue je připravené',
+      failed: 'Vytvoření GitHub issue selhalo'
+    },
+    create_branch: {
+      started: 'Vytvářím pracovní branch',
+      completed: 'Pracovní branch je připravená',
+      failed: 'Vytvoření branche selhalo'
+    },
+    commit_and_push: {
+      started: 'Odesílám změny na GitHub',
+      completed: 'Změny jsou na GitHubu',
+      failed: 'Odeslání změn selhalo'
+    },
+    create_draft_pr: {
+      started: 'Vytvářím draft pull request',
+      completed: 'Draft pull request je připravený',
+      failed: 'Vytvoření pull requestu selhalo'
+    },
+    create_pull_request: {
+      started: 'Vytvářím pull request',
+      completed: 'Pull request je připravený',
+      failed: 'Vytvoření pull requestu selhalo'
+    },
+    merge_pr: {
+      started: 'Slučuji pull request',
+      completed: 'Pull request je sloučený',
+      failed: 'Sloučení pull requestu selhalo'
+    },
+    comment_on_issue: {
+      started: 'Aktualizuji GitHub issue',
+      completed: 'GitHub issue je aktualizované',
+      failed: 'Aktualizace GitHub issue selhala'
+    }
+  };
+  return labels[operation];
 }
 
 interface WorkerConfig {

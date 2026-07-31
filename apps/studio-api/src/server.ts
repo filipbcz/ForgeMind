@@ -53,14 +53,14 @@ function startTaskNotificationBridge(
   app: FastifyInstance,
   repository: ReturnType<typeof createRepository>,
   notifications: ReturnType<typeof createNotificationService>,
-  realtime: { publishAuditEvent: (event: AuditEvent) => void }
+  realtime: { publishAuditEvent: (event: AuditEvent) => void; hasSubscribers: () => boolean }
 ) {
   const seenEvents = new Set<string>();
   let initialized = false;
 
   const stopPolling = startNonOverlappingPolling(async () => {
     try {
-      const events = await repository.getRecentWorkerEvents(50);
+      const events = await repository.getRecentWorkerEvents(100);
       const ordered = [...events].sort((a, b) => new Date(a.createdAt).getTime() - new Date(b.createdAt).getTime());
 
       for (const event of ordered) {
@@ -78,22 +78,32 @@ function startTaskNotificationBridge(
       }
 
       initialized = true;
-      trimSeenEvents(seenEvents, 400);
+      trimSeenEvents(seenEvents, 1000);
     } catch (error) {
       app.log.warn({ error }, 'Task notification bridge poll failed');
     }
-  }, 4_000);
+  }, () => realtime.hasSubscribers() ? 750 : 4_000);
 
   app.addHook('onClose', async () => {
     stopPolling();
   });
 }
 
-export function startNonOverlappingPolling(poll: () => Promise<void>, intervalMs: number): () => void {
+export function startNonOverlappingPolling(
+  poll: () => Promise<void>,
+  intervalMs: number | (() => number)
+): () => void {
   let pollInProgress = false;
+  let stopped = false;
+  let timer: NodeJS.Timeout;
 
-  const timer = setInterval(() => {
+  const schedule = () => {
+    timer = setTimeout(run, typeof intervalMs === 'function' ? intervalMs() : intervalMs);
+  };
+  const run = () => {
+    if (stopped) return;
     if (pollInProgress) {
+      schedule();
       return;
     }
 
@@ -101,14 +111,20 @@ export function startNonOverlappingPolling(poll: () => Promise<void>, intervalMs
     void poll().then(
       () => {
         pollInProgress = false;
+        if (!stopped) schedule();
       },
       () => {
         pollInProgress = false;
+        if (!stopped) schedule();
       }
     );
-  }, intervalMs);
+  };
+  run();
 
-  return () => clearInterval(timer);
+  return () => {
+    stopped = true;
+    clearTimeout(timer);
+  };
 }
 
 async function notifyFromAuditEvent(

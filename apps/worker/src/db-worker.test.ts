@@ -287,6 +287,62 @@ describe('db-worker policy enforcement', () => {
     }));
   });
 
+  it('persists semantic task activity for realtime clients', async () => {
+    runWorkerTaskMock.mockImplementationOnce(async (input: {
+      hooks?: {
+        onActivity?: (activity: {
+          phase: 'validation';
+          state: 'progress';
+          title: string;
+          detail: string;
+          operation: string;
+          attempt: number;
+          elapsedMs: number;
+        }) => Promise<void>;
+      };
+    }) => {
+      await input.hooks?.onActivity?.({
+        phase: 'validation',
+        state: 'progress',
+        title: 'Validace stále běží',
+        detail: 'npm test',
+        operation: 'validation_command',
+        attempt: 1,
+        elapsedMs: 500
+      });
+
+      return {
+        taskId: 'task_1',
+        status: 'ready_for_user_review',
+        issueUrl: '',
+        branchName: 'ai/task',
+        workspacePath: 'C:/tmp/worker',
+        validation: { command: 'npm test', exitCode: 0, stdout: '', stderr: '', passed: true },
+        summary: 'done',
+        approvals: [],
+        completedAt: new Date().toISOString()
+      };
+    });
+
+    const { runDatabaseWorkerOnce } = await import('./db-worker.js');
+    await runDatabaseWorkerOnce();
+
+    expect(repositoryMock.writeAudit).toHaveBeenCalledWith({
+      actorType: 'agent',
+      eventType: 'task_activity',
+      taskId: 'task_1',
+      payload: expect.objectContaining({
+        phase: 'validation',
+        state: 'progress',
+        title: 'Validace stále běží',
+        detail: 'npm test',
+        operation: 'validation_command',
+        attempt: 1,
+        elapsedMs: 500
+      })
+    });
+  });
+
   it('maps requested approvals to needs_approval policy path', async () => {
     runWorkerTaskMock.mockResolvedValueOnce({
       taskId: 'task_1',

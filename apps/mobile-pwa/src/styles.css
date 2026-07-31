@@ -475,6 +475,150 @@ a {
   margin-bottom: 10px;
 }
 
+.task-activity-panel {
+  margin-bottom: 12px;
+  border: 1px solid #cfd8cf;
+  border-radius: 8px;
+  overflow: hidden;
+  background: #ffffff;
+}
+
+.current-activity {
+  min-height: 126px;
+  display: grid;
+  grid-template-columns: 18px minmax(0, 1fr);
+  align-items: start;
+  gap: 12px;
+  padding: 18px;
+  border-left: 4px solid #64748b;
+  background: #f8faf9;
+}
+
+.current-activity.active {
+  border-left-color: #0f766e;
+  background: #f2fbf8;
+}
+
+.current-activity.completed {
+  border-left-color: #15803d;
+  background: #f5fbf6;
+}
+
+.current-activity.failed {
+  border-left-color: #dc2626;
+  background: #fff7f7;
+}
+
+.activity-indicator {
+  width: 12px;
+  height: 12px;
+  margin-top: 5px;
+  border: 2px solid #64748b;
+  border-radius: 50%;
+  background: #ffffff;
+}
+
+.current-activity.active .activity-indicator {
+  border-color: #0f766e;
+  background: #14b8a6;
+  box-shadow: 0 0 0 0 rgba(20, 184, 166, 0.35);
+  animation: activity-pulse 1.8s ease-out infinite;
+}
+
+.current-activity.completed .activity-indicator {
+  border-color: #15803d;
+  background: #22c55e;
+}
+
+.current-activity.failed .activity-indicator {
+  border-color: #dc2626;
+  background: #ef4444;
+}
+
+.current-activity-content {
+  min-width: 0;
+  display: grid;
+  gap: 7px;
+}
+
+.current-activity-content > strong {
+  font-size: 1.04rem;
+  overflow-wrap: anywhere;
+}
+
+.current-activity-content p,
+.current-activity-content small {
+  margin: 0;
+  overflow-wrap: anywhere;
+}
+
+.current-activity-content p {
+  color: #33413a;
+  line-height: 1.45;
+}
+
+.current-activity-content small {
+  color: #69736c;
+}
+
+.current-activity-meta {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+  color: #52615a;
+  font-size: 0.74rem;
+  font-weight: 700;
+  text-transform: uppercase;
+}
+
+.current-activity-meta span + span {
+  padding-left: 8px;
+  border-left: 1px solid #cfd8cf;
+}
+
+.activity-output-disclosure {
+  border-top: 1px solid #dde5dd;
+}
+
+.activity-output-disclosure > summary {
+  min-height: 46px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 10px 14px;
+  cursor: pointer;
+  color: #33413a;
+  background: #ffffff;
+}
+
+.activity-output-disclosure > summary small {
+  margin-left: auto;
+  color: #69736c;
+}
+
+.activity-output-disclosure > summary svg {
+  transition: transform 160ms ease;
+}
+
+.activity-output-disclosure[open] > summary svg {
+  transform: rotate(180deg);
+}
+
+@keyframes activity-pulse {
+  70% {
+    box-shadow: 0 0 0 7px rgba(20, 184, 166, 0);
+  }
+  100% {
+    box-shadow: 0 0 0 0 rgba(20, 184, 166, 0);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .current-activity.active .activity-indicator {
+    animation: none;
+  }
+}
+
 .provider-activity-header {
   min-height: 58px;
   padding: 10px 12px;
@@ -539,7 +683,7 @@ a {
 }
 
 .provider-activity-output {
-  height: 420px;
+  max-height: 420px;
   overflow: auto;
   background: #17201d;
   color: #e7eee9;
@@ -604,6 +748,13 @@ a {
   overflow-wrap: anywhere;
 }
 
+.provider-activity-entry > strong {
+  display: block;
+  margin-bottom: 6px;
+  color: #f1f5f2;
+  font-size: 0.82rem;
+}
+
 .plain-section {
   margin-top: 20px;
 }
@@ -666,7 +817,7 @@ a {
 .workflow-steps {
   list-style: none;
   display: grid;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
+  grid-template-columns: repeat(3, minmax(0, 1fr));
   margin: 0;
   padding: 0;
   border-top: 1px solid #dde5dd;
@@ -689,11 +840,11 @@ a {
   border-left: 1px solid #edf1ea;
 }
 
-.workflow-step:nth-child(odd) {
+.workflow-step:nth-child(3n + 1) {
   border-left: 0;
 }
 
-.workflow-step:nth-child(n + 3) {
+.workflow-step:nth-child(n + 4) {
   border-top: 1px solid #edf1ea;
 }
 

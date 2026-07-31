@@ -699,25 +699,59 @@ export async function runCodexProcess(
     let maxRuntimeTimer: NodeJS.Timeout;
     let terminationTimer: NodeJS.Timeout | undefined;
     let workspaceWatcher: FSWatcher | undefined;
+    let activityQueue = Promise.resolve();
+    let activityFlushTimer: NodeJS.Timeout | undefined;
+    const bufferedActivity: Record<'stdout' | 'stderr', string> = { stdout: '', stderr: '' };
 
     const cleanup = () => {
       clearTimeout(inactivityTimer);
       clearTimeout(maxRuntimeTimer);
       if (terminationTimer) clearTimeout(terminationTimer);
+      if (activityFlushTimer) clearTimeout(activityFlushTimer);
       workspaceWatcher?.close();
+    };
+    const enqueueActivity = (kind: 'lifecycle' | 'stdout' | 'stderr' | 'workspace', message: string) => {
+      activityQueue = activityQueue
+        .then(async () => {
+          await emitProviderActivityMessage(options.onActivity, {
+            kind,
+            message: stripAnsi(message),
+            elapsedMs: Date.now() - startedAt
+          });
+        })
+        .catch(() => undefined);
+    };
+    const flushBufferedActivity = () => {
+      if (activityFlushTimer) {
+        clearTimeout(activityFlushTimer);
+        activityFlushTimer = undefined;
+      }
+      for (const kind of ['stdout', 'stderr'] as const) {
+        const message = bufferedActivity[kind];
+        bufferedActivity[kind] = '';
+        if (message) enqueueActivity(kind, message);
+      }
     };
     const finish = (error?: Error, result: CodexProcessResult = {}) => {
       if (settled) return;
+      flushBufferedActivity();
       settled = true;
       cleanup();
-      error ? reject(error) : resolve(result);
+      void activityQueue.then(
+        () => error ? reject(error) : resolve(result),
+        () => error ? reject(error) : resolve(result)
+      );
     };
     const emitActivity = (kind: 'lifecycle' | 'stdout' | 'stderr' | 'workspace', message: string) => {
-      void emitProviderActivityMessage(options.onActivity, {
-        kind,
-        message: stripAnsi(message),
-        elapsedMs: Date.now() - startedAt
-      });
+      if (kind === 'stdout' || kind === 'stderr') {
+        bufferedActivity[kind] = appendCappedOutput(bufferedActivity[kind], message, 8_000);
+        if (!activityFlushTimer) {
+          activityFlushTimer = setTimeout(flushBufferedActivity, 350);
+        }
+        return;
+      }
+      flushBufferedActivity();
+      enqueueActivity(kind, message);
     };
     const stopForTimeout = (reason: CodexExecutionTimeoutError['reason']) => {
       if (settled || timeoutReason) return;
@@ -928,9 +962,9 @@ function resolvePositiveTimeout(explicitValue: number | undefined, environmentVa
   return Number.isFinite(parsed) && parsed > 0 ? Math.max(10, parsed) : fallback;
 }
 
-function appendCappedOutput(current: string, chunk: string): string {
+function appendCappedOutput(current: string, chunk: string, maxChars = 200_000): string {
   const combined = current + chunk;
-  return combined.length <= 200_000 ? combined : combined.slice(-200_000);
+  return combined.length <= maxChars ? combined : combined.slice(-maxChars);
 }
 
 function splitActivityMessage(message: string): string[] {

@@ -24,6 +24,7 @@ type RealtimeMessage =
 
 export interface RealtimeGateway {
   publishAuditEvent(event: AuditEvent): void;
+  hasSubscribers(): boolean;
 }
 
 export function registerRealtimeGateway(app: FastifyInstance): RealtimeGateway {
@@ -108,6 +109,9 @@ export function registerRealtimeGateway(app: FastifyInstance): RealtimeGateway {
   });
 
   return {
+    hasSubscribers() {
+      return subscriptions.size > 0;
+    },
     publishAuditEvent(event) {
       for (const [connection, subscription] of subscriptions.entries()) {
         if (connection.readyState !== WebSocket.OPEN) {

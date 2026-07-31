@@ -256,7 +256,16 @@ export interface OperationalMetricsSnapshot {
   };
 }
 
-const WORKER_EVENT_PREFIXES = ['task_enqueued', 'task_claimed', 'task_status_', 'task_github_', 'task_iteration_'] as const;
+const WORKER_EVENT_PREFIXES = [
+  'task_enqueued',
+  'task_claimed',
+  'task_status_',
+  'task_github_',
+  'task_iteration_',
+  'task_activity',
+  'task_provider_activity',
+  'task_failed'
+] as const;
 
 const ACTIVE_TASK_STATUSES: ReadonlySet<TaskStatus> = new Set([
   'submitted',
@@ -1265,7 +1274,10 @@ export class ForgeMindRepository {
           { eventType: { startsWith: WORKER_EVENT_PREFIXES[1] } },
           { eventType: { startsWith: WORKER_EVENT_PREFIXES[2] } },
           { eventType: { startsWith: WORKER_EVENT_PREFIXES[3] } },
-          { eventType: { startsWith: WORKER_EVENT_PREFIXES[4] } }
+          { eventType: { startsWith: WORKER_EVENT_PREFIXES[4] } },
+          { eventType: { startsWith: WORKER_EVENT_PREFIXES[5] } },
+          { eventType: { startsWith: WORKER_EVENT_PREFIXES[6] } },
+          { eventType: { startsWith: WORKER_EVENT_PREFIXES[7] } }
         ]
       },
       orderBy: { createdAt: 'desc' },

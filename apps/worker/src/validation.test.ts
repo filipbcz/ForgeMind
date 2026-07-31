@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import { mkdtemp, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
@@ -20,6 +20,29 @@ describe('validation runner', () => {
 
     expect(() => assertAllowedValidationCommand(command)).not.toThrow();
     await expect(runValidationCommand(command, cwd)).resolves.toMatchObject({ passed: true, exitCode: 0 });
+  });
+
+  it('streams validation output before reporting command completion', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'forgemind-validation-stream-'));
+    const activities: Array<{ state: string; message?: string }> = [];
+
+    const result = await runValidationChecks(
+      [{
+        kind: 'command',
+        command: `node -e "console.log('first'); setTimeout(() => console.log('second'), 500)"`,
+        criterion: 'Both progress messages are emitted.',
+        rationale: 'Verifies live validation output.'
+      }],
+      cwd,
+      vi.fn(async (activity) => {
+        activities.push({ state: activity.state, message: activity.message });
+      })
+    );
+
+    expect(result.passed).toBe(true);
+    expect(activities[0]?.state).toBe('started');
+    expect(activities.some((activity) => activity.state === 'output' && activity.message?.includes('first'))).toBe(true);
+    expect(activities.at(-1)?.state).toBe('completed');
   });
 
   it('rejects shell output redirection outside quoted arguments', () => {

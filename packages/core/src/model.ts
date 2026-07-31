@@ -38,6 +38,29 @@ export type IterationPhase =
   | 'approval'
   | 'pr_creation';
 
+export type TaskActivityPhase =
+  | 'workspace'
+  | 'planning'
+  | 'implementation'
+  | 'validation'
+  | 'review'
+  | 'git'
+  | 'github'
+  | 'completion';
+
+export type TaskActivityState = 'started' | 'progress' | 'completed' | 'failed';
+
+export interface TaskActivity {
+  phase: TaskActivityPhase;
+  state: TaskActivityState;
+  title: string;
+  detail?: string;
+  operation?: string;
+  attempt?: number;
+  elapsedMs?: number;
+  exitCode?: number;
+}
+
 export type ApprovalType =
   | 'budget_increase'
   | 'continue_after_iteration_limit'
