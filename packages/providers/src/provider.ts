@@ -99,6 +99,8 @@ export interface ReviewInput {
   repositoryPath: string;
   changedFiles: string[];
   acceptanceCriteria: string[];
+  previousReviewSummary?: string;
+  previousReviewBlockers?: string[];
   validation: {
     command: string;
     exitCode: number;

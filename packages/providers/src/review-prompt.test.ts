@@ -25,4 +25,28 @@ describe('review prompt', () => {
     expect(prompt).toContain('Command: npm test && npm run build');
     expect(prompt).toContain('+export const selected = true;');
   });
+
+  it('limits follow-up review to the correction and previous blockers', () => {
+    const prompt = buildReviewPrompt({
+      taskId: 'task-2',
+      taskTitle: 'Fix leaderboard fallback',
+      repositoryPath: '/workspace',
+      changedFiles: ['src/leaderboard.ts'],
+      acceptanceCriteria: ['Null scores use correctCount.'],
+      previousReviewSummary: 'The initial implementation had one blocker.',
+      previousReviewBlockers: ['score: null was treated as zero.'],
+      validation: {
+        command: 'npm test',
+        exitCode: 0,
+        stdout: 'passed',
+        stderr: '',
+        passed: true
+      },
+      diff: '+if (score == null) return correctCount;'
+    });
+
+    expect(prompt).toContain('This packet contains only files changed by the correction pass.');
+    expect(prompt).toContain('score: null was treated as zero.');
+    expect(prompt).toContain('+if (score == null) return correctCount;');
+  });
 });

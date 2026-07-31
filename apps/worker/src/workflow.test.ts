@@ -4,8 +4,15 @@ import { randomUUID } from 'node:crypto';
 import { tmpdir } from 'node:os';
 import { mkdir, readFile, writeFile } from 'node:fs/promises';
 import { simpleGit } from 'simple-git';
-import { runWorkerTask } from './workflow.js';
-import type { ForgeTask, Project } from '@forgemind/core';
+import {
+  compactTaskExecutionPrompt,
+  isInspectionOnlyValidationCommand,
+  isReviewSummaryOnlyPath,
+  isValidationCommandDefinitionFailure,
+  normalizeValidationChecks,
+  runWorkerTask
+} from './workflow.js';
+import type { ForgeTask, Project, TaskActivity } from '@forgemind/core';
 import type { AIProvider, CostEstimateResult, ImplementInput, ImplementResult, PlanInput, PlanResult, ReviewInput, ReviewResult } from '@forgemind/providers';
 import type { CreateDraftPullRequestInput, GitHubAdapter } from '@forgemind/github';
 
@@ -859,7 +866,9 @@ describe('worker workflow', () => {
       configYaml: noGitProjectConfig.replace('commands:\n  verify: "node --version"\n', 'commands: {}\n')
     };
     const planCalls: PlanInput[] = [];
+    const implementCalls: ImplementInput[] = [];
     const planningIterations: Array<{ phase: string; validationResult: unknown }> = [];
+    const taskActivities: TaskActivity[] = [];
 
     const provider: AIProvider = {
       kind: 'codex',
@@ -873,7 +882,7 @@ describe('worker workflow', () => {
             validationChecks: [
               {
                 kind: 'command',
-                command: "node -e \"process.exit(1)\"",
+                command: `node -e "process.stderr.write('Missing script: missing-validation-script'); process.exit(1)"`,
                 criterion: 'Initial failing validation.',
                 rationale: 'Synthetic failure for retry.'
               }
@@ -895,7 +904,8 @@ describe('worker workflow', () => {
           ]
         };
       },
-      async implement(): Promise<ImplementResult> {
+      async implement(input: ImplementInput): Promise<ImplementResult> {
+        implementCalls.push(input);
         return {
           summary: 'Implementation summary',
           changedFiles: ['status.txt'],
@@ -932,11 +942,15 @@ describe('worker workflow', () => {
       task: {
         ...demoTask,
         id: `task_${randomUUID()}`,
+        prompt: 'Parent objective:\nA very long project brief that is not needed for execution.\n\nCurrent implementation step:\nFix validation handling.\n\nAcceptance Criteria:\n- Validation passes.',
         maxIterations: 3
       },
       provider,
       workspaceRoot,
       hooks: {
+        onActivity: async (activity) => {
+          taskActivities.push(activity);
+        },
         onIteration: async (iteration) => {
           if (iteration.phase === 'planning') {
             planningIterations.push({ phase: iteration.phase, validationResult: iteration.validationResult });
@@ -948,12 +962,16 @@ describe('worker workflow', () => {
     expect(result.status).toBe('ready_for_user_review');
     expect(result.validation.passed).toBe(true);
     expect(planCalls).toHaveLength(2);
-    expect(planCalls[1]?.previousValidationError).toContain('Exit code 1');
+    expect(implementCalls).toHaveLength(1);
+    expect(planCalls[0]?.prompt).not.toContain('very long project brief');
+    expect(planCalls[1]?.prompt).toContain('Revise validation checks only');
+    expect(planCalls[1]?.prompt).not.toContain('very long project brief');
+    expect(planCalls[1]?.previousValidationError).toContain('Missing script');
     expect(planCalls[1]?.previousValidationChecks).toEqual(
       expect.arrayContaining([
         expect.objectContaining({
           kind: 'command',
-          command: expect.stringContaining('process.exit(1)')
+          command: expect.stringContaining('Missing script: missing-validation-script')
         })
       ])
     );
@@ -962,7 +980,7 @@ describe('worker workflow', () => {
         expect.objectContaining({
           phase: 'planning',
           validationResult: expect.objectContaining({
-            replannedAfterValidationError: true,
+            revisedValidationChecksOnly: true,
             validationChecks: expect.arrayContaining([
               expect.objectContaining({
                 command: expect.stringContaining('process.exit(0)')
@@ -972,7 +990,81 @@ describe('worker workflow', () => {
         })
       ])
     );
-  }, 10000);
+    expect(taskActivities).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          phase: 'planning',
+          state: 'started',
+          operation: 'provider_plan',
+          attempt: 1
+        }),
+        expect.objectContaining({
+          phase: 'planning',
+          state: 'completed',
+          operation: 'provider_plan',
+          attempt: 1,
+          elapsedMs: expect.any(Number)
+        })
+      ])
+    );
+  }, 20000);
+
+  it('keeps only the current roadmap step in provider execution context', () => {
+    expect(compactTaskExecutionPrompt([
+      'Project: Demo',
+      'Parent objective:',
+      'Large reusable brief.',
+      '',
+      'Current implementation step:',
+      'Add leaderboard API.',
+      '',
+      'Acceptance Criteria:',
+      '- GET /api/leaderboard works.'
+    ].join('\n'))).toBe([
+      'Current implementation step:',
+      'Add leaderboard API.',
+      '',
+      'Acceptance Criteria:',
+      '- GET /api/leaderboard works.'
+    ].join('\n'));
+  });
+
+  it('distinguishes invalid validation commands from implementation failures', () => {
+    expect(isValidationCommandDefinitionFailure({
+      command: 'npm run missing',
+      exitCode: 1,
+      stdout: '',
+      stderr: 'Missing script: "missing"',
+      passed: false
+    })).toBe(true);
+    expect(isValidationCommandDefinitionFailure({
+      command: 'npm test',
+      exitCode: 1,
+      stdout: 'Expected 2 but received 1',
+      stderr: '',
+      passed: false
+    })).toBe(false);
+  });
+
+  it('moves repository inspection out of executable validation', () => {
+    const command = 'git diff -- README.md docs AGENTS.md 2>/dev/null || git diff -- README.md';
+
+    expect(isInspectionOnlyValidationCommand(command)).toBe(true);
+    expect(isInspectionOnlyValidationCommand('git diff --exit-code -- README.md')).toBe(false);
+    expect(normalizeValidationChecks([{
+      kind: 'command',
+      command,
+      criterion: 'Documentation matches the implementation.'
+    }])).toEqual([expect.objectContaining({
+      kind: 'manual',
+      criterion: 'Documentation matches the implementation.'
+    })]);
+  });
+
+  it('omits generated dependency metadata from detailed review context', () => {
+    expect(isReviewSummaryOnlyPath('package-lock.json')).toBe(true);
+    expect(isReviewSummaryOnlyPath('src/domain/leaderboard.ts')).toBe(false);
+  });
 
   it('retries implementation after a validation failure within max iterations', async () => {
     const workspaceRoot = join(tmpdir(), `forgemind-worker-retry-${randomUUID()}`);
@@ -1244,6 +1336,7 @@ describe('worker workflow', () => {
   it('retries implementation after review blockers within max iterations', async () => {
     const workspaceRoot = join(tmpdir(), `forgemind-worker-review-retry-${randomUUID()}`);
     const attempts: ImplementInput[] = [];
+    const reviewInputs: ReviewInput[] = [];
     let reviewAttempt = 0;
 
     const provider: AIProvider = {
@@ -1259,18 +1352,20 @@ describe('worker workflow', () => {
         attempts.push(input);
         return {
           summary: `Attempt ${input.attemptNumber}`,
-          changedFiles: ['status.txt'],
-          diffStat: { filesChanged: 1, insertions: 1, deletions: 0 },
+          changedFiles: input.attemptNumber === 1 ? ['status.txt', 'stable.txt'] : ['status.txt'],
+          diffStat: { filesChanged: input.attemptNumber === 1 ? 2 : 1, insertions: input.attemptNumber === 1 ? 2 : 1, deletions: 0 },
           requestedApprovals: [],
           fileUpdates: [
             {
               path: 'status.txt',
               content: `attempt-${input.attemptNumber}\n`
-            }
+            },
+            ...(input.attemptNumber === 1 ? [{ path: 'stable.txt', content: 'already-reviewed\n' }] : [])
           ]
         };
       },
-      async review(_input: ReviewInput): Promise<ReviewResult> {
+      async review(input: ReviewInput): Promise<ReviewResult> {
+        reviewInputs.push(input);
         reviewAttempt += 1;
         if (reviewAttempt === 1) {
           return {
@@ -1319,6 +1414,12 @@ describe('worker workflow', () => {
     expect(attempts).toHaveLength(2);
     expect(attempts[0]?.previousReviewBlockers).toBeUndefined();
     expect(attempts[1]?.previousReviewBlockers).toEqual(['Add missing guard clause']);
+    expect(reviewInputs).toHaveLength(2);
+    expect(reviewInputs[0]?.changedFiles).toEqual(expect.arrayContaining(['status.txt', 'stable.txt']));
+    expect(reviewInputs[1]?.changedFiles).toEqual(['status.txt']);
+    expect(reviewInputs[1]?.diff).toContain('status.txt');
+    expect(reviewInputs[1]?.diff).not.toContain('stable.txt');
+    expect(reviewInputs[1]?.previousReviewBlockers).toEqual(['Add missing guard clause']);
   }, 10000);
 
   it('ignores review blockers caused only by read-only validation limitations after successful validation', async () => {

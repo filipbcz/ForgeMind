@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from 'vitest';
-import { isNoisyWorkspaceActivityPath, parseCodexCliTotalTokens, runCodexProcess } from './codex-provider.js';
+import { buildCodexImplementationPrompt, isNoisyWorkspaceActivityPath, parseCodexCliTotalTokens, runCodexProcess } from './codex-provider.js';
 
 describe('Codex process activity timeouts', () => {
   it('parses the actual total token count emitted by Codex CLI', () => {
@@ -12,6 +12,26 @@ describe('Codex process activity timeouts', () => {
     expect(isNoisyWorkspaceActivityPath('node_modules\\@prisma\\client\\index.js')).toBe(true);
     expect(isNoisyWorkspaceActivityPath('dist/assets/index.js')).toBe(true);
     expect(isNoisyWorkspaceActivityPath('src/app.js')).toBe(false);
+  });
+
+  it('keeps correction prompts focused and leaves broad validation to ForgeMind', () => {
+    const prompt = buildCodexImplementationPrompt({
+      taskId: 'task-1',
+      prompt: 'Current implementation step:\nFix null score fallback.',
+      repositoryPath: '/workspace',
+      attemptNumber: 2,
+      plan: {
+        summary: 'Implement leaderboard.',
+        steps: ['Fix the comparator.'],
+        acceptanceCriteria: ['Null score uses correctCount.']
+      },
+      previousReviewBlockers: ['score: null is treated as zero.']
+    });
+
+    expect(prompt).toContain('Preserve completed work');
+    expect(prompt).toContain('score: null is treated as zero.');
+    expect(prompt).toContain('ForgeMind runs authoritative validation');
+    expect(prompt).not.toContain('Parent objective');
   });
 
   it('keeps an active process alive past the inactivity timeout', async () => {

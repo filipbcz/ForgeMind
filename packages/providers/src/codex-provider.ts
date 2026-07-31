@@ -124,12 +124,14 @@ export class CodexProvider implements AIProvider {
     const messages: Array<{ role: 'system' | 'user' | 'assistant'; content: string }> = [
       {
         role: 'system',
-        content:
-          'You are Codex. Return JSON with summary, steps, acceptanceCriteria, validationChecks, and implementationSteps. ' +
-          'For ordinary task plans, implementationSteps must be an empty array. When the request asks for a project roadmap, it must contain objects with title, description, acceptanceCriteria, inScope, and outOfScope. ' +
-          'validationChecks must contain executable command checks or manual review checks. ' +
-          'Use { "kind": "command", "command": "...", "criterion": "...", "rationale": "..." } for commands and ' +
-          '{ "kind": "manual", "instructions": "...", "criterion": "...", "rationale": "..." } for non-executable criteria. Reply with JSON only.'
+        content: input.previousValidationError
+          ? 'Revise validation checks only. Return JSON with a short summary, empty steps and implementationSteps arrays, the supplied acceptanceCriteria, and corrected validationChecks. Do not propose or repeat implementation work. Reply with JSON only.'
+          : 'You are Codex. Return JSON with summary, steps, acceptanceCriteria, validationChecks, and implementationSteps. ' +
+            'For ordinary task plans, implementationSteps must be an empty array. When the request asks for a project roadmap, it must contain objects with title, description, acceptanceCriteria, inScope, and outOfScope. ' +
+            'validationChecks must contain executable command checks or manual review checks. ' +
+            'Commands must verify a criterion through their exit code and must not use shell redirection or fallback chains. Use manual checks for git diff/status/log inspection. ' +
+            'Use { "kind": "command", "command": "...", "criterion": "...", "rationale": "..." } for commands and ' +
+            '{ "kind": "manual", "instructions": "...", "criterion": "...", "rationale": "..." } for non-executable criteria. Reply with JSON only.'
       },
       {
         role: 'user',
@@ -172,7 +174,9 @@ export class CodexProvider implements AIProvider {
       {
         role: 'system',
         content:
-          'You are Codex implementation agent. Return JSON with summary, changedFiles, diffStat, requestedApprovals, and optional fileUpdates [{ path, content }]. Reply with JSON only.'
+          'You are Codex implementation agent. Make only the repository changes required by the supplied task and correction context. ' +
+          'Do not run broad test suites, full builds, type checks, dependency installation, database validation, or repository-wide formatting; ForgeMind runs authoritative validation after implementation. ' +
+          'Run a narrowly targeted check only when it is required to make the edit correctly. Return JSON with summary, changedFiles, diffStat, requestedApprovals, and optional fileUpdates [{ path, content }]. Reply with JSON only.'
       },
       {
         role: 'user',
@@ -292,9 +296,12 @@ export class CodexProvider implements AIProvider {
       validationChecks: []
     };
     const providerPrompt = [
-      'Create an implementation plan for this ForgeMind task.',
+      input.previousValidationError
+        ? 'Revise validation checks for this ForgeMind task. Do not repeat planning or implementation work.'
+        : 'Create an implementation plan for this ForgeMind task.',
       'Return only JSON matching the provided schema.',
       'Translate acceptance criteria into concrete validation checks whenever possible.',
+      'Commands must verify a criterion through their exit code. Use manual checks for git diff/status/log inspection, and do not use shell redirection or fallback chains.',
       `Task id: ${input.taskId}`,
       `Title: ${input.title}`,
       `Prompt:\n${input.prompt}`,
@@ -381,20 +388,7 @@ export class CodexProvider implements AIProvider {
       diffStat: { filesChanged: 0, insertions: 0, deletions: 0 },
       requestedApprovals: []
     };
-    const providerPrompt = [
-      'Implement this task directly in the repository workspace.',
-      'Do not create commits, branches, issues, or pull requests. ForgeMind handles those steps.',
-      'When finished, return only JSON matching the provided schema.',
-      `Task id: ${input.taskId}`,
-      `Attempt: ${input.attemptNumber ?? 1}`,
-      `Prompt:\n${input.prompt}`,
-      `Plan:\n${input.plan.steps.map((step, index) => `${index + 1}. ${step}`).join('\n')}`,
-      input.previousValidationError ? `Previous validation error:\n${input.previousValidationError}` : '',
-      input.previousReviewBlockers?.length ? `Previous review blockers:\n${input.previousReviewBlockers.join('\n')}` : '',
-      input.previousSafeImprovements?.length ? `Safe improvements to apply:\n${input.previousSafeImprovements.join('\n')}` : ''
-    ]
-      .filter(Boolean)
-      .join('\n\n');
+    const providerPrompt = buildCodexImplementationPrompt(input);
     const beforeSnapshot = await collectChangedFileSnapshot(input.repositoryPath);
     let content: string;
     let recoveredFromTimeout = false;
@@ -960,6 +954,28 @@ async function collectDiffStat(
 
 function stripAnsi(value: string): string {
   return value.replace(/\u001b\[[0-9;]*m/g, '').replace(/\r/g, '');
+}
+
+export function buildCodexImplementationPrompt(input: ImplementInput): string {
+  return [
+    'Implement this task directly in the repository workspace.',
+    'Do not create commits, branches, issues, or pull requests. ForgeMind handles those steps.',
+    'Do not run broad test suites, full builds, type checks, dependency installation, database validation, or repository-wide formatting. ForgeMind runs authoritative validation after implementation.',
+    'Run a narrowly targeted check only when it is required to make the edit correctly.',
+    input.attemptNumber && input.attemptNumber > 1
+      ? 'This is a correction pass. Preserve completed work and change only what is required by the supplied validation error or review blocker.'
+      : '',
+    'When finished, return only JSON matching the provided schema.',
+    `Task id: ${input.taskId}`,
+    `Attempt: ${input.attemptNumber ?? 1}`,
+    `Task scope:\n${input.prompt}`,
+    `Plan:\n${input.plan.steps.map((step, index) => `${index + 1}. ${step}`).join('\n')}`,
+    input.previousValidationError ? `Previous validation error:\n${input.previousValidationError}` : '',
+    input.previousReviewBlockers?.length ? `Previous review blockers:\n${input.previousReviewBlockers.join('\n')}` : '',
+    input.previousSafeImprovements?.length ? `Safe improvements to apply:\n${input.previousSafeImprovements.join('\n')}` : ''
+  ]
+    .filter(Boolean)
+    .join('\n\n');
 }
 
 export function parseCodexCliTotalTokens(stderr: string): number | undefined {

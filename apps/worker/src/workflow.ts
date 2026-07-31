@@ -96,6 +96,7 @@ export interface WorkerTaskResult {
 export async function runWorkerTask(input: WorkerTaskInput): Promise<WorkerTaskResult> {
   const config = resolveWorkerConfig(input.project, input);
   const provider = input.provider ?? createProvider(config.providerKind);
+  const executionPrompt = compactTaskExecutionPrompt(input.task.prompt);
   const github = input.github;
   if ((config.createIssue || config.createBranch || config.createPullRequest || config.autoPush) && !github) {
     throw new Error('GitHub adapter is required for the configured workflow.');
@@ -112,7 +113,7 @@ export async function runWorkerTask(input: WorkerTaskInput): Promise<WorkerTaskR
   });
   await mkdir(workspacePath, { recursive: true });
 
-  const usageSummary = input.usageSummary ?? formatUsageSummary(await provider.estimateCost({ prompt: input.task.prompt, repositorySizeHint: 'small' }));
+  const usageSummary = input.usageSummary ?? formatUsageSummary(await provider.estimateCost({ prompt: executionPrompt, repositorySizeHint: 'small' }));
 
   const existingIssue = resolveExistingTaskIssue(input.task);
   let issue = existingIssue ?? { issueNumber: 0, issueUrl: '' };
@@ -180,13 +181,13 @@ export async function runWorkerTask(input: WorkerTaskInput): Promise<WorkerTaskR
         });
         await input.hooks?.onIterationStarted?.({
           phase: 'planning',
-          prompt: input.task.prompt,
+          prompt: executionPrompt,
           attempt: 0
         });
         const result = await provider.plan({
           taskId: input.task.id,
           title: input.task.title,
-          prompt: input.task.prompt,
+          prompt: executionPrompt,
           repositoryPath: workspacePath,
           onActivity: (activity) => input.hooks?.onProviderActivity?.({ phase: 'planning', attempt: 0, ...activity })
         });
@@ -209,7 +210,7 @@ export async function runWorkerTask(input: WorkerTaskInput): Promise<WorkerTaskR
   if (!input.resume) {
     await input.hooks?.onIteration?.({
       phase: 'planning',
-      prompt: input.task.prompt,
+      prompt: executionPrompt,
       resultSummary: plan.summary,
       providerPrompt: plan.providerPrompt,
       providerResponse: plan.providerResponse,
@@ -267,6 +268,10 @@ export async function runWorkerTask(input: WorkerTaskInput): Promise<WorkerTaskR
 
   for (let attempt = 1; attempt <= input.task.maxIterations; attempt += 1) {
     completedAttempts = attempt;
+    const previousReviewForCorrection = review?.blockers.length ? review : undefined;
+    const beforeCorrectionSnapshot = previousReviewForCorrection
+      ? await collectChangedPathSnapshot(git, workspacePath)
+      : new Map<string, string>();
     const implementationStartedAt = Date.now();
     await emitTaskActivity(input.hooks, {
       phase: 'implementation',
@@ -278,14 +283,14 @@ export async function runWorkerTask(input: WorkerTaskInput): Promise<WorkerTaskR
     });
     await input.hooks?.onIterationStarted?.({
       phase: 'implementation',
-      prompt: input.task.prompt,
+      prompt: executionPrompt,
       attempt
     });
     const isResumedImplementation = Boolean(resumedImplementation);
     implementation = resumedImplementation
       ?? await provider.implement({
         taskId: input.task.id,
-        prompt: input.task.prompt,
+        prompt: executionPrompt,
         plan,
         repositoryPath: workspacePath,
         attemptNumber: attempt,
@@ -336,6 +341,9 @@ export async function runWorkerTask(input: WorkerTaskInput): Promise<WorkerTaskR
     const implementationStatus = await git.status();
     const implementationChangedFiles = collectStageablePaths(implementationStatus);
     const substantiveChangedFiles = implementationChangedFiles.filter(isSubstantiveImplementationPath);
+    const correctionChangedFiles = previousReviewForCorrection
+      ? await collectSnapshotChanges(beforeCorrectionSnapshot, implementationStatus, workspacePath)
+      : [];
     const actualDiffStat = await collectWorkspaceDiffStat(git, workspacePath, implementationStatus);
     implementation = {
       ...implementation,
@@ -375,7 +383,7 @@ export async function runWorkerTask(input: WorkerTaskInput): Promise<WorkerTaskR
     if (!isResumedImplementation) {
       await input.hooks?.onIteration?.({
         phase: 'implementation',
-        prompt: input.task.prompt,
+        prompt: executionPrompt,
         resultSummary: implementation.summary,
         providerPrompt: implementation.providerPrompt,
         providerResponse: implementation.providerResponse,
@@ -434,12 +442,14 @@ export async function runWorkerTask(input: WorkerTaskInput): Promise<WorkerTaskR
       continue;
     }
 
-    await input.hooks?.onStatus?.('validating', { attempt });
-    await input.hooks?.onIterationStarted?.({
-      phase: 'validation',
-      prompt: summarizeValidationChecks(validationChecks),
-      attempt
-    });
+    let validationPlanRevisionCount = 0;
+    while (true) {
+      await input.hooks?.onStatus?.('validating', { attempt });
+      await input.hooks?.onIterationStarted?.({
+        phase: 'validation',
+        prompt: summarizeValidationChecks(validationChecks),
+        attempt
+      });
       validation = await runValidationChecks(validationChecks, workspacePath, async (activity) => {
         const checkLabel = `${activity.checkIndex}/${activity.checkCount}`;
         if (activity.state === 'started') {
@@ -477,20 +487,121 @@ export async function runWorkerTask(input: WorkerTaskInput): Promise<WorkerTaskR
           exitCode: activity.exitCode
         });
       });
-    await input.hooks?.onIteration?.({
-      phase: 'validation',
-      prompt: validation.command,
-      resultSummary: validation.passed ? 'Validation passed.' : 'Validation failed.',
-      diffStat: implementation.diffStat,
-      validationResult: {
-        command: validation.command,
-        exitCode: validation.exitCode,
-        stdout: validation.stdout,
-        stderr: validation.stderr,
-        passed: validation.passed,
-        attempt
+      await input.hooks?.onIteration?.({
+        phase: 'validation',
+        prompt: validation.command,
+        resultSummary: validation.passed ? 'Validation passed.' : 'Validation failed.',
+        diffStat: implementation.diffStat,
+        validationResult: {
+          command: validation.command,
+          exitCode: validation.exitCode,
+          stdout: validation.stdout,
+          stderr: validation.stderr,
+          passed: validation.passed,
+          attempt,
+          validationPlanRevision: validationPlanRevisionCount
+        }
+      });
+
+      if (
+        validation.passed
+        || config.verifyCommand?.trim()
+        || !isValidationCommandDefinitionFailure(validation)
+        || validationPlanRevisionCount >= 2
+      ) {
+        break;
       }
-    });
+
+      validationPlanRevisionCount += 1;
+      const replanningStartedAt = Date.now();
+      await emitTaskActivity(input.hooks, {
+        phase: 'planning',
+        state: 'started',
+        title: 'AI opravuje validační příkazy',
+        operation: 'provider_plan',
+        attempt
+      });
+      await input.hooks?.onIterationStarted?.({
+        phase: 'planning',
+        prompt: buildValidationRevisionContext(plan),
+        attempt
+      });
+      const revisedValidationPlan = await provider.plan({
+        taskId: input.task.id,
+        title: input.task.title,
+        prompt: buildValidationRevisionContext(plan),
+        repositoryPath: workspacePath,
+        previousValidationError: validation.stderr || validation.stdout || `Exit code ${validation.exitCode}`,
+        previousValidationChecks: validationChecks,
+        onActivity: (activity) => input.hooks?.onProviderActivity?.({ phase: 'planning', attempt, ...activity })
+      });
+      await emitTaskActivity(input.hooks, {
+        phase: 'planning',
+        state: 'completed',
+        title: 'Validační příkazy jsou opravené',
+        detail: revisedValidationPlan.summary,
+        operation: 'provider_plan',
+        attempt,
+        elapsedMs: Date.now() - replanningStartedAt
+      });
+      validationChecks = await resolveValidationChecks({
+        plan: revisedValidationPlan,
+        explicitVerifyCommand: config.verifyCommand,
+        workspacePath
+      });
+      await input.hooks?.onIteration?.({
+        phase: 'planning',
+        prompt: buildValidationRevisionContext(plan),
+        resultSummary: revisedValidationPlan.summary,
+        providerPrompt: revisedValidationPlan.providerPrompt,
+        providerResponse: revisedValidationPlan.providerResponse,
+        diffStat: implementation.diffStat,
+        validationResult: {
+          passed: true,
+          validationChecks,
+          revisedValidationChecksOnly: true,
+          attempt,
+          validationPlanRevision: validationPlanRevisionCount
+        }
+      });
+
+      const revisedVerifyCommandApprovals = filterApprovedApprovals(
+        evaluateRuntimeApprovals(
+          computeVerifyCommandApprovals(validationChecks, config.sandbox),
+          config.mode,
+          config.approvalRequiredFor,
+          config.allowSafeOperationsWithoutApproval
+        ),
+        approvedApprovals
+      );
+      if (revisedVerifyCommandApprovals.length > 0) {
+        return {
+          taskId: input.task.id,
+          status: 'needs_approval',
+          issueUrl: issue.issueUrl,
+          branchName,
+          workspacePath,
+          validation,
+          summary: `Revised verification command is blocked by sandbox policy: ${summarizeValidationChecks(validationChecks)}`,
+          approvals: revisedVerifyCommandApprovals,
+          completedAt: nowIso()
+        };
+      }
+    }
+
+    if (!validation.passed && isValidationCommandDefinitionFailure(validation)) {
+      return {
+        taskId: input.task.id,
+        status: 'validation_failed',
+        issueUrl: issue.issueUrl,
+        branchName,
+        workspacePath,
+        validation,
+        summary: `Validation command could not be executed after ${validationPlanRevisionCount} revision(s).`,
+        approvals: [],
+        completedAt: nowIso()
+      };
+    }
 
     if (validation.passed) {
       if (input.resume?.kind === 'approved_review') {
@@ -520,13 +631,18 @@ export async function runWorkerTask(input: WorkerTaskInput): Promise<WorkerTaskR
       });
       let providerReview;
       try {
-        const reviewDiff = await collectReviewDiff(git, workspacePath);
+        const reviewChangedFiles = previousReviewForCorrection
+          ? correctionChangedFiles
+          : implementation.changedFiles;
+        const reviewDiff = await collectReviewDiff(git, workspacePath, reviewChangedFiles);
         const reviewPromise = provider.review({
             taskId: input.task.id,
             taskTitle: input.task.title,
             repositoryPath: workspacePath,
-            changedFiles: implementation.changedFiles,
+            changedFiles: reviewChangedFiles,
             acceptanceCriteria: plan.acceptanceCriteria,
+            previousReviewSummary: previousReviewForCorrection?.summary,
+            previousReviewBlockers: previousReviewForCorrection?.blockers,
             validation,
             diff: reviewDiff,
             onActivity: (activity) => input.hooks?.onProviderActivity?.({ phase: 'review', attempt, ...activity })
@@ -638,42 +754,6 @@ export async function runWorkerTask(input: WorkerTaskInput): Promise<WorkerTaskR
         approvals: [],
         completedAt: nowIso()
       };
-    }
-
-    if (!config.verifyCommand?.trim()) {
-      await input.hooks?.onIterationStarted?.({
-        phase: 'planning',
-        prompt: input.task.prompt,
-        attempt: attempt + 1
-      });
-      plan = await provider.plan({
-        taskId: input.task.id,
-        title: input.task.title,
-        prompt: input.task.prompt,
-        repositoryPath: workspacePath,
-        previousValidationError: validation.stderr || validation.stdout || `Exit code ${validation.exitCode}`,
-        previousValidationChecks: validationChecks,
-        onActivity: (activity) => input.hooks?.onProviderActivity?.({ phase: 'planning', attempt: attempt + 1, ...activity })
-      });
-      validationChecks = await resolveValidationChecks({
-        plan,
-        explicitVerifyCommand: config.verifyCommand,
-        workspacePath
-      });
-      await input.hooks?.onIteration?.({
-        phase: 'planning',
-        prompt: input.task.prompt,
-        resultSummary: plan.summary,
-        providerPrompt: plan.providerPrompt,
-        providerResponse: plan.providerResponse,
-        diffStat: implementation.diffStat,
-        validationResult: {
-          passed: true,
-          validationChecks,
-          replannedAfterValidationError: true,
-          attempt: attempt + 1
-        }
-      });
     }
 
     retryReasons.push(`Validation retry before attempt ${attempt + 1}: ${validation.stderr || validation.stdout || `Exit code ${validation.exitCode}`}`);
@@ -824,6 +904,48 @@ function createResumePlan(resume: WorkerTaskResume): PlanResult {
   };
 }
 
+export function compactTaskExecutionPrompt(prompt: string): string {
+  const normalized = prompt.trim();
+  const currentStepMarker = 'Current implementation step:';
+  const markerIndex = normalized.lastIndexOf(currentStepMarker);
+
+  if (markerIndex < 0) {
+    return normalized;
+  }
+
+  return normalized.slice(markerIndex).trim();
+}
+
+function buildValidationRevisionContext(plan: PlanResult): string {
+  return [
+    'Revise validation checks only. Do not create or repeat an implementation plan.',
+    'Inspect repository scripts only as needed to replace invalid commands.',
+    'Executable checks must verify a criterion through their exit code. Represent git diff/status/log inspection as a manual check.',
+    'Do not use shell redirection or fallback command chains in validation commands.',
+    'Do not modify repository files.',
+    'Acceptance criteria:',
+    ...(plan.acceptanceCriteria.length > 0
+      ? plan.acceptanceCriteria.map((criterion) => `- ${criterion}`)
+      : ['- Use the existing task acceptance criteria.'])
+  ].join('\n');
+}
+
+export function isValidationCommandDefinitionFailure(validation: ValidationResult): boolean {
+  const output = `${validation.stderr}\n${validation.stdout}`;
+  return [
+    /validation command is not allowed/i,
+    /missing script:/i,
+    /unknown command/i,
+    /command not found/i,
+    /is not recognized as (?:the name of a cmdlet|an internal or external command)/i,
+    /unexpected argument .* found/i,
+    /(?:unknown|unrecognized|invalid) (?:option|argument|flag)/i,
+    /no such file or directory/i,
+    /cannot find (?:module|package).*requested by the validation command/i,
+    /unexpected eof while looking for matching/i
+  ].some((pattern) => pattern.test(output));
+}
+
 async function resolveValidationChecks(input: {
   plan: PlanResult;
   explicitVerifyCommand?: string;
@@ -840,8 +962,7 @@ async function resolveValidationChecks(input: {
   }
 
   const plannedChecks = normalizeValidationChecks(input.plan.validationChecks);
-  const commandChecks = plannedChecks.filter((check): check is Extract<ValidationCheck, { kind: 'command' }> => check.kind === 'command');
-  if (commandChecks.length > 0) {
+  if (plannedChecks.length > 0) {
     return plannedChecks;
   }
 
@@ -865,7 +986,7 @@ async function resolveValidationChecks(input: {
   ];
 }
 
-function normalizeValidationChecks(value: unknown): ValidationCheck[] {
+export function normalizeValidationChecks(value: unknown): ValidationCheck[] {
   if (!Array.isArray(value)) {
     return [];
   }
@@ -877,9 +998,21 @@ function normalizeValidationChecks(value: unknown): ValidationCheck[] {
     }
 
     if (item.kind === 'command' && typeof item.command === 'string' && item.command.trim()) {
+      const command = item.command.trim();
+      if (isInspectionOnlyValidationCommand(command)) {
+        checks.push({
+          kind: 'manual',
+          instructions: `Review repository changes requested by: ${command}`,
+          criterion: typeof item.criterion === 'string' && item.criterion.trim() ? item.criterion.trim() : undefined,
+          rationale: typeof item.rationale === 'string' && item.rationale.trim()
+            ? item.rationale.trim()
+            : 'Repository inspection belongs to the review phase and is not an executable pass/fail check.'
+        });
+        continue;
+      }
       checks.push({
         kind: 'command',
-        command: item.command.trim(),
+        command,
         criterion: typeof item.criterion === 'string' && item.criterion.trim() ? item.criterion.trim() : undefined,
         rationale: typeof item.rationale === 'string' && item.rationale.trim() ? item.rationale.trim() : undefined
       });
@@ -897,6 +1030,17 @@ function normalizeValidationChecks(value: unknown): ValidationCheck[] {
   }
 
   return checks;
+}
+
+export function isInspectionOnlyValidationCommand(command: string): boolean {
+  const normalized = command.trim();
+  if (/^git\s+(?:status|log|show)\b/i.test(normalized)) {
+    return true;
+  }
+
+  return /^git\s+diff\b/i.test(normalized)
+    && !/--(?:exit-code|quiet)\b/i.test(normalized)
+    && !/\|\s*(?:grep|findstr|select-string)\b/i.test(normalized);
 }
 
 function summarizeValidationChecks(checks: ValidationCheck[]): string {
@@ -1513,14 +1657,32 @@ async function collectWorkspaceDiffStat(
   };
 }
 
-const MAX_REVIEW_DIFF_CHARS = 180_000;
+const MAX_REVIEW_DIFF_CHARS = 120_000;
 
-async function collectReviewDiff(git: SimpleGit, workspacePath: string): Promise<string> {
+async function collectReviewDiff(
+  git: SimpleGit,
+  workspacePath: string,
+  requestedPaths?: string[]
+): Promise<string> {
   const status = await git.status();
-  const changedPaths = collectStageablePaths(status).filter(isSubstantiveImplementationPath);
+  const requestedPathSet = requestedPaths
+    ? new Set(requestedPaths.map(normalizeRepoPath))
+    : undefined;
+  const changedPaths = collectStageablePaths(status)
+    .filter(isSubstantiveImplementationPath)
+    .filter((path) => !requestedPathSet || requestedPathSet.has(normalizeRepoPath(path)));
+  const summaryOnlyPaths = changedPaths.filter(isReviewSummaryOnlyPath);
+  const reviewPaths = changedPaths.filter((path) => !isReviewSummaryOnlyPath(path));
   const untrackedPaths = new Set(status.not_added.map(normalizeRepoPath));
-  const trackedPaths = changedPaths.filter((path) => !untrackedPaths.has(normalizeRepoPath(path)));
+  const trackedPaths = reviewPaths.filter((path) => !untrackedPaths.has(normalizeRepoPath(path)));
   const sections: string[] = [];
+
+  if (summaryOnlyPaths.length > 0) {
+    sections.push([
+      '[Generated dependency metadata omitted from detailed review; authoritative validation covers consistency.]',
+      ...summaryOnlyPaths.map((path) => `- ${path}`)
+    ].join('\n'));
+  }
 
   if (trackedPaths.length > 0) {
     try {
@@ -1533,7 +1695,7 @@ async function collectReviewDiff(git: SimpleGit, workspacePath: string): Promise
     }
   }
 
-  for (const path of changedPaths) {
+  for (const path of reviewPaths) {
     if (!untrackedPaths.has(normalizeRepoPath(path))) {
       continue;
     }
@@ -1542,6 +1704,49 @@ async function collectReviewDiff(git: SimpleGit, workspacePath: string): Promise
   }
 
   return truncateReviewDiff(sections.filter(Boolean).join('\n'));
+}
+
+async function collectChangedPathSnapshot(
+  git: SimpleGit,
+  workspacePath: string
+): Promise<Map<string, string>> {
+  return collectChangedPathSnapshotFromStatus(await git.status(), workspacePath);
+}
+
+async function collectChangedPathSnapshotFromStatus(
+  status: StatusResult,
+  workspacePath: string
+): Promise<Map<string, string>> {
+  const snapshot = new Map<string, string>();
+  for (const path of collectStageablePaths(status).filter(isSubstantiveImplementationPath)) {
+    const normalized = normalizeRepoPath(path);
+    try {
+      snapshot.set(normalized, (await readFile(join(workspacePath, path))).toString('base64'));
+    } catch {
+      snapshot.set(normalized, '[missing]');
+    }
+  }
+  return snapshot;
+}
+
+async function collectSnapshotChanges(
+  before: Map<string, string>,
+  afterStatus: StatusResult,
+  workspacePath: string
+): Promise<string[]> {
+  const after = await collectChangedPathSnapshotFromStatus(afterStatus, workspacePath);
+  return [...new Set([...before.keys(), ...after.keys()])]
+    .filter((path) => before.get(path) !== after.get(path));
+}
+
+export function isReviewSummaryOnlyPath(path: string): boolean {
+  const normalized = normalizeRepoPath(path);
+  return normalized === 'package-lock.json'
+    || normalized === 'npm-shrinkwrap.json'
+    || normalized === 'pnpm-lock.yaml'
+    || normalized === 'yarn.lock'
+    || normalized === 'bun.lock'
+    || normalized === 'bun.lockb';
 }
 
 async function renderUntrackedFileDiff(workspacePath: string, path: string): Promise<string> {

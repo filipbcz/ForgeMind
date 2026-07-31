@@ -109,6 +109,16 @@ const terminalStatuses = new Set<TaskSummary['status']>([
   'validation_failed'
 ]);
 
+const errorStatuses = new Set<TaskSummary['status']>([
+  'failed',
+  'budget_exceeded',
+  'iteration_limit_reached',
+  'repeated_error_detected',
+  'approval_rejected',
+  'provider_failed',
+  'validation_failed'
+]);
+
 const activeStatuses = new Set<TaskSummary['status']>([
   'submitted',
   'planning',
@@ -1355,7 +1365,7 @@ function TaskDetail(props: {
   const canCancel = !terminalStatuses.has(props.task.status) && props.task.status !== 'ready_for_user_review';
   const canComplete = props.task.status === 'ready_for_user_review';
   const latestRun = props.usage?.runs.at(-1);
-  const latestError = resolveLatestTaskError(props.logs, latestRun);
+  const latestError = resolveLatestTaskError(props.task.status, props.logs, latestRun);
   const queueLabel = formatQueueLabel(props.task, props.queue);
   const workflowItems = buildTaskWorkflow(props.task, props.logs);
 
@@ -1499,6 +1509,11 @@ interface TaskWorkflowItem {
   state: WorkflowStepState;
 }
 
+interface WorkflowStageTiming {
+  elapsedMs: number;
+  attemptCount: number;
+}
+
 function buildTaskWorkflow(task: TaskSummary, logs: AuditEventApi[]): TaskWorkflowItem[] {
   const stages = [
     { id: 'prepare', label: 'Příprava', detail: 'Zařazení tasku a vytvoření plánu', icon: LayoutList },
@@ -1540,9 +1555,13 @@ function buildTaskWorkflow(task: TaskSummary, logs: AuditEventApi[]): TaskWorkfl
     if (task.status === 'completed') state = 'completed';
     if (failed && index === currentStage) state = 'failed';
     if (task.status === 'cancelled' && index === currentStage) state = 'failed';
-    const latestStageActivity = [...activities].reverse().find((activity) => activityWorkflowStage(activity) === index);
+    const stageActivities = activities.filter((activity) => activityWorkflowStage(activity) === index);
+    const latestStageActivity = [...stageActivities].reverse().find((activity) => (
+      (activity.state === 'completed' || activity.state === 'failed') && activity.elapsedMs > 0
+    )) ?? stageActivities.at(-1);
+    const stageTiming = summarizeWorkflowStageTiming(activities, index);
     const activityDetail = latestStageActivity
-      ? `${latestStageActivity.title}${latestStageActivity.elapsedMs > 0 ? ` · ${formatElapsedTime(latestStageActivity.elapsedMs)}` : ''}`
+      ? formatWorkflowStageDetail(latestStageActivity, stageTiming, index)
       : undefined;
 
     return {
@@ -1551,6 +1570,55 @@ function buildTaskWorkflow(task: TaskSummary, logs: AuditEventApi[]): TaskWorkfl
       detail: activityDetail ?? (index === currentStage ? statusLabels[task.status] : stage.detail)
     };
   });
+}
+
+function summarizeWorkflowStageTiming(
+  activities: TaskActivityEntry[],
+  stageIndex: number
+): WorkflowStageTiming {
+  const stageActivities = activities.filter((activity) => activityWorkflowStage(activity) === stageIndex);
+  const completedActivities = stageActivities.filter((activity) => (
+    activity.kind === 'activity'
+    && (activity.state === 'completed' || activity.state === 'failed')
+    && activity.elapsedMs > 0
+  ));
+  const recordedProviderAttempts = new Set(
+    completedActivities
+      .filter((activity) => activity.operation?.startsWith('provider_'))
+      .map((activity) => `${activity.phase}:${activity.attempt}`)
+  );
+  const providerFallbacks = stageActivities.filter((activity) => (
+    activity.kind === 'lifecycle'
+    && (activity.state === 'completed' || activity.state === 'failed')
+    && activity.elapsedMs > 0
+    && !recordedProviderAttempts.has(`${activity.phase}:${activity.attempt}`)
+  ));
+  const attempts = new Set(
+    [...completedActivities, ...providerFallbacks]
+      .filter((activity) => activity.attempt > 0 || activity.phase === 'planning')
+      .map((activity) => `${activity.phase}:${activity.attempt}`)
+  );
+
+  return {
+    elapsedMs: [...completedActivities, ...providerFallbacks]
+      .reduce((total, activity) => total + activity.elapsedMs, 0),
+    attemptCount: attempts.size
+  };
+}
+
+function formatWorkflowStageDetail(
+  latestActivity: TaskActivityEntry,
+  timing: WorkflowStageTiming,
+  stageIndex: number
+): string {
+  if (timing.elapsedMs <= 0) {
+    return latestActivity.title;
+  }
+
+  const attempts = stageIndex >= 2 && stageIndex <= 4 && timing.attemptCount > 1
+    ? ` · ${timing.attemptCount} průchody`
+    : '';
+  return `${latestActivity.title} · celkem ${formatElapsedTime(timing.elapsedMs)}${attempts}`;
 }
 
 function activityWorkflowStage(activity: TaskActivityEntry): number {
@@ -1599,7 +1667,15 @@ function formatRunTitle(run: TaskRunApi): string {
   return `${run.provider}/${run.model} | ${run.status} | iterace ${run.iterationCount}`;
 }
 
-function resolveLatestTaskError(logs: AuditEventApi[], latestRun: TaskRunApi | undefined): string | undefined {
+function resolveLatestTaskError(
+  taskStatus: TaskSummary['status'],
+  logs: AuditEventApi[],
+  latestRun: TaskRunApi | undefined
+): string | undefined {
+  if (!errorStatuses.has(taskStatus)) {
+    return undefined;
+  }
+
   if (latestRun?.errorMessage?.trim()) {
     return latestRun.errorMessage.trim();
   }

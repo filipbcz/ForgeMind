@@ -97,12 +97,14 @@ export class OpenAIProvider implements AIProvider {
     const messages: Array<{ role: 'system' | 'user' | 'assistant'; content: string }> = [
       {
         role: 'system',
-        content:
-          'You are an AI project planner. Provide a JSON object with summary, steps, acceptanceCriteria, validationChecks, and implementationSteps. ' +
-          'For ordinary task plans, implementationSteps must be an empty array. When the request asks for a project roadmap, it must contain objects with title, description, acceptanceCriteria, inScope, and outOfScope. ' +
-          'validationChecks must be an array of executable checks or manual checks. ' +
-          'Use { "kind": "command", "command": "...", "criterion": "...", "rationale": "..." } for commands and ' +
-          '{ "kind": "manual", "instructions": "...", "criterion": "...", "rationale": "..." } for non-executable criteria. Respond only with JSON.'
+        content: input.previousValidationError
+          ? 'Revise validation checks only. Return JSON with a short summary, empty steps and implementationSteps arrays, the supplied acceptanceCriteria, and corrected validationChecks. Do not propose or repeat implementation work. Respond only with JSON.'
+          : 'You are an AI project planner. Provide a JSON object with summary, steps, acceptanceCriteria, validationChecks, and implementationSteps. ' +
+            'For ordinary task plans, implementationSteps must be an empty array. When the request asks for a project roadmap, it must contain objects with title, description, acceptanceCriteria, inScope, and outOfScope. ' +
+            'validationChecks must be an array of executable checks or manual checks. ' +
+            'Commands must verify a criterion through their exit code and must not use shell redirection or fallback chains. Use manual checks for git diff/status/log inspection. ' +
+            'Use { "kind": "command", "command": "...", "criterion": "...", "rationale": "..." } for commands and ' +
+            '{ "kind": "manual", "instructions": "...", "criterion": "...", "rationale": "..." } for non-executable criteria. Respond only with JSON.'
       },
       {
         role: 'user',
@@ -140,7 +142,7 @@ export class OpenAIProvider implements AIProvider {
     const messages: Array<{ role: 'system' | 'user' | 'assistant'; content: string }> = [
       {
         role: 'system',
-        content: 'You are an AI implementation assistant. Provide a JSON object with summary, changedFiles, diffStat, requestedApprovals, and optional fileUpdates [{ path, content }]. Respond only with JSON.'
+        content: 'You are an AI implementation assistant. Make only the repository changes required by the supplied task and correction context. Do not perform broad validation that ForgeMind will run after implementation. Provide a JSON object with summary, changedFiles, diffStat, requestedApprovals, and optional fileUpdates [{ path, content }]. Respond only with JSON.'
       },
       {
         role: 'user',
@@ -149,6 +151,7 @@ export class OpenAIProvider implements AIProvider {
           `Attempt: ${input.attemptNumber ?? 1}`,
           `Prompt: ${input.prompt}`,
           `Plan: ${input.plan.steps.join(' | ')}`,
+          input.attemptNumber && input.attemptNumber > 1 ? 'Preserve completed work and apply only the supplied correction.' : '',
           input.previousValidationError ? `Previous validation error: ${input.previousValidationError}` : '',
           input.previousReviewBlockers?.length ? `Previous review blockers: ${input.previousReviewBlockers.join(' | ')}` : '',
           input.previousSafeImprovements?.length ? `Apply these safe improvements automatically: ${input.previousSafeImprovements.join(' | ')}` : ''

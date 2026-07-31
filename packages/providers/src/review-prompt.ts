@@ -27,6 +27,16 @@ export function buildReviewPrompt(input: ReviewInput): string {
     '',
     'Acceptance criteria:',
     renderList(input.acceptanceCriteria, 'No explicit acceptance criteria were provided.'),
+    ...(input.previousReviewBlockers?.length
+      ? [
+          '',
+          'Previous review:',
+          input.previousReviewSummary ?? '(no summary)',
+          'Previously reported blockers:',
+          renderList(input.previousReviewBlockers, '(none)'),
+          'This packet contains only files changed by the correction pass. Treat unchanged files as already reviewed and verify that the listed blockers are resolved without new defects.'
+        ]
+      : []),
     '',
     'Authoritative validation result:',
     `Passed: ${input.validation.passed}`,
