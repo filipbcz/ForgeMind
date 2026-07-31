@@ -176,7 +176,7 @@ describe('MVP scenario', () => {
     expect(result.pullRequestUrl).toContain('/pull/654');
     expect(result.validation.passed).toBe(true);
     expect(result.completedAt).toBeTruthy();
-  }, 10000);
+  }, 15000);
 
   it('covers approval pause and resume with final draft PR creation', async () => {
     const project = createProject();

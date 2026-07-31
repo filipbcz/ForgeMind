@@ -221,12 +221,7 @@ describe('db-worker policy enforcement', () => {
     expect(result).toEqual(expect.objectContaining({ claimed: true, taskId: 'task_1' }));
     expect(createProviderMock).toHaveBeenCalledWith('openai');
     expect(createProviderMock).toHaveBeenCalledWith('codex');
-    expect(repositoryMock.recordProviderUsage).toHaveBeenCalledWith(
-      expect.objectContaining({
-        provider: 'codex',
-        model: 'codex'
-      })
-    );
+    expect(repositoryMock.recordProviderUsage).not.toHaveBeenCalled();
 
     if (previousProvider === undefined) {
       delete process.env.FORGEMIND_PROVIDER;
@@ -238,6 +233,58 @@ describe('db-worker policy enforcement', () => {
     } else {
       process.env.FORGEMIND_FALLBACK_PROVIDER = previousFallback;
     }
+  });
+
+  it('persists actual provider usage per phase and finishes the run with measured totals', async () => {
+    runWorkerTaskMock.mockImplementationOnce(async (input: {
+      hooks?: {
+        onProviderActivity?: (activity: Record<string, unknown>) => Promise<void>;
+      };
+    }) => {
+      await input.hooks?.onProviderActivity?.({
+        phase: 'review',
+        attempt: 2,
+        kind: 'lifecycle',
+        message: 'Provider usage captured.',
+        elapsedMs: 0,
+        usage: {
+          provider: 'codex',
+          model: 'gpt-5.5',
+          totalTokens: 124947,
+          source: 'actual_total'
+        }
+      });
+
+      return {
+        taskId: 'task_1',
+        status: 'ready_for_user_review',
+        issueUrl: '',
+        branchName: 'ai/task',
+        workspacePath: 'C:/tmp/worker',
+        validation: { command: 'npm test', exitCode: 0, stdout: '', stderr: '', passed: true },
+        summary: 'done',
+        approvals: [],
+        completedAt: new Date().toISOString()
+      };
+    });
+
+    const { runDatabaseWorkerOnce } = await import('./db-worker.js');
+    await runDatabaseWorkerOnce();
+
+    expect(repositoryMock.recordProviderUsage).toHaveBeenCalledWith(expect.objectContaining({
+      provider: 'codex',
+      model: 'gpt-5.5',
+      phase: 'review',
+      attempt: 2,
+      totalTokens: 124947,
+      usageSource: 'actual_total',
+      estimatedCostUsd: 0
+    }));
+    expect(repositoryMock.finishTaskRun).toHaveBeenCalledWith(expect.objectContaining({
+      totalTokens: 124947,
+      usageSource: 'actual_total',
+      actualCostUsd: null
+    }));
   });
 
   it('maps requested approvals to needs_approval policy path', async () => {

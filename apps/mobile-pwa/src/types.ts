@@ -149,7 +149,10 @@ export interface TaskUsageApi {
   inputTokens: number;
   outputTokens: number;
   cachedTokens: number;
+  totalTokens: number;
+  usageSource: 'actual_total' | 'actual_breakdown' | 'estimated' | 'mixed' | 'unavailable';
   estimatedCostUsd: number;
+  actualCostUsd: number | null;
   runs: Array<{
     id: string;
     provider: string;
@@ -158,7 +161,10 @@ export interface TaskUsageApi {
     iterationCount: number;
     inputTokens: number;
     outputTokens: number;
+    totalTokens: number;
+    usageSource: string;
     estimatedCostUsd: number;
+    actualCostUsd: number | null;
     startedAt?: string;
     finishedAt?: string;
     summary?: string | null;
@@ -168,10 +174,15 @@ export interface TaskUsageApi {
     id: string;
     provider: string;
     model: string;
+    phase?: string | null;
+    attempt?: number | null;
     inputTokens: number;
     outputTokens: number;
     cachedTokens: number;
+    totalTokens: number;
+    usageSource: string;
     estimatedCostUsd: number;
+    actualCostUsd: number | null;
     createdAt: string;
   }>;
 }

@@ -33,6 +33,37 @@ describe('OpenAI provider', () => {
     expect(result.steps).toEqual(['one']);
   });
 
+  it('emits the actual token breakdown returned by the API', async () => {
+    process.env.OPENAI_API_KEY = 'test-key';
+    const onActivity = vi.fn();
+    vi.mocked(fetch).mockResolvedValueOnce({
+      ok: true,
+      json: async () => ({
+        choices: [{ message: { content: JSON.stringify({ summary: 'ok', steps: [], acceptanceCriteria: [] }) } }],
+        usage: {
+          prompt_tokens: 120,
+          completion_tokens: 30,
+          total_tokens: 150,
+          prompt_tokens_details: { cached_tokens: 40 }
+        }
+      })
+    } as Response);
+
+    const openai = new OpenAIProvider();
+    await openai.plan({ taskId: 'usage', title: 'Usage', prompt: 'Measure usage', onActivity });
+
+    expect(onActivity).toHaveBeenCalledWith(expect.objectContaining({
+      usage: expect.objectContaining({
+        provider: 'openai',
+        totalTokens: 150,
+        inputTokens: 120,
+        outputTokens: 30,
+        cachedTokens: 40,
+        source: 'actual_breakdown'
+      })
+    }));
+  });
+
   it('should preserve concrete file updates returned by the implementation response', async () => {
     process.env.OPENAI_API_KEY = 'test-key';
     const fetchMock = vi.mocked(fetch);

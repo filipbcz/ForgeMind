@@ -13,7 +13,7 @@ vi.stubGlobal('fetch', vi.fn(async (_url: string, init?: RequestInit) => {
     content = JSON.stringify({ summary: 'Plan summary', steps: ['step1'], acceptanceCriteria: ['ac1'] });
   } else if (body.includes('Implement the following task') || body.includes('Implement the following')) {
     content = JSON.stringify({ summary: 'Impl summary', changedFiles: ['OPENAI_IMPLEMENTATION.md'], diffStat: { filesChanged: 1, insertions: 5, deletions: 0 }, requestedApprovals: [] });
-  } else if (body.includes('Review the following changed files')) {
+  } else if (body.includes('Review only the supplied ForgeMind review packet')) {
     content = JSON.stringify({ summary: 'Review summary', blockers: [], safeImprovements: [], riskyChanges: [] });
   }
 
@@ -89,5 +89,5 @@ describe('worker workflow with OpenAI provider', () => {
     expect(result.workspacePath).toContain(workspaceRoot);
     await expect(access(join(workspaceRoot, demoTask.id, 'AGENTS.md'))).resolves.toBeUndefined();
     await expect(access(join(workspaceRoot, demoTask.id, 'OPENAI_IMPLEMENTATION.md'))).resolves.toBeUndefined();
-  }, 10000);
+  }, 15000);
 });

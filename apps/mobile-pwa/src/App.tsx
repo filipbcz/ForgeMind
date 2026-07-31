@@ -1414,9 +1414,14 @@ function TaskDetail(props: {
 
       <div className="task-overview-grid">
         <MetricBlock label="Aktualni krok" value={props.task.currentStep || statusLabels[props.task.status]} />
-        <MetricBlock label="Iterace" value={`${latestRun?.iterationCount ?? props.task.iterations}/${props.task.maxIterations}`} />
+        <MetricBlock label="Pokusy" value={`${latestRun?.iterationCount ?? props.task.iterations}/${props.task.maxIterations}`} />
         <MetricBlock label="Zmeny" value={`${props.diff?.filesChanged ?? 0} souboru, +${props.diff?.insertions ?? 0} -${props.diff?.deletions ?? 0}`} />
-        <MetricBlock label="Naklady" value={`$${(props.usage?.estimatedCostUsd ?? props.task.budgetUsd).toFixed(2)} / $${props.task.maxBudgetUsd.toFixed(2)}`} />
+        <MetricBlock
+          label="Cena"
+          value={props.usage?.actualCostUsd !== null && props.usage?.actualCostUsd !== undefined
+            ? `$${props.usage.actualCostUsd.toFixed(4)}`
+            : 'Neni dostupna'}
+        />
       </div>
 
       {latestError ? (
@@ -1480,7 +1485,7 @@ function TaskDetail(props: {
           <dl className="technical-summary">
             <div><dt>Worker</dt><dd>{props.workerStatus ? `${props.workerStatus.state} | queue ${props.workerStatus.queuedTaskCount} | active ${props.workerStatus.activeTaskCount}` : 'unknown'}</dd></div>
             <div><dt>Realtime</dt><dd>{formatRealtimeState(props.realtimeState)} | {formatHeartbeatStatus(props.realtimeMeta)}</dd></div>
-            <div><dt>Tokeny</dt><dd>{props.usage?.inputTokens ?? 0} in / {props.usage?.outputTokens ?? 0} out</dd></div>
+            <div><dt>Tokeny</dt><dd>{formatTokenUsage(props.usage)}</dd></div>
           </dl>
           <h4>Log</h4>
           <div className="timeline">
@@ -1675,6 +1680,23 @@ function formatHeartbeatStatus(meta: RealtimeConnectionMeta): string {
 
   const ageSeconds = Math.max(0, Math.round((Date.now() - timestamp) / 1000));
   return `${formatProgressTime(meta.lastHeartbeatAt)} | ${ageSeconds}s ago`;
+}
+
+function formatTokenUsage(usage: TaskUsageApi | undefined): string {
+  if (!usage || usage.usageSource === 'unavailable') {
+    return 'Neni dostupne';
+  }
+
+  if (usage.usageSource === 'actual_breakdown') {
+    return `${usage.totalTokens.toLocaleString('cs-CZ')} celkem · ${usage.inputTokens.toLocaleString('cs-CZ')} in · ${usage.outputTokens.toLocaleString('cs-CZ')} out · ${usage.cachedTokens.toLocaleString('cs-CZ')} cache`;
+  }
+
+  if (usage.usageSource === 'estimated') {
+    return `${usage.totalTokens.toLocaleString('cs-CZ')} odhad`;
+  }
+
+  const suffix = usage.usageSource === 'mixed' ? ' · starsi behy jsou pouze odhad' : '';
+  return `${usage.totalTokens.toLocaleString('cs-CZ')} celkem${suffix}`;
 }
 
 function formatRunDetail(run: TaskRunApi, maxLength = 260): string {

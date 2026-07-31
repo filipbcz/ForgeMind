@@ -51,6 +51,7 @@ export interface WorkerTaskHooks {
     kind: 'lifecycle' | 'stdout' | 'stderr' | 'workspace';
     message: string;
     elapsedMs: number;
+    usage?: import('@forgemind/providers').ProviderUsageMeasurement;
   }) => Promise<void>;
   onIterationStarted?: (iteration: {
     phase: IterationPhase;
@@ -413,10 +414,15 @@ export async function runWorkerTask(input: WorkerTaskInput): Promise<WorkerTaskR
       });
       let providerReview;
       try {
+        const reviewDiff = await collectReviewDiff(git, workspacePath);
         const reviewPromise = provider.review({
             taskId: input.task.id,
+            taskTitle: input.task.title,
             repositoryPath: workspacePath,
             changedFiles: implementation.changedFiles,
+            acceptanceCriteria: plan.acceptanceCriteria,
+            validation,
+            diff: reviewDiff,
             onActivity: (activity) => input.hooks?.onProviderActivity?.({ phase: 'review', attempt, ...activity })
           });
         providerReview = provider.kind === 'codex' && process.env.FORGEMIND_REVIEW_TIMEOUT_MS === undefined
@@ -1297,6 +1303,73 @@ async function collectWorkspaceDiffStat(
     insertions,
     deletions
   };
+}
+
+const MAX_REVIEW_DIFF_CHARS = 180_000;
+
+async function collectReviewDiff(git: SimpleGit, workspacePath: string): Promise<string> {
+  const status = await git.status();
+  const changedPaths = collectStageablePaths(status).filter(isSubstantiveImplementationPath);
+  const untrackedPaths = new Set(status.not_added.map(normalizeRepoPath));
+  const trackedPaths = changedPaths.filter((path) => !untrackedPaths.has(normalizeRepoPath(path)));
+  const sections: string[] = [];
+
+  if (trackedPaths.length > 0) {
+    try {
+      const trackedDiff = await git.diff(['--unified=3', 'HEAD', '--', ...trackedPaths]);
+      if (trackedDiff.trim()) {
+        sections.push(trackedDiff);
+      }
+    } catch {
+      // A repository without an initial commit only contains untracked files, handled below.
+    }
+  }
+
+  for (const path of changedPaths) {
+    if (!untrackedPaths.has(normalizeRepoPath(path))) {
+      continue;
+    }
+
+    sections.push(await renderUntrackedFileDiff(workspacePath, path));
+  }
+
+  return truncateReviewDiff(sections.filter(Boolean).join('\n'));
+}
+
+async function renderUntrackedFileDiff(workspacePath: string, path: string): Promise<string> {
+  try {
+    const content = await readFile(join(workspacePath, path), 'utf8');
+    const lines = content.length === 0 ? [] : content.replace(/\r\n/g, '\n').split('\n');
+    if (lines.at(-1) === '') {
+      lines.pop();
+    }
+    const header = [
+      `diff --git a/${normalizeRepoPath(path)} b/${normalizeRepoPath(path)}`,
+      'new file mode 100644',
+      '--- /dev/null',
+      `+++ b/${normalizeRepoPath(path)}`
+    ];
+    if (lines.length === 0) {
+      return header.join('\n');
+    }
+
+    return [...header, `@@ -0,0 +1,${lines.length} @@`, ...lines.map((line) => `+${line}`)].join('\n');
+  } catch {
+    return `diff --git a/${normalizeRepoPath(path)} b/${normalizeRepoPath(path)}\n[unreadable or binary file]`;
+  }
+}
+
+function truncateReviewDiff(diff: string): string {
+  if (diff.length <= MAX_REVIEW_DIFF_CHARS) {
+    return diff;
+  }
+
+  const retainedChars = Math.floor((MAX_REVIEW_DIFF_CHARS - 100) / 2);
+  return [
+    diff.slice(0, retainedChars),
+    `\n[diff truncated: ${diff.length} characters total]\n`,
+    diff.slice(-retainedChars)
+  ].join('');
 }
 
 async function loadResumedImplementation(

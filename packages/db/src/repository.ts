@@ -1789,7 +1789,10 @@ export class ForgeMindRepository {
     iterationCount?: number;
     inputTokens?: number;
     outputTokens?: number;
+    totalTokens?: number;
+    usageSource?: string;
     estimatedCostUsd?: number;
+    actualCostUsd?: number | null;
   }): Promise<void> {
     await this.prisma.taskRun.update({
       where: { id: input.taskRunId },
@@ -1800,7 +1803,10 @@ export class ForgeMindRepository {
         iterationCount: input.iterationCount,
         inputTokens: input.inputTokens,
         outputTokens: input.outputTokens,
+        totalTokens: input.totalTokens,
+        usageSource: input.usageSource,
         estimatedCostUsd: input.estimatedCostUsd,
+        actualCostUsd: input.actualCostUsd,
         finishedAt: new Date()
       }
     });
@@ -1912,16 +1918,13 @@ export class ForgeMindRepository {
       orderBy: { createdAt: 'asc' }
     });
 
-    const totals = iterations.reduce(
-      (summary, iteration) => {
-        const diff = parseDiffStat(iteration.diffStatJson);
-        summary.filesChanged = Math.max(summary.filesChanged, diff.filesChanged);
-        summary.insertions += diff.insertions;
-        summary.deletions += diff.deletions;
-        return summary;
-      },
-      { filesChanged: 0, insertions: 0, deletions: 0 }
-    );
+    const latestRunId = iterations.at(-1)?.taskRunId;
+    const latestSnapshot = [...iterations]
+      .reverse()
+      .find((iteration) => iteration.taskRunId === latestRunId && iteration.phase !== 'planning');
+    const totals = latestSnapshot
+      ? parseDiffStat(latestSnapshot.diffStatJson)
+      : { filesChanged: 0, insertions: 0, deletions: 0 };
 
     return {
       taskId,
@@ -1954,20 +1957,38 @@ export class ForgeMindRepository {
       })
     ]);
 
-    const totals = usage.reduce(
+    const actualUsage = usage.filter((item) => item.usageSource.startsWith('actual'));
+    const estimatedUsage = usage.filter((item) => item.usageSource === 'estimated');
+    const measuredUsage = actualUsage.length > 0 ? actualUsage : estimatedUsage;
+    const totals = measuredUsage.reduce(
       (summary, item) => {
         summary.inputTokens += item.inputTokens;
         summary.outputTokens += item.outputTokens;
         summary.cachedTokens += item.cachedTokens;
+        summary.totalTokens += item.totalTokens;
         summary.estimatedCostUsd += Number(item.estimatedCostUsd);
         return summary;
       },
-      { inputTokens: 0, outputTokens: 0, cachedTokens: 0, estimatedCostUsd: 0 }
+      { inputTokens: 0, outputTokens: 0, cachedTokens: 0, totalTokens: 0, estimatedCostUsd: 0 }
     );
+    const hasCompleteBreakdown = actualUsage.length > 0 && actualUsage.every((item) => item.usageSource === 'actual_breakdown');
+    const actualCostAvailable = actualUsage.length > 0 && actualUsage.every((item) => item.actualCostUsd !== null);
+    const actualCostUsd = actualCostAvailable
+      ? actualUsage.reduce((sum, item) => sum + Number(item.actualCostUsd), 0)
+      : null;
+    const usageSource =
+      actualUsage.length === 0
+        ? (estimatedUsage.length > 0 ? 'estimated' : 'unavailable')
+        : (estimatedUsage.length > 0 ? 'mixed' : (hasCompleteBreakdown ? 'actual_breakdown' : 'actual_total'));
 
     return {
       taskId,
       ...totals,
+      inputTokens: hasCompleteBreakdown ? totals.inputTokens : 0,
+      outputTokens: hasCompleteBreakdown ? totals.outputTokens : 0,
+      cachedTokens: hasCompleteBreakdown ? totals.cachedTokens : 0,
+      usageSource,
+      actualCostUsd,
       runs: runs.map((run) => ({
         id: run.id,
         provider: run.provider,
@@ -1976,7 +1997,10 @@ export class ForgeMindRepository {
         iterationCount: run.iterationCount,
         inputTokens: run.inputTokens,
         outputTokens: run.outputTokens,
+        totalTokens: run.totalTokens,
+        usageSource: run.usageSource,
         estimatedCostUsd: Number(run.estimatedCostUsd),
+        actualCostUsd: run.actualCostUsd === null ? null : Number(run.actualCostUsd),
         startedAt: run.startedAt?.toISOString(),
         finishedAt: run.finishedAt?.toISOString(),
         summary: run.summary,
@@ -1986,10 +2010,15 @@ export class ForgeMindRepository {
         id: item.id,
         provider: item.provider,
         model: item.model,
+        phase: item.phase,
+        attempt: item.attempt,
         inputTokens: item.inputTokens,
         outputTokens: item.outputTokens,
         cachedTokens: item.cachedTokens,
+        totalTokens: item.totalTokens,
+        usageSource: item.usageSource,
         estimatedCostUsd: Number(item.estimatedCostUsd),
+        actualCostUsd: item.actualCostUsd === null ? null : Number(item.actualCostUsd),
         createdAt: item.createdAt.toISOString()
       }))
     };
@@ -2031,11 +2060,16 @@ export class ForgeMindRepository {
     taskRunId: string;
     provider: ProviderKind;
     model: string;
+    phase?: string;
+    attempt?: number;
     inputTokens: number;
     outputTokens: number;
     cachedTokens?: number;
+    totalTokens?: number;
+    usageSource?: string;
     credits?: number;
     estimatedCostUsd: number;
+    actualCostUsd?: number;
   }): Promise<void> {
     await this.prisma.providerUsage.create({
       data: {
@@ -2043,11 +2077,16 @@ export class ForgeMindRepository {
         taskRunId: input.taskRunId,
         provider: input.provider,
         model: input.model,
+        phase: input.phase,
+        attempt: input.attempt,
         inputTokens: input.inputTokens,
         outputTokens: input.outputTokens,
         cachedTokens: input.cachedTokens ?? 0,
+        totalTokens: input.totalTokens ?? input.inputTokens + input.outputTokens,
+        usageSource: input.usageSource ?? 'estimated',
         credits: input.credits ?? 0,
-        estimatedCostUsd: input.estimatedCostUsd
+        estimatedCostUsd: input.estimatedCostUsd,
+        actualCostUsd: input.actualCostUsd
       }
     });
   }

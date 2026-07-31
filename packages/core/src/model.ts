@@ -149,7 +149,10 @@ export interface TaskRun {
   iterationCount: number;
   inputTokens: number;
   outputTokens: number;
+  totalTokens: number;
+  usageSource: string;
   estimatedCostUsd: number;
+  actualCostUsd?: number;
   startedAt?: IsoDateString;
   finishedAt?: IsoDateString;
   summary?: string;

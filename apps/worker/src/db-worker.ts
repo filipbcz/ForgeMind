@@ -58,6 +58,16 @@ export async function runDatabaseWorkerOnce() {
   let repeatedErrorCount = 0;
   let lastErrorFingerprint: string | undefined;
   let lastProviderActivityAuditAt = 0;
+  const measuredUsage = {
+    measurements: 0,
+    inputTokens: 0,
+    outputTokens: 0,
+    cachedTokens: 0,
+    totalTokens: 0,
+    completeBreakdown: true,
+    actualCostUsd: 0,
+    completeCost: true
+  };
   const startedAtMs = Date.now();
   const verifyCommand = resolveVerifyCommand(claimed.project.configYaml);
   const workspaceRoot = resolveWorkerWorkspaceRoot();
@@ -88,7 +98,10 @@ export async function runDatabaseWorkerOnce() {
       iterationCount: attemptCount,
       inputTokens: 0,
       outputTokens: 0,
-      estimatedCostUsd: 0
+      totalTokens: 0,
+      usageSource: 'unavailable',
+      estimatedCostUsd: 0,
+      actualCostUsd: null
     });
     await repository.finalizeQueueJob(claimed.queueJobId, 'failed', message);
     return {
@@ -98,15 +111,19 @@ export async function runDatabaseWorkerOnce() {
     };
   }
   const initialLimitEvaluation = evaluateLimits(createLimitUsage({ estimatedCostUsd: costEstimate.estimatedCostUsd }), limits);
-
-  await repository.recordProviderUsage({
-    taskId: claimed.task.id,
-    taskRunId: claimed.taskRun.id,
-    provider: getLastProviderKind(),
-    model: getLastProviderKind(),
-    inputTokens: costEstimate.inputTokens,
-    outputTokens: costEstimate.outputTokens,
-    estimatedCostUsd: costEstimate.estimatedCostUsd
+  const getRunUsageFields = () => ({
+    inputTokens: measuredUsage.completeBreakdown ? measuredUsage.inputTokens : 0,
+    outputTokens: measuredUsage.completeBreakdown ? measuredUsage.outputTokens : 0,
+    totalTokens: measuredUsage.totalTokens,
+    usageSource:
+      measuredUsage.measurements === 0
+        ? 'unavailable'
+        : (measuredUsage.completeBreakdown ? 'actual_breakdown' : 'actual_total'),
+    estimatedCostUsd: costEstimate.estimatedCostUsd,
+    actualCostUsd:
+      measuredUsage.measurements > 0 && measuredUsage.completeCost
+        ? measuredUsage.actualCostUsd
+        : null
   });
 
   if (initialLimitEvaluation.signals.includes('budget_exceeded')) {
@@ -115,9 +132,7 @@ export async function runDatabaseWorkerOnce() {
       taskRunId: claimed.taskRun.id,
       status: 'failed',
       errorMessage: 'Budget limit exceeded before provider run.',
-      inputTokens: costEstimate.inputTokens,
-      outputTokens: costEstimate.outputTokens,
-      estimatedCostUsd: costEstimate.estimatedCostUsd
+      ...getRunUsageFields()
     });
     await repository.finalizeQueueJob(claimed.queueJobId, 'failed', 'Budget limit exceeded before provider run.');
     return {
@@ -135,7 +150,7 @@ export async function runDatabaseWorkerOnce() {
       provider,
       verifyCommand,
       workspaceRoot,
-      usageSummary: `Input tokens: ${costEstimate.inputTokens}, output tokens: ${costEstimate.outputTokens}, estimated cost: ${costEstimate.estimatedCostUsd.toFixed(4)} USD`,
+      usageSummary: `Pre-run estimate: ${costEstimate.inputTokens} input tokens, ${costEstimate.outputTokens} output tokens, ${costEstimate.estimatedCostUsd.toFixed(4)} USD`,
       resume: resumeContext?.workflowResume,
       github,
       hooks: {
@@ -188,6 +203,38 @@ export async function runDatabaseWorkerOnce() {
           });
         },
         onProviderActivity: async (activity) => {
+          if (activity.usage) {
+            measuredUsage.measurements += 1;
+            measuredUsage.totalTokens += activity.usage.totalTokens;
+            if (activity.usage.inputTokens === undefined || activity.usage.outputTokens === undefined) {
+              measuredUsage.completeBreakdown = false;
+            } else {
+              measuredUsage.inputTokens += activity.usage.inputTokens;
+              measuredUsage.outputTokens += activity.usage.outputTokens;
+              measuredUsage.cachedTokens += activity.usage.cachedTokens ?? 0;
+            }
+            if (activity.usage.actualCostUsd === undefined) {
+              measuredUsage.completeCost = false;
+            } else {
+              measuredUsage.actualCostUsd += activity.usage.actualCostUsd;
+            }
+
+            await repository.recordProviderUsage({
+              taskId: claimed.task.id,
+              taskRunId: claimed.taskRun.id,
+              provider: activity.usage.provider,
+              model: activity.usage.model,
+              phase: activity.phase,
+              attempt: activity.attempt,
+              inputTokens: activity.usage.inputTokens ?? 0,
+              outputTokens: activity.usage.outputTokens ?? 0,
+              cachedTokens: activity.usage.cachedTokens ?? 0,
+              totalTokens: activity.usage.totalTokens,
+              usageSource: activity.usage.source,
+              estimatedCostUsd: 0,
+              actualCostUsd: activity.usage.actualCostUsd
+            });
+          }
           const now = Date.now();
           if (activity.kind === 'workspace' && now - lastProviderActivityAuditAt < 1_500) {
             return;
@@ -206,7 +253,19 @@ export async function runDatabaseWorkerOnce() {
               kind: activity.kind,
               message: activity.message,
               elapsedMs: activity.elapsedMs,
-              provider: getLastProviderKind()
+              provider: activity.usage?.provider ?? getLastProviderKind(),
+              usage: activity.usage
+                ? {
+                    provider: activity.usage.provider,
+                    model: activity.usage.model,
+                    totalTokens: activity.usage.totalTokens,
+                    inputTokens: activity.usage.inputTokens ?? null,
+                    outputTokens: activity.usage.outputTokens ?? null,
+                    cachedTokens: activity.usage.cachedTokens ?? null,
+                    source: activity.usage.source,
+                    actualCostUsd: activity.usage.actualCostUsd ?? null
+                  }
+                : null
             }
           });
         },
@@ -281,9 +340,7 @@ export async function runDatabaseWorkerOnce() {
         status: 'succeeded',
         summary: result.summary,
         iterationCount: attemptCount,
-        inputTokens: costEstimate.inputTokens,
-        outputTokens: costEstimate.outputTokens,
-        estimatedCostUsd: costEstimate.estimatedCostUsd
+        ...getRunUsageFields()
       });
       await repository.finalizeQueueJob(claimed.queueJobId, 'succeeded');
     } else if (result.status === 'validation_failed') {
@@ -302,9 +359,7 @@ export async function runDatabaseWorkerOnce() {
         summary: result.summary,
         errorMessage: result.validation.stderr || 'Validation failed.',
         iterationCount: attemptCount,
-        inputTokens: costEstimate.inputTokens,
-        outputTokens: costEstimate.outputTokens,
-        estimatedCostUsd: costEstimate.estimatedCostUsd
+        ...getRunUsageFields()
       });
       await repository.finalizeQueueJob(claimed.queueJobId, 'failed', result.validation.stderr || 'Validation failed.');
     } else if (result.status === 'failed') {
@@ -315,9 +370,7 @@ export async function runDatabaseWorkerOnce() {
         summary: result.summary,
         errorMessage: result.summary,
         iterationCount: attemptCount,
-        inputTokens: costEstimate.inputTokens,
-        outputTokens: costEstimate.outputTokens,
-        estimatedCostUsd: costEstimate.estimatedCostUsd
+        ...getRunUsageFields()
       });
       await repository.finalizeQueueJob(claimed.queueJobId, 'failed', result.summary);
     } else {
@@ -334,9 +387,7 @@ export async function runDatabaseWorkerOnce() {
         status: 'succeeded',
         summary: result.summary,
         iterationCount: attemptCount,
-        inputTokens: costEstimate.inputTokens,
-        outputTokens: costEstimate.outputTokens,
-        estimatedCostUsd: costEstimate.estimatedCostUsd
+        ...getRunUsageFields()
       });
       await repository.finalizeQueueJob(claimed.queueJobId, 'succeeded');
     }
@@ -353,9 +404,7 @@ export async function runDatabaseWorkerOnce() {
         status: 'succeeded',
         summary: error.message,
         iterationCount: attemptCount,
-        inputTokens: costEstimate.inputTokens,
-        outputTokens: costEstimate.outputTokens,
-        estimatedCostUsd: costEstimate.estimatedCostUsd
+        ...getRunUsageFields()
       });
       await repository.finalizeQueueJob(claimed.queueJobId, 'succeeded');
       return {
@@ -373,9 +422,7 @@ export async function runDatabaseWorkerOnce() {
       status: 'failed',
       errorMessage: message,
       iterationCount: attemptCount,
-      inputTokens: costEstimate.inputTokens,
-      outputTokens: costEstimate.outputTokens,
-      estimatedCostUsd: costEstimate.estimatedCostUsd
+      ...getRunUsageFields()
     });
     await repository.finalizeQueueJob(claimed.queueJobId, 'failed', message);
     if (error instanceof WorkerLimitError || error instanceof ProviderExecutionError) {

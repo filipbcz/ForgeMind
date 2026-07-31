@@ -1,4 +1,5 @@
 export * from './provider.js';
+export * from './review-prompt.js';
 export * from './openai-provider.js';
 export * from './codex-provider.js';
 

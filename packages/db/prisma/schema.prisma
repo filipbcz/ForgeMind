@@ -345,7 +345,10 @@ model TaskRun {
   iterationCount   Int          @default(0) @map("iteration_count")
   inputTokens      Int          @default(0) @map("input_tokens")
   outputTokens     Int          @default(0) @map("output_tokens")
+  totalTokens      Int          @default(0) @map("total_tokens")
+  usageSource      String       @default("estimated") @map("usage_source")
   estimatedCostUsd Decimal      @default(0.00) @map("estimated_cost_usd") @db.Decimal(10, 4)
+  actualCostUsd    Decimal?     @map("actual_cost_usd") @db.Decimal(10, 4)
   startedAt        DateTime?    @map("started_at")
   finishedAt       DateTime?    @map("finished_at")
   summary          String?
@@ -405,11 +408,16 @@ model ProviderUsage {
   taskRunId        String       @map("task_run_id")
   provider         ProviderKind
   model            String
+  phase            String?
+  attempt          Int?
   inputTokens      Int          @default(0) @map("input_tokens")
   outputTokens     Int          @default(0) @map("output_tokens")
   cachedTokens     Int          @default(0) @map("cached_tokens")
+  totalTokens      Int          @default(0) @map("total_tokens")
+  usageSource      String       @default("estimated") @map("usage_source")
   credits          Decimal      @default(0.00) @db.Decimal(12, 4)
   estimatedCostUsd Decimal      @default(0.00) @map("estimated_cost_usd") @db.Decimal(10, 4)
+  actualCostUsd    Decimal?     @map("actual_cost_usd") @db.Decimal(10, 4)
   createdAt        DateTime     @default(now()) @map("created_at")
 
   task    Task    @relation(fields: [taskId], references: [id])

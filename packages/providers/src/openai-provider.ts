@@ -10,6 +10,8 @@ import type {
   ReviewInput,
   ReviewResult
 } from './provider.js';
+import { emitCapturedUsage, normalizeTokenBreakdown } from './provider-usage.js';
+import { buildReviewPrompt } from './review-prompt.js';
 
 const DEFAULT_OPENAI_API_URL = 'https://api.openai.com/v1/chat/completions';
 const DEFAULT_OPENAI_MODEL = 'gpt-4o-mini';
@@ -118,7 +120,9 @@ export class OpenAIProvider implements AIProvider {
           .join('\n\n')
       }
     ];
-    const content = await this.requestChat(messages);
+    const response = await this.requestChat(messages);
+    const content = response.content;
+    await emitCapturedUsage(input.onActivity, response.usage);
 
     return {
       ...parseJsonContent<PlanResult>(content, {
@@ -153,7 +157,9 @@ export class OpenAIProvider implements AIProvider {
           .join('\n')
       }
     ];
-    const content = await this.requestChat(messages);
+    const response = await this.requestChat(messages);
+    const content = response.content;
+    await emitCapturedUsage(input.onActivity, response.usage);
 
     const fallback: ImplementResult = {
       summary: `OpenAI implementation summary for task ${input.taskId}.`,
@@ -194,17 +200,20 @@ export class OpenAIProvider implements AIProvider {
   }
 
   async review(input: ReviewInput): Promise<ReviewResult> {
+    const reviewPrompt = buildReviewPrompt(input);
     const messages: Array<{ role: 'system' | 'user' | 'assistant'; content: string }> = [
       {
         role: 'system',
-        content: 'You are an AI code reviewer. Provide a JSON object with summary, blockers, safeImprovements, and riskyChanges. Respond only with JSON.'
+        content: 'You are an AI code reviewer. Follow the review packet constraints and return JSON with summary, blockers, safeImprovements, and riskyChanges.'
       },
       {
         role: 'user',
-        content: `Review the following changed files for task ${input.taskId}: ${input.changedFiles.join(', ')}. Provide blockers, safe improvements, and risky changes.`
+        content: reviewPrompt
       }
     ];
-    const content = await this.requestChat(messages);
+    const response = await this.requestChat(messages);
+    const content = response.content;
+    await emitCapturedUsage(input.onActivity, response.usage);
 
     return {
       ...parseJsonContent<ReviewResult>(content, {
@@ -238,7 +247,9 @@ export class OpenAIProvider implements AIProvider {
     return false;
   }
 
-  protected async requestChat(messages: Array<{ role: 'system' | 'user' | 'assistant'; content: string }>): Promise<string> {
+  protected async requestChat(
+    messages: Array<{ role: 'system' | 'user' | 'assistant'; content: string }>
+  ): Promise<{ content: string; usage?: import('./provider.js').ProviderUsageMeasurement }> {
     const response = await fetch(process.env.OPENAI_API_BASE_URL ?? DEFAULT_OPENAI_API_URL, {
       method: 'POST',
       headers: {
@@ -258,7 +269,25 @@ export class OpenAIProvider implements AIProvider {
       throw new Error(`OpenAI request failed with ${response.status}: ${text}`);
     }
 
-    const data = (await response.json()) as { choices?: Array<{ message?: { content?: string } }> };
-    return data.choices?.[0]?.message?.content?.trim() ?? '';
+    const data = (await response.json()) as {
+      choices?: Array<{ message?: { content?: string } }>;
+      usage?: {
+        prompt_tokens?: number;
+        completion_tokens?: number;
+        total_tokens?: number;
+        prompt_tokens_details?: { cached_tokens?: number };
+      };
+    };
+    return {
+      content: data.choices?.[0]?.message?.content?.trim() ?? '',
+      usage: normalizeTokenBreakdown({
+        provider: 'openai',
+        model: process.env.OPENAI_MODEL ?? DEFAULT_OPENAI_MODEL,
+        inputTokens: data.usage?.prompt_tokens,
+        outputTokens: data.usage?.completion_tokens,
+        cachedTokens: data.usage?.prompt_tokens_details?.cached_tokens,
+        totalTokens: data.usage?.total_tokens
+      })
+    };
   }
 }

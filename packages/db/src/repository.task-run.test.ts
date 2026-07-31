@@ -187,7 +187,7 @@ function createMockPrisma() {
       count: vi.fn(async () => 1),
       updateMany: vi.fn(async () => ({ count: 1 }))
     },
-    taskIteration: { create: vi.fn() },
+    taskIteration: { create: vi.fn(), findMany: vi.fn() },
     approval: { create: vi.fn(), findMany: vi.fn(), findUnique: vi.fn(), update: vi.fn() },
     providerUsage: { create: vi.fn(), findMany: vi.fn() },
     auditLog: { create: vi.fn(async () => ({ id: 'audit_1', createdAt: new Date() })), findMany: vi.fn() },
@@ -383,4 +383,44 @@ describe('ForgeMindRepository task runs', () => {
       }
     });
   });
+
+  it('reports the latest run diff snapshot instead of summing cumulative phase snapshots', async () => {
+    const { prisma } = createMockPrisma();
+    prisma.taskIteration.findMany.mockResolvedValueOnce([
+      createIterationFixture('run_1', 1, 'implementation', { filesChanged: 4, insertions: 100, deletions: 10 }),
+      createIterationFixture('run_1', 2, 'validation', { filesChanged: 4, insertions: 100, deletions: 10 }),
+      createIterationFixture('run_2', 1, 'planning', { filesChanged: 0, insertions: 0, deletions: 0 }),
+      createIterationFixture('run_2', 2, 'validation', { filesChanged: 6, insertions: 140, deletions: 12 })
+    ] as any);
+    const repository = new ForgeMindRepository(prisma);
+
+    const diff = await repository.getTaskDiff('task_1');
+
+    expect(diff).toEqual(expect.objectContaining({
+      filesChanged: 6,
+      insertions: 140,
+      deletions: 12
+    }));
+  });
 });
+
+function createIterationFixture(
+  taskRunId: string,
+  iterationNumber: number,
+  phase: 'planning' | 'implementation' | 'validation' | 'review',
+  diffStatJson: { filesChanged: number; insertions: number; deletions: number }
+) {
+  return {
+    id: `${taskRunId}-${iterationNumber}`,
+    taskRunId,
+    iterationNumber,
+    phase,
+    prompt: phase,
+    resultSummary: phase,
+    providerPrompt: null,
+    providerResponse: null,
+    diffStatJson,
+    validationResultJson: {},
+    createdAt: new Date(`2026-07-28T00:00:0${iterationNumber}.000Z`)
+  };
+}

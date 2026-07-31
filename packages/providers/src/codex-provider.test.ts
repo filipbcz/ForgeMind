@@ -1,7 +1,12 @@
 import { describe, expect, it, vi } from 'vitest';
-import { runCodexProcess } from './codex-provider.js';
+import { parseCodexCliTotalTokens, runCodexProcess } from './codex-provider.js';
 
 describe('Codex process activity timeouts', () => {
+  it('parses the actual total token count emitted by Codex CLI', () => {
+    expect(parseCodexCliTotalTokens('codex output\ntokens used\n124,947\n')).toBe(124947);
+    expect(parseCodexCliTotalTokens('codex output without usage')).toBeUndefined();
+  });
+
   it('keeps an active process alive past the inactivity timeout', async () => {
     const onActivity = vi.fn();
 

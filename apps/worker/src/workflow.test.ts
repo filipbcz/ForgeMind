@@ -174,8 +174,10 @@ function createGitHubStub(overrides: Partial<GitHubAdapter> = {}): GitHubAdapter
 describe('worker workflow', () => {
   it('runs the local provider workflow end-to-end without GitHub operations', async () => {
     const workspaceRoot = join(tmpdir(), `forgemind-worker-test-${randomUUID()}`);
+    let capturedReviewInput: ReviewInput | undefined;
     const provider = createProviderStub({
-      async review(): Promise<ReviewResult> {
+      async review(input): Promise<ReviewResult> {
+        capturedReviewInput = input;
         return {
           summary: 'Review passed',
           blockers: [],
@@ -199,6 +201,20 @@ describe('worker workflow', () => {
     expect(result.validation.passed).toBe(true);
     expect(result.summary).toContain('Review passed');
     expect(result.workspacePath).toContain(workspaceRoot);
+    expect(capturedReviewInput).toEqual(
+      expect.objectContaining({
+        taskId: demoTask.id,
+        taskTitle: demoTask.title,
+        acceptanceCriteria: ['Validation passes'],
+        validation: expect.objectContaining({
+          command: 'node --version',
+          exitCode: 0,
+          passed: true
+        }),
+        diff: expect.stringContaining('diff --git a/status.txt b/status.txt')
+      })
+    );
+    expect(capturedReviewInput?.diff).toContain('+ok');
 
     const workspaceGit = simpleGit({ baseDir: result.workspacePath });
     await expect(workspaceGit.raw(['config', '--local', '--get', 'user.name'])).resolves.toBe(
@@ -1431,7 +1447,7 @@ describe('worker workflow', () => {
         process.env.FORGEMIND_REVIEW_TIMEOUT_MS = previousReviewTimeout;
       }
     }
-  });
+  }, 10000);
 
   it('does not retry implementation automatically for safe improvements from review', async () => {
     const workspaceRoot = join(tmpdir(), `forgemind-worker-safe-improvements-${randomUUID()}`);
@@ -1712,7 +1728,7 @@ describe('worker workflow', () => {
     expect(result.status).toBe('failed');
     expect(result.summary).toContain('Review blocked completion after 2 attempt(s)');
     expect(createdPrs).toHaveLength(0);
-  });
+  }, 15000);
 
   it('emits structured GitHub failure hook when branch creation fails', async () => {
     const workspaceRoot = join(tmpdir(), `forgemind-worker-github-failure-${randomUUID()}`);

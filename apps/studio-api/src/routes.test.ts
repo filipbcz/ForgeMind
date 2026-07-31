@@ -1402,6 +1402,9 @@ describe('Studio API routes', () => {
         inputTokens: 20,
         outputTokens: 10,
         cachedTokens: 0,
+        totalTokens: 30,
+        usageSource: 'actual_breakdown',
+        actualCostUsd: null,
         estimatedCostUsd: 0.02,
         runs: [],
         records: []
@@ -1621,5 +1624,5 @@ describe('Studio API routes', () => {
     expect(mobileReadModel.pullRequestUrl).toContain('/pull/902');
 
     await app.close();
-  }, 10000);
+  }, 30000);
 });

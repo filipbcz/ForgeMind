@@ -4,9 +4,21 @@ export interface ProviderActivity {
   kind: 'lifecycle' | 'stdout' | 'stderr' | 'workspace';
   message: string;
   elapsedMs: number;
+  usage?: ProviderUsageMeasurement;
 }
 
 export type ProviderActivityHandler = (activity: ProviderActivity) => void | Promise<void>;
+
+export interface ProviderUsageMeasurement {
+  provider: ProviderKind;
+  model: string;
+  totalTokens: number;
+  inputTokens?: number;
+  outputTokens?: number;
+  cachedTokens?: number;
+  source: 'actual_total' | 'actual_breakdown';
+  actualCostUsd?: number;
+}
 
 export interface PlanInput {
   taskId: string;
@@ -83,8 +95,18 @@ export interface ImplementResult {
 
 export interface ReviewInput {
   taskId: string;
+  taskTitle: string;
   repositoryPath: string;
   changedFiles: string[];
+  acceptanceCriteria: string[];
+  validation: {
+    command: string;
+    exitCode: number;
+    stdout: string;
+    stderr: string;
+    passed: boolean;
+  };
+  diff: string;
   onActivity?: ProviderActivityHandler;
 }
 

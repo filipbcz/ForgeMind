@@ -14,9 +14,12 @@ import type {
   PlanInput,
   PlanResult,
   ProviderActivityHandler,
+  ProviderUsageMeasurement,
   ReviewInput,
   ReviewResult
 } from './provider.js';
+import { emitCapturedUsage, normalizeTokenBreakdown } from './provider-usage.js';
+import { buildReviewPrompt } from './review-prompt.js';
 
 const DEFAULT_CODEX_API_URL = 'https://api.openai.com/v1/responses';
 const DEFAULT_CODEX_MODEL = 'gpt-5.5';
@@ -144,7 +147,9 @@ export class CodexProvider implements AIProvider {
           .join('\n\n')
       }
     ];
-    const content = await this.requestResponses(messages);
+    const response = await this.requestResponses(messages);
+    const content = response.content;
+    await emitCapturedUsage(input.onActivity, response.usage);
 
     return {
       ...parseJsonContent<PlanResult>(content, {
@@ -184,7 +189,9 @@ export class CodexProvider implements AIProvider {
           .join('\n')
       }
     ];
-    const content = await this.requestResponses(messages);
+    const response = await this.requestResponses(messages);
+    const content = response.content;
+    await emitCapturedUsage(input.onActivity, response.usage);
 
     const fallback: ImplementResult = {
       summary: `Codex implementation summary for task ${input.taskId}.`,
@@ -225,21 +232,24 @@ export class CodexProvider implements AIProvider {
   }
 
   async review(input: ReviewInput): Promise<ReviewResult> {
+    const reviewPrompt = buildReviewPrompt(input);
     if (this.authMode === 'oauth') {
-      return this.reviewWithCli(input);
+      return this.reviewWithCli(input, reviewPrompt);
     }
 
     const messages: Array<{ role: 'system' | 'user' | 'assistant'; content: string }> = [
       {
         role: 'system',
-        content: 'You are Codex reviewer. Return JSON with summary, blockers, safeImprovements, and riskyChanges. Reply with JSON only.'
+        content: 'You are Codex reviewer. Follow the review packet constraints and return JSON with summary, blockers, safeImprovements, and riskyChanges.'
       },
       {
         role: 'user',
-        content: `Review changed files for task ${input.taskId}: ${input.changedFiles.join(', ')}`
+        content: reviewPrompt
       }
     ];
-    const content = await this.requestResponses(messages);
+    const response = await this.requestResponses(messages);
+    const content = response.content;
+    await emitCapturedUsage(input.onActivity, response.usage);
 
     return {
       ...parseJsonContent<ReviewResult>(content, {
@@ -454,19 +464,13 @@ export class CodexProvider implements AIProvider {
     return result;
   }
 
-  private async reviewWithCli(input: ReviewInput): Promise<ReviewResult> {
+  private async reviewWithCli(input: ReviewInput, providerPrompt: string): Promise<ReviewResult> {
     const fallback: ReviewResult = {
       summary: `Codex review of ${input.changedFiles.length} changed file(s).`,
       blockers: [],
       safeImprovements: ['Add targeted tests for changed files.'],
       riskyChanges: []
     };
-    const providerPrompt = [
-      'Review the current repository changes for this ForgeMind task.',
-      'Do not modify files. Return only JSON matching the provided schema.',
-      `Task id: ${input.taskId}`,
-      `Changed files:\n${input.changedFiles.join('\n')}`
-    ].join('\n\n');
     const content = await this.runCodexExec({
       repositoryPath: input.repositoryPath,
       sandbox: 'read-only',
@@ -519,10 +523,18 @@ export class CodexProvider implements AIProvider {
         message: `Prompt sent to Codex:\n${input.prompt}`,
         elapsedMs: 0
       });
-      await runCodexProcess(args, input.prompt, {
+      const execution = await runCodexProcess(args, input.prompt, {
         cwd: input.repositoryPath,
         onActivity: input.onActivity
       });
+      if (execution.totalTokens !== undefined) {
+        await emitCapturedUsage(input.onActivity, {
+          provider: 'codex',
+          model: process.env.CODEX_MODEL ?? DEFAULT_CODEX_MODEL,
+          totalTokens: execution.totalTokens,
+          source: 'actual_total'
+        });
+      }
       return await readFile(outputPath, 'utf8');
     } catch (error) {
       if (error instanceof CodexExecutionTimeoutError) {
@@ -534,7 +546,9 @@ export class CodexProvider implements AIProvider {
     }
   }
 
-  private async requestResponses(messages: Array<{ role: 'system' | 'user' | 'assistant'; content: string }>): Promise<string> {
+  private async requestResponses(
+    messages: Array<{ role: 'system' | 'user' | 'assistant'; content: string }>
+  ): Promise<{ content: string; usage?: ProviderUsageMeasurement }> {
     if (!this.apiKey) {
       throw new Error('CODEX_API_KEY is required for Codex API key provider mode.');
     }
@@ -564,19 +578,36 @@ export class CodexProvider implements AIProvider {
     const data = (await response.json()) as {
       output_text?: string;
       output?: Array<{ content?: Array<{ text?: string }> }>;
+      usage?: {
+        input_tokens?: number;
+        output_tokens?: number;
+        total_tokens?: number;
+        input_tokens_details?: { cached_tokens?: number };
+      };
     };
 
+    let content = '';
     if (typeof data.output_text === 'string' && data.output_text.trim().length > 0) {
-      return data.output_text.trim();
+      content = data.output_text.trim();
+    } else {
+      content = data.output
+        ?.flatMap((item) => item.content ?? [])
+        .map((chunk) => chunk.text ?? '')
+        .join('\n')
+        .trim() ?? '';
     }
 
-    const text = data.output
-      ?.flatMap((item) => item.content ?? [])
-      .map((chunk) => chunk.text ?? '')
-      .join('\n')
-      .trim();
-
-    return text ?? '';
+    return {
+      content,
+      usage: normalizeTokenBreakdown({
+        provider: 'codex',
+        model: process.env.CODEX_MODEL ?? DEFAULT_CODEX_MODEL,
+        inputTokens: data.usage?.input_tokens,
+        outputTokens: data.usage?.output_tokens,
+        cachedTokens: data.usage?.input_tokens_details?.cached_tokens,
+        totalTokens: data.usage?.total_tokens
+      })
+    };
   }
 }
 
@@ -618,6 +649,10 @@ export interface CodexProcessOptions {
   onActivity?: ProviderActivityHandler;
 }
 
+export interface CodexProcessResult {
+  totalTokens?: number;
+}
+
 export class CodexExecutionTimeoutError extends Error {
   lastMessage = '';
 
@@ -636,7 +671,11 @@ export class CodexExecutionTimeoutError extends Error {
   }
 }
 
-export async function runCodexProcess(args: string[], stdin: string, options: CodexProcessOptions = {}): Promise<void> {
+export async function runCodexProcess(
+  args: string[],
+  stdin: string,
+  options: CodexProcessOptions = {}
+): Promise<CodexProcessResult> {
   const startedAt = Date.now();
   const inactivityTimeoutMs = resolvePositiveTimeout(
     options.inactivityTimeoutMs,
@@ -645,7 +684,7 @@ export async function runCodexProcess(args: string[], stdin: string, options: Co
   );
   const maxRuntimeMs = resolvePositiveTimeout(options.maxRuntimeMs, process.env.CODEX_EXEC_MAX_RUNTIME_MS, 3_600_000);
 
-  await new Promise<void>((resolve, reject) => {
+  return await new Promise<CodexProcessResult>((resolve, reject) => {
     const child = spawn(options.binary ?? resolveCodexBinary(), args, {
       cwd: options.cwd ?? process.cwd(),
       env: process.env,
@@ -667,11 +706,11 @@ export async function runCodexProcess(args: string[], stdin: string, options: Co
       if (terminationTimer) clearTimeout(terminationTimer);
       workspaceWatcher?.close();
     };
-    const finish = (error?: Error) => {
+    const finish = (error?: Error, result: CodexProcessResult = {}) => {
       if (settled) return;
       settled = true;
       cleanup();
-      error ? reject(error) : resolve();
+      error ? reject(error) : resolve(result);
     };
     const emitActivity = (kind: 'lifecycle' | 'stdout' | 'stderr' | 'workspace', message: string) => {
       void emitProviderActivityMessage(options.onActivity, {
@@ -733,7 +772,7 @@ export async function runCodexProcess(args: string[], stdin: string, options: Co
       }
       if (code === 0) {
         emitActivity('lifecycle', 'Codex process completed.');
-        finish();
+        finish(undefined, { totalTokens: parseCodexCliTotalTokens(stderr) });
         return;
       }
 
@@ -871,6 +910,17 @@ async function collectDiffStat(
 
 function stripAnsi(value: string): string {
   return value.replace(/\u001b\[[0-9;]*m/g, '').replace(/\r/g, '');
+}
+
+export function parseCodexCliTotalTokens(stderr: string): number | undefined {
+  const matches = [...stripAnsi(stderr).matchAll(/tokens used\s+([0-9][0-9,]*)/gi)];
+  const rawValue = matches.at(-1)?.[1]?.replace(/,/g, '');
+  if (!rawValue) {
+    return undefined;
+  }
+
+  const parsed = Number(rawValue);
+  return Number.isSafeInteger(parsed) && parsed >= 0 ? parsed : undefined;
 }
 
 function resolvePositiveTimeout(explicitValue: number | undefined, environmentValue: string | undefined, fallback: number): number {
