@@ -170,6 +170,7 @@ export interface ClaimedTask {
   project: Project;
   taskRun: ReturnType<typeof toTaskRun>;
   queueJobId?: string;
+  queueReason?: string;
 }
 
 export interface TaskQueuePosition {
@@ -264,6 +265,7 @@ const WORKER_EVENT_PREFIXES = [
   'task_iteration_',
   'task_activity',
   'task_provider_activity',
+  'task_worker_interrupted',
   'task_failed'
 ] as const;
 
@@ -1158,7 +1160,7 @@ export class ForgeMindRepository {
     return { enqueued: true };
   }
 
-  async recoverStuckQueueJobs(claimTimeoutMinutes = 15): Promise<QueueRecoveryResult> {
+  async recoverStuckQueueJobs(claimTimeoutMinutes = 2): Promise<QueueRecoveryResult> {
     const timeoutMinutes = Math.max(1, claimTimeoutMinutes);
     const cutoff = new Date(Date.now() - timeoutMinutes * 60_000);
 
@@ -1173,50 +1175,345 @@ export class ForgeMindRepository {
       }
     });
 
-    if (stuckJobs.length === 0) {
-      return {
-        recoveredCount: 0,
-        queueJobIds: []
-      };
+    const queueJobIds: string[] = [];
+    for (const job of stuckJobs) {
+      const recovered = await this.prisma.$transaction(async (tx) => {
+        const [queueJob, task] = await Promise.all([
+          tx.taskQueueJob.findUnique({
+            where: { id: job.id },
+            select: {
+              id: true,
+              status: true,
+              claimedAt: true
+            }
+          }),
+          tx.task.findUnique({
+            where: { id: job.taskId },
+            select: {
+              id: true,
+              projectId: true,
+              status: true
+            }
+          })
+        ]);
+
+        if (!queueJob || queueJob.status !== 'claimed' || !queueJob.claimedAt || queueJob.claimedAt >= cutoff) {
+          return false;
+        }
+
+        if (!task) {
+          await tx.taskQueueJob.update({
+            where: { id: job.id },
+            data: {
+              status: 'failed',
+              claimedAt: null,
+              nextAttemptAt: null,
+              errorMessage: `Task "${job.taskId}" no longer exists.`,
+              finishedAt: new Date()
+            }
+          });
+          return false;
+        }
+
+        if (task.status !== 'submitted' && !ACTIVE_TASK_STATUSES.has(task.status)) {
+          await tx.taskQueueJob.update({
+            where: { id: job.id },
+            data: {
+              status: task.status === 'cancelled' ? 'cancelled' : 'failed',
+              claimedAt: null,
+              nextAttemptAt: null,
+              errorMessage: `Task "${task.id}" is ${task.status}; interrupted queue job was not recovered.`,
+              finishedAt: new Date()
+            }
+          });
+          return false;
+        }
+
+        const interruptedAt = new Date();
+        const interruptionMessage = 'Worker execution was interrupted and will resume from the existing workspace.';
+        await tx.taskRun.updateMany({
+          where: {
+            taskId: task.id,
+            status: 'running'
+          },
+          data: {
+            status: 'failed',
+            finishedAt: interruptedAt,
+            errorMessage: interruptionMessage
+          }
+        });
+        await tx.task.update({
+          where: { id: task.id },
+          data: {
+            status: 'submitted',
+            finishedAt: null
+          }
+        });
+        await tx.taskQueueJob.update({
+          where: { id: job.id },
+          data: {
+            status: 'pending',
+            reason: 'worker_interrupted',
+            claimedAt: null,
+            nextAttemptAt: interruptedAt,
+            errorMessage: interruptionMessage,
+            finishedAt: null
+          }
+        });
+        await tx.auditLog.create({
+          data: {
+            actorType: 'system',
+            eventType: 'task_worker_interrupted',
+            projectId: task.projectId,
+            taskId: task.id,
+            payload: {
+              queueJobId: job.id,
+              claimTimeoutMinutes: timeoutMinutes,
+              resumeFromWorkspace: true
+            }
+          }
+        });
+        await tx.auditLog.create({
+          data: {
+            actorType: 'system',
+            eventType: 'task_queue_job_recovered',
+            projectId: task.projectId,
+            taskId: task.id,
+            payload: {
+              queueJobId: job.id,
+              claimTimeoutMinutes: timeoutMinutes
+            }
+          }
+        });
+        return true;
+      });
+
+      if (recovered) {
+        queueJobIds.push(job.id);
+      }
     }
 
-    const queueJobIds = stuckJobs.map((job) => job.id);
-
-    await this.prisma.taskQueueJob.updateMany({
+    const orphanedTasks = await this.prisma.task.findMany({
       where: {
-        id: { in: queueJobIds }
+        status: { in: [...ACTIVE_TASK_STATUSES] },
+        queueJobs: {
+          none: {
+            status: { in: [...ACTIVE_QUEUE_STATUSES] }
+          }
+        }
       },
-      data: {
-        status: 'pending',
-        claimedAt: null,
-        errorMessage: null
+      select: {
+        id: true,
+        projectId: true
       }
     });
-
-    for (const job of stuckJobs) {
-      await this.writeAudit({
-        actorType: 'system',
-        eventType: 'task_queue_job_recovered',
-        taskId: job.taskId,
-        payload: {
-          queueJobId: job.id,
-          claimTimeoutMinutes: timeoutMinutes
+    for (const orphanedTask of orphanedTasks) {
+      const recoveredQueueJobId = await this.prisma.$transaction(async (tx) => {
+        const task = await tx.task.findUnique({
+          where: { id: orphanedTask.id },
+          select: {
+            id: true,
+            projectId: true,
+            status: true
+          }
+        });
+        if (!task || !ACTIVE_TASK_STATUSES.has(task.status)) {
+          return undefined;
         }
+
+        const activeQueueJobCount = await tx.taskQueueJob.count({
+          where: {
+            taskId: task.id,
+            status: { in: [...ACTIVE_QUEUE_STATUSES] }
+          }
+        });
+        if (activeQueueJobCount > 0) {
+          return undefined;
+        }
+
+        const recoveredAt = new Date();
+        const interruptionMessage = 'Active task had no live worker claim and will resume from the existing workspace.';
+        await tx.taskRun.updateMany({
+          where: {
+            taskId: task.id,
+            status: 'running'
+          },
+          data: {
+            status: 'failed',
+            finishedAt: recoveredAt,
+            errorMessage: interruptionMessage
+          }
+        });
+        await tx.task.update({
+          where: { id: task.id },
+          data: {
+            status: 'submitted',
+            finishedAt: null
+          }
+        });
+        const queueJob = await tx.taskQueueJob.create({
+          data: {
+            taskId: task.id,
+            reason: 'worker_interrupted',
+            status: 'pending',
+            nextAttemptAt: recoveredAt,
+            errorMessage: interruptionMessage
+          },
+          select: {
+            id: true
+          }
+        });
+        await tx.auditLog.create({
+          data: {
+            actorType: 'system',
+            eventType: 'task_worker_interrupted',
+            projectId: task.projectId,
+            taskId: task.id,
+            payload: {
+              queueJobId: queueJob.id,
+              orphanedTask: true,
+              resumeFromWorkspace: true
+            }
+          }
+        });
+        return queueJob.id;
       });
+
+      if (recoveredQueueJobId) {
+        queueJobIds.push(recoveredQueueJobId);
+      }
     }
 
     return {
-      recoveredCount: stuckJobs.length,
+      recoveredCount: queueJobIds.length,
       queueJobIds
     };
   }
 
+  async refreshQueueJobClaim(queueJobId: string): Promise<boolean> {
+    const result = await this.prisma.taskQueueJob.updateMany({
+      where: {
+        id: queueJobId,
+        status: 'claimed'
+      },
+      data: {
+        claimedAt: new Date()
+      }
+    });
+    return result.count === 1;
+  }
+
+  async interruptClaimedTask(input: {
+    queueJobId: string;
+    taskId: string;
+    taskRunId: string;
+    signal: 'SIGTERM' | 'SIGINT';
+  }): Promise<boolean> {
+    return this.prisma.$transaction(async (tx) => {
+      const [queueJob, task] = await Promise.all([
+        tx.taskQueueJob.findUnique({
+          where: { id: input.queueJobId },
+          select: {
+            id: true,
+            taskId: true,
+            status: true
+          }
+        }),
+        tx.task.findUnique({
+          where: { id: input.taskId },
+          select: {
+            id: true,
+            projectId: true,
+            status: true
+          }
+        })
+      ]);
+      if (
+        !queueJob
+        || queueJob.taskId !== input.taskId
+        || queueJob.status !== 'claimed'
+        || !task
+        || (task.status !== 'submitted' && !ACTIVE_TASK_STATUSES.has(task.status))
+      ) {
+        return false;
+      }
+
+      const interruptedAt = new Date();
+      const errorMessage = `Worker received ${input.signal}; execution will resume from the existing workspace.`;
+      await tx.taskRun.updateMany({
+        where: {
+          id: input.taskRunId,
+          taskId: input.taskId,
+          status: 'running'
+        },
+        data: {
+          status: 'failed',
+          finishedAt: interruptedAt,
+          errorMessage
+        }
+      });
+      await tx.task.update({
+        where: { id: input.taskId },
+        data: {
+          status: 'submitted',
+          finishedAt: null
+        }
+      });
+      await tx.taskQueueJob.update({
+        where: { id: input.queueJobId },
+        data: {
+          status: 'pending',
+          reason: 'worker_interrupted',
+          claimedAt: null,
+          nextAttemptAt: interruptedAt,
+          errorMessage,
+          finishedAt: null
+        }
+      });
+      await tx.auditLog.create({
+        data: {
+          actorType: 'system',
+          eventType: 'task_worker_interrupted',
+          projectId: task.projectId,
+          taskId: task.id,
+          payload: {
+            queueJobId: input.queueJobId,
+            taskRunId: input.taskRunId,
+            signal: input.signal,
+            resumeFromWorkspace: true
+          }
+        }
+      });
+      return true;
+    });
+  }
+
   async getWorkerStatus(): Promise<WorkerStatusSnapshot> {
+    const claimTimeoutMinutes = Math.max(1, Number(process.env.FORGEMIND_QUEUE_CLAIM_TIMEOUT_MINUTES ?? 2));
+    const activeClaimCutoff = new Date(Date.now() - claimTimeoutMinutes * 60_000);
+    const activeClaimFilter = {
+      status: 'claimed' as const,
+      claimedAt: { gte: activeClaimCutoff }
+    };
     const [queuedTaskCount, activeTaskCount, runningRun, lastCompletedRun] = await Promise.all([
       this.prisma.taskQueueJob.count({ where: { status: 'pending' } }),
-      this.prisma.task.count({ where: { status: { in: [...ACTIVE_TASK_STATUSES] } } }),
+      this.prisma.task.count({
+        where: {
+          status: { in: [...ACTIVE_TASK_STATUSES] },
+          queueJobs: {
+            some: activeClaimFilter
+          }
+        }
+      }),
       this.prisma.taskRun.findFirst({
-        where: { status: 'running' },
+        where: {
+          status: 'running',
+          task: {
+            queueJobs: {
+              some: activeClaimFilter
+            }
+          }
+        },
         orderBy: { startedAt: 'desc' }
       }),
       this.prisma.taskRun.findFirst({
@@ -1716,7 +2013,8 @@ export class ForgeMindRepository {
         task: toTask(updated),
         project: toProject(updated.project),
         taskRun: toTaskRun(taskRun),
-        queueJobId: claimedQueueJob.id
+        queueJobId: claimedQueueJob.id,
+        queueReason: claimedQueueJob.reason
       };
     });
   }

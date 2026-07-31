@@ -39,7 +39,7 @@ export interface WorkerTaskInput {
 type GitHubOperation = 'create_issue' | 'create_branch' | 'commit_and_push' | 'create_draft_pr' | 'create_pull_request' | 'merge_pr' | 'comment_on_issue';
 
 export interface WorkerTaskResume {
-  kind: 'approved_large_diff' | 'approved_review';
+  kind: 'approved_large_diff' | 'approved_review' | 'worker_interrupted';
   planSummary?: string;
   implementationSummary: string;
   reviewSummary?: string;
@@ -815,7 +815,9 @@ function createResumePlan(resume: WorkerTaskResume): PlanResult {
       resume.planSummary
       ?? (resume.kind === 'approved_review'
         ? 'Resume previously reviewed implementation after approval.'
-        : 'Resume previously approved implementation.'),
+        : resume.kind === 'worker_interrupted'
+          ? 'Resume implementation after the previous worker process was interrupted.'
+          : 'Resume previously approved implementation.'),
     steps: [],
     acceptanceCriteria: [],
     validationChecks: normalizeValidationChecks(resume.validationChecks)

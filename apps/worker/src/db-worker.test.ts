@@ -4,10 +4,8 @@ const createProviderMock = vi.fn();
 const runWorkerTaskMock = vi.fn();
 const advanceRoadmapAfterTaskCompletionMock = vi.fn(async () => ({ advanced: false }));
 
-const repositoryMock = {
-  recoverStuckQueueJobs: vi.fn(async () => ({ recoveredCount: 0, queueJobIds: [] })),
-  getGitHubConnectionSecret: vi.fn(async () => undefined),
-  claimNextSubmittedTask: vi.fn(async (): Promise<unknown> => ({
+function createClaimedTask(queueReason = 'task_started') {
+  return {
     task: {
       id: 'task_1',
       projectId: 'project_1',
@@ -35,8 +33,15 @@ const repositoryMock = {
     taskRun: {
       id: 'run_1'
     },
-    queueJobId: 'queue_1'
-  })),
+    queueJobId: 'queue_1',
+    queueReason
+  };
+}
+
+const repositoryMock = {
+  recoverStuckQueueJobs: vi.fn(async () => ({ recoveredCount: 0, queueJobIds: [] })),
+  getGitHubConnectionSecret: vi.fn(async () => undefined),
+  claimNextSubmittedTask: vi.fn(async (): Promise<unknown> => createClaimedTask()),
   recordProviderUsage: vi.fn(async () => undefined),
   transitionTask: vi.fn(async () => undefined),
   createApproval: vi.fn(async () => ({ id: 'approval_1' })),
@@ -128,6 +133,65 @@ describe('db-worker policy enforcement', () => {
           queueJobId: 'queue_1',
           operation: 'create_pr',
           errorMessage: expect.stringContaining('500: Internal Server Error')
+        })
+      })
+    );
+  });
+
+  it('resumes an interrupted worker run from the preserved workspace', async () => {
+    repositoryMock.claimNextSubmittedTask.mockResolvedValueOnce(createClaimedTask('worker_interrupted'));
+    repositoryMock.getTaskDiff.mockResolvedValueOnce({
+      taskId: 'task_1',
+      filesChanged: 3,
+      insertions: 20,
+      deletions: 2,
+      iterations: [
+        {
+          phase: 'planning',
+          resultSummary: 'Existing plan',
+          validationResult: {
+            validationChecks: [
+              {
+                kind: 'command',
+                command: 'npm test'
+              }
+            ]
+          }
+        }
+      ]
+    });
+    runWorkerTaskMock.mockResolvedValueOnce({
+      taskId: 'task_1',
+      status: 'ready_for_user_review',
+      branchName: 'ai/1-task',
+      workspacePath: 'C:/tmp/worker',
+      validation: {
+        command: 'npm test',
+        exitCode: 0,
+        stdout: '',
+        stderr: '',
+        passed: true
+      },
+      summary: 'Resumed successfully.',
+      approvals: [],
+      completedAt: new Date().toISOString()
+    });
+
+    const { runDatabaseWorkerOnce } = await import('./db-worker.js');
+    await runDatabaseWorkerOnce();
+
+    expect(runWorkerTaskMock).toHaveBeenCalledWith(
+      expect.objectContaining({
+        resume: expect.objectContaining({
+          kind: 'worker_interrupted',
+          planSummary: 'Existing plan',
+          implementationSummary: expect.stringContaining('preserved in the workspace'),
+          validationChecks: [
+            expect.objectContaining({
+              kind: 'command',
+              command: 'npm test'
+            })
+          ]
         })
       })
     );

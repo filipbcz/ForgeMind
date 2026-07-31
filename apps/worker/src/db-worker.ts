@@ -39,7 +39,7 @@ export async function runDatabaseWorkerOnce() {
   const fallbackProviderOverride = process.env.FORGEMIND_FALLBACK_PROVIDER as ProviderKind | undefined;
   const providerKind = providerOverride ?? aiProviderConnection?.provider ?? 'codex';
   const providerModel = resolveProviderModel(providerKind, aiProviderConnection);
-  const claimTimeoutMinutes = Number(process.env.FORGEMIND_QUEUE_CLAIM_TIMEOUT_MINUTES ?? 15);
+  const claimTimeoutMinutes = Number(process.env.FORGEMIND_QUEUE_CLAIM_TIMEOUT_MINUTES ?? 2);
   const recovery = await repository.recoverStuckQueueJobs(claimTimeoutMinutes);
   const claimed = await repository.claimNextSubmittedTask(providerKind, providerModel);
 
@@ -50,6 +50,26 @@ export async function runDatabaseWorkerOnce() {
       recoveredQueueJobs: recovery.recoveredCount
     };
   }
+  const stopQueueHeartbeat = startQueueClaimHeartbeat(repository, claimed.queueJobId, claimTimeoutMinutes);
+  const stopInterruptionRecovery = installWorkerInterruptionRecovery({
+    repository,
+    queueJobId: claimed.queueJobId,
+    taskId: claimed.task.id,
+    taskRunId: claimed.taskRun.id,
+    stopQueueHeartbeat
+  });
+  const finalizeQueueJob = async (
+    status: 'succeeded' | 'failed' | 'cancelled',
+    errorMessage?: string
+  ) => {
+    stopQueueHeartbeat();
+    stopInterruptionRecovery();
+    if (errorMessage === undefined) {
+      await repository.finalizeQueueJob(claimed.queueJobId, status);
+    } else {
+      await repository.finalizeQueueJob(claimed.queueJobId, status, errorMessage);
+    }
+  };
 
   let iterationNumber = 0;
   let attemptCount = 0;
@@ -84,7 +104,11 @@ export async function runDatabaseWorkerOnce() {
     fallbackProvider: selection.fallback ? createProvider(selection.fallback) : undefined
   });
   const limits = resolveLimits(claimed.project.configYaml, claimed.task.maxIterations, claimed.task.maxBudgetUsd);
-  const resumeContext = await resolveTaskResumeContext(repository, claimed.task.id);
+  const resumeContext = await resolveTaskResumeContext(
+    repository,
+    claimed.task.id,
+    claimed.queueReason === 'worker_interrupted'
+  );
   let costEstimate;
   try {
     costEstimate = await provider.estimateCost({ prompt: claimed.task.prompt, repositorySizeHint: 'small' });
@@ -103,7 +127,7 @@ export async function runDatabaseWorkerOnce() {
       estimatedCostUsd: 0,
       actualCostUsd: null
     });
-    await repository.finalizeQueueJob(claimed.queueJobId, 'failed', message);
+    await finalizeQueueJob('failed', message);
     return {
       claimed: true,
       taskId: claimed.task.id,
@@ -134,7 +158,7 @@ export async function runDatabaseWorkerOnce() {
       errorMessage: 'Budget limit exceeded before provider run.',
       ...getRunUsageFields()
     });
-    await repository.finalizeQueueJob(claimed.queueJobId, 'failed', 'Budget limit exceeded before provider run.');
+    await finalizeQueueJob('failed', 'Budget limit exceeded before provider run.');
     return {
       claimed: true,
       taskId: claimed.task.id,
@@ -360,7 +384,7 @@ export async function runDatabaseWorkerOnce() {
         iterationCount: attemptCount,
         ...getRunUsageFields()
       });
-      await repository.finalizeQueueJob(claimed.queueJobId, 'succeeded');
+      await finalizeQueueJob('succeeded');
     } else if (result.status === 'validation_failed') {
       await repository.transitionTask(claimed.task.id, 'validation_failed', {
         validation: {
@@ -379,7 +403,7 @@ export async function runDatabaseWorkerOnce() {
         iterationCount: attemptCount,
         ...getRunUsageFields()
       });
-      await repository.finalizeQueueJob(claimed.queueJobId, 'failed', result.validation.stderr || 'Validation failed.');
+      await finalizeQueueJob('failed', result.validation.stderr || 'Validation failed.');
     } else if (result.status === 'failed') {
       await repository.failTask(claimed.task.id, result.summary, 'failed');
       await repository.finishTaskRun({
@@ -390,7 +414,7 @@ export async function runDatabaseWorkerOnce() {
         iterationCount: attemptCount,
         ...getRunUsageFields()
       });
-      await repository.finalizeQueueJob(claimed.queueJobId, 'failed', result.summary);
+      await finalizeQueueJob('failed', result.summary);
     } else {
       await repository.transitionTask(claimed.task.id, 'ready_for_user_review', {
         pullRequestUrl: result.pullRequestUrl ?? null,
@@ -407,7 +431,7 @@ export async function runDatabaseWorkerOnce() {
         iterationCount: attemptCount,
         ...getRunUsageFields()
       });
-      await repository.finalizeQueueJob(claimed.queueJobId, 'succeeded');
+      await finalizeQueueJob('succeeded');
     }
 
     return {
@@ -424,7 +448,7 @@ export async function runDatabaseWorkerOnce() {
         iterationCount: attemptCount,
         ...getRunUsageFields()
       });
-      await repository.finalizeQueueJob(claimed.queueJobId, 'succeeded');
+      await finalizeQueueJob('succeeded');
       return {
         claimed: true,
         taskId: claimed.task.id,
@@ -442,7 +466,7 @@ export async function runDatabaseWorkerOnce() {
       iterationCount: attemptCount,
       ...getRunUsageFields()
     });
-    await repository.finalizeQueueJob(claimed.queueJobId, 'failed', message);
+    await finalizeQueueJob('failed', message);
     if (error instanceof WorkerLimitError || error instanceof ProviderExecutionError) {
       return {
         claimed: true,
@@ -803,6 +827,93 @@ function toLimitsPayload(limits: Limits): Record<string, JsonValue> {
   };
 }
 
+function startQueueClaimHeartbeat(
+  repository: {
+    refreshQueueJobClaim?: (queueJobId: string) => Promise<boolean>;
+  },
+  queueJobId: string | undefined,
+  claimTimeoutMinutes: number
+): () => void {
+  if (!queueJobId || typeof repository.refreshQueueJobClaim !== 'function') {
+    return () => undefined;
+  }
+
+  const heartbeatIntervalMs = Math.max(5_000, Math.min(30_000, claimTimeoutMinutes * 20_000));
+  let stopped = false;
+  let inFlight = false;
+  const timer = setInterval(() => {
+    if (stopped || inFlight) return;
+    inFlight = true;
+    void repository.refreshQueueJobClaim!(queueJobId)
+      .then((refreshed) => {
+        if (!refreshed) {
+          stopped = true;
+          clearInterval(timer);
+        }
+      })
+      .catch(() => undefined)
+      .finally(() => {
+        inFlight = false;
+      });
+  }, heartbeatIntervalMs);
+  timer.unref();
+
+  return () => {
+    if (stopped) return;
+    stopped = true;
+    clearInterval(timer);
+  };
+}
+
+function installWorkerInterruptionRecovery(input: {
+  repository: {
+    interruptClaimedTask?: (input: {
+      queueJobId: string;
+      taskId: string;
+      taskRunId: string;
+      signal: 'SIGTERM' | 'SIGINT';
+    }) => Promise<boolean>;
+  };
+  queueJobId: string | undefined;
+  taskId: string;
+  taskRunId: string;
+  stopQueueHeartbeat: () => void;
+}): () => void {
+  if (!input.queueJobId || typeof input.repository.interruptClaimedTask !== 'function') {
+    return () => undefined;
+  }
+
+  let stopped = false;
+  let handlingSignal = false;
+  const handleSignal = (signal: 'SIGTERM' | 'SIGINT') => {
+    if (stopped || handlingSignal) return;
+    handlingSignal = true;
+    input.stopQueueHeartbeat();
+    const forcedExitTimer = setTimeout(() => process.exit(1), 8_000);
+    forcedExitTimer.unref();
+    void input.repository.interruptClaimedTask!({
+      queueJobId: input.queueJobId!,
+      taskId: input.taskId,
+      taskRunId: input.taskRunId,
+      signal
+    }).finally(() => {
+      clearTimeout(forcedExitTimer);
+      process.exit(0);
+    });
+  };
+  const handleSigterm = () => handleSignal('SIGTERM');
+  const handleSigint = () => handleSignal('SIGINT');
+  process.once('SIGTERM', handleSigterm);
+  process.once('SIGINT', handleSigint);
+
+  return () => {
+    if (stopped) return;
+    stopped = true;
+    process.off('SIGTERM', handleSigterm);
+    process.off('SIGINT', handleSigint);
+  };
+}
+
 async function resolveTaskResumeContext(
   repository: {
     listApprovals: () => Promise<Array<{ taskId: string; type: ApprovalType; status: 'pending' | 'approved' | 'rejected' | 'cancelled'; payload: unknown; createdAt: string }>>;
@@ -810,7 +921,8 @@ async function resolveTaskResumeContext(
       iterations: TaskDiffIterationSnapshot[];
     }>;
   },
-  taskId: string
+  taskId: string,
+  workerInterrupted = false
 ): Promise<TaskResumeContext | undefined> {
   const [approvals, diff] = await Promise.all([repository.listApprovals(), repository.getTaskDiff(taskId)]);
   const taskApprovals = approvals.filter((approval) => approval.taskId === taskId);
@@ -823,6 +935,21 @@ async function resolveTaskResumeContext(
   const latestApprovedReviewAt = approvedReviewResume
     ? getLatestApprovedReviewAt(taskApprovals, approvedReviewResume.riskyChanges ?? [])
     : undefined;
+
+  if (workerInterrupted) {
+    return {
+      workflowResume: {
+        kind: 'worker_interrupted',
+        planSummary: lastPlanningIteration?.resultSummary,
+        implementationSummary:
+          lastImplementationIteration?.resultSummary
+          ?? 'Continue the implementation preserved in the workspace after the worker was interrupted.',
+        validationChecks: extractValidationChecks(lastPlanningIteration?.validationResult),
+        approvedApprovals: Array.from(approvedTypes)
+      },
+      ignoredLimitSignals: []
+    };
+  }
 
   if (latestApprovedLargeDiffAt && (!latestApprovedReviewAt || latestApprovedLargeDiffAt >= latestApprovedReviewAt)) {
     if (!lastImplementationIteration) {

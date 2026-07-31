@@ -1768,6 +1768,20 @@ function toTaskActivityEntry(event: AuditEventApi): TaskActivityEntry | undefine
     };
   }
 
+  if (event.eventType === 'task_worker_interrupted') {
+    return {
+      id: event.id,
+      createdAt: event.createdAt,
+      phase: 'workspace',
+      attempt: 0,
+      state: 'progress',
+      title: 'Worker byl restartován',
+      detail: 'Task bude pokračovat ze zachovaného pracovního prostoru.',
+      kind: 'activity',
+      elapsedMs: 0
+    };
+  }
+
   if (event.eventType.startsWith('task_status_')) {
     const status = event.eventType.slice('task_status_'.length) as TaskSummary['status'];
     if (!Object.prototype.hasOwnProperty.call(statusLabels, status)) {
@@ -1879,7 +1893,7 @@ function summarizeProviderActivity(
     return { state: 'progress', title: 'AI spouští příkaz', detail: normalized };
   }
   if (/^succeeded in\b/i.test(normalized)) {
-    return { state: 'progress', title: 'Příkaz AI skončil', detail: normalized };
+    return { state: 'progress', title: 'Podřízený příkaz byl dokončen', detail: normalized };
   }
   if (/tokens used/i.test(normalized)) {
     return { state: 'progress', title: 'AI dokončuje odpověď', detail: normalized };

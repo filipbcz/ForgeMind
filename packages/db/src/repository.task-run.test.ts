@@ -145,7 +145,7 @@ function createMockPrisma() {
         taskRuns: []
       })),
       create: vi.fn(),
-      findMany: vi.fn()
+      findMany: vi.fn(async () => [])
     },
     taskRun: {
       create: taskRunCreate,
@@ -290,14 +290,142 @@ describe('ForgeMindRepository task runs', () => {
   });
 
   it('recovers stuck claimed queue jobs back to pending', async () => {
-    const { prisma } = createMockPrisma();
+    const { prisma, taskQueueJobFindUnique } = createMockPrisma();
+    taskQueueJobFindUnique.mockResolvedValueOnce({
+      id: 'queue_1',
+      status: 'claimed',
+      claimedAt: new Date(Date.now() - 10 * 60_000)
+    } as any);
+    prisma.task.findUnique.mockResolvedValueOnce({
+      id: 'task_1',
+      projectId: 'project_1',
+      status: 'running_ai'
+    });
     const repository = new ForgeMindRepository(prisma);
 
     const result = await repository.recoverStuckQueueJobs(5);
 
     expect(result.recoveredCount).toBe(1);
     expect(result.queueJobIds).toEqual(['queue_1']);
-    expect(prisma.taskQueueJob.updateMany).toHaveBeenCalled();
+    expect(prisma.taskRun.updateMany).toHaveBeenCalledWith({
+      where: {
+        taskId: 'task_1',
+        status: 'running'
+      },
+      data: {
+        status: 'failed',
+        finishedAt: expect.any(Date),
+        errorMessage: 'Worker execution was interrupted and will resume from the existing workspace.'
+      }
+    });
+    expect(prisma.task.update).toHaveBeenCalledWith({
+      where: { id: 'task_1' },
+      data: {
+        status: 'submitted',
+        finishedAt: null
+      }
+    });
+    expect(prisma.taskQueueJob.update).toHaveBeenCalledWith({
+      where: { id: 'queue_1' },
+      data: expect.objectContaining({
+        status: 'pending',
+        reason: 'worker_interrupted',
+        claimedAt: null,
+        nextAttemptAt: expect.any(Date)
+      })
+    });
+  });
+
+  it('refreshes the queue claim used as the worker heartbeat', async () => {
+    const { prisma } = createMockPrisma();
+    const repository = new ForgeMindRepository(prisma);
+
+    await expect(repository.refreshQueueJobClaim('queue_1')).resolves.toBe(true);
+
+    expect(prisma.taskQueueJob.updateMany).toHaveBeenCalledWith({
+      where: {
+        id: 'queue_1',
+        status: 'claimed'
+      },
+      data: {
+        claimedAt: expect.any(Date)
+      }
+    });
+  });
+
+  it('requeues an orphaned active task without a live queue claim', async () => {
+    const { prisma } = createMockPrisma();
+    prisma.taskQueueJob.findMany.mockResolvedValueOnce([]);
+    prisma.task.findMany.mockResolvedValueOnce([
+      {
+        id: 'task_1',
+        projectId: 'project_1'
+      }
+    ]);
+    prisma.task.findUnique.mockResolvedValueOnce({
+      id: 'task_1',
+      projectId: 'project_1',
+      status: 'running_ai'
+    });
+    prisma.taskQueueJob.count.mockResolvedValueOnce(0);
+    prisma.taskQueueJob.create.mockResolvedValueOnce({ id: 'queue_recovered' });
+    const repository = new ForgeMindRepository(prisma);
+
+    const result = await repository.recoverStuckQueueJobs(2);
+
+    expect(result).toEqual({
+      recoveredCount: 1,
+      queueJobIds: ['queue_recovered']
+    });
+    expect(prisma.taskQueueJob.create).toHaveBeenCalledWith({
+      data: expect.objectContaining({
+        taskId: 'task_1',
+        reason: 'worker_interrupted',
+        status: 'pending',
+        nextAttemptAt: expect.any(Date)
+      }),
+      select: {
+        id: true
+      }
+    });
+  });
+
+  it('requeues an active task when the worker receives a shutdown signal', async () => {
+    const { prisma } = createMockPrisma();
+    prisma.task.findUnique.mockResolvedValueOnce({
+      id: 'task_1',
+      projectId: 'project_1',
+      status: 'running_ai'
+    });
+    const repository = new ForgeMindRepository(prisma);
+
+    await expect(repository.interruptClaimedTask({
+      queueJobId: 'queue_1',
+      taskId: 'task_1',
+      taskRunId: 'run_1',
+      signal: 'SIGTERM'
+    })).resolves.toBe(true);
+
+    expect(prisma.taskRun.updateMany).toHaveBeenCalledWith({
+      where: {
+        id: 'run_1',
+        taskId: 'task_1',
+        status: 'running'
+      },
+      data: {
+        status: 'failed',
+        finishedAt: expect.any(Date),
+        errorMessage: 'Worker received SIGTERM; execution will resume from the existing workspace.'
+      }
+    });
+    expect(prisma.taskQueueJob.update).toHaveBeenCalledWith({
+      where: { id: 'queue_1' },
+      data: expect.objectContaining({
+        status: 'pending',
+        reason: 'worker_interrupted',
+        claimedAt: null
+      })
+    });
   });
 
   it('cancels pending and claimed queue jobs when task is cancelled', async () => {

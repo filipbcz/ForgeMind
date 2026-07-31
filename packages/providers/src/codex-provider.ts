@@ -779,7 +779,11 @@ export async function runCodexProcess(
       try {
         workspaceWatcher = watch(options.cwd, { recursive: true }, (_eventType, filename) => {
           const path = String(filename ?? '');
-          if (!path || path === '.git' || path.startsWith('.git/') || path.startsWith('.git\\')) return;
+          if (!path) return;
+          if (isNoisyWorkspaceActivityPath(path)) {
+            resetInactivityTimer();
+            return;
+          }
           recordActivity('workspace', `Workspace changed: ${path}`);
         });
       } catch {
@@ -814,6 +818,18 @@ export async function runCodexProcess(
     });
     child.stdin?.end(stdin);
   });
+}
+
+export function isNoisyWorkspaceActivityPath(path: string): boolean {
+  const normalized = path.replaceAll('\\', '/');
+  const firstSegment = normalized.split('/', 1)[0]?.toLowerCase();
+  return firstSegment === '.git'
+    || firstSegment === 'node_modules'
+    || firstSegment === 'dist'
+    || firstSegment === 'build'
+    || firstSegment === 'coverage'
+    || firstSegment === '.cache'
+    || firstSegment === '.next';
 }
 
 export function resolveCodexBinary(env: NodeJS.ProcessEnv = process.env): string {

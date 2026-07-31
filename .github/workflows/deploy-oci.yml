@@ -20,6 +20,7 @@ jobs:
       contents: read
       packages: write
     outputs:
+      runtime_base_image: ${{ steps.image_names.outputs.runtime_base }}
       runtime_image: ${{ steps.image_names.outputs.runtime }}
       web_image: ${{ steps.image_names.outputs.web }}
     steps:
@@ -33,6 +34,13 @@ jobs:
         run: |
           set -euo pipefail
           repository="${GITHUB_REPOSITORY,,}"
+          dependency_hash="$(
+            {
+              printf '%s\n' infra/Dockerfile package.json package-lock.json packages/db/prisma/schema.prisma
+              find apps packages -mindepth 2 -maxdepth 2 -name package.json -type f -print
+            } | LC_ALL=C sort -u | xargs sha256sum | sha256sum | cut -d ' ' -f 1
+          )"
+          echo "runtime_base=ghcr.io/${repository}-runtime-base:deps-${dependency_hash}" >> "${GITHUB_OUTPUT}"
           echo "runtime=ghcr.io/${repository}-runtime:${GITHUB_SHA}" >> "${GITHUB_OUTPUT}"
           echo "runtime_main=ghcr.io/${repository}-runtime:main" >> "${GITHUB_OUTPUT}"
           echo "web=ghcr.io/${repository}-web:${GITHUB_SHA}" >> "${GITHUB_OUTPUT}"
@@ -44,6 +52,32 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      - name: Check runtime base image
+        id: runtime_base
+        shell: bash
+        run: |
+          if docker buildx imagetools inspect "${{ steps.image_names.outputs.runtime_base }}" >/dev/null 2>&1; then
+            echo "exists=true" >> "${GITHUB_OUTPUT}"
+          else
+            echo "exists=false" >> "${GITHUB_OUTPUT}"
+          fi
+
+      - name: Build and push runtime base image
+        if: steps.runtime_base.outputs.exists != 'true'
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: infra/Dockerfile
+          target: runtime-base
+          push: true
+          tags: ${{ steps.image_names.outputs.runtime_base }}
+          cache-from: type=gha,scope=forgemind-runtime-base
+          cache-to: |
+            type=gha,mode=max,scope=forgemind-runtime-base
+            type=inline
+          provenance: false
+          sbom: false
+
       - name: Build and push runtime image
         uses: docker/build-push-action@v6
         with:
@@ -54,7 +88,9 @@ jobs:
           tags: |
             ${{ steps.image_names.outputs.runtime }}
             ${{ steps.image_names.outputs.runtime_main }}
-          cache-from: type=gha,scope=forgemind-production
+          cache-from: |
+            type=gha,scope=forgemind-production
+            type=registry,ref=${{ steps.image_names.outputs.runtime_base }}
           cache-to: type=gha,mode=max,scope=forgemind-production
           provenance: false
           sbom: false
@@ -84,6 +120,7 @@ jobs:
     env:
       APP_ROOT: /opt/forgemind
       RELEASE_ARCHIVE: forgemind-${{ github.sha }}.tar.gz
+      FORGEMIND_RUNTIME_BASE_IMAGE: ${{ needs.build_images.outputs.runtime_base_image }}
       FORGEMIND_RUNTIME_IMAGE: ${{ needs.build_images.outputs.runtime_image }}
       FORGEMIND_WEB_IMAGE: ${{ needs.build_images.outputs.web_image }}
     steps:
@@ -145,6 +182,7 @@ jobs:
             rsync -a --delete \"\${RELEASE_DIR}/\" \"\${APP_ROOT}/app/\"
             rm -f \"/tmp/${RELEASE_ARCHIVE}\"
             APP_ROOT=\"\${APP_ROOT}\" \
+            FORGEMIND_RUNTIME_BASE_IMAGE='${FORGEMIND_RUNTIME_BASE_IMAGE}' \
             FORGEMIND_RUNTIME_IMAGE='${FORGEMIND_RUNTIME_IMAGE}' \
             FORGEMIND_WEB_IMAGE='${FORGEMIND_WEB_IMAGE}' \
             bash \"\${APP_ROOT}/app/infra/deploy/remote-deploy.sh\"

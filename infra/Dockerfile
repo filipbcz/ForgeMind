@@ -30,7 +30,7 @@ COPY packages packages
 RUN npm run db:generate
 RUN npm run build
 
-FROM node:22-bookworm-slim AS runtime
+FROM node:22-bookworm-slim AS runtime-base
 
 ARG CODEX_VERSION=0.142.5
 
@@ -56,9 +56,12 @@ COPY packages/shared/package.json packages/shared/package.json
 RUN npm ci --omit=dev \
   && npm install --no-save prisma@6.9.0
 
-COPY packages/db/prisma packages/db/prisma
+COPY packages/db/prisma/schema.prisma packages/db/prisma/schema.prisma
 RUN npx prisma generate --schema packages/db/prisma/schema.prisma
 
+FROM runtime-base AS runtime
+
+COPY packages/db/prisma packages/db/prisma
 COPY --from=build /app/apps/studio-api/dist apps/studio-api/dist
 COPY --from=build /app/apps/worker/dist apps/worker/dist
 COPY --from=build /app/packages/config/dist packages/config/dist

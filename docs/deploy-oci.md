@@ -111,16 +111,19 @@ The workflow uses its short-lived `GITHUB_TOKEN` to publish images and authentic
 
 Deployment runs automatically after a push to `main` or manually through the `Deploy to OCI` workflow. The workflow:
 
-1. builds the `runtime` and `web` images on the GitHub-hosted runner,
-2. publishes immutable commit-SHA tags and moving `main` tags to GHCR,
-3. uploads an immutable Git archive,
-4. synchronizes it to `/opt/forgemind/app`,
-5. pulls the exact commit-SHA images on the OCI host,
-6. applies Prisma migrations,
-7. starts the API, worker and web proxy,
-8. waits for the API health check.
+1. builds the stable `runtime-base` image only when dependencies, the Dockerfile, or the Prisma schema change,
+2. builds the small application `runtime` layer and the `web` image on the GitHub-hosted runner,
+3. publishes immutable dependency and commit-SHA tags plus moving `main` tags to GHCR,
+4. uploads an immutable Git archive,
+5. synchronizes it to `/opt/forgemind/app`,
+6. stops the worker so an active task is requeued before image downloads,
+7. reuses the pinned runtime base and pulls the exact commit-SHA application images,
+8. applies Prisma migrations only when their checksum or the database migration state changed,
+9. starts the API, worker and web proxy,
+10. waits for the API health check.
 
 The OCI host does not run `npm ci` or compile the monorepo during deployment. The `main` image tags are defaults for manual Compose inspection; automated deployment always passes immutable SHA tags.
+Each deployment prints `docker system df` and a runtime-base cache hit or miss so unexpected OCI cache cleanup is visible directly in the Actions log.
 
 ## Provider configuration
 
