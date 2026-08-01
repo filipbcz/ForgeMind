@@ -925,6 +925,7 @@ export function isValidationCommandDefinitionFailure(validation: ValidationResul
     /missing script:/i,
     /unknown command/i,
     /command not found/i,
+    /(?:^|\n)(?:\/bin\/)?(?:ba)?sh:\s*\d+:\s*[^:\r\n]+:\s*not found\b/im,
     /is not recognized as (?:the name of a cmdlet|an internal or external command)/i,
     /unexpected argument .* found/i,
     /(?:unknown|unrecognized|invalid) (?:option|argument|flag)/i,

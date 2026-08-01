@@ -33,6 +33,24 @@ export interface ValidationActivity {
 
 export type ValidationActivityHandler = (activity: ValidationActivity) => Promise<void> | void;
 
+export function normalizeValidationCommandForEnvironment(command: string): string {
+  const trimmed = command.trim();
+  const firstSegment = trimmed.split(/&&|\|\||;/, 1)[0] ?? trimmed;
+  if (!/^npm(?:\.cmd)?\s+ci\b/i.test(firstSegment)) {
+    return trimmed;
+  }
+
+  if (
+    /--(?:include|omit)(?:=|\s+)dev\b/i.test(firstSegment)
+    || /--production\b/i.test(firstSegment)
+    || /--only(?:=|\s+)prod(?:uction)?\b/i.test(firstSegment)
+  ) {
+    return trimmed;
+  }
+
+  return trimmed.replace(/^(npm(?:\.cmd)?\s+ci)\b/i, '$1 --include=dev');
+}
+
 export function assertAllowedValidationCommand(command: string): void {
   for (const pattern of forbiddenCommandPatterns) {
     if (pattern.test(command)) {
@@ -118,12 +136,13 @@ export async function runValidationCommand(
   cwd: string,
   onOutput?: (stream: 'stdout' | 'stderr', message: string) => Promise<void> | void
 ): Promise<ValidationResult> {
-  assertAllowedValidationCommand(command);
+  const effectiveCommand = normalizeValidationCommandForEnvironment(command);
+  assertAllowedValidationCommand(effectiveCommand);
 
   try {
-    const subprocess = execaCommand(command, {
+    const subprocess = execaCommand(effectiveCommand, {
       cwd,
-      shell: shouldUsePowerShell(command) ? 'powershell.exe' : true,
+      shell: shouldUsePowerShell(effectiveCommand) ? 'powershell.exe' : true,
       timeout: 10 * 60 * 1000,
       reject: false
     });
@@ -162,7 +181,7 @@ export async function runValidationCommand(
     await outputQueue;
 
     return {
-      command,
+      command: effectiveCommand,
       exitCode: result.exitCode ?? 0,
       stdout: sanitizeValidationOutput(result.stdout),
       stderr: sanitizeValidationOutput(result.stderr),
@@ -170,7 +189,7 @@ export async function runValidationCommand(
     };
   } catch (error) {
     return {
-      command,
+      command: effectiveCommand,
       exitCode: 1,
       stdout: '',
       stderr: error instanceof Error ? error.message : String(error),
@@ -199,18 +218,19 @@ export async function runValidationChecks(
   let failingResult: ValidationResult | undefined;
 
   for (const [index, check] of commandChecks.entries()) {
+    const effectiveCommand = normalizeValidationCommandForEnvironment(check.command);
     const startedAt = Date.now();
     await onActivity?.({
       state: 'started',
-      command: check.command,
+      command: effectiveCommand,
       checkIndex: index + 1,
       checkCount: commandChecks.length,
       elapsedMs: 0
     });
-    const result = await runValidationCommand(check.command, cwd, async (stream, message) => {
+    const result = await runValidationCommand(effectiveCommand, cwd, async (stream, message) => {
       await onActivity?.({
         state: 'output',
-        command: check.command,
+        command: effectiveCommand,
         checkIndex: index + 1,
         checkCount: commandChecks.length,
         elapsedMs: Date.now() - startedAt,
@@ -220,13 +240,13 @@ export async function runValidationChecks(
     });
     await onActivity?.({
       state: 'completed',
-      command: check.command,
+      command: effectiveCommand,
       checkIndex: index + 1,
       checkCount: commandChecks.length,
       elapsedMs: Date.now() - startedAt,
       exitCode: result.exitCode
     });
-    outputs.push(`[command] ${check.command}`);
+    outputs.push(`[command] ${effectiveCommand}`);
     if (check.criterion) {
       outputs.push(`[criterion] ${check.criterion}`);
     }
@@ -249,7 +269,7 @@ export async function runValidationChecks(
   }
 
   return {
-    command: commandChecks.map((check) => check.command).join(' && '),
+    command: commandChecks.map((check) => normalizeValidationCommandForEnvironment(check.command)).join(' && '),
     exitCode: failingResult?.exitCode ?? 0,
     stdout: outputs.join('\n'),
     stderr: failingResult?.stderr ?? '',

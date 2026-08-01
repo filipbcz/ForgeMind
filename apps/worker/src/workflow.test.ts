@@ -882,7 +882,7 @@ describe('worker workflow', () => {
             validationChecks: [
               {
                 kind: 'command',
-                command: `node -e "process.stderr.write('Missing script: missing-validation-script'); process.exit(1)"`,
+                command: `node -e "process.stderr.write('sh: 1: tsc: not found'); process.exit(1)"`,
                 criterion: 'Initial failing validation.',
                 rationale: 'Synthetic failure for retry.'
               }
@@ -966,12 +966,12 @@ describe('worker workflow', () => {
     expect(planCalls[0]?.prompt).not.toContain('very long project brief');
     expect(planCalls[1]?.prompt).toContain('Revise validation checks only');
     expect(planCalls[1]?.prompt).not.toContain('very long project brief');
-    expect(planCalls[1]?.previousValidationError).toContain('Missing script');
+    expect(planCalls[1]?.previousValidationError).toContain('tsc: not found');
     expect(planCalls[1]?.previousValidationChecks).toEqual(
       expect.arrayContaining([
         expect.objectContaining({
           kind: 'command',
-          command: expect.stringContaining('Missing script: missing-validation-script')
+          command: expect.stringContaining('tsc: not found')
         })
       ])
     );
@@ -1044,6 +1044,13 @@ describe('worker workflow', () => {
       stderr: '',
       passed: false
     })).toBe(false);
+    expect(isValidationCommandDefinitionFailure({
+      command: 'npm run typecheck',
+      exitCode: 127,
+      stdout: '',
+      stderr: 'sh: 1: tsc: not found',
+      passed: false
+    })).toBe(true);
   });
 
   it('moves repository inspection out of executable validation', () => {

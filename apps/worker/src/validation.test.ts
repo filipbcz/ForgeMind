@@ -2,9 +2,23 @@ import { describe, expect, it, vi } from 'vitest';
 import { mkdtemp, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
-import { assertAllowedValidationCommand, runValidationCommand, runValidationChecks } from './validation.js';
+import {
+  assertAllowedValidationCommand,
+  normalizeValidationCommandForEnvironment,
+  runValidationCommand,
+  runValidationChecks
+} from './validation.js';
 
 describe('validation runner', () => {
+  it('installs development dependencies for npm ci validation', () => {
+    expect(normalizeValidationCommandForEnvironment('npm ci')).toBe('npm ci --include=dev');
+    expect(normalizeValidationCommandForEnvironment('npm ci && npm test')).toBe('npm ci --include=dev && npm test');
+    expect(normalizeValidationCommandForEnvironment('npm ci --include=dev')).toBe('npm ci --include=dev');
+    expect(normalizeValidationCommandForEnvironment('npm ci --omit=dev')).toBe('npm ci --omit=dev');
+    expect(normalizeValidationCommandForEnvironment('npm ci --production')).toBe('npm ci --production');
+    expect(normalizeValidationCommandForEnvironment('node -e "console.log(\'npm ci\')"')).toBe('node -e "console.log(\'npm ci\')"');
+  });
+
   it('executes plain command checks', async () => {
     const cwd = await mkdtemp(join(tmpdir(), 'forgemind-validation-cmd-'));
 
