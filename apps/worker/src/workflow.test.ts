@@ -565,7 +565,7 @@ describe('worker workflow', () => {
     expect(createDraftPullRequest).toHaveBeenCalledOnce();
   }, 10000);
 
-  it('does not re-request already approved github workflow changes on resumed large diffs', async () => {
+  it('does not re-request an approved github workflow change when resuming the preserved diff', async () => {
     const workspaceRoot = join(tmpdir(), `forgemind-worker-resume-approved-workflow-${randomUUID()}`);
     const task = {
       ...demoTask,
@@ -658,9 +658,9 @@ describe('worker workflow', () => {
       verifyCommand: `node -e "const { readFileSync } = require('node:fs'); process.exit(readFileSync('status.txt', 'utf8').trim() === 'pass' ? 0 : 1)"`,
       workspaceRoot,
       resume: {
-        kind: 'approved_large_diff',
-        implementationSummary: 'Large scaffold created.',
-        approvedApprovals: ['risky_refactor', 'github_workflow_change']
+        kind: 'approved_operation',
+        implementationSummary: 'GitHub workflow changes preserved.',
+        approvedApprovals: ['github_workflow_change']
       }
     });
 
@@ -2022,6 +2022,7 @@ describe('worker workflow', () => {
 
   it('still requires approval for protected operations when safe approvals are disabled', async () => {
     const workspaceRoot = join(tmpdir(), `forgemind-worker-protected-approval-${randomUUID()}`);
+    const onIteration = vi.fn(async () => undefined);
     const result = await runWorkerTask({
       project: {
         ...demoProject,
@@ -2043,11 +2044,16 @@ describe('worker workflow', () => {
         }
       }),
       verifyCommand: 'node --version',
-      workspaceRoot
+      workspaceRoot,
+      hooks: { onIteration }
     });
 
     expect(result.status).toBe('needs_approval');
     expect(result.approvals).toEqual(['database_migration']);
+    expect(onIteration).toHaveBeenCalledWith(expect.objectContaining({
+      phase: 'implementation',
+      resultSummary: 'Database migration requested'
+    }));
   }, 15000);
 
   it('allows non-required risky changes in auto mode', async () => {

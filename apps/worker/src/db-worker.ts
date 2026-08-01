@@ -978,6 +978,21 @@ async function resolveTaskResumeContext(
     };
   }
 
+  if (approvedTypes.size > 0 && (lastPlanningIteration || lastImplementationIteration)) {
+    return {
+      workflowResume: {
+        kind: 'approved_operation',
+        planSummary: lastPlanningIteration?.resultSummary,
+        implementationSummary:
+          lastImplementationIteration?.resultSummary
+          ?? 'Resume workspace changes after the requested operation was approved.',
+        validationChecks: extractValidationChecks(lastPlanningIteration?.validationResult),
+        approvedApprovals: Array.from(approvedTypes)
+      },
+      ignoredLimitSignals: []
+    };
+  }
+
   return undefined;
 }
 

@@ -39,7 +39,7 @@ export interface WorkerTaskInput {
 type GitHubOperation = 'create_issue' | 'create_branch' | 'commit_and_push' | 'create_draft_pr' | 'create_pull_request' | 'merge_pr' | 'comment_on_issue';
 
 export interface WorkerTaskResume {
-  kind: 'approved_large_diff' | 'approved_review' | 'worker_interrupted';
+  kind: 'approved_large_diff' | 'approved_operation' | 'approved_review' | 'worker_interrupted';
   planSummary?: string;
   implementationSummary: string;
   reviewSummary?: string;
@@ -229,12 +229,16 @@ export async function runWorkerTask(input: WorkerTaskInput): Promise<WorkerTaskR
   const appliedSafeImprovements = new Set<string>();
   const resolvedReviewBlockers = new Set<string>();
   const approvedApprovals = new Set(normalizeRuntimeApprovals(input.resume?.approvedApprovals ?? []));
+  const noApprovedApprovals = new Set<ApprovalType>();
   let completedAttempts = 0;
-  const verifyCommandApprovals = evaluateRuntimeApprovals(
-    computeVerifyCommandApprovals(validationChecks, config.sandbox),
-    config.mode,
-    config.approvalRequiredFor,
-    config.allowSafeOperationsWithoutApproval
+  const verifyCommandApprovals = filterApprovedApprovals(
+    evaluateRuntimeApprovals(
+      computeVerifyCommandApprovals(validationChecks, config.sandbox),
+      config.mode,
+      config.approvalRequiredFor,
+      config.allowSafeOperationsWithoutApproval
+    ),
+    approvedApprovals
   );
   if (verifyCommandApprovals.length > 0) {
     return {
@@ -287,6 +291,7 @@ export async function runWorkerTask(input: WorkerTaskInput): Promise<WorkerTaskR
       attempt
     });
     const isResumedImplementation = Boolean(resumedImplementation);
+    const attemptApprovedApprovals = attempt === 1 ? approvedApprovals : noApprovedApprovals;
     implementation = resumedImplementation
       ?? await provider.implement({
         taskId: input.task.id,
@@ -312,30 +317,6 @@ export async function runWorkerTask(input: WorkerTaskInput): Promise<WorkerTaskR
       elapsedMs: Date.now() - implementationStartedAt
     });
 
-    const implementationApprovals = filterApprovedApprovals(
-      evaluateRuntimeApprovals(implementation.requestedApprovals, config.mode, config.approvalRequiredFor, config.allowSafeOperationsWithoutApproval),
-      approvedApprovals
-    );
-    if (implementationApprovals.length > 0) {
-      return {
-        taskId: input.task.id,
-        status: 'needs_approval',
-        issueUrl: issue.issueUrl,
-        branchName,
-        workspacePath,
-        validation: {
-          command: summarizeValidationChecks(validationChecks),
-          exitCode: 0,
-          stdout: '',
-          stderr: '',
-          passed: true
-        },
-        summary: implementation.summary,
-        approvals: implementationApprovals,
-        completedAt: nowIso()
-      };
-    }
-
     await writeProviderFiles(workspacePath, implementation);
 
     const implementationStatus = await git.status();
@@ -351,35 +332,6 @@ export async function runWorkerTask(input: WorkerTaskInput): Promise<WorkerTaskR
       diffStat: actualDiffStat
     };
 
-    const changedPathApprovals = filterApprovedApprovals(
-      evaluateRuntimeApprovals(
-        computeChangedPathApprovals(implementationStatus, config.sandbox),
-        config.mode,
-        config.approvalRequiredFor,
-        config.allowSafeOperationsWithoutApproval
-      ),
-      approvedApprovals
-    );
-    if (changedPathApprovals.length > 0) {
-      return {
-        taskId: input.task.id,
-        status: 'needs_approval',
-        issueUrl: issue.issueUrl,
-        branchName,
-        workspacePath,
-        validation: {
-          command: summarizeValidationChecks(validationChecks),
-          exitCode: 0,
-          stdout: '',
-          stderr: '',
-          passed: true
-        },
-        summary: implementation.summary,
-        approvals: changedPathApprovals,
-        completedAt: nowIso()
-      };
-    }
-
     if (!isResumedImplementation) {
       await input.hooks?.onIteration?.({
         phase: 'implementation',
@@ -394,6 +346,42 @@ export async function runWorkerTask(input: WorkerTaskInput): Promise<WorkerTaskR
           changedFiles: substantiveChangedFiles
         }
       });
+    }
+
+    const implementationApprovals = evaluateRuntimeApprovals(
+      implementation.requestedApprovals,
+      config.mode,
+      config.approvalRequiredFor,
+      config.allowSafeOperationsWithoutApproval
+    );
+    const changedPathApprovals = evaluateRuntimeApprovals(
+      computeChangedPathApprovals(implementationStatus, config.sandbox),
+      config.mode,
+      config.approvalRequiredFor,
+      config.allowSafeOperationsWithoutApproval
+    );
+    const pendingImplementationApprovals = filterApprovedApprovals(
+      uniqueApprovals([...implementationApprovals, ...changedPathApprovals]),
+      attemptApprovedApprovals
+    );
+    if (pendingImplementationApprovals.length > 0) {
+      return {
+        taskId: input.task.id,
+        status: 'needs_approval',
+        issueUrl: issue.issueUrl,
+        branchName,
+        workspacePath,
+        validation: {
+          command: summarizeValidationChecks(validationChecks),
+          exitCode: 0,
+          stdout: '',
+          stderr: '',
+          passed: true
+        },
+        summary: implementation.summary,
+        approvals: pendingImplementationApprovals,
+        completedAt: nowIso()
+      };
     }
 
     if (substantiveChangedFiles.length === 0) {
@@ -572,7 +560,7 @@ export async function runWorkerTask(input: WorkerTaskInput): Promise<WorkerTaskR
           config.approvalRequiredFor,
           config.allowSafeOperationsWithoutApproval
         ),
-        approvedApprovals
+        attemptApprovedApprovals
       );
       if (revisedVerifyCommandApprovals.length > 0) {
         return {
@@ -693,7 +681,7 @@ export async function runWorkerTask(input: WorkerTaskInput): Promise<WorkerTaskR
       if (review.blockers.length === 0) {
         const reviewRiskApprovals = filterApprovedApprovals(
           evaluateRuntimeApprovals(review.riskyChanges, config.mode, config.approvalRequiredFor, config.allowSafeOperationsWithoutApproval),
-          approvedApprovals
+          attemptApprovedApprovals
         );
         if (reviewRiskApprovals.length > 0) {
           return {

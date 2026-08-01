@@ -801,6 +801,81 @@ describe('db-worker policy enforcement', () => {
     );
   });
 
+  it('resumes preserved workspace changes after a protected operation is approved', async () => {
+    repositoryMock.listApprovals.mockResolvedValueOnce([
+      {
+        id: 'approval_workflow',
+        taskId: 'task_1',
+        type: 'github_workflow_change',
+        status: 'approved',
+        requestedBy: 'agent',
+        title: 'Approval required: github_workflow_change',
+        description: 'GitHub workflow change approval.',
+        riskLevel: 'high',
+        payload: {},
+        createdAt: new Date().toISOString()
+      }
+    ]);
+    repositoryMock.getTaskDiff.mockResolvedValueOnce({
+      taskId: 'task_1',
+      filesChanged: 2,
+      insertions: 118,
+      deletions: 4,
+      iterations: [
+        {
+          id: 'iteration_plan',
+          taskRunId: 'run_old',
+          iterationNumber: 1,
+          phase: 'planning',
+          prompt: 'Add CI quality gate',
+          resultSummary: 'Create and gate the quality workflow.',
+          diffStat: { filesChanged: 0, insertions: 0, deletions: 0 },
+          validationResult: {
+            validationChecks: [{ kind: 'command', command: 'npm test' }]
+          },
+          createdAt: new Date().toISOString()
+        }
+      ]
+    });
+
+    runWorkerTaskMock.mockImplementationOnce(async (input: {
+      resume?: {
+        kind: 'approved_operation';
+        implementationSummary: string;
+        approvedApprovals?: string[];
+      };
+    }) => {
+      expect(input.resume).toEqual(expect.objectContaining({
+        kind: 'approved_operation',
+        implementationSummary: 'Resume workspace changes after the requested operation was approved.',
+        approvedApprovals: ['github_workflow_change']
+      }));
+
+      return {
+        taskId: 'task_1',
+        status: 'ready_for_user_review',
+        issueUrl: 'https://github.com/demo/repo/issues/1',
+        branchName: 'ai/1-task',
+        workspacePath: 'C:/tmp/worker',
+        validation: {
+          command: 'npm test',
+          exitCode: 0,
+          stdout: '',
+          stderr: '',
+          passed: true
+        },
+        summary: 'done',
+        approvals: [],
+        completedAt: new Date().toISOString()
+      };
+    });
+
+    const { runDatabaseWorkerOnce } = await import('./db-worker.js');
+    const result = await runDatabaseWorkerOnce();
+
+    expect(result).toEqual(expect.objectContaining({ claimed: true, taskId: 'task_1' }));
+  });
+
   it('reuses approved review approvals to resume without restarting planning', async () => {
     repositoryMock.listApprovals.mockResolvedValueOnce([
       {
