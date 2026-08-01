@@ -432,7 +432,9 @@ export async function runWorkerTask(input: WorkerTaskInput): Promise<WorkerTaskR
 
     let validationPlanRevisionCount = 0;
     while (true) {
-      await input.hooks?.onStatus?.('validating', { attempt });
+      if (validationPlanRevisionCount === 0) {
+        await input.hooks?.onStatus?.('validating', { attempt });
+      }
       await input.hooks?.onIterationStarted?.({
         phase: 'validation',
         prompt: summarizeValidationChecks(validationChecks),

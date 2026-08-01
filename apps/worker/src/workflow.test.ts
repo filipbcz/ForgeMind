@@ -869,6 +869,7 @@ describe('worker workflow', () => {
     const implementCalls: ImplementInput[] = [];
     const planningIterations: Array<{ phase: string; validationResult: unknown }> = [];
     const taskActivities: TaskActivity[] = [];
+    const validationStatuses: string[] = [];
 
     const provider: AIProvider = {
       kind: 'codex',
@@ -948,6 +949,11 @@ describe('worker workflow', () => {
       provider,
       workspaceRoot,
       hooks: {
+        onStatus: async (status) => {
+          if (status === 'validating') {
+            validationStatuses.push(status);
+          }
+        },
         onActivity: async (activity) => {
           taskActivities.push(activity);
         },
@@ -963,6 +969,7 @@ describe('worker workflow', () => {
     expect(result.validation.passed).toBe(true);
     expect(planCalls).toHaveLength(2);
     expect(implementCalls).toHaveLength(1);
+    expect(validationStatuses).toEqual(['validating']);
     expect(planCalls[0]?.prompt).not.toContain('very long project brief');
     expect(planCalls[1]?.prompt).toContain('Revise validation checks only');
     expect(planCalls[1]?.prompt).not.toContain('very long project brief');
