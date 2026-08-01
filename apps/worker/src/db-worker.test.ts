@@ -64,6 +64,18 @@ const repositoryMock = {
       iterations: []
     })
   ),
+  getTaskUsage: vi.fn(async () => ({
+    taskId: 'task_1',
+    inputTokens: 0,
+    outputTokens: 0,
+    cachedTokens: 0,
+    totalTokens: 0,
+    estimatedCostUsd: 0,
+    usageSource: 'unavailable',
+    actualCostUsd: null,
+    runs: [],
+    records: []
+  })),
   failTask: vi.fn(async () => undefined),
   finishTaskRun: vi.fn(async () => undefined),
   finalizeQueueJob: vi.fn(async () => undefined),
@@ -94,6 +106,18 @@ vi.mock('./workflow.js', () => ({
 describe('db-worker policy enforcement', () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    repositoryMock.getTaskUsage.mockResolvedValue({
+      taskId: 'task_1',
+      inputTokens: 0,
+      outputTokens: 0,
+      cachedTokens: 0,
+      totalTokens: 0,
+      estimatedCostUsd: 0,
+      usageSource: 'unavailable',
+      actualCostUsd: null,
+      runs: [],
+      records: []
+    });
 
     createProviderMock.mockReturnValue({
       estimateCost: vi.fn(async () => ({
@@ -195,6 +219,61 @@ describe('db-worker policy enforcement', () => {
         })
       })
     );
+  });
+
+  it('retries a validation failure from the preserved implementation', async () => {
+    repositoryMock.claimNextSubmittedTask.mockResolvedValueOnce(createClaimedTask('task_retried'));
+    repositoryMock.getTaskDiff.mockResolvedValueOnce({
+      taskId: 'task_1',
+      filesChanged: 2,
+      insertions: 12,
+      deletions: 0,
+      iterations: [
+        {
+          phase: 'implementation',
+          prompt: 'Implement task',
+          resultSummary: 'Implementation is already present.',
+          validationResult: { passed: true }
+        },
+        {
+          phase: 'planning',
+          prompt: 'Correct validation',
+          resultSummary: 'Use the focused build command.',
+          validationResult: {
+            passed: true,
+            validationChecks: [{ kind: 'command', command: 'cmake --preset test' }]
+          }
+        },
+        {
+          phase: 'validation',
+          prompt: 'cmake --preset test',
+          resultSummary: 'Validation failed.',
+          validationResult: { passed: false, stderr: 'cmake: not found' }
+        }
+      ]
+    });
+    runWorkerTaskMock.mockResolvedValueOnce({
+      taskId: 'task_1',
+      status: 'ready_for_user_review',
+      branchName: 'ai/1-task',
+      workspacePath: 'C:/tmp/worker',
+      validation: { command: 'cmake --preset test', exitCode: 0, stdout: '', stderr: '', passed: true },
+      summary: 'Validation resumed successfully.',
+      approvals: [],
+      completedAt: new Date().toISOString()
+    });
+
+    const { runDatabaseWorkerOnce } = await import('./db-worker.js');
+    await runDatabaseWorkerOnce();
+
+    expect(runWorkerTaskMock).toHaveBeenCalledWith(expect.objectContaining({
+      resume: expect.objectContaining({
+        kind: 'validation_retry',
+        planSummary: 'Use the focused build command.',
+        implementationSummary: 'Implementation is already present.',
+        validationChecks: [{ kind: 'command', command: 'cmake --preset test' }]
+      })
+    }));
   });
 
   it('maps provider estimate failure to provider_failed status', async () => {
@@ -1136,6 +1215,36 @@ describe('db-worker policy enforcement', () => {
     );
     expect(runWorkerTaskMock).not.toHaveBeenCalled();
     expect(repositoryMock.failTask).toHaveBeenCalledWith('task_1', 'Budget limit exceeded before provider run.', 'budget_exceeded');
+  });
+
+  it('enforces cumulative actual tokens from previous task runs before another provider call', async () => {
+    repositoryMock.getTaskUsage.mockResolvedValue({
+      taskId: 'task_1',
+      inputTokens: 0,
+      outputTokens: 0,
+      cachedTokens: 0,
+      totalTokens: 250_000,
+      estimatedCostUsd: 0,
+      usageSource: 'actual_total',
+      actualCostUsd: null,
+      runs: [],
+      records: []
+    });
+
+    const { runDatabaseWorkerOnce } = await import('./db-worker.js');
+    const result = await runDatabaseWorkerOnce();
+
+    expect(result).toEqual(expect.objectContaining({
+      claimed: true,
+      taskId: 'task_1',
+      status: 'budget_exceeded'
+    }));
+    expect(runWorkerTaskMock).not.toHaveBeenCalled();
+    expect(repositoryMock.failTask).toHaveBeenCalledWith(
+      'task_1',
+      expect.stringContaining('250000 actual token(s) across all runs'),
+      'budget_exceeded'
+    );
   });
 
   it('stops with repeated_error_detected when the same validation error repeats', async () => {

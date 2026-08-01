@@ -6,6 +6,7 @@ export const DEFAULT_LIMITS: Limits = {
   maxChangedFiles: 20,
   maxDiffLines: 2000,
   maxRepeatedErrorCount: 3,
+  maxTokens: 250_000,
   maxBudgetUsd: 2,
   softBudgetThresholdPercent: 75,
   hardBudgetThresholdPercent: 100
@@ -17,6 +18,7 @@ export interface LimitUsage {
   changedFiles: number;
   diffLines: number;
   repeatedErrorCount: number;
+  totalTokens: number;
   estimatedCostUsd: number;
 }
 
@@ -42,6 +44,7 @@ export function evaluateLimits(usage: LimitUsage, limits: Limits): LimitEvaluati
   if (usage.changedFiles > limits.maxChangedFiles) signals.push('changed_files_limit_reached');
   if (usage.diffLines > limits.maxDiffLines) signals.push('diff_lines_limit_reached');
   if (usage.repeatedErrorCount >= limits.maxRepeatedErrorCount) signals.push('repeated_error_detected');
+  if (usage.totalTokens >= limits.maxTokens) signals.push('budget_exceeded');
 
   const budgetPercent = limits.maxBudgetUsd === 0 ? 100 : (usage.estimatedCostUsd / limits.maxBudgetUsd) * 100;
   if (budgetPercent >= limits.hardBudgetThresholdPercent) {
@@ -55,4 +58,3 @@ export function evaluateLimits(usage: LimitUsage, limits: Limits): LimitEvaluati
     signals
   };
 }
-

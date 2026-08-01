@@ -125,7 +125,7 @@ export class CodexProvider implements AIProvider {
       {
         role: 'system',
         content: input.previousValidationError
-          ? 'Revise validation checks only. Return JSON with a short summary, empty steps and implementationSteps arrays, the supplied acceptanceCriteria, and corrected validationChecks. Do not propose or repeat implementation work. Reply with JSON only.'
+          ? 'Revise only the supplied failed validation check. Return JSON with a short summary, empty steps and implementationSteps arrays, the supplied acceptanceCriteria, and replacement validationChecks for that failed check only. Do not repeat successful or unrelated checks and do not propose implementation work. Reply with JSON only.'
           : 'You are Codex. Return JSON with summary, steps, acceptanceCriteria, validationChecks, and implementationSteps. ' +
             'For ordinary task plans, implementationSteps must be an empty array. When the request asks for a project roadmap, it must contain objects with title, description, acceptanceCriteria, inScope, and outOfScope. ' +
             'validationChecks must contain executable command checks or manual review checks. ' +
@@ -142,7 +142,7 @@ export class CodexProvider implements AIProvider {
             ? `Previous validation checks:\n${input.previousValidationChecks.map((check) => check.kind === 'command' ? check.command : check.instructions).join('\n')}`
             : '',
           input.previousValidationError
-            ? 'Replace any broken validation command with a corrected command suitable for the execution environment.'
+            ? 'Return only corrected replacement check(s) for the supplied failed check. Do not repeat any other validation checks.'
             : ''
         ]
           .filter(Boolean)
@@ -297,7 +297,7 @@ export class CodexProvider implements AIProvider {
     };
     const providerPrompt = [
       input.previousValidationError
-        ? 'Revise validation checks for this ForgeMind task. Do not repeat planning or implementation work.'
+        ? 'Revise only the supplied failed validation check for this ForgeMind task. Do not repeat planning, implementation work, successful checks, or unrelated checks.'
         : 'Create an implementation plan for this ForgeMind task.',
       'Return only JSON matching the provided schema.',
       'Translate acceptance criteria into concrete validation checks whenever possible.',
@@ -310,7 +310,7 @@ export class CodexProvider implements AIProvider {
         ? `Previous validation checks:\n${input.previousValidationChecks.map((check) => check.kind === 'command' ? check.command : check.instructions).join('\n')}`
         : '',
       input.previousValidationError
-        ? 'Replace any broken validation command with a corrected command suitable for the execution environment.'
+        ? 'Return only corrected replacement check(s) for the supplied failed check. Do not repeat any other validation checks.'
         : ''
     ].join('\n\n');
     const content = await this.runCodexExec({

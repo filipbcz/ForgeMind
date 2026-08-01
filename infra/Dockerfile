@@ -35,7 +35,15 @@ FROM node:22-bookworm-slim AS runtime-base
 ARG CODEX_VERSION=0.142.5
 
 RUN apt-get update \
-  && apt-get install -y --no-install-recommends ca-certificates git openssh-client \
+  && apt-get install -y --no-install-recommends \
+    build-essential \
+    ca-certificates \
+    cmake \
+    git \
+    ninja-build \
+    openssh-client \
+    pkg-config \
+    ripgrep \
   && npm install --global "@openai/codex@${CODEX_VERSION}" \
   && rm -rf /var/lib/apt/lists/*
 

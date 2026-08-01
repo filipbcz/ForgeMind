@@ -37,11 +37,14 @@ Projektova konfigurace se nacita z agent.config.yaml pres packages/config (parse
 - max_changed_files
 - max_diff_lines
 - max_repeated_error_count
+- max_tokens
 - max_budget_usd
 - soft_budget_threshold_percent
 - hard_budget_threshold_percent
 
 ### commands
+
+`commands.install` instaluje pouze zavislosti deklarovane repozitarem a bezi pred validacnimi prikazy. Systemove build nastroje se neinstaluji za behu tasku; musi byt soucasti verzovaneho ForgeMind runtime image. Zakladni produkcni image obsahuje Node.js, Git, CMake/CTest, Ninja, GNU C/C++ toolchain, pkg-config a ripgrep.
 
 - install (optional)
 - lint (optional)
@@ -112,4 +115,3 @@ Nize uvedene promenne nejsou soucasti YAML, ale ovlivnuji runtime queue:
 ## 7) Kompatibilita
 
 Parser je strict schema validation. Nezname nebo nevalidni hodnoty maji vyhodit validacni chybu pri nacitani konfigurace.
-

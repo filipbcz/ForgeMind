@@ -21,7 +21,13 @@ import {
 import { createProvider, type AIProvider, type ImplementResult, type PlanResult, type ValidationCheck } from '@forgemind/providers';
 import { parseAgentConfigYaml, type AgentConfig } from '@forgemind/config';
 import { nowIso, toErrorMessage, type JsonValue } from '@forgemind/shared';
-import { runValidationChecks, type ValidationResult } from './validation.js';
+import {
+  collectPassedValidationCheckResults,
+  normalizeValidationCommandForEnvironment,
+  runValidationChecks,
+  type ValidationCheckExecutionResult,
+  type ValidationResult
+} from './validation.js';
 
 export interface WorkerTaskInput {
   project: Project;
@@ -39,7 +45,7 @@ export interface WorkerTaskInput {
 type GitHubOperation = 'create_issue' | 'create_branch' | 'commit_and_push' | 'create_draft_pr' | 'create_pull_request' | 'merge_pr' | 'comment_on_issue';
 
 export interface WorkerTaskResume {
-  kind: 'approved_large_diff' | 'approved_operation' | 'approved_review' | 'worker_interrupted';
+  kind: 'approved_large_diff' | 'approved_operation' | 'approved_review' | 'validation_retry' | 'worker_interrupted';
   planSummary?: string;
   implementationSummary: string;
   reviewSummary?: string;
@@ -167,10 +173,11 @@ export async function runWorkerTask(input: WorkerTaskInput): Promise<WorkerTaskR
 
   const isResumeRun = Boolean(input.resume);
   await input.hooks?.onStatus?.('running_ai', isResumeRun && input.resume ? { resumed: true, kind: input.resume.kind } : undefined);
-  await writeAgentsInstructions(workspacePath, input.project, input.task, input.project.configYaml);
+  await writeAgentsInstructions(workspacePath, input.project, input.task, executionPrompt, input.project.configYaml);
+  const roadmapPlan = createRoadmapTaskPlan(executionPrompt);
   let plan = input.resume
     ? createResumePlan(input.resume)
-    : await (async () => {
+    : roadmapPlan ?? await (async () => {
         const startedAt = Date.now();
         await emitTaskActivity(input.hooks, {
           phase: 'planning',
@@ -202,8 +209,20 @@ export async function runWorkerTask(input: WorkerTaskInput): Promise<WorkerTaskR
         });
         return result;
       })();
+  if (!input.resume && roadmapPlan) {
+    await emitTaskActivity(input.hooks, {
+      phase: 'planning',
+      state: 'completed',
+      title: 'PlĂˇn byl odvozen z roadmap kroku',
+      detail: roadmapPlan.summary,
+      operation: 'roadmap_plan',
+      attempt: 0,
+      elapsedMs: 0
+    });
+  }
   let validationChecks = await resolveValidationChecks({
     plan,
+    installCommand: config.installCommand,
     explicitVerifyCommand: config.verifyCommand,
     workspacePath
   });
@@ -431,6 +450,8 @@ export async function runWorkerTask(input: WorkerTaskInput): Promise<WorkerTaskR
     }
 
     let validationPlanRevisionCount = 0;
+    let missingSystemValidationTool: string | undefined;
+    const passedValidationCheckResults = new Map<string, ValidationCheckExecutionResult>();
     while (true) {
       if (validationPlanRevisionCount === 0) {
         await input.hooks?.onStatus?.('validating', { attempt });
@@ -469,14 +490,22 @@ export async function runWorkerTask(input: WorkerTaskInput): Promise<WorkerTaskR
         await emitTaskActivity(input.hooks, {
           phase: 'validation',
           state: activity.exitCode === 0 ? 'completed' : 'failed',
-          title: activity.exitCode === 0 ? `Validace ${checkLabel} prošla` : `Validace ${checkLabel} selhala`,
-          detail: activity.command,
+          title: activity.reused
+            ? `Validace ${checkLabel} byla převzata`
+            : activity.exitCode === 0
+              ? `Validace ${checkLabel} prošla`
+              : `Validace ${checkLabel} selhala`,
+          detail: activity.reused
+            ? `${activity.command} (již dříve prošla, znovu se nespouští)`
+            : activity.command,
           operation: 'validation_command',
           attempt,
           elapsedMs: activity.elapsedMs,
           exitCode: activity.exitCode
         });
-      });
+      }, passedValidationCheckResults);
+      collectPassedValidationCheckResults(validation, passedValidationCheckResults);
+      missingSystemValidationTool = getMissingSystemValidationTool(validation);
       await input.hooks?.onIteration?.({
         phase: 'validation',
         prompt: validation.command,
@@ -495,6 +524,7 @@ export async function runWorkerTask(input: WorkerTaskInput): Promise<WorkerTaskR
 
       if (
         validation.passed
+        || Boolean(missingSystemValidationTool)
         || config.verifyCommand?.trim()
         || !isValidationCommandDefinitionFailure(validation)
         || validationPlanRevisionCount >= 2
@@ -503,6 +533,15 @@ export async function runWorkerTask(input: WorkerTaskInput): Promise<WorkerTaskR
       }
 
       validationPlanRevisionCount += 1;
+      const failedValidationCheck = findFailedValidationCheck(validationChecks, validation.failingCommand);
+      if (!failedValidationCheck) {
+        validation = {
+          ...validation,
+          stderr: `${validation.stderr}\nForgeMind could not identify the failed validation check.`.trim()
+        };
+        break;
+      }
+      const validationRevisionContext = buildValidationRevisionContext(failedValidationCheck);
       const replanningStartedAt = Date.now();
       await emitTaskActivity(input.hooks, {
         phase: 'planning',
@@ -513,16 +552,16 @@ export async function runWorkerTask(input: WorkerTaskInput): Promise<WorkerTaskR
       });
       await input.hooks?.onIterationStarted?.({
         phase: 'planning',
-        prompt: buildValidationRevisionContext(plan),
+        prompt: validationRevisionContext,
         attempt
       });
       const revisedValidationPlan = await provider.plan({
         taskId: input.task.id,
         title: input.task.title,
-        prompt: buildValidationRevisionContext(plan),
+        prompt: validationRevisionContext,
         repositoryPath: workspacePath,
         previousValidationError: validation.stderr || validation.stdout || `Exit code ${validation.exitCode}`,
-        previousValidationChecks: validationChecks,
+        previousValidationChecks: [failedValidationCheck],
         onActivity: (activity) => input.hooks?.onProviderActivity?.({ phase: 'planning', attempt, ...activity })
       });
       await emitTaskActivity(input.hooks, {
@@ -534,14 +573,22 @@ export async function runWorkerTask(input: WorkerTaskInput): Promise<WorkerTaskR
         attempt,
         elapsedMs: Date.now() - replanningStartedAt
       });
-      validationChecks = await resolveValidationChecks({
-        plan: revisedValidationPlan,
-        explicitVerifyCommand: config.verifyCommand,
-        workspacePath
-      });
+      const revisedValidationChecks = replaceFailedValidationCheck(
+        validationChecks,
+        validation.failingCommand,
+        revisedValidationPlan.validationChecks
+      );
+      if (!revisedValidationChecks) {
+        validation = {
+          ...validation,
+          stderr: `${validation.stderr}\nAI did not provide a distinct replacement for the failed validation check.`.trim()
+        };
+        break;
+      }
+      validationChecks = revisedValidationChecks;
       await input.hooks?.onIteration?.({
         phase: 'planning',
-        prompt: buildValidationRevisionContext(plan),
+        prompt: validationRevisionContext,
         resultSummary: revisedValidationPlan.summary,
         providerPrompt: revisedValidationPlan.providerPrompt,
         providerResponse: revisedValidationPlan.providerResponse,
@@ -587,7 +634,9 @@ export async function runWorkerTask(input: WorkerTaskInput): Promise<WorkerTaskR
         branchName,
         workspacePath,
         validation,
-        summary: `Validation command could not be executed after ${validationPlanRevisionCount} revision(s).`,
+        summary: missingSystemValidationTool
+          ? `Validation infrastructure is missing required executable "${missingSystemValidationTool}".`
+          : `Validation command could not be executed after ${validationPlanRevisionCount} revision(s).`,
         approvals: [],
         completedAt: nowIso()
       };
@@ -887,6 +936,8 @@ function createResumePlan(resume: WorkerTaskResume): PlanResult {
         ? 'Resume previously reviewed implementation after approval.'
         : resume.kind === 'worker_interrupted'
           ? 'Resume implementation after the previous worker process was interrupted.'
+          : resume.kind === 'validation_retry'
+            ? 'Resume the preserved implementation and rerun validation only.'
           : 'Resume previously approved implementation.'),
     steps: [],
     acceptanceCriteria: [],
@@ -906,18 +957,107 @@ export function compactTaskExecutionPrompt(prompt: string): string {
   return normalized.slice(markerIndex).trim();
 }
 
-function buildValidationRevisionContext(plan: PlanResult): string {
+export function createRoadmapTaskPlan(prompt: string): PlanResult | undefined {
+  if (
+    !prompt.includes('Current implementation step:')
+    || !prompt.includes('Step description and scope:')
+    || !prompt.includes('Execution boundary:')
+  ) {
+    return undefined;
+  }
+
+  const title = readPromptSection(prompt, 'Current implementation step:');
+  const description = readPromptSection(prompt, 'Step description and scope:');
+  if (!title || !description) {
+    return undefined;
+  }
+
+  const acceptanceCriteria = readPromptSection(prompt, 'Acceptance Criteria:')
+    .split(/\r?\n/)
+    .map((line) => line.replace(/^\s*-\s*/, '').trim())
+    .filter(Boolean);
+
+  return {
+    summary: `Implement roadmap step: ${title}`,
+    steps: [description],
+    acceptanceCriteria,
+    validationChecks: []
+  };
+}
+
+function readPromptSection(prompt: string, heading: string): string {
+  const start = prompt.indexOf(heading);
+  if (start < 0) return '';
+
+  const sectionStart = start + heading.length;
+  const remainder = prompt.slice(sectionStart).replace(/^\s*\r?\n?/, '');
+  const nextHeading = remainder.search(/\r?\n\r?\n(?=[A-Z][^\r\n]*:)/);
+  return (nextHeading < 0 ? remainder : remainder.slice(0, nextHeading)).trim();
+}
+
+function buildValidationRevisionContext(failedCheck: ValidationCheck): string {
   return [
-    'Revise validation checks only. Do not create or repeat an implementation plan.',
-    'Inspect repository scripts only as needed to replace invalid commands.',
+    'Revise the single failed validation check only. Do not create or repeat an implementation plan.',
+    'Return only replacement validationChecks for the failed check. Do not repeat successful or unrelated checks.',
+    'Inspect repository scripts only as needed to replace this invalid check.',
     'Executable checks must verify a criterion through their exit code. Represent git diff/status/log inspection as a manual check.',
     'Do not use shell redirection or fallback command chains in validation commands.',
     'Do not modify repository files.',
-    'Acceptance criteria:',
-    ...(plan.acceptanceCriteria.length > 0
-      ? plan.acceptanceCriteria.map((criterion) => `- ${criterion}`)
-      : ['- Use the existing task acceptance criteria.'])
+    `Failed check: ${failedCheck.kind === 'command' ? failedCheck.command : failedCheck.instructions}`,
+    `Criterion: ${failedCheck.criterion ?? 'Preserve the criterion of the failed check.'}`
   ].join('\n');
+}
+
+function findFailedValidationCheck(
+  checks: ValidationCheck[],
+  failingCommand?: string
+): Extract<ValidationCheck, { kind: 'command' }> | undefined {
+  if (!failingCommand) {
+    return undefined;
+  }
+  const failingKey = normalizeValidationCommandForEnvironment(failingCommand);
+  return checks.find((check): check is Extract<ValidationCheck, { kind: 'command' }> => (
+    check.kind === 'command'
+    && normalizeValidationCommandForEnvironment(check.command) === failingKey
+  ));
+}
+
+export function replaceFailedValidationCheck(
+  currentChecks: ValidationCheck[],
+  failingCommand: string | undefined,
+  proposedChecks: unknown
+): ValidationCheck[] | undefined {
+  const failedCheck = findFailedValidationCheck(currentChecks, failingCommand);
+  if (!failedCheck || !failingCommand) {
+    return undefined;
+  }
+
+  const failedIndex = currentChecks.indexOf(failedCheck);
+  const existingOtherIdentities = new Set(
+    currentChecks
+      .filter((_, index) => index !== failedIndex)
+      .map(validationCheckIdentity)
+  );
+  const failedIdentity = validationCheckIdentity(failedCheck);
+  const replacements = normalizeValidationChecks(proposedChecks).filter((check) => {
+    const identity = validationCheckIdentity(check);
+    return identity !== failedIdentity && !existingOtherIdentities.has(identity);
+  });
+  if (replacements.length === 0) {
+    return undefined;
+  }
+
+  return [
+    ...currentChecks.slice(0, failedIndex),
+    ...replacements,
+    ...currentChecks.slice(failedIndex + 1)
+  ];
+}
+
+function validationCheckIdentity(check: ValidationCheck): string {
+  return check.kind === 'command'
+    ? `command:${normalizeValidationCommandForEnvironment(check.command)}`
+    : `manual:${check.instructions.trim()}`;
 }
 
 export function isValidationCommandDefinitionFailure(validation: ValidationResult): boolean {
@@ -937,43 +1077,71 @@ export function isValidationCommandDefinitionFailure(validation: ValidationResul
   ].some((pattern) => pattern.test(output));
 }
 
+const systemValidationTools = new Set([
+  'cmake',
+  'ctest',
+  'make',
+  'ninja',
+  'gcc',
+  'g++',
+  'clang',
+  'clang++',
+  'rg'
+]);
+
+export function getMissingSystemValidationTool(validation: ValidationResult): string | undefined {
+  const output = `${validation.stderr}\n${validation.stdout}`;
+  const unixMatch = output.match(/(?:^|\n)(?:\/bin\/)?(?:ba)?sh:\s*\d+:\s*([^:\s\r\n]+):\s*not found\b/im);
+  const windowsMatch = output.match(/'([^']+)' is not recognized as (?:the name of a cmdlet|an internal or external command)/i);
+  const executable = (unixMatch?.[1] ?? windowsMatch?.[1])?.trim().toLowerCase();
+  return executable && systemValidationTools.has(executable) ? executable : undefined;
+}
+
 async function resolveValidationChecks(input: {
   plan: PlanResult;
+  installCommand?: string;
   explicitVerifyCommand?: string;
   workspacePath: string;
 }): Promise<ValidationCheck[]> {
+  let checks: ValidationCheck[];
   if (input.explicitVerifyCommand?.trim()) {
-    return [
+    checks = [
       {
         kind: 'command',
         command: input.explicitVerifyCommand.trim(),
         rationale: 'Configured project validation command.'
       }
     ];
+  } else {
+    const plannedChecks = normalizeValidationChecks(input.plan.validationChecks);
+    if (plannedChecks.length > 0) {
+      checks = plannedChecks;
+    } else {
+      const inferredCommand = await inferValidationCommand(input.workspacePath, input.plan.acceptanceCriteria);
+      checks = [
+        {
+          kind: 'command',
+          command: inferredCommand ?? 'node --version',
+          rationale: inferredCommand
+            ? 'Inferred from repository context and acceptance criteria.'
+            : 'Fallback environment smoke check because no stronger validation command was planned.'
+        }
+      ];
+    }
   }
 
-  const plannedChecks = normalizeValidationChecks(input.plan.validationChecks);
-  if (plannedChecks.length > 0) {
-    return plannedChecks;
-  }
-
-  const inferredCommand = await inferValidationCommand(input.workspacePath, input.plan.acceptanceCriteria);
-  if (inferredCommand) {
-    return [
-      {
-        kind: 'command',
-        command: inferredCommand,
-        rationale: 'Inferred from repository context and acceptance criteria.'
-      }
-    ];
+  const installCommand = input.installCommand?.trim();
+  if (!installCommand || checks.some((check) => check.kind === 'command' && check.command.trim() === installCommand)) {
+    return checks;
   }
 
   return [
     {
       kind: 'command',
-      command: 'node --version',
-      rationale: 'Fallback environment smoke check because no stronger validation command was planned.'
-    }
+      command: installCommand,
+      rationale: 'Configured repository dependency installation command.'
+    },
+    ...checks
   ];
 }
 
@@ -1226,6 +1394,7 @@ interface WorkerConfig {
   providerKind: ProviderKind;
   mode: TaskMode;
   verifyCommand?: string;
+  installCommand?: string;
   issueLabel: string;
   branchPrefix: string;
   autoPush: boolean;
@@ -1255,6 +1424,7 @@ function resolveWorkerConfig(project: Project, input: WorkerTaskInput): WorkerCo
     providerKind: input.providerKind ?? config?.ai.primary_provider ?? 'codex',
     mode: input.task.mode ?? config?.workflow.default_mode ?? 'safe',
     verifyCommand: input.verifyCommand ?? config?.commands.verify ?? config?.commands.build,
+    installCommand: config?.commands.install,
     issueLabel: config?.github.issue_label ?? 'ai-task',
     branchPrefix: config?.github.branch_prefix ?? 'ai/',
     autoPush: config?.workflow.auto_push ?? true,
@@ -1543,7 +1713,13 @@ async function withTimeout<T>(promise: Promise<T>, timeoutMs: number, createErro
   });
 }
 
-async function writeAgentsInstructions(workspacePath: string, project: Project, task: ForgeTask, configYaml?: string) {
+async function writeAgentsInstructions(
+  workspacePath: string,
+  project: Project,
+  task: ForgeTask,
+  executionPrompt: string,
+  configYaml?: string
+) {
   let projectConfig: AgentConfig | undefined;
   try {
     projectConfig = configYaml ? parseAgentConfigYaml(configYaml) : undefined;
@@ -1561,10 +1737,12 @@ async function writeAgentsInstructions(workspacePath: string, project: Project, 
     '',
     '## Task',
     `- title: ${task.title}`,
-    `- prompt: ${task.prompt}`,
     `- mode: ${task.mode}`,
     `- max iterations: ${task.maxIterations}`,
     `- max budget: ${task.maxBudgetUsd} USD`,
+    '',
+    '## Current Step Context',
+    executionPrompt,
     ''
   ];
 

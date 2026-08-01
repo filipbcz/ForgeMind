@@ -28,12 +28,6 @@ docker network inspect shared-edge >/dev/null 2>&1 || docker network create shar
 
 "${compose[@]}" up -d postgres
 
-WORKER_CONTAINER="$("${compose[@]}" ps -q worker)"
-if [ -n "${WORKER_CONTAINER}" ]; then
-  echo "Stopping worker before image pulls so active tasks can be requeued cleanly."
-  "${compose[@]}" stop --timeout 15 worker
-fi
-
 echo "Docker storage before deployment:"
 docker system df
 
@@ -46,6 +40,13 @@ fi
 
 docker pull "${FORGEMIND_RUNTIME_IMAGE}"
 docker pull "${FORGEMIND_WEB_IMAGE}"
+
+WORKER_CONTAINER="$("${compose[@]}" ps -q worker)"
+if [ -n "${WORKER_CONTAINER}" ]; then
+  WORKER_DRAIN_TIMEOUT_SECONDS="${FORGEMIND_WORKER_DRAIN_TIMEOUT_SECONDS:-5400}"
+  echo "Draining worker before migrations and replacement (timeout: ${WORKER_DRAIN_TIMEOUT_SECONDS}s)."
+  "${compose[@]}" stop --timeout "${WORKER_DRAIN_TIMEOUT_SECONDS}" worker
+fi
 
 MIGRATION_STATE_FILE="${APP_ROOT}/shared/migrations.sha256"
 MIGRATIONS_DIR="${APP_DIR}/packages/db/prisma/migrations"

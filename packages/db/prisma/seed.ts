@@ -29,6 +29,7 @@ limits:
   max_changed_files: 20
   max_diff_lines: 2000
   max_repeated_error_count: 3
+  max_tokens: 250000
   max_budget_usd: 2.00
   soft_budget_threshold_percent: 75
   hard_budget_threshold_percent: 100

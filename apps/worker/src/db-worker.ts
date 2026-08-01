@@ -31,7 +31,7 @@ interface PlannedValidationCheckSnapshot {
   rationale?: string;
 }
 
-export async function runDatabaseWorkerOnce() {
+export async function runDatabaseWorkerOnce(options: { deferInterruptSignals?: boolean } = {}) {
   const repository = createRepository(getPrismaClient());
   const aiProviderConnection = await readAIProviderConnectionSecret(repository);
   applyAIProviderConnectionEnv(aiProviderConnection);
@@ -56,7 +56,8 @@ export async function runDatabaseWorkerOnce() {
     queueJobId: claimed.queueJobId,
     taskId: claimed.task.id,
     taskRunId: claimed.taskRun.id,
-    stopQueueHeartbeat
+    stopQueueHeartbeat,
+    deferInterruptSignals: options.deferInterruptSignals ?? false
   });
   const finalizeQueueJob = async (
     status: 'succeeded' | 'failed' | 'cancelled',
@@ -96,19 +97,43 @@ export async function runDatabaseWorkerOnce() {
     ? new GitHubAppAdapter({ token: githubConnection.token, apiBaseUrl: githubConnection.apiBaseUrl })
     : await createGitHubAdapterFromEnv();
   const projectConfig = parseProjectConfig(claimed.project.configYaml);
+  const limits = resolveLimits(claimed.project.configYaml, claimed.task.maxIterations, claimed.task.maxBudgetUsd);
+  const historicalUsage = await repository.getTaskUsage(claimed.task.id);
   const selection = resolveProviderSelection(projectConfig, providerOverride ?? aiProviderConnection?.provider, fallbackProviderOverride);
   const { provider, getLastProviderKind } = createPolicyAwareProvider({
     primaryKind: selection.primary,
     primaryProvider: createProvider(selection.primary),
     fallbackKind: selection.fallback,
-    fallbackProvider: selection.fallback ? createProvider(selection.fallback) : undefined
+    fallbackProvider: selection.fallback ? createProvider(selection.fallback) : undefined,
+    beforeCall: async () => {
+      const usage = await repository.getTaskUsage(claimed.task.id);
+      assertCumulativeProviderBudget(usage, limits);
+    }
   });
-  const limits = resolveLimits(claimed.project.configYaml, claimed.task.maxIterations, claimed.task.maxBudgetUsd);
   const resumeContext = await resolveTaskResumeContext(
     repository,
     claimed.task.id,
-    claimed.queueReason === 'worker_interrupted'
+    claimed.queueReason
   );
+  const historicalBudgetError = getCumulativeProviderBudgetError(historicalUsage, limits);
+  if (historicalBudgetError) {
+    await repository.failTask(claimed.task.id, historicalBudgetError, 'budget_exceeded');
+    await repository.finishTaskRun({
+      taskRunId: claimed.taskRun.id,
+      status: 'failed',
+      errorMessage: historicalBudgetError,
+      iterationCount: attemptCount,
+      inputTokens: 0,
+      outputTokens: 0,
+      totalTokens: 0,
+      usageSource: 'unavailable',
+      estimatedCostUsd: 0,
+      actualCostUsd: null
+    });
+    await finalizeQueueJob('failed', historicalBudgetError);
+    return { claimed: true, taskId: claimed.task.id, status: 'budget_exceeded' };
+  }
+
   let costEstimate;
   try {
     costEstimate = await provider.estimateCost({ prompt: claimed.task.prompt, repositorySizeHint: 'small' });
@@ -342,6 +367,7 @@ export async function runDatabaseWorkerOnce() {
             changedFiles,
             diffLines,
             repeatedErrorCount,
+            totalTokens: historicalUsage.totalTokens + measuredUsage.totalTokens,
             estimatedCostUsd: costEstimate.estimatedCostUsd
           };
           await handleWorkerLimitsOrThrow(
@@ -483,21 +509,30 @@ function createPolicyAwareProvider(input: {
   primaryProvider: AIProvider;
   fallbackKind?: ProviderKind;
   fallbackProvider?: AIProvider;
+  beforeCall?: (operation: string, provider: ProviderKind) => Promise<void>;
 }): { provider: AIProvider; getLastProviderKind: () => ProviderKind } {
   let lastProviderKind: ProviderKind = input.primaryKind;
 
   const callWithFallback = async <T>(operation: string, action: (provider: AIProvider) => Promise<T>): Promise<T> => {
     try {
+      await input.beforeCall?.(operation, input.primaryKind);
       const result = await action(input.primaryProvider);
       lastProviderKind = input.primaryKind;
       return result;
     } catch (primaryError) {
+      if (primaryError instanceof WorkerLimitError) {
+        throw primaryError;
+      }
       if (input.fallbackProvider && input.fallbackKind && input.fallbackKind !== input.primaryKind) {
         try {
+          await input.beforeCall?.(operation, input.fallbackKind);
           const result = await action(input.fallbackProvider);
           lastProviderKind = input.fallbackKind;
           return result;
         } catch (fallbackError) {
+          if (fallbackError instanceof WorkerLimitError) {
+            throw fallbackError;
+          }
           throw new ProviderExecutionError(operation, toErrorMessage(fallbackError), input.fallbackKind);
         }
       }
@@ -702,6 +737,32 @@ function resolveLimits(configYaml: string | undefined, maxIterations: number, ma
   };
 }
 
+function getCumulativeProviderBudgetError(
+  usage: { totalTokens: number; actualCostUsd: number | null },
+  limits: Limits
+): string | undefined {
+  if (usage.totalTokens >= limits.maxTokens) {
+    return `Task used ${usage.totalTokens} actual token(s) across all runs, reaching the configured limit of ${limits.maxTokens}.`;
+  }
+
+  const hardCostLimit = limits.maxBudgetUsd * (limits.hardBudgetThresholdPercent / 100);
+  if (usage.actualCostUsd !== null && usage.actualCostUsd >= hardCostLimit) {
+    return `Task used ${usage.actualCostUsd.toFixed(4)} USD across all runs, reaching the configured limit of ${hardCostLimit.toFixed(4)} USD.`;
+  }
+
+  return undefined;
+}
+
+function assertCumulativeProviderBudget(
+  usage: { totalTokens: number; actualCostUsd: number | null },
+  limits: Limits
+): void {
+  const message = getCumulativeProviderBudgetError(usage, limits);
+  if (message) {
+    throw new WorkerLimitError('budget_exceeded', message);
+  }
+}
+
 function createLimitUsage(overrides: Partial<LimitUsage>): LimitUsage {
   return {
     iterations: 0,
@@ -709,6 +770,7 @@ function createLimitUsage(overrides: Partial<LimitUsage>): LimitUsage {
     changedFiles: 0,
     diffLines: 0,
     repeatedErrorCount: 0,
+    totalTokens: 0,
     estimatedCostUsd: 0,
     ...overrides
   };
@@ -810,6 +872,7 @@ function toLimitUsagePayload(usage: LimitUsage): Record<string, JsonValue> {
     changedFiles: usage.changedFiles,
     diffLines: usage.diffLines,
     repeatedErrorCount: usage.repeatedErrorCount,
+    totalTokens: usage.totalTokens,
     estimatedCostUsd: usage.estimatedCostUsd
   };
 }
@@ -821,6 +884,7 @@ function toLimitsPayload(limits: Limits): Record<string, JsonValue> {
     maxChangedFiles: limits.maxChangedFiles,
     maxDiffLines: limits.maxDiffLines,
     maxRepeatedErrorCount: limits.maxRepeatedErrorCount,
+    maxTokens: limits.maxTokens,
     maxBudgetUsd: limits.maxBudgetUsd,
     softBudgetThresholdPercent: limits.softBudgetThresholdPercent,
     hardBudgetThresholdPercent: limits.hardBudgetThresholdPercent
@@ -878,8 +942,9 @@ function installWorkerInterruptionRecovery(input: {
   taskId: string;
   taskRunId: string;
   stopQueueHeartbeat: () => void;
+  deferInterruptSignals: boolean;
 }): () => void {
-  if (!input.queueJobId || typeof input.repository.interruptClaimedTask !== 'function') {
+  if (input.deferInterruptSignals || !input.queueJobId || typeof input.repository.interruptClaimedTask !== 'function') {
     return () => undefined;
   }
 
@@ -922,13 +987,14 @@ async function resolveTaskResumeContext(
     }>;
   },
   taskId: string,
-  workerInterrupted = false
+  queueReason?: string
 ): Promise<TaskResumeContext | undefined> {
   const [approvals, diff] = await Promise.all([repository.listApprovals(), repository.getTaskDiff(taskId)]);
   const taskApprovals = approvals.filter((approval) => approval.taskId === taskId);
   const approvedTypes = new Set(taskApprovals.filter((approval) => approval.status === 'approved').map((approval) => approval.type));
   const lastPlanningIteration = findLastIteration(diff.iterations, 'planning');
   const lastImplementationIteration = findLastIteration(diff.iterations, 'implementation');
+  const lastValidationIteration = findLastIteration(diff.iterations, 'validation');
   const lastReviewIteration = findLastIteration(diff.iterations, 'review');
   const approvedReviewResume = buildApprovedReviewResume(lastPlanningIteration, lastImplementationIteration, lastReviewIteration, approvedTypes);
   const latestApprovedLargeDiffAt = getLatestApprovedLargeDiffAt(taskApprovals);
@@ -936,7 +1002,7 @@ async function resolveTaskResumeContext(
     ? getLatestApprovedReviewAt(taskApprovals, approvedReviewResume.riskyChanges ?? [])
     : undefined;
 
-  if (workerInterrupted) {
+  if (queueReason === 'worker_interrupted') {
     return {
       workflowResume: {
         kind: 'worker_interrupted',
@@ -944,6 +1010,19 @@ async function resolveTaskResumeContext(
         implementationSummary:
           lastImplementationIteration?.resultSummary
           ?? 'Continue the implementation preserved in the workspace after the worker was interrupted.',
+        validationChecks: extractValidationChecks(lastPlanningIteration?.validationResult),
+        approvedApprovals: Array.from(approvedTypes)
+      },
+      ignoredLimitSignals: []
+    };
+  }
+
+  if (queueReason === 'task_retried' && lastImplementationIteration && isFailedValidationIteration(lastValidationIteration)) {
+    return {
+      workflowResume: {
+        kind: 'validation_retry',
+        planSummary: lastPlanningIteration?.resultSummary,
+        implementationSummary: lastImplementationIteration.resultSummary || 'Resume the preserved implementation for validation.',
         validationChecks: extractValidationChecks(lastPlanningIteration?.validationResult),
         approvedApprovals: Array.from(approvedTypes)
       },
@@ -994,6 +1073,14 @@ async function resolveTaskResumeContext(
   }
 
   return undefined;
+}
+
+function isFailedValidationIteration(iteration: TaskDiffIterationSnapshot | undefined): boolean {
+  if (!iteration?.validationResult || typeof iteration.validationResult !== 'object' || Array.isArray(iteration.validationResult)) {
+    return false;
+  }
+
+  return (iteration.validationResult as Record<string, unknown>).passed === false;
 }
 
 function buildApprovedReviewResume(

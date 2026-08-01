@@ -9,7 +9,8 @@ const forbiddenCommandPatterns = [
   /\brm\s+-rf\b/i,
   /\|\s*sh\b/i,
   /\|\s*bash\b/i,
-  /\bchmod\s+777\b/i
+  /\bchmod\s+777\b/i,
+  /\b(?:apt|apt-get|apk|dnf|yum|pacman|brew|choco|winget)\s+(?:add|install)\b/i
 ];
 
 export interface ValidationResult {
@@ -18,6 +19,20 @@ export interface ValidationResult {
   stdout: string;
   stderr: string;
   passed: boolean;
+  checkResults?: ValidationCheckExecutionResult[];
+  executedCheckCount?: number;
+  reusedCheckCount?: number;
+  failingCommand?: string;
+}
+
+export interface ValidationCheckExecutionResult {
+  command: string;
+  exitCode: number;
+  stdout: string;
+  stderr: string;
+  passed: boolean;
+  criterion?: string;
+  rationale?: string;
 }
 
 export interface ValidationActivity {
@@ -29,6 +44,7 @@ export interface ValidationActivity {
   stream?: 'stdout' | 'stderr';
   message?: string;
   exitCode?: number;
+  reused?: boolean;
 }
 
 export type ValidationActivityHandler = (activity: ValidationActivity) => Promise<void> | void;
@@ -201,7 +217,8 @@ export async function runValidationCommand(
 export async function runValidationChecks(
   checks: ValidationCheck[],
   cwd: string,
-  onActivity?: ValidationActivityHandler
+  onActivity?: ValidationActivityHandler,
+  passedCheckResults: ReadonlyMap<string, ValidationCheckExecutionResult> = new Map()
 ): Promise<ValidationResult> {
   const commandChecks = checks.filter((check): check is Extract<ValidationCheck, { kind: 'command' }> => check.kind === 'command');
   if (commandChecks.length === 0) {
@@ -210,15 +227,44 @@ export async function runValidationChecks(
       exitCode: 0,
       stdout: 'No executable validation command was planned.',
       stderr: '',
-      passed: true
+      passed: true,
+      checkResults: [],
+      executedCheckCount: 0,
+      reusedCheckCount: 0
     };
   }
 
   const outputs: string[] = [];
+  const checkResults: ValidationCheckExecutionResult[] = [];
+  let executedCheckCount = 0;
+  let reusedCheckCount = 0;
   let failingResult: ValidationResult | undefined;
 
   for (const [index, check] of commandChecks.entries()) {
     const effectiveCommand = normalizeValidationCommandForEnvironment(check.command);
+    const passedResult = passedCheckResults.get(effectiveCommand);
+    if (passedResult?.passed) {
+      reusedCheckCount += 1;
+      checkResults.push({
+        ...passedResult,
+        criterion: check.criterion,
+        rationale: check.rationale
+      });
+      outputs.push(`[command] ${effectiveCommand}`);
+      outputs.push('[result] Previously passed; not executed again.');
+      await onActivity?.({
+        state: 'completed',
+        command: effectiveCommand,
+        checkIndex: index + 1,
+        checkCount: commandChecks.length,
+        elapsedMs: 0,
+        exitCode: 0,
+        reused: true
+      });
+      continue;
+    }
+
+    executedCheckCount += 1;
     const startedAt = Date.now();
     await onActivity?.({
       state: 'started',
@@ -259,6 +305,11 @@ export async function runValidationChecks(
     if (result.stderr) {
       outputs.push(result.stderr);
     }
+    checkResults.push({
+      ...result,
+      criterion: check.criterion,
+      rationale: check.rationale
+    });
 
     if (!result.passed) {
       const normalizedError = result.stderr || result.stdout || `Exit code ${result.exitCode}`;
@@ -273,8 +324,24 @@ export async function runValidationChecks(
     exitCode: failingResult?.exitCode ?? 0,
     stdout: outputs.join('\n'),
     stderr: failingResult?.stderr ?? '',
-    passed: !failingResult
+    passed: !failingResult,
+    checkResults,
+    executedCheckCount,
+    reusedCheckCount,
+    failingCommand: failingResult?.command
   };
+}
+
+export function collectPassedValidationCheckResults(
+  result: ValidationResult,
+  target: Map<string, ValidationCheckExecutionResult> = new Map()
+): Map<string, ValidationCheckExecutionResult> {
+  for (const checkResult of result.checkResults ?? []) {
+    if (checkResult.passed) {
+      target.set(checkResult.command, checkResult);
+    }
+  }
+  return target;
 }
 
 function sanitizeValidationOutput(value: string): string {

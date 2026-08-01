@@ -98,7 +98,7 @@ export class OpenAIProvider implements AIProvider {
       {
         role: 'system',
         content: input.previousValidationError
-          ? 'Revise validation checks only. Return JSON with a short summary, empty steps and implementationSteps arrays, the supplied acceptanceCriteria, and corrected validationChecks. Do not propose or repeat implementation work. Respond only with JSON.'
+          ? 'Revise only the supplied failed validation check. Return JSON with a short summary, empty steps and implementationSteps arrays, the supplied acceptanceCriteria, and replacement validationChecks for that failed check only. Do not repeat successful or unrelated checks and do not propose implementation work. Respond only with JSON.'
           : 'You are an AI project planner. Provide a JSON object with summary, steps, acceptanceCriteria, validationChecks, and implementationSteps. ' +
             'For ordinary task plans, implementationSteps must be an empty array. When the request asks for a project roadmap, it must contain objects with title, description, acceptanceCriteria, inScope, and outOfScope. ' +
             'validationChecks must be an array of executable checks or manual checks. ' +
@@ -115,7 +115,7 @@ export class OpenAIProvider implements AIProvider {
             ? `Previous validation checks:\n${input.previousValidationChecks.map((check) => check.kind === 'command' ? check.command : check.instructions).join('\n')}`
             : '',
           input.previousValidationError
-            ? 'Replace any broken validation command with a corrected command suitable for the execution environment.'
+            ? 'Return only corrected replacement check(s) for the supplied failed check. Do not repeat any other validation checks.'
             : ''
         ]
           .filter(Boolean)

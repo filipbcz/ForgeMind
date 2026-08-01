@@ -1,9 +1,10 @@
 import { describe, expect, it, vi } from 'vitest';
-import { mkdtemp, writeFile } from 'node:fs/promises';
+import { mkdtemp, readFile, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import {
   assertAllowedValidationCommand,
+  collectPassedValidationCheckResults,
   normalizeValidationCommandForEnvironment,
   runValidationCommand,
   runValidationChecks
@@ -59,8 +60,55 @@ describe('validation runner', () => {
     expect(activities.at(-1)?.state).toBe('completed');
   });
 
+  it('reuses passed checks and executes only failed or not-yet-run checks after correction', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'forgemind-validation-resume-'));
+    const passedCommand = `node -e "const fs=require('node:fs');const p='passed-count.txt';const n=fs.existsSync(p)?Number(fs.readFileSync(p,'utf8')):0;fs.writeFileSync(p,String(n+1))"`;
+    const failedCommand = `node -e "process.stderr.write('sh: 1: missing-tool: not found');process.exit(1)"`;
+    const correctedCommand = `node -e "require('node:fs').writeFileSync('corrected.txt','ok')"`;
+    const laterCommand = `node -e "require('node:fs').writeFileSync('later.txt','ok')"`;
+
+    const firstResult = await runValidationChecks([
+      { kind: 'command', command: passedCommand },
+      { kind: 'command', command: failedCommand },
+      { kind: 'command', command: laterCommand }
+    ], cwd);
+    const passedResults = collectPassedValidationCheckResults(firstResult);
+    const activities: Array<{ command: string; state: string; reused?: boolean }> = [];
+
+    const correctedResult = await runValidationChecks([
+      { kind: 'command', command: passedCommand },
+      { kind: 'command', command: correctedCommand },
+      { kind: 'command', command: laterCommand }
+    ], cwd, async (activity) => {
+      activities.push({ command: activity.command, state: activity.state, reused: activity.reused });
+    }, passedResults);
+
+    expect(firstResult.passed).toBe(false);
+    expect(correctedResult.passed).toBe(true);
+    expect(correctedResult.executedCheckCount).toBe(2);
+    expect(correctedResult.reusedCheckCount).toBe(1);
+    expect(await readFile(join(cwd, 'passed-count.txt'), 'utf8')).toBe('1');
+    expect(await readFile(join(cwd, 'corrected.txt'), 'utf8')).toBe('ok');
+    expect(await readFile(join(cwd, 'later.txt'), 'utf8')).toBe('ok');
+    expect(activities).toContainEqual(expect.objectContaining({
+      command: normalizeValidationCommandForEnvironment(passedCommand),
+      state: 'completed',
+      reused: true
+    }));
+    expect(activities).not.toContainEqual(expect.objectContaining({
+      command: normalizeValidationCommandForEnvironment(passedCommand),
+      state: 'started'
+    }));
+  });
+
   it('rejects shell output redirection outside quoted arguments', () => {
     expect(() => assertAllowedValidationCommand('node --version > version.txt')).toThrow(
+      'Validation command is not allowed'
+    );
+  });
+
+  it('rejects mutable operating-system package installation during validation', () => {
+    expect(() => assertAllowedValidationCommand('apt-get install -y cmake')).toThrow(
       'Validation command is not allowed'
     );
   });

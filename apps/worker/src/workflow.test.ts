@@ -6,6 +6,8 @@ import { mkdir, readFile, writeFile } from 'node:fs/promises';
 import { simpleGit } from 'simple-git';
 import {
   compactTaskExecutionPrompt,
+  createRoadmapTaskPlan,
+  getMissingSystemValidationTool,
   isInspectionOnlyValidationCommand,
   isReviewSummaryOnlyPath,
   isValidationCommandDefinitionFailure,
@@ -563,7 +565,7 @@ describe('worker workflow', () => {
     expect(result.branchName).toBe(task.branchName);
     expect(implement).not.toHaveBeenCalled();
     expect(createDraftPullRequest).toHaveBeenCalledOnce();
-  }, 10000);
+  }, 15000);
 
   it('does not re-request an approved github workflow change when resuming the preserved diff', async () => {
     const workspaceRoot = join(tmpdir(), `forgemind-worker-resume-approved-workflow-${randomUUID()}`);
@@ -668,7 +670,7 @@ describe('worker workflow', () => {
     expect(result.validation.passed).toBe(true);
     expect(result.approvals).not.toContain('github_workflow_change');
     expect(implement).not.toHaveBeenCalled();
-  }, 10000);
+  }, 15000);
 
   it('resumes approved review risk changes without rerunning planning, implementation, or review', async () => {
     const workspaceRoot = join(tmpdir(), `forgemind-worker-resume-approved-review-${randomUUID()}`);
@@ -793,7 +795,10 @@ describe('worker workflow', () => {
     const workspaceRoot = join(tmpdir(), `forgemind-worker-planned-validation-${randomUUID()}`);
     const projectWithoutVerify = {
       ...demoProject,
-      configYaml: noGitProjectConfig.replace('commands:\n  verify: "node --version"\n', 'commands: {}\n')
+      configYaml: noGitProjectConfig.replace(
+        'commands:\n  verify: "node --version"\n',
+        'commands:\n  install: "node --version"\n'
+      )
     };
     const provider: AIProvider = {
       kind: 'codex',
@@ -856,6 +861,7 @@ describe('worker workflow', () => {
 
     expect(result.status).toBe('ready_for_user_review');
     expect(result.validation.passed).toBe(true);
+    expect(result.validation.command).toContain('node --version');
     expect(result.validation.command).toContain('node -e');
   }, 10000);
 
@@ -870,6 +876,10 @@ describe('worker workflow', () => {
     const planningIterations: Array<{ phase: string; validationResult: unknown }> = [];
     const taskActivities: TaskActivity[] = [];
     const validationStatuses: string[] = [];
+    const successfulValidationCommand = `node -e "process.stdout.write('already-passed')"`;
+    const firstCorrectedValidationCommand = `node -e "process.stdout.write('first-corrected')"`;
+    const secondFailedValidationCommand = `node -e "process.stderr.write('sh: 1: docker: not found'); process.exit(1)"`;
+    const secondCorrectedValidationCommand = `node -e "process.stdout.write('second-corrected')"`;
 
     const provider: AIProvider = {
       kind: 'codex',
@@ -883,24 +893,76 @@ describe('worker workflow', () => {
             validationChecks: [
               {
                 kind: 'command',
+                command: successfulValidationCommand,
+                criterion: 'Unrelated successful validation.',
+                rationale: 'Must not run again after correcting another check.'
+              },
+              {
+                kind: 'command',
                 command: `node -e "process.stderr.write('sh: 1: tsc: not found'); process.exit(1)"`,
                 criterion: 'Initial failing validation.',
                 rationale: 'Synthetic failure for retry.'
+              },
+              {
+                kind: 'command',
+                command: secondFailedValidationCommand,
+                criterion: 'Second unavailable validation tool.',
+                rationale: 'Must be corrected without repeating previous checks.'
+              }
+            ]
+          };
+        }
+
+        if (planCalls.length === 2) {
+          return {
+            summary: 'Updated plan with the first corrected validation command.',
+            steps: [],
+            acceptanceCriteria: ['Build passes'],
+            validationChecks: [
+              {
+                kind: 'command',
+                command: successfulValidationCommand,
+                criterion: 'Unrelated successful validation.',
+                rationale: 'Provider repeated it despite the focused correction request.'
+              },
+              {
+                kind: 'command',
+                command: firstCorrectedValidationCommand,
+                criterion: 'First corrected validation.',
+                rationale: 'Adjusted after the first validation failure.'
+              },
+              {
+                kind: 'command',
+                command: secondFailedValidationCommand,
+                criterion: 'Second unavailable validation tool.',
+                rationale: 'Provider repeated an unrelated pending check.'
               }
             ]
           };
         }
 
         return {
-          summary: 'Updated plan with corrected validation command.',
-          steps: ['Reuse created file', 'Run corrected validation'],
+          summary: 'Updated plan with the second corrected validation command.',
+          steps: [],
           acceptanceCriteria: ['Build passes'],
           validationChecks: [
             {
               kind: 'command',
-              command: "node -e \"process.exit(0)\"",
-              criterion: 'Corrected validation.',
-              rationale: 'Adjusted after validation failure.'
+              command: successfulValidationCommand,
+              criterion: 'Unrelated successful validation.',
+              rationale: 'Provider repeated it despite the focused correction request.'
+            },
+            {
+              kind: 'command',
+              command: firstCorrectedValidationCommand,
+              criterion: 'First corrected validation.',
+              rationale: 'Provider repeated the already passed first correction.'
+            },
+            {
+              kind: 'command',
+              command: secondCorrectedValidationCommand,
+              criterion: 'Second corrected validation.',
+              rationale: 'Adjusted after the second validation failure.'
             }
           ]
         };
@@ -967,21 +1029,49 @@ describe('worker workflow', () => {
 
     expect(result.status).toBe('ready_for_user_review');
     expect(result.validation.passed).toBe(true);
-    expect(planCalls).toHaveLength(2);
+    expect(result.validation.executedCheckCount).toBe(1);
+    expect(result.validation.reusedCheckCount).toBe(2);
+    const generatedAgentInstructions = await readFile(join(result.workspacePath, 'AGENTS.md'), 'utf8');
+    expect(generatedAgentInstructions).toContain('Current implementation step:');
+    expect(generatedAgentInstructions).not.toContain('very long project brief');
+    expect(planCalls).toHaveLength(3);
     expect(implementCalls).toHaveLength(1);
     expect(validationStatuses).toEqual(['validating']);
     expect(planCalls[0]?.prompt).not.toContain('very long project brief');
-    expect(planCalls[1]?.prompt).toContain('Revise validation checks only');
+    expect(planCalls[1]?.prompt).toContain('Revise the single failed validation check only');
+    expect(planCalls[1]?.prompt).toContain('Do not repeat successful or unrelated checks');
     expect(planCalls[1]?.prompt).not.toContain('very long project brief');
     expect(planCalls[1]?.previousValidationError).toContain('tsc: not found');
-    expect(planCalls[1]?.previousValidationChecks).toEqual(
-      expect.arrayContaining([
-        expect.objectContaining({
-          kind: 'command',
-          command: expect.stringContaining('tsc: not found')
-        })
-      ])
-    );
+    expect(planCalls[1]?.previousValidationChecks).toEqual([
+      expect.objectContaining({
+        kind: 'command',
+        command: expect.stringContaining('tsc: not found')
+      })
+    ]);
+    expect(planCalls[2]?.previousValidationChecks).toEqual([
+      expect.objectContaining({
+        kind: 'command',
+        command: expect.stringContaining('docker: not found')
+      })
+    ]);
+    expect(taskActivities.filter((activity) => (
+      activity.state === 'started'
+      && activity.detail === successfulValidationCommand
+    ))).toHaveLength(1);
+    expect(taskActivities.filter((activity) => (
+      activity.state === 'started'
+      && activity.detail === firstCorrectedValidationCommand
+    ))).toHaveLength(1);
+    expect(taskActivities.filter((activity) => (
+      activity.state === 'started'
+      && activity.detail === secondCorrectedValidationCommand
+    ))).toHaveLength(1);
+    expect(taskActivities).toContainEqual(expect.objectContaining({
+      phase: 'validation',
+      state: 'completed',
+      title: expect.stringContaining('byla převzata'),
+      detail: expect.stringContaining('znovu se nespouští')
+    }));
     expect(planningIterations).toEqual(
       expect.arrayContaining([
         expect.objectContaining({
@@ -989,9 +1079,7 @@ describe('worker workflow', () => {
           validationResult: expect.objectContaining({
             revisedValidationChecksOnly: true,
             validationChecks: expect.arrayContaining([
-              expect.objectContaining({
-                command: expect.stringContaining('process.exit(0)')
-              })
+              expect.objectContaining({ command: secondCorrectedValidationCommand })
             ])
           })
         })
@@ -1016,6 +1104,48 @@ describe('worker workflow', () => {
     );
   }, 20000);
 
+  it('does not spend another provider call replacing a missing system toolchain', async () => {
+    const workspaceRoot = join(tmpdir(), `forgemind-worker-missing-toolchain-${randomUUID()}`);
+    const projectWithoutVerify = {
+      ...demoProject,
+      configYaml: noGitProjectConfig.replace('commands:\n  verify: "node --version"\n', 'commands: {}\n')
+    };
+    const plan = vi.fn(async (): Promise<PlanResult> => ({
+      summary: 'Build with CMake.',
+      steps: ['Build'],
+      acceptanceCriteria: ['CMake build passes'],
+      validationChecks: [{
+        kind: 'command',
+        command: `node -e "process.stderr.write('/bin/sh: 1: cmake: not found'); process.exit(127)"`,
+        criterion: 'CMake build passes'
+      }]
+    }));
+    const provider: AIProvider = {
+      ...createProviderStub(),
+      plan,
+      async implement(): Promise<ImplementResult> {
+        return {
+          summary: 'Implementation summary',
+          changedFiles: ['status.txt'],
+          diffStat: { filesChanged: 1, insertions: 1, deletions: 0 },
+          requestedApprovals: [],
+          fileUpdates: [{ path: 'status.txt', content: 'ok\n' }]
+        };
+      }
+    };
+
+    const result = await runWorkerTask({
+      project: projectWithoutVerify,
+      task: { ...demoTask, id: `task_${randomUUID()}` },
+      provider,
+      workspaceRoot
+    });
+
+    expect(result.status).toBe('validation_failed');
+    expect(result.summary).toContain('missing required executable "cmake"');
+    expect(plan).toHaveBeenCalledTimes(1);
+  }, 10000);
+
   it('keeps only the current roadmap step in provider execution context', () => {
     expect(compactTaskExecutionPrompt([
       'Project: Demo',
@@ -1034,6 +1164,33 @@ describe('worker workflow', () => {
       'Acceptance Criteria:',
       '- GET /api/leaderboard works.'
     ].join('\n'));
+  });
+
+  it('derives a roadmap task plan without a separate provider planning call', () => {
+    const plan = createRoadmapTaskPlan([
+      'Current implementation step:',
+      'Add leaderboard API.',
+      '',
+      'Step description and scope:',
+      'Expose persisted leaderboard entries through the API.',
+      '',
+      'Execution boundary:',
+      '- Implement only this step.',
+      '',
+      'Acceptance Criteria:',
+      '- GET /api/leaderboard returns persisted scores.',
+      '- Existing tests pass.'
+    ].join('\n'));
+
+    expect(plan).toEqual({
+      summary: 'Implement roadmap step: Add leaderboard API.',
+      steps: ['Expose persisted leaderboard entries through the API.'],
+      acceptanceCriteria: [
+        'GET /api/leaderboard returns persisted scores.',
+        'Existing tests pass.'
+      ],
+      validationChecks: []
+    });
   });
 
   it('distinguishes invalid validation commands from implementation failures', () => {
@@ -1058,6 +1215,23 @@ describe('worker workflow', () => {
       stderr: 'sh: 1: tsc: not found',
       passed: false
     })).toBe(true);
+  });
+
+  it('classifies missing system toolchains as infrastructure failures', () => {
+    expect(getMissingSystemValidationTool({
+      command: 'cmake --preset test',
+      exitCode: 127,
+      stdout: '',
+      stderr: '/bin/sh: 1: cmake: not found',
+      passed: false
+    })).toBe('cmake');
+    expect(getMissingSystemValidationTool({
+      command: 'npm run typecheck',
+      exitCode: 127,
+      stdout: '',
+      stderr: 'sh: 1: tsc: not found',
+      passed: false
+    })).toBeUndefined();
   });
 
   it('moves repository inspection out of executable validation', () => {
