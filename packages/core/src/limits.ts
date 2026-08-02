@@ -2,7 +2,7 @@ import type { Limits } from './model.js';
 
 export const DEFAULT_LIMITS: Limits = {
   maxIterations: 10,
-  maxRuntimeMinutes: 90,
+  maxRuntimeMinutes: 600,
   maxChangedFiles: 20,
   maxDiffLines: 2000,
   maxRepeatedErrorCount: 3

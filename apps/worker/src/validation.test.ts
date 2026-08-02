@@ -29,6 +29,20 @@ describe('validation runner', () => {
     expect(result.stdout).toContain('v');
   });
 
+  it('treats stderr warnings as diagnostic output when the command exits successfully', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'forgemind-validation-warning-'));
+    const command = `node -e "process.stderr.write('compiler warning\\n')"`;
+
+    const commandResult = await runValidationCommand(command, cwd);
+    const suiteResult = await runValidationChecks([{ kind: 'command', command }], cwd);
+
+    expect(commandResult).toMatchObject({ exitCode: 0, passed: true });
+    expect(commandResult.stderr).toContain('compiler warning');
+    expect(suiteResult).toMatchObject({ exitCode: 0, passed: true, failingCommand: undefined });
+    expect(suiteResult.stdout).toContain('compiler warning');
+    expect(suiteResult.stderr).toBe('');
+  });
+
   it('skips validation when there are no executable checks', async () => {
     const cwd = await mkdtemp(join(tmpdir(), 'forgemind-validation-empty-'));
 

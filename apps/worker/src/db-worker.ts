@@ -1148,17 +1148,25 @@ function normalizeResumePhase(value: unknown): WorkerTaskResume['resumeFrom'] | 
 
 function extractValidationResult(value: unknown): WorkerTaskResume['validation'] {
   const payload = asRecord(value);
-  if (!payload || typeof payload.passed !== 'boolean') return undefined;
+  const passed = resolveValidationPassed(payload);
+  if (!payload || passed === undefined) return undefined;
+  const exitCode = typeof payload.exitCode === 'number' ? payload.exitCode : passed ? 0 : 1;
   return {
     command: typeof payload.command === 'string' ? payload.command : 'resumed-validation',
-    exitCode: typeof payload.exitCode === 'number' ? payload.exitCode : payload.passed ? 0 : 1,
+    exitCode,
     stdout: typeof payload.stdout === 'string' ? payload.stdout : '',
     stderr: typeof payload.stderr === 'string' ? payload.stderr : '',
-    passed: payload.passed,
+    passed,
     executedCheckCount: typeof payload.executedCheckCount === 'number' ? payload.executedCheckCount : undefined,
     reusedCheckCount: typeof payload.reusedCheckCount === 'number' ? payload.reusedCheckCount : undefined,
-    failingCommand: typeof payload.failingCommand === 'string' ? payload.failingCommand : undefined
+    failingCommand: !passed && typeof payload.failingCommand === 'string' ? payload.failingCommand : undefined
   };
+}
+
+function resolveValidationPassed(payload: Record<string, unknown> | undefined): boolean | undefined {
+  if (!payload) return undefined;
+  if (typeof payload.exitCode === 'number') return payload.exitCode === 0;
+  return typeof payload.passed === 'boolean' ? payload.passed : undefined;
 }
 
 function extractReviewBlockers(iteration: TaskDiffIterationSnapshot | undefined): string[] {
@@ -1209,11 +1217,7 @@ function timestampOf(value: string | undefined): number {
 }
 
 function isFailedValidationIteration(iteration: TaskDiffIterationSnapshot | undefined): boolean {
-  if (!iteration?.validationResult || typeof iteration.validationResult !== 'object' || Array.isArray(iteration.validationResult)) {
-    return false;
-  }
-
-  return (iteration.validationResult as Record<string, unknown>).passed === false;
+  return resolveValidationPassed(asRecord(iteration?.validationResult)) === false;
 }
 
 function buildApprovedReviewResume(

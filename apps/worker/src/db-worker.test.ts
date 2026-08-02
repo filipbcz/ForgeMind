@@ -325,6 +325,18 @@ describe('db-worker policy enforcement', () => {
       expected: { resumeFrom: 'review', validation: expect.objectContaining({ passed: true, command: 'npm test' }) }
     },
     {
+      label: 'legacy validation result with warnings and a successful exit code',
+      iterations: [
+        { phase: 'implementation', prompt: 'Implement', resultSummary: 'Implementation', diffStat: { filesChanged: 1, insertions: 5, deletions: 0 }, validationResult: { changedFiles: ['src/a.ts'], validationChecks: [{ kind: 'command', command: 'cmake --build build' }], attempt: 1 }, createdAt: '2026-08-02T10:00:20.000Z' },
+        { phase: 'validation', prompt: 'cmake --build build', resultSummary: 'Validation failed', validationResult: { command: 'cmake --build build', exitCode: 0, stdout: 'Built target app', stderr: 'compiler warning', passed: false, attempt: 1 }, createdAt: '2026-08-02T10:00:30.000Z' }
+      ],
+      audit: [
+        { eventType: 'task_iteration_started', payload: { taskRunId: 'run_old', phase: 'review', attempt: 1 }, createdAt: '2026-08-02T10:00:40.000Z' },
+        { eventType: 'task_failed', payload: { status: 'provider_failed' }, createdAt: '2026-08-02T10:00:50.000Z' }
+      ],
+      expected: { resumeFrom: 'review', validation: expect.objectContaining({ passed: true, exitCode: 0, stderr: 'compiler warning' }) }
+    },
+    {
       label: 'worker failure during a validation suite',
       iterations: [
         { phase: 'implementation', prompt: 'Implement', resultSummary: 'Implementation', diffStat: { filesChanged: 1, insertions: 5, deletions: 0 }, validationResult: { changedFiles: ['src/a.ts'], validationChecks: [{ kind: 'command', command: 'npm run lint' }, { kind: 'command', command: 'npm test' }], attempt: 1 }, createdAt: '2026-08-02T10:00:20.000Z' }

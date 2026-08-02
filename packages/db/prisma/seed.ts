@@ -25,7 +25,7 @@ ai:
   model_profile: "balanced"
 limits:
   max_iterations: 10
-  max_runtime_minutes: 90
+  max_runtime_minutes: 600
   max_changed_files: 20
   max_diff_lines: 2000
   max_repeated_error_count: 3
