@@ -49,6 +49,7 @@ const repositoryMock = {
   listApprovals: vi.fn(
     async (): Promise<Array<Record<string, unknown> & { taskId: string; type: string; status: string; payload: Record<string, unknown> }>> => []
   ),
+  listTaskAudit: vi.fn(async (): Promise<Array<{ eventType: string; payload: Record<string, unknown>; createdAt: string }>> => []),
   getTaskDiff: vi.fn(
     async (): Promise<{
       taskId: string;
@@ -273,6 +274,129 @@ describe('db-worker policy enforcement', () => {
         implementationSummary: 'Implementation is already present.',
         validationChecks: [{ kind: 'command', command: 'cmake --preset test' }]
       })
+    }));
+  });
+
+  it.each([
+    {
+      label: 'planning provider failure',
+      iterations: [],
+      audit: [
+        { eventType: 'task_iteration_started', payload: { taskRunId: 'run_old', phase: 'planning', attempt: 0 }, createdAt: '2026-08-02T10:00:10.000Z' },
+        { eventType: 'task_failed', payload: { status: 'provider_failed' }, createdAt: '2026-08-02T10:00:20.000Z' }
+      ],
+      expected: { resumeFrom: 'planning', attempt: 1 }
+    },
+    {
+      label: 'implementation provider failure after review blockers',
+      iterations: [
+        { phase: 'planning', prompt: 'Plan', resultSummary: 'Plan ready', validationResult: {}, createdAt: '2026-08-02T10:00:10.000Z' },
+        { phase: 'implementation', prompt: 'Implement', resultSummary: 'Initial implementation', diffStat: { filesChanged: 2, insertions: 20, deletions: 1 }, validationResult: { changedFiles: ['src/a.ts', 'src/b.ts'], validationChecks: [{ kind: 'command', command: 'npm test' }], attempt: 1 }, createdAt: '2026-08-02T10:00:20.000Z' },
+        { phase: 'validation', prompt: 'npm test', resultSummary: 'Validation passed', validationResult: { command: 'npm test', exitCode: 0, stdout: 'ok', stderr: '', passed: true, attempt: 1 }, createdAt: '2026-08-02T10:00:30.000Z' },
+        { phase: 'review', prompt: 'Review', resultSummary: 'One blocker', validationResult: { blockers: ['Fix adapter lookup.'], safeImprovements: ['Keep the focused test.'], riskyChanges: [], attempt: 1 }, createdAt: '2026-08-02T10:00:40.000Z' }
+      ],
+      audit: [
+        { eventType: 'task_iteration_started', payload: { taskRunId: 'run_old', phase: 'implementation', attempt: 2 }, createdAt: '2026-08-02T10:00:45.000Z' },
+        { eventType: 'task_failed', payload: { status: 'provider_failed' }, createdAt: '2026-08-02T10:00:50.000Z' }
+      ],
+      expected: { resumeFrom: 'implementation', attempt: 2, previousReviewBlockers: ['Fix adapter lookup.'] }
+    },
+    {
+      label: 'failed validation requiring implementation correction',
+      iterations: [
+        { phase: 'implementation', prompt: 'Implement', resultSummary: 'Implementation', diffStat: { filesChanged: 1, insertions: 5, deletions: 0 }, validationResult: { changedFiles: ['src/a.ts'], validationChecks: [{ kind: 'command', command: 'npm test' }], attempt: 1 }, createdAt: '2026-08-02T10:00:20.000Z' },
+        { phase: 'validation', prompt: 'npm test', resultSummary: 'Validation failed', validationResult: { command: 'npm test', exitCode: 1, stdout: '', stderr: 'Assertion failed', passed: false, attempt: 1 }, createdAt: '2026-08-02T10:00:30.000Z' }
+      ],
+      audit: [
+        { eventType: 'task_status_validation_failed', payload: {}, createdAt: '2026-08-02T10:00:40.000Z' }
+      ],
+      expected: { resumeFrom: 'implementation', previousValidationError: 'Assertion failed' }
+    },
+    {
+      label: 'review provider failure after successful validation',
+      iterations: [
+        { phase: 'implementation', prompt: 'Implement', resultSummary: 'Implementation', diffStat: { filesChanged: 1, insertions: 5, deletions: 0 }, validationResult: { changedFiles: ['src/a.ts'], validationChecks: [{ kind: 'command', command: 'npm test' }], attempt: 1 }, createdAt: '2026-08-02T10:00:20.000Z' },
+        { phase: 'validation', prompt: 'npm test', resultSummary: 'Validation passed', validationResult: { command: 'npm test', exitCode: 0, stdout: 'ok', stderr: '', passed: true, attempt: 1 }, createdAt: '2026-08-02T10:00:30.000Z' }
+      ],
+      audit: [
+        { eventType: 'task_iteration_started', payload: { taskRunId: 'run_old', phase: 'review', attempt: 1 }, createdAt: '2026-08-02T10:00:40.000Z' },
+        { eventType: 'task_failed', payload: { status: 'provider_failed' }, createdAt: '2026-08-02T10:00:50.000Z' }
+      ],
+      expected: { resumeFrom: 'review', validation: expect.objectContaining({ passed: true, command: 'npm test' }) }
+    },
+    {
+      label: 'worker failure during a validation suite',
+      iterations: [
+        { phase: 'implementation', prompt: 'Implement', resultSummary: 'Implementation', diffStat: { filesChanged: 1, insertions: 5, deletions: 0 }, validationResult: { changedFiles: ['src/a.ts'], validationChecks: [{ kind: 'command', command: 'npm run lint' }, { kind: 'command', command: 'npm test' }], attempt: 1 }, createdAt: '2026-08-02T10:00:20.000Z' }
+      ],
+      audit: [
+        { eventType: 'task_activity', payload: { taskRunId: 'run_old', phase: 'validation', state: 'completed', operation: 'validation_command', detail: 'npm run lint', exitCode: 0 }, createdAt: '2026-08-02T10:00:30.000Z' },
+        { eventType: 'task_iteration_started', payload: { taskRunId: 'run_old', phase: 'validation', attempt: 1 }, createdAt: '2026-08-02T10:00:31.000Z' },
+        { eventType: 'task_failed', payload: { status: 'failed' }, createdAt: '2026-08-02T10:00:40.000Z' }
+      ],
+      expected: {
+        resumeFrom: 'validation',
+        passedValidationChecks: expect.arrayContaining([expect.objectContaining({ command: 'npm run lint', passed: true })])
+      }
+    },
+    {
+      label: 'provider failure while revising validation commands',
+      iterations: [
+        { phase: 'implementation', prompt: 'Implement', resultSummary: 'Implementation', diffStat: { filesChanged: 1, insertions: 5, deletions: 0 }, validationResult: { changedFiles: ['src/a.ts'], validationChecks: [{ kind: 'command', command: 'missing-tool test' }], attempt: 1 }, createdAt: '2026-08-02T10:00:20.000Z' },
+        { phase: 'validation', prompt: 'missing-tool test', resultSummary: 'Validation failed', validationResult: { command: 'missing-tool test', exitCode: 1, stdout: '', stderr: 'not found', passed: false, failingCommand: 'missing-tool test', attempt: 1 }, createdAt: '2026-08-02T10:00:30.000Z' }
+      ],
+      audit: [
+        { eventType: 'task_iteration_started', payload: { taskRunId: 'run_old', phase: 'planning', attempt: 1 }, createdAt: '2026-08-02T10:00:31.000Z' },
+        { eventType: 'task_failed', payload: { status: 'provider_failed' }, createdAt: '2026-08-02T10:00:40.000Z' }
+      ],
+      expected: {
+        resumeFrom: 'validation',
+        resumeValidationPlanRevision: true,
+        validation: expect.objectContaining({ passed: false, failingCommand: 'missing-tool test' })
+      }
+    },
+    {
+      label: 'delivery failure after completed review',
+      iterations: [
+        { phase: 'implementation', prompt: 'Implement', resultSummary: 'Implementation', diffStat: { filesChanged: 1, insertions: 5, deletions: 0 }, validationResult: { changedFiles: ['src/a.ts'], validationChecks: [{ kind: 'command', command: 'npm test' }], attempt: 1 }, createdAt: '2026-08-02T10:00:20.000Z' },
+        { phase: 'validation', prompt: 'npm test', resultSummary: 'Validation passed', validationResult: { command: 'npm test', exitCode: 0, stdout: 'ok', stderr: '', passed: true, attempt: 1 }, createdAt: '2026-08-02T10:00:30.000Z' },
+        { phase: 'review', prompt: 'Review', resultSummary: 'Review passed', validationResult: { blockers: [], riskyChanges: [], attempt: 1 }, createdAt: '2026-08-02T10:00:40.000Z' }
+      ],
+      audit: [
+        { eventType: 'task_activity', payload: { taskRunId: 'run_old', phase: 'git', state: 'completed', operation: 'commit' }, createdAt: '2026-08-02T10:00:42.000Z' },
+        { eventType: 'task_activity', payload: { taskRunId: 'run_old', phase: 'git', state: 'completed', operation: 'commit_and_push' }, createdAt: '2026-08-02T10:00:44.000Z' },
+        { eventType: 'task_github_operation_failed', payload: { taskRunId: 'run_old', operation: 'create_draft_pr' }, createdAt: '2026-08-02T10:00:46.000Z' },
+        { eventType: 'task_failed', payload: { status: 'failed' }, createdAt: '2026-08-02T10:00:50.000Z' }
+      ],
+      expected: { resumeFrom: 'delivery', completedOperations: expect.arrayContaining(['commit', 'commit_and_push']) }
+    }
+  ])('resumes exactly at $label', async ({ iterations, audit, expected }) => {
+    repositoryMock.claimNextSubmittedTask.mockResolvedValueOnce(createClaimedTask('task_retried'));
+    repositoryMock.getTaskDiff.mockResolvedValueOnce({
+      taskId: 'task_1',
+      filesChanged: 1,
+      insertions: 5,
+      deletions: 0,
+      iterations
+    });
+    repositoryMock.listTaskAudit.mockResolvedValueOnce(audit);
+    runWorkerTaskMock.mockResolvedValueOnce({
+      taskId: 'task_1',
+      status: 'ready_for_user_review',
+      issueUrl: 'https://github.com/demo/repo/issues/1',
+      branchName: 'ai/1-task',
+      workspacePath: 'C:/tmp/worker',
+      validation: { command: 'npm test', exitCode: 0, stdout: '', stderr: '', passed: true },
+      summary: 'Resumed successfully.',
+      approvals: [],
+      completedAt: new Date().toISOString()
+    });
+
+    const { runDatabaseWorkerOnce } = await import('./db-worker.js');
+    await runDatabaseWorkerOnce();
+
+    expect(runWorkerTaskMock).toHaveBeenCalledWith(expect.objectContaining({
+      resume: expect.objectContaining({ kind: 'phase_retry', ...expected })
     }));
   });
 

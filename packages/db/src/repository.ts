@@ -2026,6 +2026,7 @@ export class ForgeMindRepository {
       where: { id: queueJobId },
       select: {
         id: true,
+        taskId: true,
         status: true,
         attemptCount: true
       }
@@ -2040,14 +2041,41 @@ export class ForgeMindRepository {
 
       if (shouldRetry) {
         const delaySeconds = backoffSeconds * Math.max(1, 2 ** Math.max(0, queueJob.attemptCount - 1));
-        await this.prisma.taskQueueJob.update({
-          where: { id: queueJobId },
-          data: {
-            status: 'pending',
-            claimedAt: null,
-            nextAttemptAt: new Date(Date.now() + delaySeconds * 1000),
-            errorMessage
-          }
+        const nextAttemptAt = new Date(Date.now() + delaySeconds * 1000);
+        await this.prisma.$transaction(async (tx) => {
+          await tx.taskQueueJob.update({
+            where: { id: queueJobId },
+            data: {
+              status: 'pending',
+              reason: 'phase_retry',
+              claimedAt: null,
+              nextAttemptAt,
+              errorMessage
+            }
+          });
+          await tx.task.updateMany({
+            where: {
+              id: queueJob.taskId,
+              status: { notIn: ['completed', 'cancelled'] }
+            },
+            data: {
+              status: 'submitted',
+              finishedAt: null
+            }
+          });
+          await tx.auditLog.create({
+            data: {
+              actorType: 'system',
+              eventType: 'task_queue_retry_scheduled',
+              taskId: queueJob.taskId,
+              payload: {
+                queueJobId,
+                nextAttemptAt: nextAttemptAt.toISOString(),
+                errorMessage: errorMessage ?? null,
+                resumeFromCheckpoint: true
+              }
+            }
+          });
         });
         return;
       }

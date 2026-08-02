@@ -111,6 +111,7 @@ function createMockPrisma() {
           updatedAt: new Date()
         }
       })),
+      updateMany: vi.fn(async () => ({ count: 1 })),
       findFirst: vi.fn(async () => ({
         id: 'task_1',
         projectId: 'project_1',
@@ -293,6 +294,7 @@ describe('ForgeMindRepository task runs', () => {
     const { prisma, taskQueueJobFindUnique } = createMockPrisma();
     taskQueueJobFindUnique.mockResolvedValueOnce({
       id: 'queue_1',
+      taskId: 'task_1',
       status: 'claimed',
       claimedAt: new Date(Date.now() - 10 * 60_000)
     } as any);
@@ -471,6 +473,7 @@ describe('ForgeMindRepository task runs', () => {
     const { prisma, taskQueueJobFindUnique } = createMockPrisma();
     taskQueueJobFindUnique.mockResolvedValueOnce({
       id: 'queue_1',
+      taskId: 'task_1',
       status: 'claimed',
       attemptCount: 1
     } as any);
@@ -482,9 +485,27 @@ describe('ForgeMindRepository task runs', () => {
       where: { id: 'queue_1' },
       data: expect.objectContaining({
         status: 'pending',
+        reason: 'phase_retry',
         claimedAt: null,
         errorMessage: 'temporary error',
         nextAttemptAt: expect.any(Date)
+      })
+    });
+    expect(prisma.task.updateMany).toHaveBeenCalledWith({
+      where: {
+        id: 'task_1',
+        status: { notIn: ['completed', 'cancelled'] }
+      },
+      data: {
+        status: 'submitted',
+        finishedAt: null
+      }
+    });
+    expect(prisma.auditLog.create).toHaveBeenCalledWith({
+      data: expect.objectContaining({
+        eventType: 'task_queue_retry_scheduled',
+        taskId: 'task_1',
+        payload: expect.objectContaining({ resumeFromCheckpoint: true })
       })
     });
   });

@@ -45,13 +45,24 @@ export interface WorkerTaskInput {
 type GitHubOperation = 'create_issue' | 'create_branch' | 'commit_and_push' | 'create_draft_pr' | 'create_pull_request' | 'merge_pr' | 'comment_on_issue';
 
 export interface WorkerTaskResume {
-  kind: 'approved_large_diff' | 'approved_operation' | 'approved_review' | 'validation_retry' | 'worker_interrupted';
+  kind: 'approved_large_diff' | 'approved_operation' | 'approved_review' | 'validation_retry' | 'worker_interrupted' | 'phase_retry';
+  resumeFrom?: 'planning' | 'implementation' | 'validation' | 'review' | 'delivery';
+  attempt?: number;
   planSummary?: string;
   implementationSummary: string;
+  changedFiles?: string[];
+  diffStat?: ImplementResult['diffStat'];
+  previousValidationError?: string;
+  previousReviewBlockers?: string[];
+  previousSafeImprovements?: string[];
+  validation?: ValidationResult;
+  passedValidationChecks?: ValidationCheckExecutionResult[];
+  resumeValidationPlanRevision?: boolean;
   reviewSummary?: string;
   riskyChanges?: ApprovalType[];
   validationChecks?: ValidationCheck[];
   approvedApprovals?: ApprovalType[];
+  completedOperations?: string[];
 }
 
 export interface WorkerTaskHooks {
@@ -175,8 +186,9 @@ export async function runWorkerTask(input: WorkerTaskInput): Promise<WorkerTaskR
   await input.hooks?.onStatus?.('running_ai', isResumeRun && input.resume ? { resumed: true, kind: input.resume.kind } : undefined);
   await writeAgentsInstructions(workspacePath, input.project, input.task, executionPrompt, input.project.configYaml);
   const roadmapPlan = createRoadmapTaskPlan(executionPrompt);
-  let plan = input.resume
-    ? createResumePlan(input.resume)
+  const rerunPlanning = input.resume?.resumeFrom === 'planning';
+  let plan = input.resume && !rerunPlanning
+    ? createResumePlan(input.resume, roadmapPlan)
     : roadmapPlan ?? await (async () => {
         const startedAt = Date.now();
         await emitTaskActivity(input.hooks, {
@@ -209,7 +221,7 @@ export async function runWorkerTask(input: WorkerTaskInput): Promise<WorkerTaskR
         });
         return result;
       })();
-  if (!input.resume && roadmapPlan) {
+  if ((!input.resume || rerunPlanning) && roadmapPlan) {
     await emitTaskActivity(input.hooks, {
       phase: 'planning',
       state: 'completed',
@@ -225,7 +237,7 @@ export async function runWorkerTask(input: WorkerTaskInput): Promise<WorkerTaskR
     installCommand: config.installCommand,
     explicitVerifyCommand: config.verifyCommand
   });
-  if (!input.resume) {
+  if (!input.resume || rerunPlanning) {
     await input.hooks?.onIteration?.({
       phase: 'planning',
       prompt: executionPrompt,
@@ -233,15 +245,20 @@ export async function runWorkerTask(input: WorkerTaskInput): Promise<WorkerTaskR
       providerPrompt: plan.providerPrompt,
       providerResponse: plan.providerResponse,
       diffStat: { filesChanged: 0, insertions: 0, deletions: 0 },
-      validationResult: { passed: true, validationChecks }
+      validationResult: { passed: true, validationChecks: validationChecksToJson(validationChecks) }
     });
   }
 
   let implementation: ImplementResult | undefined;
-  let validation: ValidationResult | undefined;
-  let resumedImplementation =
+  let validation: ValidationResult | undefined = input.resume?.validation;
+  const reuseImplementationCheckpoint = Boolean(
     input.resume
-      ? await loadResumedImplementation(git, workspacePath, input.resume.implementationSummary)
+    && input.resume.resumeFrom !== 'planning'
+    && input.resume.resumeFrom !== 'implementation'
+  );
+  let resumedImplementation =
+    input.resume && reuseImplementationCheckpoint
+      ? await loadResumedImplementation(git, workspacePath, input.resume)
       : undefined;
   const retryReasons: string[] = [];
   const appliedSafeImprovements = new Set<string>();
@@ -286,9 +303,23 @@ export async function runWorkerTask(input: WorkerTaskInput): Promise<WorkerTaskR
       providerPrompt?: string;
       providerResponse?: string;
       }
-    | undefined;
+    | undefined = input.resume?.previousReviewBlockers?.length
+      ? {
+          summary: input.resume.reviewSummary ?? 'Resume correction for previously reported review blockers.',
+          blockers: input.resume.previousReviewBlockers,
+          safeImprovements: input.resume.previousSafeImprovements ?? [],
+          riskyChanges: normalizeRuntimeApprovals(input.resume.riskyChanges ?? [])
+        }
+      : undefined;
 
-  for (let attempt = 1; attempt <= input.task.maxIterations; attempt += 1) {
+  let resumedValidation = input.resume?.resumeFrom === 'review' || input.resume?.resumeFrom === 'delivery'
+    ? input.resume.validation
+    : undefined;
+  const resumeDelivery = input.resume?.resumeFrom === 'delivery';
+  const completedOperations = new Set(input.resume?.completedOperations ?? []);
+  const firstAttempt = Math.max(1, Math.min(input.task.maxIterations, input.resume?.attempt ?? 1));
+
+  for (let attempt = firstAttempt; attempt <= input.task.maxIterations; attempt += 1) {
     completedAttempts = attempt;
     const previousReviewForCorrection = review?.blockers.length ? review : undefined;
     const beforeCorrectionSnapshot = previousReviewForCorrection
@@ -309,7 +340,7 @@ export async function runWorkerTask(input: WorkerTaskInput): Promise<WorkerTaskR
       attempt
     });
     const isResumedImplementation = Boolean(resumedImplementation);
-    const attemptApprovedApprovals = attempt === 1 ? approvedApprovals : noApprovedApprovals;
+    const attemptApprovedApprovals = attempt === firstAttempt ? approvedApprovals : noApprovedApprovals;
     implementation = resumedImplementation
       ?? await provider.implement({
         taskId: input.task.id,
@@ -317,7 +348,8 @@ export async function runWorkerTask(input: WorkerTaskInput): Promise<WorkerTaskR
         plan,
         repositoryPath: workspacePath,
         attemptNumber: attempt,
-        previousValidationError: validation && !validation.passed ? validation.stderr || validation.stdout || `Exit code ${validation.exitCode}` : undefined,
+        previousValidationError: input.resume?.previousValidationError
+          ?? (validation && !validation.passed ? validation.stderr || validation.stdout || `Exit code ${validation.exitCode}` : undefined),
         previousReviewBlockers: review?.blockers.length ? review.blockers : undefined,
         previousSafeImprovements: review?.safeImprovements.length ? review.safeImprovements : undefined,
         onActivity: (activity) => input.hooks?.onProviderActivity?.({ phase: 'implementation', attempt, ...activity })
@@ -349,7 +381,7 @@ export async function runWorkerTask(input: WorkerTaskInput): Promise<WorkerTaskR
       changedFiles: uniqueStrings([...implementation.changedFiles, ...substantiveChangedFiles]).filter(isSubstantiveImplementationPath),
       diffStat: actualDiffStat
     };
-    if (!config.verifyCommand?.trim()) {
+    if (!isResumedImplementation && !config.verifyCommand?.trim()) {
       validationChecks = await resolveValidationChecks({
         plan: { ...plan, validationChecks: implementation.validationChecks },
         installCommand: config.installCommand
@@ -368,7 +400,7 @@ export async function runWorkerTask(input: WorkerTaskInput): Promise<WorkerTaskR
           passed: substantiveChangedFiles.length > 0,
           attempt,
           changedFiles: substantiveChangedFiles,
-          validationChecks
+          validationChecks: validationChecksToJson(validationChecks)
         }
       });
     }
@@ -415,7 +447,7 @@ export async function runWorkerTask(input: WorkerTaskInput): Promise<WorkerTaskR
       };
     }
 
-    if (substantiveChangedFiles.length === 0) {
+    if (substantiveChangedFiles.length === 0 && !isResumedImplementation) {
       validation = {
         command: 'implementation-changes',
         exitCode: 1,
@@ -462,46 +494,59 @@ export async function runWorkerTask(input: WorkerTaskInput): Promise<WorkerTaskR
     }
 
     let validationPlanRevisionCount = 0;
+    const isFirstResumedAttempt = attempt === firstAttempt;
+    let resumeValidationPlanRevision = isFirstResumedAttempt && input.resume?.resumeValidationPlanRevision === true;
     let missingSystemValidationTool: string | undefined;
-    const passedValidationCheckResults = new Map<string, ValidationCheckExecutionResult>();
+    const passedValidationCheckResults = new Map<string, ValidationCheckExecutionResult>(
+      (isFirstResumedAttempt ? input.resume?.passedValidationChecks ?? [] : [])
+        .filter((result) => result.passed)
+        .map((result) => [normalizeValidationCommandForEnvironment(result.command), result])
+    );
     while (true) {
-      if (validationPlanRevisionCount === 0) {
+      if (resumedValidation?.passed) {
+        await input.hooks?.onStatus?.('validating', { attempt, resumed: true, kind: input.resume?.kind ?? 'phase_retry' });
+        validation = resumedValidation;
+        resumedValidation = undefined;
+        break;
+      }
+      if (!resumeValidationPlanRevision && validationPlanRevisionCount === 0) {
         await input.hooks?.onStatus?.('validating', { attempt });
       }
-      await input.hooks?.onIterationStarted?.({
-        phase: 'validation',
-        prompt: summarizeValidationChecks(validationChecks),
-        attempt
-      });
-      validation = await runValidationChecks(validationChecks, workspacePath, async (activity) => {
-        const checkLabel = `${activity.checkIndex}/${activity.checkCount}`;
-        if (activity.state === 'started') {
-          await emitTaskActivity(input.hooks, {
-            phase: 'validation',
-            state: 'started',
-            title: `Spouštím validaci ${checkLabel}`,
-            detail: activity.command,
-            operation: 'validation_command',
-            attempt,
-            elapsedMs: activity.elapsedMs
-          });
-          return;
-        }
-        if (activity.state === 'output') {
-          await emitTaskActivity(input.hooks, {
-            phase: 'validation',
-            state: 'progress',
-            title: `Validace ${checkLabel} stále běží`,
-            detail: activity.message,
-            operation: activity.stream ?? 'validation_output',
-            attempt,
-            elapsedMs: activity.elapsedMs
-          });
-          return;
-        }
-        await emitTaskActivity(input.hooks, {
+      if (!resumeValidationPlanRevision) {
+        await input.hooks?.onIterationStarted?.({
           phase: 'validation',
-          state: activity.exitCode === 0 ? 'completed' : 'failed',
+          prompt: summarizeValidationChecks(validationChecks),
+          attempt
+        });
+        validation = await runValidationChecks(validationChecks, workspacePath, async (activity) => {
+          const checkLabel = `${activity.checkIndex}/${activity.checkCount}`;
+          if (activity.state === 'started') {
+            await emitTaskActivity(input.hooks, {
+              phase: 'validation',
+              state: 'started',
+            title: `Spouštím validaci ${checkLabel}`,
+              detail: activity.command,
+              operation: 'validation_command',
+              attempt,
+              elapsedMs: activity.elapsedMs
+            });
+            return;
+          }
+          if (activity.state === 'output') {
+            await emitTaskActivity(input.hooks, {
+              phase: 'validation',
+              state: 'progress',
+            title: `Validace ${checkLabel} stále běží`,
+              detail: activity.message,
+              operation: activity.stream ?? 'validation_output',
+              attempt,
+              elapsedMs: activity.elapsedMs
+            });
+            return;
+          }
+          await emitTaskActivity(input.hooks, {
+            phase: 'validation',
+            state: activity.exitCode === 0 ? 'completed' : 'failed',
           title: activity.reused
             ? `Validace ${checkLabel} byla převzata`
             : activity.exitCode === 0
@@ -510,36 +555,47 @@ export async function runWorkerTask(input: WorkerTaskInput): Promise<WorkerTaskR
           detail: activity.reused
             ? `${activity.command} (již dříve prošla, znovu se nespouští)`
             : activity.command,
-          operation: 'validation_command',
-          attempt,
-          elapsedMs: activity.elapsedMs,
-          exitCode: activity.exitCode
+            operation: 'validation_command',
+            attempt,
+            elapsedMs: activity.elapsedMs,
+            exitCode: activity.exitCode
+          });
+        }, passedValidationCheckResults);
+        collectPassedValidationCheckResults(validation, passedValidationCheckResults);
+        missingSystemValidationTool = getMissingSystemValidationTool(validation);
+        await input.hooks?.onIteration?.({
+          phase: 'validation',
+          prompt: validation.command,
+          resultSummary: validation.passed ? 'Validation passed.' : 'Validation failed.',
+          diffStat: implementation.diffStat,
+          validationResult: {
+            command: validation.command,
+            exitCode: validation.exitCode,
+            stdout: validation.stdout,
+            stderr: validation.stderr,
+            passed: validation.passed,
+            passedValidationCommands: (validation.checkResults ?? [])
+              .filter((result) => result.passed)
+              .map((result) => result.command),
+            executedCheckCount: validation.executedCheckCount ?? 0,
+            reusedCheckCount: validation.reusedCheckCount ?? 0,
+            failingCommand: validation.failingCommand ?? null,
+            attempt,
+            validationPlanRevision: validationPlanRevisionCount
+          }
         });
-      }, passedValidationCheckResults);
-      collectPassedValidationCheckResults(validation, passedValidationCheckResults);
-      missingSystemValidationTool = getMissingSystemValidationTool(validation);
-      await input.hooks?.onIteration?.({
-        phase: 'validation',
-        prompt: validation.command,
-        resultSummary: validation.passed ? 'Validation passed.' : 'Validation failed.',
-        diffStat: implementation.diffStat,
-        validationResult: {
-          command: validation.command,
-          exitCode: validation.exitCode,
-          stdout: validation.stdout,
-          stderr: validation.stderr,
-          passed: validation.passed,
-          attempt,
-          validationPlanRevision: validationPlanRevisionCount
-        }
-      });
+      }
+      if (!validation) {
+        throw new Error('Validation checkpoint is missing while resuming validation-plan correction.');
+      }
 
       if (
-        validation.passed
-        || Boolean(missingSystemValidationTool)
-        || config.verifyCommand?.trim()
-        || !isValidationCommandDefinitionFailure(validation)
-        || validationPlanRevisionCount >= 2
+        !resumeValidationPlanRevision
+        && (validation.passed
+          || Boolean(missingSystemValidationTool)
+          || config.verifyCommand?.trim()
+          || !isValidationCommandDefinitionFailure(validation)
+          || validationPlanRevisionCount >= 2)
       ) {
         break;
       }
@@ -598,6 +654,7 @@ export async function runWorkerTask(input: WorkerTaskInput): Promise<WorkerTaskR
         break;
       }
       validationChecks = revisedValidationChecks;
+      resumeValidationPlanRevision = false;
       await input.hooks?.onIteration?.({
         phase: 'planning',
         prompt: validationRevisionContext,
@@ -607,7 +664,7 @@ export async function runWorkerTask(input: WorkerTaskInput): Promise<WorkerTaskR
         diffStat: implementation.diffStat,
         validationResult: {
           passed: true,
-          validationChecks,
+          validationChecks: validationChecksToJson(validationChecks),
           revisedValidationChecksOnly: true,
           attempt,
           validationPlanRevision: validationPlanRevisionCount
@@ -655,13 +712,14 @@ export async function runWorkerTask(input: WorkerTaskInput): Promise<WorkerTaskR
     }
 
     if (validation.passed) {
-      if (input.resume?.kind === 'approved_review') {
-        await input.hooks?.onStatus?.('reviewing', { attempt, resumed: true, kind: input.resume.kind });
+      const reviewResume = input.resume;
+      if (reviewResume && (reviewResume.kind === 'approved_review' || resumeDelivery)) {
+        await input.hooks?.onStatus?.('reviewing', { attempt, resumed: true, kind: reviewResume.kind });
         review = {
-          summary: input.resume.reviewSummary ?? 'Previously approved review resumed.',
+          summary: reviewResume.reviewSummary ?? 'Previously approved review resumed.',
           blockers: [],
           safeImprovements: [],
-          riskyChanges: normalizeRuntimeApprovals(input.resume.riskyChanges ?? [])
+          riskyChanges: normalizeRuntimeApprovals(reviewResume.riskyChanges ?? [])
         };
         break;
       }
@@ -819,23 +877,25 @@ export async function runWorkerTask(input: WorkerTaskInput): Promise<WorkerTaskR
   }
 
   if (git) {
-    const commitStartedAt = Date.now();
-    await emitTaskActivity(input.hooks, {
-      phase: 'git',
-      state: 'started',
+    if (!completedOperations.has('commit')) {
+      const commitStartedAt = Date.now();
+      await emitTaskActivity(input.hooks, {
+        phase: 'git',
+        state: 'started',
       title: 'Vytvářím Git commit',
-      detail: `AI: ${input.task.title}`,
-      operation: 'commit'
-    });
-    await stageAndCommitChanges(git, `AI: ${input.task.title}`);
-    await emitTaskActivity(input.hooks, {
-      phase: 'git',
-      state: 'completed',
+        detail: `AI: ${input.task.title}`,
+        operation: 'commit'
+      });
+      await stageAndCommitChanges(git, `AI: ${input.task.title}`);
+      await emitTaskActivity(input.hooks, {
+        phase: 'git',
+        state: 'completed',
       title: 'Git commit je připravený',
-      operation: 'commit',
-      elapsedMs: Date.now() - commitStartedAt
-    });
-    if (config.autoPush) {
+        operation: 'commit',
+        elapsedMs: Date.now() - commitStartedAt
+      });
+    }
+    if (config.autoPush && !completedOperations.has('commit_and_push')) {
       await runGitHubOperation(
         input.hooks,
         'commit_and_push',
@@ -879,7 +939,7 @@ export async function runWorkerTask(input: WorkerTaskInput): Promise<WorkerTaskR
     }
   }
 
-  if (config.createIssue) {
+  if (config.createIssue && !completedOperations.has('comment_on_issue')) {
     await runGitHubOperation(
       input.hooks,
       'comment_on_issue',
@@ -894,18 +954,14 @@ export async function runWorkerTask(input: WorkerTaskInput): Promise<WorkerTaskR
     if (!github?.mergePullRequest) {
       mergeFailure = 'The configured GitHub adapter does not support pull request merge.';
     } else {
-      try {
-        const merge = await runGitHubOperation(
-          input.hooks,
-          'merge_pr',
-          { pullRequestNumber: pr.pullRequestNumber, targetBranch: input.project.defaultBranch },
-          async () => github.mergePullRequest!(input.project, pr!.pullRequestNumber)
-        );
-        mergeConfirmed = merge.merged;
-        if (!merge.merged) mergeFailure = merge.message;
-      } catch (error) {
-        mergeFailure = toErrorMessage(error);
-      }
+      const merge = await runGitHubOperation(
+        input.hooks,
+        'merge_pr',
+        { pullRequestNumber: pr.pullRequestNumber, targetBranch: input.project.defaultBranch },
+        async () => github.mergePullRequest!(input.project, pr!.pullRequestNumber)
+      );
+      mergeConfirmed = merge.merged;
+      if (!merge.merged) mergeFailure = merge.message;
     }
   }
 
@@ -940,7 +996,7 @@ function formatUsageSummary(input: { inputTokens: number; outputTokens: number; 
   return `Input tokens: ${input.inputTokens}, output tokens: ${input.outputTokens}, estimated cost: ${input.estimatedCostUsd.toFixed(4)} USD`;
 }
 
-function createResumePlan(resume: WorkerTaskResume): PlanResult {
+function createResumePlan(resume: WorkerTaskResume, fallback?: PlanResult): PlanResult {
   return {
     summary:
       resume.planSummary
@@ -951,8 +1007,8 @@ function createResumePlan(resume: WorkerTaskResume): PlanResult {
           : resume.kind === 'validation_retry'
             ? 'Resume the preserved implementation and rerun validation only.'
           : 'Resume previously approved implementation.'),
-    steps: [],
-    acceptanceCriteria: [],
+    steps: fallback?.steps ?? [],
+    acceptanceCriteria: fallback?.acceptanceCriteria ?? [],
     validationChecks: normalizeValidationChecks(resume.validationChecks)
   };
 }
@@ -1173,6 +1229,15 @@ export function normalizeValidationChecks(value: unknown): ValidationCheck[] {
   }
 
   return checks;
+}
+
+function validationChecksToJson(checks: ValidationCheck[]): JsonValue[] {
+  return checks.map((check) => ({
+    kind: check.kind,
+    command: check.command,
+    criterion: check.criterion ?? null,
+    rationale: check.rationale ?? null
+  }));
 }
 
 export function isInspectionOnlyValidationCommand(command: string): boolean {
@@ -1892,18 +1957,21 @@ function truncateReviewDiff(diff: string): string {
 async function loadResumedImplementation(
   git: SimpleGit,
   workspacePath: string,
-  implementationSummary: string
+  resume: WorkerTaskResume
 ): Promise<ImplementResult | undefined> {
   const status = await git.status();
-  const changedFiles = collectStageablePaths(status).filter(isSubstantiveImplementationPath);
-  if (changedFiles.length === 0) {
+  const workspaceChangedFiles = collectStageablePaths(status).filter(isSubstantiveImplementationPath);
+  const changedFiles = uniqueStrings([...workspaceChangedFiles, ...(resume.changedFiles ?? [])]).filter(isSubstantiveImplementationPath);
+  if (changedFiles.length === 0 && !resume.diffStat) {
     return undefined;
   }
 
   return {
-    summary: implementationSummary,
+    summary: resume.implementationSummary,
     changedFiles: uniqueStrings(changedFiles),
-    diffStat: await collectWorkspaceDiffStat(git, workspacePath, status),
+    diffStat: workspaceChangedFiles.length > 0
+      ? await collectWorkspaceDiffStat(git, workspacePath, status)
+      : resume.diffStat ?? { filesChanged: changedFiles.length, insertions: 0, deletions: 0 },
     requestedApprovals: []
   };
 }

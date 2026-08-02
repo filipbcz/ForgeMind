@@ -20,7 +20,15 @@ interface TaskDiffIterationSnapshot {
   phase: string;
   prompt: string;
   resultSummary: string;
+  diffStat?: unknown;
   validationResult: unknown;
+  createdAt?: string;
+}
+
+interface TaskAuditSnapshot {
+  eventType: string;
+  payload: unknown;
+  createdAt: string;
 }
 
 interface PlannedValidationCheckSnapshot {
@@ -108,7 +116,8 @@ export async function runDatabaseWorkerOnce(options: { deferInterruptSignals?: b
   const resumeContext = await resolveTaskResumeContext(
     repository,
     claimed.task.id,
-    claimed.queueReason
+    claimed.queueReason,
+    claimed.taskRun.id
   );
   let costEstimate;
   try {
@@ -883,14 +892,20 @@ function installWorkerInterruptionRecovery(input: {
 async function resolveTaskResumeContext(
   repository: {
     listApprovals: () => Promise<Array<{ taskId: string; type: ApprovalType; status: 'pending' | 'approved' | 'rejected' | 'cancelled'; payload: unknown; createdAt: string }>>;
+    listTaskAudit: (taskId: string) => Promise<TaskAuditSnapshot[]>;
     getTaskDiff: (taskId: string) => Promise<{
       iterations: TaskDiffIterationSnapshot[];
     }>;
   },
   taskId: string,
-  queueReason?: string
+  queueReason?: string,
+  currentTaskRunId?: string
 ): Promise<TaskResumeContext | undefined> {
-  const [approvals, diff] = await Promise.all([repository.listApprovals(), repository.getTaskDiff(taskId)]);
+  const [approvals, diff, audit] = await Promise.all([
+    repository.listApprovals(),
+    repository.getTaskDiff(taskId),
+    repository.listTaskAudit(taskId)
+  ]);
   const taskApprovals = approvals.filter((approval) => approval.taskId === taskId);
   const approvedTypes = new Set(taskApprovals.filter((approval) => approval.status === 'approved').map((approval) => approval.type));
   const lastPlanningIteration = findLastIteration(diff.iterations, 'planning');
@@ -903,6 +918,16 @@ async function resolveTaskResumeContext(
     ? getLatestApprovedReviewAt(taskApprovals, approvedReviewResume.riskyChanges ?? [])
     : undefined;
 
+  if (queueReason === 'task_retried' || queueReason === 'worker_interrupted' || queueReason === 'phase_retry') {
+    const phaseRetryResume = buildPhaseRetryResume(diff.iterations, audit, approvedTypes, currentTaskRunId);
+    if (phaseRetryResume) {
+      return {
+        workflowResume: phaseRetryResume,
+        ignoredLimitSignals: [],
+      };
+    }
+  }
+
   if (queueReason === 'worker_interrupted') {
     return {
       workflowResume: {
@@ -911,7 +936,7 @@ async function resolveTaskResumeContext(
         implementationSummary:
           lastImplementationIteration?.resultSummary
           ?? 'Continue the implementation preserved in the workspace after the worker was interrupted.',
-        validationChecks: extractValidationChecks(lastPlanningIteration?.validationResult),
+        validationChecks: extractLatestValidationChecks(diff.iterations),
         approvedApprovals: Array.from(approvedTypes)
       },
       ignoredLimitSignals: []
@@ -924,7 +949,7 @@ async function resolveTaskResumeContext(
         kind: 'validation_retry',
         planSummary: lastPlanningIteration?.resultSummary,
         implementationSummary: lastImplementationIteration.resultSummary || 'Resume the preserved implementation for validation.',
-        validationChecks: extractValidationChecks(lastPlanningIteration?.validationResult),
+        validationChecks: extractLatestValidationChecks(diff.iterations),
         approvedApprovals: Array.from(approvedTypes)
       },
       ignoredLimitSignals: []
@@ -941,7 +966,7 @@ async function resolveTaskResumeContext(
         kind: 'approved_large_diff',
         planSummary: lastPlanningIteration?.resultSummary,
         implementationSummary: lastImplementationIteration.resultSummary || 'Resuming previously approved implementation.',
-        validationChecks: extractValidationChecks(lastPlanningIteration?.validationResult),
+        validationChecks: extractLatestValidationChecks(diff.iterations),
         approvedApprovals: Array.from(approvedTypes)
       },
       ignoredLimitSignals: ['diff_lines_limit_reached', 'changed_files_limit_reached']
@@ -966,7 +991,7 @@ async function resolveTaskResumeContext(
         implementationSummary:
           lastImplementationIteration?.resultSummary
           ?? 'Resume workspace changes after the requested operation was approved.',
-        validationChecks: extractValidationChecks(lastPlanningIteration?.validationResult),
+        validationChecks: extractLatestValidationChecks(diff.iterations),
         approvedApprovals: Array.from(approvedTypes)
       },
       ignoredLimitSignals: []
@@ -974,6 +999,213 @@ async function resolveTaskResumeContext(
   }
 
   return undefined;
+}
+
+function buildPhaseRetryResume(
+  iterations: TaskDiffIterationSnapshot[],
+  audit: TaskAuditSnapshot[],
+  approvedTypes: ReadonlySet<ApprovalType>,
+  currentTaskRunId?: string
+): WorkerTaskResume | undefined {
+  const failureAt = findLatestFailureTimestamp(audit);
+  if (failureAt === undefined) {
+    return undefined;
+  }
+
+  const completedIterations = [...iterations].sort((left, right) => timestampOf(left.createdAt) - timestampOf(right.createdAt));
+  const latestIteration = completedIterations.at(-1);
+  const latestImplementation = findLastIteration(completedIterations, 'implementation');
+  const latestValidation = findLastIteration(completedIterations, 'validation');
+  const latestReview = findLastIteration(completedIterations, 'review');
+  const latestPlanning = findLastIteration(completedIterations, 'planning');
+  const relevantAudit = audit.filter((event) => {
+    const payload = asRecord(event.payload);
+    return !currentTaskRunId || payload?.taskRunId !== currentTaskRunId;
+  });
+  const latestGitHubFailure = [...relevantAudit]
+    .reverse()
+    .find((event) => event.eventType === 'task_github_operation_failed' && timestampOf(event.createdAt) <= failureAt);
+  const latestIterationStarted = [...relevantAudit]
+    .reverse()
+    .find((event) => event.eventType === 'task_iteration_started' && timestampOf(event.createdAt) <= failureAt);
+  const latestCompletedAt = timestampOf(latestIteration?.createdAt);
+  const inFlightPhase = latestIterationStarted && timestampOf(latestIterationStarted.createdAt) > latestCompletedAt
+    ? normalizeResumePhase(asRecord(latestIterationStarted.payload)?.phase)
+    : undefined;
+
+  let resumeFrom: NonNullable<WorkerTaskResume['resumeFrom']>;
+  if (latestGitHubFailure && timestampOf(latestGitHubFailure.createdAt) > latestCompletedAt) {
+    const failedOperation = asRecord(latestGitHubFailure.payload)?.operation;
+    resumeFrom = failedOperation === 'create_issue' || failedOperation === 'create_branch' ? 'planning' : 'delivery';
+  } else if (inFlightPhase === 'planning' && isFailedValidationIteration(latestValidation)) {
+    resumeFrom = 'validation';
+  } else if (inFlightPhase) {
+    resumeFrom = inFlightPhase;
+  } else if (latestIteration?.phase === 'review') {
+    resumeFrom = extractReviewBlockers(latestReview).length > 0 ? 'implementation' : 'delivery';
+  } else if (latestIteration?.phase === 'validation') {
+    resumeFrom = isFailedValidationIteration(latestValidation) ? 'implementation' : 'review';
+  } else if (latestIteration?.phase === 'implementation') {
+    resumeFrom = 'validation';
+  } else if (latestIteration?.phase === 'planning') {
+    resumeFrom = 'implementation';
+  } else {
+    resumeFrom = 'planning';
+  }
+
+  const validation = extractValidationResult(latestValidation?.validationResult);
+  const reviewBlockers = extractReviewBlockers(latestReview);
+  const reviewSafeImprovements = extractStringArray(latestReview?.validationResult, 'safeImprovements');
+  const reviewRisks = normalizeRuntimeApprovals(extractUnknownArray(latestReview?.validationResult, 'riskyChanges'));
+  const implementationPayload = asRecord(latestImplementation?.validationResult);
+  const changedFiles = Array.isArray(implementationPayload?.changedFiles)
+    ? implementationPayload.changedFiles.filter((item): item is string => typeof item === 'string' && item.length > 0)
+    : [];
+  const diffStat = normalizeResumeDiffStat(latestImplementation?.diffStat);
+  const startedPayload = asRecord(latestIterationStarted?.payload);
+  const attempt = typeof startedPayload?.attempt === 'number' && Number.isFinite(startedPayload.attempt)
+    ? Math.max(1, Math.trunc(startedPayload.attempt))
+    : extractLatestAttempt(completedIterations);
+  const completedOperations = relevantAudit
+    .filter((event) => timestampOf(event.createdAt) >= timestampOf(latestImplementation?.createdAt))
+    .filter((event) => event.eventType === 'task_activity')
+    .map((event) => asRecord(event.payload))
+    .filter((payload) => payload?.state === 'completed' && typeof payload.operation === 'string')
+    .map((payload) => payload!.operation as string);
+  const completedValidationCommands = relevantAudit
+    .filter((event) => timestampOf(event.createdAt) >= timestampOf(latestImplementation?.createdAt))
+    .filter((event) => event.eventType === 'task_activity')
+    .map((event) => asRecord(event.payload))
+    .filter((payload) => (
+      payload?.phase === 'validation'
+      && payload.operation === 'validation_command'
+      && payload.state === 'completed'
+      && payload.exitCode === 0
+      && typeof payload.detail === 'string'
+    ))
+    .map((payload) => payload!.detail as string);
+  const persistedValidationCommands = extractStringArray(latestValidation?.validationResult, 'passedValidationCommands');
+  const passedValidationChecks = Array.from(new Set([
+    ...completedValidationCommands,
+    ...persistedValidationCommands
+  ])).map((command) => ({
+      command,
+      exitCode: 0,
+      stdout: 'Previously passed before the worker retry.',
+      stderr: '',
+      passed: true
+    }));
+  const resumeValidationPlanRevision = (
+    inFlightPhase === 'planning'
+    && Boolean(validation && !validation.passed && validation.failingCommand)
+  );
+
+  return {
+    kind: 'phase_retry',
+    resumeFrom,
+    attempt,
+    planSummary: latestPlanning?.resultSummary,
+    implementationSummary: latestImplementation?.resultSummary
+      ?? 'Continue from the implementation preserved in the workspace.',
+    changedFiles,
+    diffStat,
+    previousValidationError: resumeFrom === 'implementation' && validation && !validation.passed
+      ? validation.stderr || validation.stdout || `Exit code ${validation.exitCode}`
+      : undefined,
+    previousReviewBlockers: resumeFrom === 'implementation' ? reviewBlockers : undefined,
+    previousSafeImprovements: resumeFrom === 'implementation' ? reviewSafeImprovements : undefined,
+    validation,
+    passedValidationChecks,
+    resumeValidationPlanRevision,
+    reviewSummary: latestReview?.resultSummary,
+    riskyChanges: reviewRisks,
+    validationChecks: extractLatestValidationChecks(completedIterations),
+    approvedApprovals: Array.from(approvedTypes),
+    completedOperations: Array.from(new Set(completedOperations))
+  };
+}
+
+function findLatestFailureTimestamp(audit: TaskAuditSnapshot[]): number | undefined {
+  const failure = [...audit].reverse().find((event) => (
+    event.eventType === 'task_failed'
+    || event.eventType === 'task_worker_interrupted'
+    || event.eventType === 'task_status_validation_failed'
+    || event.eventType === 'task_status_iteration_limit_reached'
+    || event.eventType === 'task_status_repeated_error_detected'
+  ));
+  return failure ? timestampOf(failure.createdAt) : undefined;
+}
+
+function normalizeResumePhase(value: unknown): WorkerTaskResume['resumeFrom'] | undefined {
+  if (value === 'planning' || value === 'implementation' || value === 'validation' || value === 'review') {
+    return value;
+  }
+  if (value === 'git' || value === 'github' || value === 'completion') {
+    return 'delivery';
+  }
+  return undefined;
+}
+
+function extractValidationResult(value: unknown): WorkerTaskResume['validation'] {
+  const payload = asRecord(value);
+  if (!payload || typeof payload.passed !== 'boolean') return undefined;
+  return {
+    command: typeof payload.command === 'string' ? payload.command : 'resumed-validation',
+    exitCode: typeof payload.exitCode === 'number' ? payload.exitCode : payload.passed ? 0 : 1,
+    stdout: typeof payload.stdout === 'string' ? payload.stdout : '',
+    stderr: typeof payload.stderr === 'string' ? payload.stderr : '',
+    passed: payload.passed,
+    executedCheckCount: typeof payload.executedCheckCount === 'number' ? payload.executedCheckCount : undefined,
+    reusedCheckCount: typeof payload.reusedCheckCount === 'number' ? payload.reusedCheckCount : undefined,
+    failingCommand: typeof payload.failingCommand === 'string' ? payload.failingCommand : undefined
+  };
+}
+
+function extractReviewBlockers(iteration: TaskDiffIterationSnapshot | undefined): string[] {
+  return extractStringArray(iteration?.validationResult, 'blockers');
+}
+
+function extractStringArray(value: unknown, key: string): string[] {
+  return extractUnknownArray(value, key).filter((item): item is string => typeof item === 'string' && item.length > 0);
+}
+
+function extractUnknownArray(value: unknown, key: string): unknown[] {
+  const payload = asRecord(value);
+  return Array.isArray(payload?.[key]) ? payload[key] : [];
+}
+
+function extractLatestValidationChecks(iterations: TaskDiffIterationSnapshot[]): WorkerTaskResume['validationChecks'] {
+  for (let index = iterations.length - 1; index >= 0; index -= 1) {
+    const checks = extractValidationChecks(iterations[index]?.validationResult);
+    if (checks?.length) return checks;
+  }
+  return undefined;
+}
+
+function normalizeResumeDiffStat(value: unknown): WorkerTaskResume['diffStat'] | undefined {
+  const payload = asRecord(value);
+  if (!payload) return undefined;
+  const filesChanged = typeof payload.filesChanged === 'number' ? payload.filesChanged : 0;
+  const insertions = typeof payload.insertions === 'number' ? payload.insertions : 0;
+  const deletions = typeof payload.deletions === 'number' ? payload.deletions : 0;
+  return { filesChanged, insertions, deletions };
+}
+
+function extractLatestAttempt(iterations: TaskDiffIterationSnapshot[]): number {
+  return iterations.reduce((latest, iteration) => {
+    const payload = asRecord(iteration.validationResult);
+    return typeof payload?.attempt === 'number' ? Math.max(latest, Math.trunc(payload.attempt)) : latest;
+  }, 1);
+}
+
+function asRecord(value: unknown): Record<string, unknown> | undefined {
+  return value && typeof value === 'object' && !Array.isArray(value) ? value as Record<string, unknown> : undefined;
+}
+
+function timestampOf(value: string | undefined): number {
+  if (!value) return 0;
+  const timestamp = Date.parse(value);
+  return Number.isFinite(timestamp) ? timestamp : 0;
 }
 
 function isFailedValidationIteration(iteration: TaskDiffIterationSnapshot | undefined): boolean {

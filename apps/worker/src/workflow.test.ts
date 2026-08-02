@@ -672,6 +672,270 @@ describe('worker workflow', () => {
     expect(implement).not.toHaveBeenCalled();
   }, 15000);
 
+  it('resumes a failed implementation attempt with its original review blockers', async () => {
+    const workspaceRoot = join(tmpdir(), `forgemind-worker-resume-implementation-${randomUUID()}`);
+    const task = { ...demoTask, id: `task_${randomUUID()}` };
+    const workspacePath = join(workspaceRoot, task.id);
+    await mkdir(workspacePath, { recursive: true });
+    await writeFile(join(workspacePath, 'status.txt'), 'partial\n', 'utf8');
+
+    const plan = vi.fn();
+    const implement = vi.fn(async (input: ImplementInput): Promise<ImplementResult> => {
+      expect(input.attemptNumber).toBe(2);
+      expect(input.previousReviewBlockers).toEqual(['Fix adapter lookup.']);
+      expect(input.previousSafeImprovements).toEqual(['Keep the focused test.']);
+      return {
+        summary: 'Corrected only the reported blocker.',
+        changedFiles: ['status.txt'],
+        diffStat: { filesChanged: 1, insertions: 1, deletions: 1 },
+        requestedApprovals: [],
+        fileUpdates: [{ path: 'status.txt', content: 'corrected\n' }]
+      };
+    });
+    const review = vi.fn(async (input: ReviewInput): Promise<ReviewResult> => {
+      expect(input.previousReviewBlockers).toEqual(['Fix adapter lookup.']);
+      return { summary: 'Review passed', blockers: [], safeImprovements: [], riskyChanges: [] };
+    });
+    const provider = createProviderStub({ plan, implement, review });
+
+    const result = await runWorkerTask({
+      project: demoProject,
+      task,
+      provider,
+      workspaceRoot,
+      resume: {
+        kind: 'phase_retry',
+        resumeFrom: 'implementation',
+        attempt: 2,
+        planSummary: 'Original plan',
+        implementationSummary: 'Partial implementation is preserved.',
+        previousReviewBlockers: ['Fix adapter lookup.'],
+        previousSafeImprovements: ['Keep the focused test.'],
+        validation: { command: 'node --version', exitCode: 0, stdout: 'v22', stderr: '', passed: true },
+        validationChecks: [{ kind: 'command', command: 'node --version' }]
+      }
+    });
+
+    expect(result.status).toBe('ready_for_user_review');
+    expect(plan).not.toHaveBeenCalled();
+    expect(implement).toHaveBeenCalledOnce();
+    expect(review).toHaveBeenCalledOnce();
+    expect(await readFile(join(workspacePath, 'status.txt'), 'utf8')).toBe('corrected\n');
+  }, 15000);
+
+  it('resumes review without repeating implementation or successful validation', async () => {
+    const workspaceRoot = join(tmpdir(), `forgemind-worker-resume-review-${randomUUID()}`);
+    const task = { ...demoTask, id: `task_${randomUUID()}` };
+    const workspacePath = join(workspaceRoot, task.id);
+    await mkdir(workspacePath, { recursive: true });
+    await writeFile(join(workspacePath, 'status.txt'), 'implemented\n', 'utf8');
+
+    const plan = vi.fn();
+    const implement = vi.fn();
+    const review = vi.fn(async (): Promise<ReviewResult> => ({
+      summary: 'Review resumed and passed.',
+      blockers: [],
+      safeImprovements: [],
+      riskyChanges: []
+    }));
+    const iterationPhases: string[] = [];
+    const provider = createProviderStub({ plan, implement, review });
+
+    const result = await runWorkerTask({
+      project: demoProject,
+      task,
+      provider,
+      workspaceRoot,
+      resume: {
+        kind: 'phase_retry',
+        resumeFrom: 'review',
+        attempt: 1,
+        planSummary: 'Original plan',
+        implementationSummary: 'Implementation already completed.',
+        changedFiles: ['status.txt'],
+        diffStat: { filesChanged: 1, insertions: 1, deletions: 0 },
+        validation: { command: 'node -e "process.exit(9)"', exitCode: 0, stdout: 'Previously passed', stderr: '', passed: true },
+        validationChecks: [{ kind: 'command', command: 'node -e "process.exit(9)"' }]
+      },
+      hooks: {
+        onIteration: async (iteration) => {
+          iterationPhases.push(iteration.phase);
+        }
+      }
+    });
+
+    expect(result.status).toBe('ready_for_user_review');
+    expect(result.validation.stdout).toBe('Previously passed');
+    expect(plan).not.toHaveBeenCalled();
+    expect(implement).not.toHaveBeenCalled();
+    expect(review).toHaveBeenCalledOnce();
+    expect(iterationPhases).toEqual(['review']);
+  }, 15000);
+
+  it('resumes an interrupted validation suite without rerunning passed checks', async () => {
+    const workspaceRoot = join(tmpdir(), `forgemind-worker-resume-validation-${randomUUID()}`);
+    const task = { ...demoTask, id: `task_${randomUUID()}` };
+    const project = { ...demoProject, configYaml: noGitProjectConfig.replace('commands:\n  verify: "node --version"', 'commands: {}') };
+    const workspacePath = join(workspaceRoot, task.id);
+    await mkdir(workspacePath, { recursive: true });
+    await writeFile(join(workspacePath, 'status.txt'), 'implemented\n', 'utf8');
+
+    const plan = vi.fn();
+    const implement = vi.fn();
+    const review = vi.fn(async (): Promise<ReviewResult> => ({
+      summary: 'Review passed.',
+      blockers: [],
+      safeImprovements: [],
+      riskyChanges: []
+    }));
+    const provider = createProviderStub({ plan, implement, review });
+
+    const result = await runWorkerTask({
+      project,
+      task,
+      provider,
+      workspaceRoot,
+      resume: {
+        kind: 'phase_retry',
+        resumeFrom: 'validation',
+        attempt: 1,
+        implementationSummary: 'Implementation already completed.',
+        changedFiles: ['status.txt'],
+        diffStat: { filesChanged: 1, insertions: 1, deletions: 0 },
+        validationChecks: [
+          { kind: 'command', command: 'node -e "process.exit(9)"' },
+          { kind: 'command', command: 'node --version' }
+        ],
+        passedValidationChecks: [{
+          command: 'node -e "process.exit(9)"',
+          exitCode: 0,
+          stdout: 'Passed before interruption.',
+          stderr: '',
+          passed: true
+        }]
+      }
+    });
+
+    expect(result.status).toBe('ready_for_user_review');
+    expect(result.validation.passed).toBe(true);
+    expect(result.validation.executedCheckCount).toBe(1);
+    expect(result.validation.reusedCheckCount).toBe(1);
+    expect(plan).not.toHaveBeenCalled();
+    expect(implement).not.toHaveBeenCalled();
+    expect(review).toHaveBeenCalledOnce();
+  }, 15000);
+
+  it('resumes failed validation-plan revision without rerunning the invalid command', async () => {
+    const workspaceRoot = join(tmpdir(), `forgemind-worker-resume-validation-plan-${randomUUID()}`);
+    const task = { ...demoTask, id: `task_${randomUUID()}` };
+    const project = { ...demoProject, configYaml: noGitProjectConfig.replace('commands:\n  verify: "node --version"', 'commands: {}') };
+    const workspacePath = join(workspaceRoot, task.id);
+    await mkdir(workspacePath, { recursive: true });
+    await writeFile(join(workspacePath, 'status.txt'), 'implemented\n', 'utf8');
+
+    const plan = vi.fn(async (input: PlanInput): Promise<PlanResult> => {
+      expect(input.previousValidationError).toBe('missing-tool: not found');
+      return {
+        summary: 'Replaced unavailable validation command.',
+        steps: [],
+        acceptanceCriteria: [],
+        validationChecks: [{ kind: 'command', command: 'node --version' }]
+      };
+    });
+    const implement = vi.fn();
+    const review = vi.fn(async (): Promise<ReviewResult> => ({
+      summary: 'Review passed.',
+      blockers: [],
+      safeImprovements: [],
+      riskyChanges: []
+    }));
+    const provider = createProviderStub({ plan, implement, review });
+
+    const result = await runWorkerTask({
+      project,
+      task,
+      provider,
+      workspaceRoot,
+      resume: {
+        kind: 'phase_retry',
+        resumeFrom: 'validation',
+        attempt: 1,
+        implementationSummary: 'Implementation already completed.',
+        changedFiles: ['status.txt'],
+        diffStat: { filesChanged: 1, insertions: 1, deletions: 0 },
+        validationChecks: [{ kind: 'command', command: 'missing-tool test' }],
+        validation: {
+          command: 'missing-tool test',
+          exitCode: 1,
+          stdout: '',
+          stderr: 'missing-tool: not found',
+          passed: false,
+          failingCommand: 'missing-tool test'
+        },
+        resumeValidationPlanRevision: true
+      }
+    });
+
+    expect(result.status).toBe('ready_for_user_review');
+    expect(result.validation.passed).toBe(true);
+    expect(result.validation.command).toBe('node --version');
+    expect(plan).toHaveBeenCalledOnce();
+    expect(implement).not.toHaveBeenCalled();
+    expect(review).toHaveBeenCalledOnce();
+  }, 15000);
+
+  it('resumes delivery without repeating AI, commit, or push checkpoints', async () => {
+    const workspaceRoot = join(tmpdir(), `forgemind-worker-resume-delivery-${randomUUID()}`);
+    const task = {
+      ...demoTask,
+      id: `task_${randomUUID()}`,
+      githubIssueNumber: 1234,
+      githubIssueUrl: `https://github.com/${demoProject.githubOwner}/${demoProject.githubRepo}/issues/1234`,
+      branchName: 'ai/1234-resume-delivery'
+    };
+    const workspacePath = join(workspaceRoot, task.id);
+    await mkdir(workspacePath, { recursive: true });
+    await writeFile(join(workspacePath, 'status.txt'), 'implemented\n', 'utf8');
+
+    const plan = vi.fn();
+    const implement = vi.fn();
+    const review = vi.fn();
+    const commitAndPush = vi.fn(async () => undefined);
+    const createDraftPullRequest = vi.fn(async () => ({
+      pullRequestNumber: 4321,
+      pullRequestUrl: 'https://github.com/demo/demo-static-gallery/pull/4321'
+    }));
+    const github = createGitHubStub({ commitAndPush, createDraftPullRequest });
+    const provider = createProviderStub({ plan, implement, review });
+
+    const result = await runWorkerTask({
+      project: gitEnabledProject,
+      task,
+      provider,
+      github,
+      workspaceRoot,
+      resume: {
+        kind: 'phase_retry',
+        resumeFrom: 'delivery',
+        attempt: 1,
+        planSummary: 'Original plan',
+        implementationSummary: 'Implementation already completed.',
+        changedFiles: ['status.txt'],
+        diffStat: { filesChanged: 1, insertions: 1, deletions: 0 },
+        validation: { command: 'node --version', exitCode: 0, stdout: 'Previously passed', stderr: '', passed: true },
+        reviewSummary: 'Review already passed.',
+        completedOperations: ['commit', 'commit_and_push']
+      }
+    });
+
+    expect(result.status).toBe('ready_for_user_review');
+    expect(plan).not.toHaveBeenCalled();
+    expect(implement).not.toHaveBeenCalled();
+    expect(review).not.toHaveBeenCalled();
+    expect(commitAndPush).not.toHaveBeenCalled();
+    expect(createDraftPullRequest).toHaveBeenCalledOnce();
+  }, 15000);
+
   it('resumes approved review risk changes without rerunning planning, implementation, or review', async () => {
     const workspaceRoot = join(tmpdir(), `forgemind-worker-resume-approved-review-${randomUUID()}`);
     const task = {

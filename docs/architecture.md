@@ -47,9 +47,11 @@ Worker flow (apps/worker/src/db-worker.ts):
 5. runWorkerTask provede planning/implementation/validation/review/GitHub kroky.
 6. hooks zapisuji status prechody, iteration data, GitHub IDs a audit eventy.
 7. finalizeQueueJob pouzije retry/backoff semantiku:
-- failed a attempt < max -> pending + exponential backoff do next_attempt_at
+- failed a attempt < max -> task submitted + queue reason phase_retry + pending s exponential backoff do next_attempt_at
 - failed po limitu -> final failed
 - succeeded/cancelled -> final stav
+
+Retry a obnova workeru jsou phase-aware. Z iteration checkpointu a audit udalosti se urci posledni nedokoncena faze. Planning, implementation, validation, review a delivery se obnovuji samostatne; uspesne predchozi faze ani dokoncene commit/push operace se neopakuji. U validacni sady se zachovaji i jednotlive uspesne prikazy a pad pri AI oprave validacniho planu navaze primo novym pokusem o opravu. Implementacni retry dostane posledni validation error nebo review blockers a pokracuje nad zachovanym workspace.
 
 ## 5) Policy enforcement (aktualni)
 
