@@ -2373,7 +2373,6 @@ function ProjectsPanel(props: {
           </div>
           <div className="detail-grid">
             <MetricBlock label="Open PR" value={String(selectedProject.openPullRequests)} />
-            <MetricBlock label="AI budget" value={`$${selectedProject.budgetUsd.toFixed(2)}`} />
             <MetricBlock label="Cykly" value={String(props.roadmap?.cycles.length ?? 0)} />
             <MetricBlock label="Kroky" value={String(cycleSteps.length)} />
           </div>

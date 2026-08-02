@@ -97,43 +97,19 @@ export async function runDatabaseWorkerOnce(options: { deferInterruptSignals?: b
     ? new GitHubAppAdapter({ token: githubConnection.token, apiBaseUrl: githubConnection.apiBaseUrl })
     : await createGitHubAdapterFromEnv();
   const projectConfig = parseProjectConfig(claimed.project.configYaml);
-  const limits = resolveLimits(claimed.project.configYaml, claimed.task.maxIterations, claimed.task.maxBudgetUsd);
-  const historicalUsage = await repository.getTaskUsage(claimed.task.id);
+  const limits = resolveLimits(claimed.project.configYaml, claimed.task.maxIterations);
   const selection = resolveProviderSelection(projectConfig, providerOverride ?? aiProviderConnection?.provider, fallbackProviderOverride);
   const { provider, getLastProviderKind } = createPolicyAwareProvider({
     primaryKind: selection.primary,
     primaryProvider: createProvider(selection.primary),
     fallbackKind: selection.fallback,
-    fallbackProvider: selection.fallback ? createProvider(selection.fallback) : undefined,
-    beforeCall: async () => {
-      const usage = await repository.getTaskUsage(claimed.task.id);
-      assertCumulativeProviderBudget(usage, limits);
-    }
+    fallbackProvider: selection.fallback ? createProvider(selection.fallback) : undefined
   });
   const resumeContext = await resolveTaskResumeContext(
     repository,
     claimed.task.id,
     claimed.queueReason
   );
-  const historicalBudgetError = getCumulativeProviderBudgetError(historicalUsage, limits);
-  if (historicalBudgetError) {
-    await repository.failTask(claimed.task.id, historicalBudgetError, 'budget_exceeded');
-    await repository.finishTaskRun({
-      taskRunId: claimed.taskRun.id,
-      status: 'failed',
-      errorMessage: historicalBudgetError,
-      iterationCount: attemptCount,
-      inputTokens: 0,
-      outputTokens: 0,
-      totalTokens: 0,
-      usageSource: 'unavailable',
-      estimatedCostUsd: 0,
-      actualCostUsd: null
-    });
-    await finalizeQueueJob('failed', historicalBudgetError);
-    return { claimed: true, taskId: claimed.task.id, status: 'budget_exceeded' };
-  }
-
   let costEstimate;
   try {
     costEstimate = await provider.estimateCost({ prompt: claimed.task.prompt, repositorySizeHint: 'small' });
@@ -159,7 +135,6 @@ export async function runDatabaseWorkerOnce(options: { deferInterruptSignals?: b
       status: 'provider_failed'
     };
   }
-  const initialLimitEvaluation = evaluateLimits(createLimitUsage({ estimatedCostUsd: costEstimate.estimatedCostUsd }), limits);
   const getRunUsageFields = () => ({
     inputTokens: measuredUsage.completeBreakdown ? measuredUsage.inputTokens : 0,
     outputTokens: measuredUsage.completeBreakdown ? measuredUsage.outputTokens : 0,
@@ -174,22 +149,6 @@ export async function runDatabaseWorkerOnce(options: { deferInterruptSignals?: b
         ? measuredUsage.actualCostUsd
         : null
   });
-
-  if (initialLimitEvaluation.signals.includes('budget_exceeded')) {
-    await repository.failTask(claimed.task.id, 'Budget limit exceeded before provider run.', 'budget_exceeded');
-    await repository.finishTaskRun({
-      taskRunId: claimed.taskRun.id,
-      status: 'failed',
-      errorMessage: 'Budget limit exceeded before provider run.',
-      ...getRunUsageFields()
-    });
-    await finalizeQueueJob('failed', 'Budget limit exceeded before provider run.');
-    return {
-      claimed: true,
-      taskId: claimed.task.id,
-      status: 'budget_exceeded'
-    };
-  }
 
   try {
     const result = await runWorkerTask({
@@ -366,9 +325,7 @@ export async function runDatabaseWorkerOnce(options: { deferInterruptSignals?: b
             runtimeMinutes: (Date.now() - startedAtMs) / 60_000,
             changedFiles,
             diffLines,
-            repeatedErrorCount,
-            totalTokens: historicalUsage.totalTokens + measuredUsage.totalTokens,
-            estimatedCostUsd: costEstimate.estimatedCostUsd
+            repeatedErrorCount
           };
           await handleWorkerLimitsOrThrow(
             repository,
@@ -509,30 +466,21 @@ function createPolicyAwareProvider(input: {
   primaryProvider: AIProvider;
   fallbackKind?: ProviderKind;
   fallbackProvider?: AIProvider;
-  beforeCall?: (operation: string, provider: ProviderKind) => Promise<void>;
 }): { provider: AIProvider; getLastProviderKind: () => ProviderKind } {
   let lastProviderKind: ProviderKind = input.primaryKind;
 
   const callWithFallback = async <T>(operation: string, action: (provider: AIProvider) => Promise<T>): Promise<T> => {
     try {
-      await input.beforeCall?.(operation, input.primaryKind);
       const result = await action(input.primaryProvider);
       lastProviderKind = input.primaryKind;
       return result;
     } catch (primaryError) {
-      if (primaryError instanceof WorkerLimitError) {
-        throw primaryError;
-      }
       if (input.fallbackProvider && input.fallbackKind && input.fallbackKind !== input.primaryKind) {
         try {
-          await input.beforeCall?.(operation, input.fallbackKind);
           const result = await action(input.fallbackProvider);
           lastProviderKind = input.fallbackKind;
           return result;
         } catch (fallbackError) {
-          if (fallbackError instanceof WorkerLimitError) {
-            throw fallbackError;
-          }
           throw new ProviderExecutionError(operation, toErrorMessage(fallbackError), input.fallbackKind);
         }
       }
@@ -720,7 +668,7 @@ function resolveWorkerWorkspaceRoot(): string {
   return join(tmpdir(), 'forgemind-workspaces');
 }
 
-function resolveLimits(configYaml: string | undefined, maxIterations: number, maxBudgetUsd: number): Limits {
+function resolveLimits(configYaml: string | undefined, maxIterations: number): Limits {
   let limits = DEFAULT_LIMITS;
   if (configYaml) {
     try {
@@ -732,47 +680,7 @@ function resolveLimits(configYaml: string | undefined, maxIterations: number, ma
 
   return {
     ...limits,
-    maxIterations,
-    maxBudgetUsd
-  };
-}
-
-function getCumulativeProviderBudgetError(
-  usage: { totalTokens: number; actualCostUsd: number | null },
-  limits: Limits
-): string | undefined {
-  if (usage.totalTokens >= limits.maxTokens) {
-    return `Task used ${usage.totalTokens} actual token(s) across all runs, reaching the configured limit of ${limits.maxTokens}.`;
-  }
-
-  const hardCostLimit = limits.maxBudgetUsd * (limits.hardBudgetThresholdPercent / 100);
-  if (usage.actualCostUsd !== null && usage.actualCostUsd >= hardCostLimit) {
-    return `Task used ${usage.actualCostUsd.toFixed(4)} USD across all runs, reaching the configured limit of ${hardCostLimit.toFixed(4)} USD.`;
-  }
-
-  return undefined;
-}
-
-function assertCumulativeProviderBudget(
-  usage: { totalTokens: number; actualCostUsd: number | null },
-  limits: Limits
-): void {
-  const message = getCumulativeProviderBudgetError(usage, limits);
-  if (message) {
-    throw new WorkerLimitError('budget_exceeded', message);
-  }
-}
-
-function createLimitUsage(overrides: Partial<LimitUsage>): LimitUsage {
-  return {
-    iterations: 0,
-    runtimeMinutes: 0,
-    changedFiles: 0,
-    diffLines: 0,
-    repeatedErrorCount: 0,
-    totalTokens: 0,
-    estimatedCostUsd: 0,
-    ...overrides
+    maxIterations
   };
 }
 
@@ -819,8 +727,7 @@ async function handleWorkerLimitsOrThrow(
   const ignoredSignals = new Set(ignoredLimitSignals);
   const stopSignal = limitEvaluation.signals.find(
     (signal) =>
-      signal !== 'budget_soft_limit_reached'
-      && !(allowRuntimeGrace && signal === 'runtime_limit_reached')
+      !(allowRuntimeGrace && signal === 'runtime_limit_reached')
       && !ignoredSignals.has(signal as ApprovedLimitSignal)
   );
   if (!stopSignal) return;
@@ -871,9 +778,7 @@ function toLimitUsagePayload(usage: LimitUsage): Record<string, JsonValue> {
     runtimeMinutes: usage.runtimeMinutes,
     changedFiles: usage.changedFiles,
     diffLines: usage.diffLines,
-    repeatedErrorCount: usage.repeatedErrorCount,
-    totalTokens: usage.totalTokens,
-    estimatedCostUsd: usage.estimatedCostUsd
+    repeatedErrorCount: usage.repeatedErrorCount
   };
 }
 
@@ -883,11 +788,7 @@ function toLimitsPayload(limits: Limits): Record<string, JsonValue> {
     maxRuntimeMinutes: limits.maxRuntimeMinutes,
     maxChangedFiles: limits.maxChangedFiles,
     maxDiffLines: limits.maxDiffLines,
-    maxRepeatedErrorCount: limits.maxRepeatedErrorCount,
-    maxTokens: limits.maxTokens,
-    maxBudgetUsd: limits.maxBudgetUsd,
-    softBudgetThresholdPercent: limits.softBudgetThresholdPercent,
-    hardBudgetThresholdPercent: limits.hardBudgetThresholdPercent
+    maxRepeatedErrorCount: limits.maxRepeatedErrorCount
   };
 }
 
@@ -1251,7 +1152,6 @@ function buildIterationErrorFingerprint(phase: string, validationResult: unknown
 
 function stopSignalToTaskStatus(signal: string): TaskStatus {
   if (signal === 'iteration_limit_reached') return 'iteration_limit_reached';
-  if (signal === 'budget_exceeded') return 'budget_exceeded';
   if (signal === 'repeated_error_detected') return 'repeated_error_detected';
   return 'failed';
 }

@@ -1739,7 +1739,6 @@ async function writeAgentsInstructions(
     `- title: ${task.title}`,
     `- mode: ${task.mode}`,
     `- max iterations: ${task.maxIterations}`,
-    `- max budget: ${task.maxBudgetUsd} USD`,
     '',
     '## Current Step Context',
     executionPrompt,

@@ -25,10 +25,6 @@ limits:
   max_changed_files: 12
   max_diff_lines: 500
   max_repeated_error_count: 3
-  max_tokens: 125000
-  max_budget_usd: 1.5
-  soft_budget_threshold_percent: 75
-  hard_budget_threshold_percent: 100
 commands:
   verify: npm run build
 approval:
@@ -56,6 +52,6 @@ describe('agent config parser', () => {
     expect(config.project.id).toBe('demo');
     expect(config.ai.primary_provider).toBe('codex');
     expect(toCoreLimits(config).maxIterations).toBe(7);
-    expect(toCoreLimits(config).maxTokens).toBe(125000);
+    expect(toCoreLimits(config).maxDiffLines).toBe(500);
   });
 });

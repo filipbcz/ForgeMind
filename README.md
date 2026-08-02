@@ -301,10 +301,6 @@ limits:
   max_changed_files: 25
   max_diff_lines: 2000
   max_repeated_error_count: 3
-  max_tokens: 250000
-  max_budget_usd: 5.00
-  soft_budget_threshold_percent: 75
-  hard_budget_threshold_percent: 100
 
 commands:
   install: "npm ci"
@@ -512,8 +508,6 @@ max_runtime_minutes
 max_changed_files
 max_diff_lines
 max_repeated_error_count
-max_tokens
-max_budget_usd
 max_auto_improvements
 ```
 

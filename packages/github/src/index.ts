@@ -941,7 +941,6 @@ export function renderIssueBody(task: ForgeTask): string {
     '',
     '## Limity',
     `- max iterací: ${task.maxIterations}`,
-    `- max rozpočet: ${task.maxBudgetUsd} USD`
   ].join('\n');
 }
 

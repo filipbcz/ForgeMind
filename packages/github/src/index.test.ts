@@ -705,8 +705,7 @@ describe('GitHub helpers', () => {
       safe
 
       ## Limity
-      - max iterací: 5
-      - max rozpočet: 3 USD"
+      - max iterací: 5"
     `);
   });
 
@@ -733,8 +732,7 @@ describe('GitHub helpers', () => {
       safe
 
       ## Limity
-      - max iterací: 5
-      - max rozpočet: 3 USD"
+      - max iterací: 5"
     `);
   });
 });

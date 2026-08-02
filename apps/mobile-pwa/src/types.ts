@@ -502,7 +502,6 @@ export interface AssignProjectRepositoryRequest {
 
 export interface ProjectSummary extends ProjectApi {
   openPullRequests: number;
-  budgetUsd: number;
 }
 
 export interface TaskSummary {
@@ -515,8 +514,6 @@ export interface TaskSummary {
   mode: TaskApi['mode'];
   iterations: number;
   maxIterations: number;
-  budgetUsd: number;
-  maxBudgetUsd: number;
   updatedAt: string;
   branchName?: string;
   issueUrl?: string;

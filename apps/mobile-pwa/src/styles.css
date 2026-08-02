@@ -1265,6 +1265,10 @@ a {
   min-width: 0;
 }
 
+.task-form label:has(input[name="maxBudgetUsd"]) {
+  display: none;
+}
+
 .task-form input,
 .task-form select,
 .task-form textarea {

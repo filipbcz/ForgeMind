@@ -42,7 +42,7 @@ Worker flow (apps/worker/src/db-worker.ts):
 
 1. recoverStuckQueueJobs vrati zasekle claimed joby zpet do pending.
 2. claimNextSubmittedTask claimne nejstarsi pending job, ktery je ready podle next_attempt_at.
-3. provider estimate + limits gate: pri budget_exceeded nebo provider fail se beh zastavi pred execute.
+3. provider estimate se ulozi pro reporting; pouze provider fail zastavi beh pred execute.
 4. runWorkerTask provede planning/implementation/validation/review/GitHub kroky.
 5. hooks zapisuji status prechody, iteration data, GitHub IDs a audit eventy.
 6. finalizeQueueJob pouzije retry/backoff semantiku:
@@ -56,7 +56,7 @@ Aktivne vynucene policy vetve:
 
 - risky provider outcome -> needs_approval + approval record.
 - approval finalizace -> automatic resume + re-enqueue.
-- budget overrun -> budget_exceeded.
+- tokeny a cena se zaznamenavaji jako metriky, bez budget stopu.
 - repeated stejna validation/review chyba -> repeated_error_detected.
 - max iterace -> iteration_limit_reached.
 - provider exception -> provider_failed.
@@ -89,4 +89,3 @@ Aktualni endpoint `/api/metrics` publikuje agregovane metriky z DB snapshotu:
 - Mobile PWA registruje Service Worker a vytvari PushManager subscription pres VAPID public key (`/api/notifications/vapid-public-key`).
 - Subscription metadata se uklada do `notification_subscriptions`, user preference do `notification_settings`.
 - Studio API ma event bridge, ktery polluje `getRecentWorkerEvents` a pri `task_status_needs_approval`, `task_status_completed` a failure status eventech odesila push payloady na aktivni subscriptions.
-

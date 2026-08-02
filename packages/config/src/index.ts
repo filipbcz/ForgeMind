@@ -31,11 +31,7 @@ export const agentConfigSchema = z.object({
     max_runtime_minutes: z.number().int().positive().default(DEFAULT_LIMITS.maxRuntimeMinutes),
     max_changed_files: z.number().int().positive().default(DEFAULT_LIMITS.maxChangedFiles),
     max_diff_lines: z.number().int().positive().default(DEFAULT_LIMITS.maxDiffLines),
-    max_repeated_error_count: z.number().int().positive().default(DEFAULT_LIMITS.maxRepeatedErrorCount),
-    max_tokens: z.number().int().positive().default(DEFAULT_LIMITS.maxTokens),
-    max_budget_usd: z.number().nonnegative().default(DEFAULT_LIMITS.maxBudgetUsd),
-    soft_budget_threshold_percent: z.number().min(1).max(100).default(DEFAULT_LIMITS.softBudgetThresholdPercent),
-    hard_budget_threshold_percent: z.number().min(1).max(100).default(DEFAULT_LIMITS.hardBudgetThresholdPercent)
+    max_repeated_error_count: z.number().int().positive().default(DEFAULT_LIMITS.maxRepeatedErrorCount)
   }),
   commands: z.object({
     install: z.string().optional(),
@@ -75,10 +71,6 @@ export function toCoreLimits(config: AgentConfig) {
     maxRuntimeMinutes: config.limits.max_runtime_minutes,
     maxChangedFiles: config.limits.max_changed_files,
     maxDiffLines: config.limits.max_diff_lines,
-    maxRepeatedErrorCount: config.limits.max_repeated_error_count,
-    maxTokens: config.limits.max_tokens,
-    maxBudgetUsd: config.limits.max_budget_usd,
-    softBudgetThresholdPercent: config.limits.soft_budget_threshold_percent,
-    hardBudgetThresholdPercent: config.limits.hard_budget_threshold_percent
+    maxRepeatedErrorCount: config.limits.max_repeated_error_count
   };
 }

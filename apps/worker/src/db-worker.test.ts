@@ -1188,7 +1188,7 @@ describe('db-worker policy enforcement', () => {
     expect(result).toEqual(expect.objectContaining({ claimed: true, taskId: 'task_1' }));
   });
 
-  it('stops with budget_exceeded before running workflow when estimate is over budget', async () => {
+  it('records a high provider estimate without blocking the workflow', async () => {
     createProviderMock.mockReturnValueOnce({
       estimateCost: vi.fn(async () => ({
         inputTokens: 1000,
@@ -1202,47 +1202,31 @@ describe('db-worker policy enforcement', () => {
       supportsLocalRepo: () => true,
       supportsGitHubNativeFlow: () => false
     });
-
-    const { runDatabaseWorkerOnce } = await import('./db-worker.js');
-    const result = await runDatabaseWorkerOnce();
-
-    expect(result).toEqual(
-      expect.objectContaining({
-        claimed: true,
-        taskId: 'task_1',
-        status: 'budget_exceeded'
-      })
-    );
-    expect(runWorkerTaskMock).not.toHaveBeenCalled();
-    expect(repositoryMock.failTask).toHaveBeenCalledWith('task_1', 'Budget limit exceeded before provider run.', 'budget_exceeded');
-  });
-
-  it('enforces cumulative actual tokens from previous task runs before another provider call', async () => {
-    repositoryMock.getTaskUsage.mockResolvedValue({
+    runWorkerTaskMock.mockResolvedValueOnce({
       taskId: 'task_1',
-      inputTokens: 0,
-      outputTokens: 0,
-      cachedTokens: 0,
-      totalTokens: 250_000,
-      estimatedCostUsd: 0,
-      usageSource: 'actual_total',
-      actualCostUsd: null,
-      runs: [],
-      records: []
+      status: 'ready_for_user_review',
+      branchName: 'ai/1-task',
+      workspacePath: 'C:/tmp/worker',
+      validation: {
+        command: 'npm run build',
+        exitCode: 0,
+        stdout: '',
+        stderr: '',
+        passed: true
+      },
+      summary: 'done',
+      approvals: [],
+      completedAt: new Date().toISOString()
     });
 
     const { runDatabaseWorkerOnce } = await import('./db-worker.js');
     const result = await runDatabaseWorkerOnce();
 
-    expect(result).toEqual(expect.objectContaining({
-      claimed: true,
-      taskId: 'task_1',
-      status: 'budget_exceeded'
-    }));
-    expect(runWorkerTaskMock).not.toHaveBeenCalled();
-    expect(repositoryMock.failTask).toHaveBeenCalledWith(
+    expect(result).toEqual(expect.objectContaining({ claimed: true, taskId: 'task_1' }));
+    expect(runWorkerTaskMock).toHaveBeenCalledOnce();
+    expect(repositoryMock.failTask).not.toHaveBeenCalledWith(
       'task_1',
-      expect.stringContaining('250000 actual token(s) across all runs'),
+      expect.any(String),
       'budget_exceeded'
     );
   });

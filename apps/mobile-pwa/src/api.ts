@@ -107,7 +107,7 @@ export async function createProject(input: CreateProjectRequest): Promise<Projec
     method: 'POST',
     body: JSON.stringify(input)
   });
-  return { ...project, budgetUsd: 0, openPullRequests: 0 };
+  return { ...project, openPullRequests: 0 };
 }
 
 export async function updateProject(projectId: string, input: UpdateProjectRequest): Promise<ProjectSummary> {
@@ -115,7 +115,7 @@ export async function updateProject(projectId: string, input: UpdateProjectReque
     method: 'PATCH',
     body: JSON.stringify(input)
   });
-  return { ...project, budgetUsd: 0, openPullRequests: 0 };
+  return { ...project, openPullRequests: 0 };
 }
 
 export async function deleteProject(projectId: string, input: DeleteProjectRequest): Promise<DeleteProjectResponse> {
@@ -130,7 +130,7 @@ export async function assignProjectRepository(projectId: string, input: AssignPr
     method: 'POST',
     body: JSON.stringify(input)
   });
-  return { ...project, budgetUsd: 0, openPullRequests: 0 };
+  return { ...project, openPullRequests: 0 };
 }
 
 export async function fetchProjectRoadmap(projectId: string): Promise<ProjectRoadmapApi> {
@@ -335,8 +335,7 @@ function summarizeProjects(projects: ProjectApi[], tasks: TaskApi[]): ProjectSum
     const projectTasks = tasks.filter((task) => task.projectId === project.id);
     return {
       ...project,
-      openPullRequests: projectTasks.filter((task) => Boolean(task.pullRequestUrl)).length,
-      budgetUsd: projectTasks.reduce((sum, task) => sum + estimateTaskSpend(task), 0)
+      openPullRequests: projectTasks.filter((task) => Boolean(task.pullRequestUrl)).length
     };
   });
 }
@@ -352,8 +351,6 @@ export function toTaskSummary(task: TaskApi): TaskSummary {
     mode: task.mode,
     iterations: 0,
     maxIterations: task.maxIterations,
-    budgetUsd: estimateTaskSpend(task),
-    maxBudgetUsd: task.maxBudgetUsd,
     updatedAt: task.updatedAt,
     branchName: task.branchName,
     issueUrl: task.githubIssueUrl,
@@ -407,10 +404,4 @@ function currentStep(status: TaskApi['status']): string {
     validation_failed: 'Validation failed'
   };
   return labels[status];
-}
-
-function estimateTaskSpend(task: TaskApi): number {
-  if (task.status === 'draft') return 0;
-  if (task.status === 'completed' || task.status === 'ready_for_user_review') return Math.min(task.maxBudgetUsd, 0.25);
-  return Math.min(task.maxBudgetUsd, 0.1);
 }

@@ -8,7 +8,7 @@ Tento dokument je provozni baseline pro ForgeMind MVP. Cilem je mit jasne hranic
 2. Automaticky deploy do produkce a automaticky merge do main jsou mimo scope MVP.
 3. Rizikove zmeny musi byt zastaveny do stavu needs_approval.
 4. Secrets nesmi byt zapisovany do promptu, logu, issue, PR ani audit payloadu.
-5. Kazdy task musi mit limity: iterace, runtime, diff, pocet souboru, opakovane chyby a rozpocet.
+5. Kazdy task musi mit provozni limity: iterace, runtime, diff, pocet souboru a opakovane chyby.
 6. Worker smi zapisovat pouze do vyhrazenych workspace cest.
 
 ## 2) Co je implementovane ted
@@ -16,7 +16,7 @@ Tento dokument je provozni baseline pro ForgeMind MVP. Cilem je mit jasne hranic
 1. Worker bezi v oddelene service identite (systemd user/group forgemind-agent).
 2. Queue je persistovana v PostgreSQL a ma claim/recovery/retry semantiku.
 3. Worker policy enforcement je aktivni:
-- budget overrun zastavi beh (budget_exceeded)
+- tokeny a cena se zaznamenavaji pro reporting, ale nezastavuji beh
 - opakovane stejne chyby zastavi beh (repeated_error_detected)
 - max iterace zastavi beh (iteration_limit_reached)
 - provider selhani je mapovano na provider_failed

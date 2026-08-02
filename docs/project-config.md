@@ -37,10 +37,6 @@ Projektova konfigurace se nacita z agent.config.yaml pres packages/config (parse
 - max_changed_files
 - max_diff_lines
 - max_repeated_error_count
-- max_tokens
-- max_budget_usd
-- soft_budget_threshold_percent
-- hard_budget_threshold_percent
 
 ### commands
 
@@ -80,16 +76,17 @@ Worker pouziva konfiguraci takto:
 2. github.issue_label a github.branch_prefix ridi issue label a naming branche.
 3. commands.verify (fallback commands.build) urcuje validacni prikaz.
 4. limits jsou mapovany pres toCoreLimits() do evaluateLimits policy toku.
-5. task.maxIterations a task.maxBudgetUsd maji prednost jako runtime override nad globalnimi limity.
+5. task.maxIterations ma prednost jako runtime override nad globalnimi limity.
 
 ## 3) Aktualni chovani limitu
 
 Limit evaluation v workeru aktualne aktivne vynucuje:
 
-1. budget_exceeded (vcetne pre-run estimate gate).
-2. iteration_limit_reached.
-3. repeated_error_detected na opakovanou stejnou validation/review chybu.
-4. soft budget signal je warning, ne hard stop.
+1. iteration_limit_reached.
+2. repeated_error_detected na opakovanou stejnou validation/review chybu.
+3. runtime, velikost diffu a pocet zmenenych souboru podle workflow pravidel.
+
+Spotreba tokenu a cena se meri pro reporting, ale nezastavuji task ani provider volani.
 
 ## 4) Approval a resume semantika
 
@@ -108,7 +105,7 @@ Nize uvedene promenne nejsou soucasti YAML, ale ovlivnuji runtime queue:
 ## 6) Doporuceni pro projektove configy
 
 1. MVP: workflow.auto_merge drzet false.
-2. Pro kriticke repozitare snizit max_budget_usd a max_iterations.
+2. Pro kriticke repozitare snizit max_iterations a runtime/diff limity.
 3. Vynutit explicitni commands.verify misto implicitniho fallbacku.
 4. U risky domen mit approval.required_for naplnene konkretnimi akcemi.
 
