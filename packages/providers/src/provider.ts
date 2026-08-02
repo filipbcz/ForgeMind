@@ -48,19 +48,28 @@ export interface ImplementationStepPlan {
   outOfScope: string[];
 }
 
-export type ValidationCheck =
-  | {
-      kind: 'command';
-      command: string;
-      criterion?: string;
-      rationale?: string;
+export interface ValidationCheck {
+  kind: 'command';
+  command: string;
+  criterion?: string;
+  rationale?: string;
+}
+
+export function normalizeValidationChecks(value: unknown): ValidationCheck[] {
+  if (!Array.isArray(value)) return [];
+
+  return value.flatMap((item): ValidationCheck[] => {
+    if (!item || typeof item !== 'object' || Array.isArray(item)) return [];
+    const check = item as Record<string, unknown>;
+    const criterion = typeof check.criterion === 'string' ? check.criterion.trim() || undefined : undefined;
+    const rationale = typeof check.rationale === 'string' ? check.rationale.trim() || undefined : undefined;
+
+    if (check.kind === 'command' && typeof check.command === 'string' && check.command.trim()) {
+      return [{ kind: 'command', command: check.command.trim(), criterion, rationale }];
     }
-  | {
-      kind: 'manual';
-      instructions: string;
-      criterion?: string;
-      rationale?: string;
-    };
+    return [];
+  });
+}
 
 export interface ImplementInput {
   taskId: string;
@@ -88,6 +97,7 @@ export interface ImplementResult {
     deletions: number;
   };
   requestedApprovals: ApprovalType[];
+  validationChecks?: ValidationCheck[];
   fileUpdates?: FileUpdate[];
   providerPrompt?: string;
   providerResponse?: string;

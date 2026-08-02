@@ -10,6 +10,7 @@ import type {
   ReviewInput,
   ReviewResult
 } from './provider.js';
+import { normalizeValidationChecks } from './provider.js';
 import { emitCapturedUsage, normalizeTokenBreakdown } from './provider-usage.js';
 import { buildReviewPrompt } from './review-prompt.js';
 
@@ -101,10 +102,9 @@ export class OpenAIProvider implements AIProvider {
           ? 'Revise only the supplied failed validation check. Return JSON with a short summary, empty steps and implementationSteps arrays, the supplied acceptanceCriteria, and replacement validationChecks for that failed check only. Do not repeat successful or unrelated checks and do not propose implementation work. Respond only with JSON.'
           : 'You are an AI project planner. Provide a JSON object with summary, steps, acceptanceCriteria, validationChecks, and implementationSteps. ' +
             'For ordinary task plans, implementationSteps must be an empty array. When the request asks for a project roadmap, it must contain objects with title, description, acceptanceCriteria, inScope, and outOfScope. ' +
-            'validationChecks must be an array of executable checks or manual checks. ' +
-            'Commands must verify a criterion through their exit code and must not use shell redirection or fallback chains. Use manual checks for git diff/status/log inspection. ' +
-            'Use { "kind": "command", "command": "...", "criterion": "...", "rationale": "..." } for commands and ' +
-            '{ "kind": "manual", "instructions": "...", "criterion": "...", "rationale": "..." } for non-executable criteria. Respond only with JSON.'
+            'validationChecks must contain only executable command checks. Omit criteria that cannot be verified automatically. ' +
+            'Commands must verify a criterion through their exit code and must not use shell redirection, fallback chains, or inspection-only git diff/status/log commands. ' +
+            'Use { "kind": "command", "command": "...", "criterion": "...", "rationale": "..." }. Respond only with JSON.'
       },
       {
         role: 'user',
@@ -112,7 +112,7 @@ export class OpenAIProvider implements AIProvider {
           `Create a plan for the task titled "${input.title}" with the prompt:\n${input.prompt}`,
           input.previousValidationError ? `Previous validation error: ${input.previousValidationError}` : '',
           input.previousValidationChecks?.length
-            ? `Previous validation checks:\n${input.previousValidationChecks.map((check) => check.kind === 'command' ? check.command : check.instructions).join('\n')}`
+            ? `Previous validation checks:\n${input.previousValidationChecks.map((check) => check.command).join('\n')}`
             : '',
           input.previousValidationError
             ? 'Return only corrected replacement check(s) for the supplied failed check. Do not repeat any other validation checks.'
@@ -142,7 +142,7 @@ export class OpenAIProvider implements AIProvider {
     const messages: Array<{ role: 'system' | 'user' | 'assistant'; content: string }> = [
       {
         role: 'system',
-        content: 'You are an AI implementation assistant. Make only the repository changes required by the supplied task and correction context. Do not perform broad validation that ForgeMind will run after implementation. Provide a JSON object with summary, changedFiles, diffStat, requestedApprovals, and optional fileUpdates [{ path, content }]. Respond only with JSON.'
+        content: 'You are an AI implementation assistant. Make only the repository changes required by the supplied task and correction context. Do not perform broad validation that ForgeMind will run after implementation. After editing, propose the smallest authoritative validationChecks set that verifies the acceptance criteria against the resulting repository. Provide a JSON object with summary, changedFiles, diffStat, requestedApprovals, validationChecks, and optional fileUpdates [{ path, content }]. Respond only with JSON.'
       },
       {
         role: 'user',
@@ -169,6 +169,7 @@ export class OpenAIProvider implements AIProvider {
       changedFiles: ['OPENAI_IMPLEMENTATION.md'],
       diffStat: summarizeDiffStats(input.prompt),
       requestedApprovals: [],
+      validationChecks: [],
       fileUpdates: [
         {
           path: 'OPENAI_IMPLEMENTATION.md',
@@ -196,6 +197,7 @@ export class OpenAIProvider implements AIProvider {
     if (!Array.isArray(result.requestedApprovals)) {
       result.requestedApprovals = [];
     }
+    result.validationChecks = normalizeValidationChecks(result.validationChecks);
     result.providerPrompt = serializeMessages(messages);
     result.providerResponse = content;
 

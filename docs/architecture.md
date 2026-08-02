@@ -43,9 +43,10 @@ Worker flow (apps/worker/src/db-worker.ts):
 1. recoverStuckQueueJobs vrati zasekle claimed joby zpet do pending.
 2. claimNextSubmittedTask claimne nejstarsi pending job, ktery je ready podle next_attempt_at.
 3. provider estimate se ulozi pro reporting; pouze provider fail zastavi beh pred execute.
-4. runWorkerTask provede planning/implementation/validation/review/GitHub kroky.
-5. hooks zapisuji status prechody, iteration data, GitHub IDs a audit eventy.
-6. finalizeQueueJob pouzije retry/backoff semantiku:
+4. implementacni provider vrati zmeny i minimalni autoritativni spustitelne validationChecks ve stejne odpovedi; worker je pote spusti pred review. Manualni kontroly se negeneruji ani nevyhodnocuji; pokud zadne kriterium nelze automatizovat, validation faze se oznaci jako preskocena a workflow pokracuje.
+5. runWorkerTask provede planning/implementation/validation/review/GitHub kroky.
+6. hooks zapisuji status prechody, iteration data, GitHub IDs a audit eventy.
+7. finalizeQueueJob pouzije retry/backoff semantiku:
 - failed a attempt < max -> pending + exponential backoff do next_attempt_at
 - failed po limitu -> final failed
 - succeeded/cancelled -> final stav

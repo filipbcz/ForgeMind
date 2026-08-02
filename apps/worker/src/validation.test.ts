@@ -29,6 +29,21 @@ describe('validation runner', () => {
     expect(result.stdout).toContain('v');
   });
 
+  it('skips validation when there are no executable checks', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'forgemind-validation-empty-'));
+
+    const result = await runValidationChecks([], cwd);
+
+    expect(result).toMatchObject({
+      command: 'no-executable-checks',
+      exitCode: 0,
+      passed: true,
+      executedCheckCount: 0,
+      reusedCheckCount: 0
+    });
+    expect(result.stdout).toContain('validation was skipped');
+  });
+
   it('executes quoted inline JavaScript containing arrow functions', async () => {
     const cwd = await mkdtemp(join(tmpdir(), 'forgemind-validation-inline-js-'));
     const command = `node --input-type=module -e "const items = [{ id: 1 }]; if (!items.some((item) => item.id === 1)) process.exit(1);"`;

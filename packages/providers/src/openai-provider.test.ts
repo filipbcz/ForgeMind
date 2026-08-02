@@ -77,7 +77,15 @@ describe('OpenAI provider', () => {
                 summary: 'implemented',
                 changedFiles: [{ path: 'src/demo.ts', content: 'export const demo = true;\n' }],
                 diffStat: { filesChanged: 1, insertions: 1, deletions: 0 },
-                requestedApprovals: []
+                requestedApprovals: [],
+                validationChecks: [
+                  {
+                    kind: 'command',
+                    command: 'npm test -- demo',
+                    criterion: 'The changed module passes its focused tests.',
+                    rationale: 'This is the narrowest authoritative check.'
+                  }
+                ]
               })
             }
           }
@@ -94,6 +102,9 @@ describe('OpenAI provider', () => {
     });
 
     expect(result.fileUpdates).toEqual([{ path: 'src/demo.ts', content: 'export const demo = true;\n' }]);
+    expect(result.validationChecks).toEqual([
+      expect.objectContaining({ kind: 'command', command: 'npm test -- demo' })
+    ]);
   });
 });
 

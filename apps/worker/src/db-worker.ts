@@ -1100,15 +1100,6 @@ function normalizeValidationCheckSnapshot(item: unknown) {
     };
   }
 
-  if (check.kind === 'manual' && typeof check.instructions === 'string' && check.instructions.trim()) {
-    return {
-      kind: 'manual' as const,
-      instructions: check.instructions.trim(),
-      criterion: typeof check.criterion === 'string' && check.criterion.trim() ? check.criterion.trim() : undefined,
-      rationale: typeof check.rationale === 'string' && check.rationale.trim() ? check.rationale.trim() : undefined
-    };
-  }
-
   return undefined;
 }
 

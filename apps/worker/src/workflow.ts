@@ -223,8 +223,7 @@ export async function runWorkerTask(input: WorkerTaskInput): Promise<WorkerTaskR
   let validationChecks = await resolveValidationChecks({
     plan,
     installCommand: config.installCommand,
-    explicitVerifyCommand: config.verifyCommand,
-    workspacePath
+    explicitVerifyCommand: config.verifyCommand
   });
   if (!input.resume) {
     await input.hooks?.onIteration?.({
@@ -350,6 +349,12 @@ export async function runWorkerTask(input: WorkerTaskInput): Promise<WorkerTaskR
       changedFiles: uniqueStrings([...implementation.changedFiles, ...substantiveChangedFiles]).filter(isSubstantiveImplementationPath),
       diffStat: actualDiffStat
     };
+    if (!config.verifyCommand?.trim()) {
+      validationChecks = await resolveValidationChecks({
+        plan: { ...plan, validationChecks: implementation.validationChecks },
+        installCommand: config.installCommand
+      });
+    }
 
     if (!isResumedImplementation) {
       await input.hooks?.onIteration?.({
@@ -362,7 +367,8 @@ export async function runWorkerTask(input: WorkerTaskInput): Promise<WorkerTaskR
         validationResult: {
           passed: substantiveChangedFiles.length > 0,
           attempt,
-          changedFiles: substantiveChangedFiles
+          changedFiles: substantiveChangedFiles,
+          validationChecks
         }
       });
     }
@@ -379,8 +385,14 @@ export async function runWorkerTask(input: WorkerTaskInput): Promise<WorkerTaskR
       config.approvalRequiredFor,
       config.allowSafeOperationsWithoutApproval
     );
+    const validationCommandApprovals = evaluateRuntimeApprovals(
+      computeVerifyCommandApprovals(validationChecks, config.sandbox),
+      config.mode,
+      config.approvalRequiredFor,
+      config.allowSafeOperationsWithoutApproval
+    );
     const pendingImplementationApprovals = filterApprovedApprovals(
-      uniqueApprovals([...implementationApprovals, ...changedPathApprovals]),
+      uniqueApprovals([...implementationApprovals, ...changedPathApprovals, ...validationCommandApprovals]),
       attemptApprovedApprovals
     );
     if (pendingImplementationApprovals.length > 0) {
@@ -1000,10 +1012,10 @@ function buildValidationRevisionContext(failedCheck: ValidationCheck): string {
     'Revise the single failed validation check only. Do not create or repeat an implementation plan.',
     'Return only replacement validationChecks for the failed check. Do not repeat successful or unrelated checks.',
     'Inspect repository scripts only as needed to replace this invalid check.',
-    'Executable checks must verify a criterion through their exit code. Represent git diff/status/log inspection as a manual check.',
+    'Return only executable checks that verify a criterion through their exit code. Omit criteria that cannot be verified automatically.',
     'Do not use shell redirection or fallback command chains in validation commands.',
     'Do not modify repository files.',
-    `Failed check: ${failedCheck.kind === 'command' ? failedCheck.command : failedCheck.instructions}`,
+    `Failed check: ${failedCheck.command}`,
     `Criterion: ${failedCheck.criterion ?? 'Preserve the criterion of the failed check.'}`
   ].join('\n');
 }
@@ -1055,9 +1067,7 @@ export function replaceFailedValidationCheck(
 }
 
 function validationCheckIdentity(check: ValidationCheck): string {
-  return check.kind === 'command'
-    ? `command:${normalizeValidationCommandForEnvironment(check.command)}`
-    : `manual:${check.instructions.trim()}`;
+  return `command:${normalizeValidationCommandForEnvironment(check.command)}`;
 }
 
 export function isValidationCommandDefinitionFailure(validation: ValidationResult): boolean {
@@ -1101,7 +1111,6 @@ async function resolveValidationChecks(input: {
   plan: PlanResult;
   installCommand?: string;
   explicitVerifyCommand?: string;
-  workspacePath: string;
 }): Promise<ValidationCheck[]> {
   let checks: ValidationCheck[];
   if (input.explicitVerifyCommand?.trim()) {
@@ -1117,21 +1126,12 @@ async function resolveValidationChecks(input: {
     if (plannedChecks.length > 0) {
       checks = plannedChecks;
     } else {
-      const inferredCommand = await inferValidationCommand(input.workspacePath, input.plan.acceptanceCriteria);
-      checks = [
-        {
-          kind: 'command',
-          command: inferredCommand ?? 'node --version',
-          rationale: inferredCommand
-            ? 'Inferred from repository context and acceptance criteria.'
-            : 'Fallback environment smoke check because no stronger validation command was planned.'
-        }
-      ];
+      checks = [];
     }
   }
 
   const installCommand = input.installCommand?.trim();
-  if (!installCommand || checks.some((check) => check.kind === 'command' && check.command.trim() === installCommand)) {
+  if (!installCommand || checks.some((check) => check.command.trim() === installCommand)) {
     return checks;
   }
 
@@ -1159,14 +1159,6 @@ export function normalizeValidationChecks(value: unknown): ValidationCheck[] {
     if (item.kind === 'command' && typeof item.command === 'string' && item.command.trim()) {
       const command = item.command.trim();
       if (isInspectionOnlyValidationCommand(command)) {
-        checks.push({
-          kind: 'manual',
-          instructions: `Review repository changes requested by: ${command}`,
-          criterion: typeof item.criterion === 'string' && item.criterion.trim() ? item.criterion.trim() : undefined,
-          rationale: typeof item.rationale === 'string' && item.rationale.trim()
-            ? item.rationale.trim()
-            : 'Repository inspection belongs to the review phase and is not an executable pass/fail check.'
-        });
         continue;
       }
       checks.push({
@@ -1178,14 +1170,6 @@ export function normalizeValidationChecks(value: unknown): ValidationCheck[] {
       continue;
     }
 
-    if (item.kind === 'manual' && typeof item.instructions === 'string' && item.instructions.trim()) {
-      checks.push({
-        kind: 'manual',
-        instructions: item.instructions.trim(),
-        criterion: typeof item.criterion === 'string' && item.criterion.trim() ? item.criterion.trim() : undefined,
-        rationale: typeof item.rationale === 'string' && item.rationale.trim() ? item.rationale.trim() : undefined
-      });
-    }
   }
 
   return checks;
@@ -1203,52 +1187,8 @@ export function isInspectionOnlyValidationCommand(command: string): boolean {
 }
 
 function summarizeValidationChecks(checks: ValidationCheck[]): string {
-  const commands = checks.filter((check): check is Extract<ValidationCheck, { kind: 'command' }> => check.kind === 'command').map((check) => check.command);
-  return commands.length > 0 ? commands.join(' && ') : 'manual-review';
-}
-
-async function inferValidationCommand(workspacePath: string, acceptanceCriteria: string[]): Promise<string | undefined> {
-  const combinedCriteria = acceptanceCriteria.join('\n').toLowerCase();
-  const packageManager = await detectPackageManager(workspacePath);
-  const packageScripts = await readPackageScripts(workspacePath);
-
-  if (/\bbuild\b/.test(combinedCriteria) && packageScripts.build) {
-    return `${packageManager} run build`;
-  }
-
-  if (/\btests?\b/.test(combinedCriteria) && packageScripts.test) {
-    return `${packageManager} test`;
-  }
-
-  if (packageScripts.build) {
-    return `${packageManager} run build`;
-  }
-
-  if (packageScripts.test) {
-    return `${packageManager} test`;
-  }
-
-  return undefined;
-}
-
-async function detectPackageManager(workspacePath: string): Promise<'npm' | 'pnpm' | 'yarn'> {
-  const files: string[] = await readdir(workspacePath).catch(() => []);
-  if (files.includes('pnpm-lock.yaml')) {
-    return 'pnpm';
-  }
-  if (files.includes('yarn.lock')) {
-    return 'yarn';
-  }
-  return 'npm';
-}
-
-async function readPackageScripts(workspacePath: string): Promise<Record<string, string>> {
-  try {
-    const packageJson = JSON.parse(await readFile(join(workspacePath, 'package.json'), 'utf8')) as { scripts?: Record<string, string> };
-    return packageJson.scripts ?? {};
-  } catch {
-    return {};
-  }
+  const commands = checks.map((check) => check.command);
+  return commands.length > 0 ? commands.join(' && ') : 'no-executable-checks';
 }
 
 function resolveExistingTaskIssue(task: ForgeTask): { issueNumber: number; issueUrl: string } | undefined {
@@ -1554,10 +1494,6 @@ function computeVerifyCommandApprovals(
   const approvals: ApprovalType[] = [];
 
   for (const check of validationChecks) {
-    if (check.kind !== 'command') {
-      continue;
-    }
-
     if (!sandbox.allowSudo && /(^|\s)sudo(\s|$)/i.test(check.command)) {
       approvals.push('config_change');
     }

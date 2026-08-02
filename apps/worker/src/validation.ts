@@ -220,12 +220,11 @@ export async function runValidationChecks(
   onActivity?: ValidationActivityHandler,
   passedCheckResults: ReadonlyMap<string, ValidationCheckExecutionResult> = new Map()
 ): Promise<ValidationResult> {
-  const commandChecks = checks.filter((check): check is Extract<ValidationCheck, { kind: 'command' }> => check.kind === 'command');
-  if (commandChecks.length === 0) {
+  if (checks.length === 0) {
     return {
-      command: 'manual-review',
+      command: 'no-executable-checks',
       exitCode: 0,
-      stdout: 'No executable validation command was planned.',
+      stdout: 'No acceptance criteria can be verified by an executable command; validation was skipped.',
       stderr: '',
       passed: true,
       checkResults: [],
@@ -240,7 +239,7 @@ export async function runValidationChecks(
   let reusedCheckCount = 0;
   let failingResult: ValidationResult | undefined;
 
-  for (const [index, check] of commandChecks.entries()) {
+  for (const [index, check] of checks.entries()) {
     const effectiveCommand = normalizeValidationCommandForEnvironment(check.command);
     const passedResult = passedCheckResults.get(effectiveCommand);
     if (passedResult?.passed) {
@@ -256,7 +255,7 @@ export async function runValidationChecks(
         state: 'completed',
         command: effectiveCommand,
         checkIndex: index + 1,
-        checkCount: commandChecks.length,
+        checkCount: checks.length,
         elapsedMs: 0,
         exitCode: 0,
         reused: true
@@ -270,7 +269,7 @@ export async function runValidationChecks(
       state: 'started',
       command: effectiveCommand,
       checkIndex: index + 1,
-      checkCount: commandChecks.length,
+      checkCount: checks.length,
       elapsedMs: 0
     });
     const result = await runValidationCommand(effectiveCommand, cwd, async (stream, message) => {
@@ -278,7 +277,7 @@ export async function runValidationChecks(
         state: 'output',
         command: effectiveCommand,
         checkIndex: index + 1,
-        checkCount: commandChecks.length,
+        checkCount: checks.length,
         elapsedMs: Date.now() - startedAt,
         stream,
         message
@@ -288,7 +287,7 @@ export async function runValidationChecks(
       state: 'completed',
       command: effectiveCommand,
       checkIndex: index + 1,
-      checkCount: commandChecks.length,
+      checkCount: checks.length,
       elapsedMs: Date.now() - startedAt,
       exitCode: result.exitCode
     });
@@ -320,7 +319,7 @@ export async function runValidationChecks(
   }
 
   return {
-    command: commandChecks.map((check) => normalizeValidationCommandForEnvironment(check.command)).join(' && '),
+    command: checks.map((check) => normalizeValidationCommandForEnvironment(check.command)).join(' && '),
     exitCode: failingResult?.exitCode ?? 0,
     stdout: outputs.join('\n'),
     stderr: failingResult?.stderr ?? '',

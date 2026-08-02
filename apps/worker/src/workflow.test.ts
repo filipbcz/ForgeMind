@@ -791,7 +791,7 @@ describe('worker workflow', () => {
     expect(createDraftPullRequest).toHaveBeenCalledOnce();
   }, 10000);
 
-  it('uses AI planned validation commands when no explicit verifyCommand is configured', async () => {
+  it('uses validation commands proposed by the implementation AI', async () => {
     const workspaceRoot = join(tmpdir(), `forgemind-worker-planned-validation-${randomUUID()}`);
     const projectWithoutVerify = {
       ...demoProject,
@@ -810,9 +810,9 @@ describe('worker workflow', () => {
           validationChecks: [
             {
               kind: 'command',
-              command: `node -e "process.exit(0)"`,
+              command: `node -e "process.exit(9)"`,
               criterion: 'Build passes',
-              rationale: 'Simulated build check for the test harness.'
+              rationale: 'Outdated planning-time validation must not run.'
             }
           ]
         };
@@ -823,6 +823,14 @@ describe('worker workflow', () => {
           changedFiles: ['status.txt'],
           diffStat: { filesChanged: 1, insertions: 1, deletions: 0 },
           requestedApprovals: [],
+          validationChecks: [
+            {
+              kind: 'command',
+              command: `node -e "process.exit(0)"`,
+              criterion: 'Build passes',
+              rationale: 'Selected after implementation from the resulting repository.'
+            }
+          ],
           fileUpdates: [{ path: 'status.txt', content: 'ok\n' }]
         };
       },
@@ -863,6 +871,48 @@ describe('worker workflow', () => {
     expect(result.validation.passed).toBe(true);
     expect(result.validation.command).toContain('node --version');
     expect(result.validation.command).toContain('node -e');
+    expect(result.validation.command).not.toContain('process.exit(9)');
+  }, 10000);
+
+  it('continues without inventing an environment smoke check when AI has no executable validation', async () => {
+    const workspaceRoot = join(tmpdir(), `forgemind-worker-missing-ai-validation-${randomUUID()}`);
+    const projectWithoutVerify = {
+      ...demoProject,
+      configYaml: noGitProjectConfig.replace('commands:\n  verify: "node --version"\n', 'commands: {}\n')
+    };
+    const provider: AIProvider = {
+      ...createProviderStub(),
+      async plan(): Promise<PlanResult> {
+        return {
+          summary: 'Implement the requested change.',
+          steps: ['Update status'],
+          acceptanceCriteria: ['Status is updated'],
+          validationChecks: []
+        };
+      },
+      async implement(): Promise<ImplementResult> {
+        return {
+          summary: 'Implementation completed without a validation proposal.',
+          changedFiles: ['status.txt'],
+          diffStat: { filesChanged: 1, insertions: 1, deletions: 0 },
+          requestedApprovals: [],
+          validationChecks: [],
+          fileUpdates: [{ path: 'status.txt', content: 'ok\n' }]
+        };
+      }
+    };
+
+    const result = await runWorkerTask({
+      project: projectWithoutVerify,
+      task: { ...demoTask, id: `task_${randomUUID()}` },
+      provider,
+      workspaceRoot
+    });
+
+    expect(result.status).toBe('ready_for_user_review');
+    expect(result.validation.command).toBe('no-executable-checks');
+    expect(result.validation.stdout).toContain('validation was skipped');
+    expect(result.validation.command).not.toContain('node --version');
   }, 10000);
 
   it('replans validation checks after a validation failure when no explicit verify command is configured', async () => {
@@ -974,6 +1024,7 @@ describe('worker workflow', () => {
           changedFiles: ['status.txt'],
           diffStat: { filesChanged: 1, insertions: 1, deletions: 0 },
           requestedApprovals: [],
+          validationChecks: input.plan.validationChecks,
           fileUpdates: [{ path: 'status.txt', content: 'ok\n' }]
         };
       },
@@ -1123,12 +1174,13 @@ describe('worker workflow', () => {
     const provider: AIProvider = {
       ...createProviderStub(),
       plan,
-      async implement(): Promise<ImplementResult> {
+      async implement(input: ImplementInput): Promise<ImplementResult> {
         return {
           summary: 'Implementation summary',
           changedFiles: ['status.txt'],
           diffStat: { filesChanged: 1, insertions: 1, deletions: 0 },
           requestedApprovals: [],
+          validationChecks: input.plan.validationChecks,
           fileUpdates: [{ path: 'status.txt', content: 'ok\n' }]
         };
       }
@@ -1234,19 +1286,22 @@ describe('worker workflow', () => {
     })).toBeUndefined();
   });
 
-  it('moves repository inspection out of executable validation', () => {
+  it('drops repository inspection and manual checks from executable validation', () => {
     const command = 'git diff -- README.md docs AGENTS.md 2>/dev/null || git diff -- README.md';
 
     expect(isInspectionOnlyValidationCommand(command)).toBe(true);
     expect(isInspectionOnlyValidationCommand('git diff --exit-code -- README.md')).toBe(false);
-    expect(normalizeValidationChecks([{
-      kind: 'command',
-      command,
-      criterion: 'Documentation matches the implementation.'
-    }])).toEqual([expect.objectContaining({
-      kind: 'manual',
-      criterion: 'Documentation matches the implementation.'
-    })]);
+    expect(normalizeValidationChecks([
+      {
+        kind: 'command',
+        command,
+        criterion: 'Documentation matches the implementation.'
+      },
+      {
+        kind: 'manual',
+        instructions: 'Inspect the documentation.'
+      }
+    ])).toEqual([]);
   });
 
   it('omits generated dependency metadata from detailed review context', () => {

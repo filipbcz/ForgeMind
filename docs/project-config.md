@@ -74,9 +74,10 @@ Worker pouziva konfiguraci takto:
 
 1. workflow.create_issue/create_branch/create_draft_pr/auto_push ridi GitHub kroky.
 2. github.issue_label a github.branch_prefix ridi issue label a naming branche.
-3. commands.verify (fallback commands.build) urcuje validacni prikaz.
-4. limits jsou mapovany pres toCoreLimits() do evaluateLimits policy toku.
-5. task.maxIterations ma prednost jako runtime override nad globalnimi limity.
+3. Implementacni AI navrhne po provedeni zmen minimalni sadu autoritativnich spustitelnych validacnich kontrol ve stejne odpovedi jako vysledek implementace. Manualni kontroly se nevyhodnocuji a do sady se nezarazuji.
+4. commands.verify (fallback commands.build) je explicitni projektovy override AI navrhu.
+5. limits jsou mapovany pres toCoreLimits() do evaluateLimits policy toku.
+6. task.maxIterations ma prednost jako runtime override nad globalnimi limity.
 
 ## 3) Aktualni chovani limitu
 
@@ -106,7 +107,7 @@ Nize uvedene promenne nejsou soucasti YAML, ale ovlivnuji runtime queue:
 
 1. MVP: workflow.auto_merge drzet false.
 2. Pro kriticke repozitare snizit max_iterations a runtime/diff limity.
-3. Vynutit explicitni commands.verify misto implicitniho fallbacku.
+3. Explicitni commands.verify pouzit pouze tehdy, kdyz projekt vyzaduje stabilni administrativne urceny prikaz; jinak validaci navrhuje implementacni AI podle vysledneho repozitare.
 4. U risky domen mit approval.required_for naplnene konkretnimi akcemi.
 
 ## 7) Kompatibilita
