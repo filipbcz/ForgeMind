@@ -294,7 +294,7 @@ const ACTIVE_QUEUE_STATUSES = ['pending', 'claimed'] as const;
 const DEFAULT_QUEUE_MAX_ATTEMPTS = 3;
 const DEFAULT_QUEUE_BACKOFF_SECONDS = 30;
 const WORKER_QUEUE_CONTROL_ID = 'global';
-const WORKER_QUEUE_ADVISORY_LOCK_SQL = 'SELECT pg_advisory_xact_lock(742764962030481)';
+const WORKER_QUEUE_ADVISORY_LOCK_SQL = 'SELECT pg_advisory_xact_lock(742764962030481)::text AS "lock"';
 
 interface WorkerQueueControlRow {
   queuePaused: boolean;

@@ -317,6 +317,9 @@ describe('ForgeMindRepository task runs', () => {
     expect(claimed).toBeUndefined();
     expect(taskQueueJobFindFirst).not.toHaveBeenCalled();
     expect(resumed.queuePaused).toBe(false);
+    expect(prisma.$queryRawUnsafe).toHaveBeenCalledWith(
+      expect.stringContaining('pg_advisory_xact_lock(742764962030481)::text')
+    );
     expect(prisma.auditLog.create).toHaveBeenCalledWith(expect.objectContaining({
       data: expect.objectContaining({ eventType: 'worker_queue_paused' })
     }));
