@@ -13,6 +13,7 @@ import {
   GitBranch,
   Github,
   LayoutList,
+  Pause,
   Play,
   Plus,
   RefreshCw,
@@ -55,6 +56,7 @@ import {
   generateProjectRoadmap as generateProjectRoadmapRequest,
   resolveApproval as resolveApprovalRequest,
   retryTask as retryTaskRequest,
+  setWorkerQueuePaused,
   subscribeNotification,
   startCodexOAuth,
   startTask as startTaskRequest,
@@ -447,6 +449,14 @@ export function App() {
     }
   });
 
+  const workerQueueControlMutation = useMutation({
+    mutationFn: setWorkerQueuePaused,
+    onSuccess: (status) => {
+      queryClient.setQueryData(['worker-status'], status);
+      queryClient.invalidateQueries({ queryKey: ['worker-events'] });
+    }
+  });
+
   const createProjectMutation = useMutation({
     mutationFn: createProjectRequest,
     onSuccess: (project) => {
@@ -746,22 +756,36 @@ export function App() {
             <p>{projects.length} projekty</p>
             <h1>{viewTitle(view)}</h1>
             <p>
-              Worker: {workerStatusQuery.data?.state ?? 'unknown'} · queue {workerStatusQuery.data?.queuedTaskCount ?? 0} · active {workerStatusQuery.data?.activeTaskCount ?? 0}
+              Worker: {workerStatusQuery.data?.state ?? 'unknown'} · queue {workerStatusQuery.data?.queuedTaskCount ?? 0} · active {workerStatusQuery.data?.activeTaskCount ?? 0} · {workerStatusQuery.data?.queuePaused ? 'fronta pozastavena' : 'fronta aktivní'}
             </p>
             <div className="connection-indicators" aria-label="Realtime status">
               <RealtimeStatusBadge label="Global feed" state={globalRealtimeState} meta={globalRealtimeMeta} />
               {view === 'tasks' && selectedTask ? <RealtimeStatusBadge label="Task feed" state={taskRealtimeState} meta={taskRealtimeMeta} /> : null}
             </div>
           </div>
-          {view !== 'new-task' ? (
-            <button className="primary-action" type="button" onClick={() => setView('new-task')}>
-              <Plus size={18} />
-              Nový task
+          <div className="topbar-actions">
+            <button
+              className="secondary-action"
+              type="button"
+              disabled={!workerStatusQuery.data || workerQueueControlMutation.isPending}
+              onClick={() => workerQueueControlMutation.mutate(!workerStatusQuery.data?.queuePaused)}
+            >
+              {workerStatusQuery.data?.queuePaused ? <Play size={18} /> : <Pause size={18} />}
+              {workerStatusQuery.data?.queuePaused ? 'Obnovit frontu' : 'Pozastavit frontu'}
             </button>
-          ) : null}
+            {view !== 'new-task' ? (
+              <button className="primary-action" type="button" onClick={() => setView('new-task')}>
+                <Plus size={18} />
+                Nový task
+              </button>
+            ) : null}
+          </div>
         </header>
 
         {hasApiError ? <div className="error-banner">API není dostupné, zobrazuji lokální fallback.</div> : null}
+        {workerQueueControlMutation.error ? (
+          <div className="error-banner">Změna stavu fronty selhala: {workerQueueControlMutation.error.message}</div>
+        ) : null}
 
         {view === 'tasks' ? (
           <section className="workspace">

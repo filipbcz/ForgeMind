@@ -183,6 +183,13 @@ export async function fetchWorkerStatus(): Promise<WorkerStatusApi> {
   return request<WorkerStatusApi>('/api/worker/status');
 }
 
+export async function setWorkerQueuePaused(paused: boolean): Promise<WorkerStatusApi> {
+  return request<WorkerStatusApi>('/api/worker/queue', {
+    method: 'PUT',
+    body: JSON.stringify({ paused })
+  });
+}
+
 export async function fetchWorkerEvents(limit = 8): Promise<WorkerEventApi[]> {
   return request<WorkerEventApi[]>(`/api/worker/events?limit=${limit}`);
 }

@@ -178,6 +178,12 @@ export interface TaskQueuePosition {
   queuePosition: number | null;
 }
 
+export interface WorkerQueueControlSnapshot {
+  queuePaused: boolean;
+  pausedAt?: string;
+  updatedAt: string;
+}
+
 export interface QueueRecoveryResult {
   recoveredCount: number;
   queueJobIds: string[];
@@ -185,6 +191,8 @@ export interface QueueRecoveryResult {
 
 export interface WorkerStatusSnapshot {
   state: 'idle' | 'running';
+  queuePaused: boolean;
+  queuePausedAt?: string;
   queuedTaskCount: number;
   activeTaskCount: number;
   runningRun?: {
@@ -258,6 +266,7 @@ export interface OperationalMetricsSnapshot {
 }
 
 const WORKER_EVENT_PREFIXES = [
+  'worker_queue_',
   'task_enqueued',
   'task_claimed',
   'task_status_',
@@ -284,6 +293,14 @@ const ACTIVE_TASK_STATUSES: ReadonlySet<TaskStatus> = new Set([
 const ACTIVE_QUEUE_STATUSES = ['pending', 'claimed'] as const;
 const DEFAULT_QUEUE_MAX_ATTEMPTS = 3;
 const DEFAULT_QUEUE_BACKOFF_SECONDS = 30;
+const WORKER_QUEUE_CONTROL_ID = 'global';
+const WORKER_QUEUE_ADVISORY_LOCK_SQL = 'SELECT pg_advisory_xact_lock(742764962030481)';
+
+interface WorkerQueueControlRow {
+  queuePaused: boolean;
+  pausedAt: Date | null;
+  updatedAt: Date;
+}
 
 function isActiveQueueStatus(status: QueueJobStatus): status is (typeof ACTIVE_QUEUE_STATUSES)[number] {
   return status === 'pending' || status === 'claimed';
@@ -1495,7 +1512,8 @@ export class ForgeMindRepository {
       status: 'claimed' as const,
       claimedAt: { gte: activeClaimCutoff }
     };
-    const [queuedTaskCount, activeTaskCount, runningRun, lastCompletedRun] = await Promise.all([
+    const [queueControl, queuedTaskCount, activeTaskCount, runningRun, lastCompletedRun] = await Promise.all([
+      this.getWorkerQueueControl(),
       this.prisma.taskQueueJob.count({ where: { status: 'pending' } }),
       this.prisma.task.count({
         where: {
@@ -1535,6 +1553,8 @@ export class ForgeMindRepository {
 
     return {
       state: runningRun ? 'running' : 'idle',
+      queuePaused: queueControl.queuePaused,
+      queuePausedAt: queueControl.pausedAt,
       queuedTaskCount,
       activeTaskCount,
       runningRun: runningRun
@@ -1563,19 +1583,67 @@ export class ForgeMindRepository {
     };
   }
 
+  async getWorkerQueueControl(): Promise<WorkerQueueControlSnapshot> {
+    const [control] = await this.prisma.$queryRawUnsafe<WorkerQueueControlRow[]>(
+      'SELECT "queue_paused" AS "queuePaused", "paused_at" AS "pausedAt", "updated_at" AS "updatedAt" FROM "worker_control" WHERE "id" = $1',
+      WORKER_QUEUE_CONTROL_ID
+    );
+
+    return control
+      ? {
+          queuePaused: control.queuePaused,
+          pausedAt: control.pausedAt?.toISOString(),
+          updatedAt: control.updatedAt.toISOString()
+        }
+      : {
+          queuePaused: false,
+          updatedAt: new Date(0).toISOString()
+        };
+  }
+
+  async setWorkerQueuePaused(paused: boolean): Promise<WorkerQueueControlSnapshot> {
+    return this.prisma.$transaction(async (tx) => {
+      await tx.$queryRawUnsafe(WORKER_QUEUE_ADVISORY_LOCK_SQL);
+      const now = new Date();
+      const [control] = await tx.$queryRawUnsafe<WorkerQueueControlRow[]>(
+        `INSERT INTO "worker_control" ("id", "queue_paused", "paused_at", "updated_at")
+         VALUES ($1, $2, $3, $4)
+         ON CONFLICT ("id") DO UPDATE SET
+           "queue_paused" = EXCLUDED."queue_paused",
+           "paused_at" = EXCLUDED."paused_at",
+           "updated_at" = EXCLUDED."updated_at"
+         RETURNING "queue_paused" AS "queuePaused", "paused_at" AS "pausedAt", "updated_at" AS "updatedAt"`,
+        WORKER_QUEUE_CONTROL_ID,
+        paused,
+        paused ? now : null,
+        now
+      );
+      if (!control) {
+        throw new Error('Worker queue control could not be persisted.');
+      }
+      await tx.auditLog.create({
+        data: {
+          actorType: 'user',
+          eventType: paused ? 'worker_queue_paused' : 'worker_queue_resumed',
+          payload: {
+            queuePaused: paused,
+            effectiveAfterActiveTask: true
+          }
+        }
+      });
+
+      return {
+        queuePaused: control.queuePaused,
+        pausedAt: control.pausedAt?.toISOString(),
+        updatedAt: control.updatedAt.toISOString()
+      };
+    });
+  }
+
   async getRecentWorkerEvents(limit = 20): Promise<AuditEvent[]> {
     const events = await this.prisma.auditLog.findMany({
       where: {
-        OR: [
-          { eventType: { startsWith: WORKER_EVENT_PREFIXES[0] } },
-          { eventType: { startsWith: WORKER_EVENT_PREFIXES[1] } },
-          { eventType: { startsWith: WORKER_EVENT_PREFIXES[2] } },
-          { eventType: { startsWith: WORKER_EVENT_PREFIXES[3] } },
-          { eventType: { startsWith: WORKER_EVENT_PREFIXES[4] } },
-          { eventType: { startsWith: WORKER_EVENT_PREFIXES[5] } },
-          { eventType: { startsWith: WORKER_EVENT_PREFIXES[6] } },
-          { eventType: { startsWith: WORKER_EVENT_PREFIXES[7] } }
-        ]
+        OR: WORKER_EVENT_PREFIXES.map((prefix) => ({ eventType: { startsWith: prefix } }))
       },
       orderBy: { createdAt: 'desc' },
       take: Math.max(1, Math.min(100, limit))
@@ -1905,6 +1973,13 @@ export class ForgeMindRepository {
 
   async claimNextSubmittedTask(provider: ProviderKind, model = 'queued'): Promise<ClaimedTask | undefined> {
     return this.prisma.$transaction(async (tx) => {
+      await tx.$queryRawUnsafe(WORKER_QUEUE_ADVISORY_LOCK_SQL);
+      const [workerControl] = await tx.$queryRawUnsafe<Array<{ queuePaused: boolean }>>(
+        'SELECT "queue_paused" AS "queuePaused" FROM "worker_control" WHERE "id" = $1',
+        WORKER_QUEUE_CONTROL_ID
+      );
+      if (workerControl?.queuePaused) return undefined;
+
       const queueJob = await tx.taskQueueJob.findFirst({
         where: {
           status: 'pending',

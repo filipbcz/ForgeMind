@@ -195,6 +195,8 @@ export interface TaskQueueApi {
 
 export interface WorkerStatusApi {
   state: 'idle' | 'running';
+  queuePaused: boolean;
+  queuePausedAt?: string;
   queuedTaskCount: number;
   activeTaskCount: number;
   runningRun?: {

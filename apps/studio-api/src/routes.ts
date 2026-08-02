@@ -124,6 +124,10 @@ const workerEventsQuerySchema = z.object({
   limit: z.coerce.number().int().min(1).max(100).optional().default(20)
 });
 
+const workerQueueControlSchema = z.object({
+  paused: z.boolean()
+});
+
 const providerConnectSchema = z
   .object({
     provider: z.enum(['openai', 'codex']),
@@ -274,6 +278,16 @@ export function registerRoutes(app: FastifyInstance, repository: ForgeMindReposi
   app.get('/api/me', async () => repository.getCurrentUser());
 
   app.get('/api/worker/status', async () => repository.getWorkerStatus());
+
+  app.put('/api/worker/queue', async (request, reply) => {
+    try {
+      const input = workerQueueControlSchema.parse(request.body);
+      await repository.setWorkerQueuePaused(input.paused);
+      return repository.getWorkerStatus();
+    } catch (error) {
+      return sendBadRequest(reply, error);
+    }
+  });
 
   app.get('/api/worker/events', async (request) => {
     const query = workerEventsQuerySchema.parse(request.query ?? {});

@@ -94,6 +94,12 @@ a {
   font-size: 0.9rem;
 }
 
+.topbar-actions {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
 .connection-indicators {
   display: flex;
   flex-wrap: wrap;
@@ -1624,8 +1630,15 @@ a {
     display: grid;
   }
 
-  .topbar .primary-action {
+  .topbar-actions,
+  .topbar .primary-action,
+  .topbar .secondary-action {
     width: 100%;
+  }
+
+  .topbar-actions {
+    display: grid;
+    grid-template-columns: 1fr;
   }
 
   .approval-grid {

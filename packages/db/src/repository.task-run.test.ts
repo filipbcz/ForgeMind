@@ -2,6 +2,7 @@ import { describe, expect, it, vi } from 'vitest';
 import { ForgeMindRepository } from './repository.js';
 
 function createMockPrisma() {
+  let queuePaused = false;
   const taskRunCreate = vi.fn(async () => ({
     id: 'run_1',
     taskId: 'task_1',
@@ -194,6 +195,19 @@ function createMockPrisma() {
     auditLog: { create: vi.fn(async () => ({ id: 'audit_1', createdAt: new Date() })), findMany: vi.fn() },
     notificationSettings: { findUnique: vi.fn(), upsert: vi.fn() },
     notificationSubscription: { findMany: vi.fn(), upsert: vi.fn(), findFirst: vi.fn(), delete: vi.fn(), count: vi.fn() },
+    $queryRawUnsafe: vi.fn(async (query: string, ...parameters: unknown[]) => {
+      if (query.includes('INSERT INTO "worker_control"')) {
+        queuePaused = parameters[1] === true;
+      }
+      if (query.includes('"worker_control"')) {
+        return [{
+          queuePaused,
+          pausedAt: queuePaused ? new Date() : null,
+          updatedAt: new Date()
+        }];
+      }
+      return [];
+    }),
     $transaction: vi.fn(async (callback: (tx: unknown) => Promise<unknown>) => callback(prisma)),
     $disconnect: vi.fn()
   };
@@ -288,6 +302,27 @@ describe('ForgeMindRepository task runs', () => {
         })
       })
     );
+  });
+
+  it('does not claim another task while the persistent queue control is paused', async () => {
+    const { prisma, taskQueueJobFindFirst } = createMockPrisma();
+    const repository = new ForgeMindRepository(prisma);
+
+    const paused = await repository.setWorkerQueuePaused(true);
+    taskQueueJobFindFirst.mockClear();
+    const claimed = await repository.claimNextSubmittedTask('codex', 'codex');
+    const resumed = await repository.setWorkerQueuePaused(false);
+
+    expect(paused.queuePaused).toBe(true);
+    expect(claimed).toBeUndefined();
+    expect(taskQueueJobFindFirst).not.toHaveBeenCalled();
+    expect(resumed.queuePaused).toBe(false);
+    expect(prisma.auditLog.create).toHaveBeenCalledWith(expect.objectContaining({
+      data: expect.objectContaining({ eventType: 'worker_queue_paused' })
+    }));
+    expect(prisma.auditLog.create).toHaveBeenCalledWith(expect.objectContaining({
+      data: expect.objectContaining({ eventType: 'worker_queue_resumed' })
+    }));
   });
 
   it('recovers stuck claimed queue jobs back to pending', async () => {

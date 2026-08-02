@@ -336,6 +336,15 @@ model TaskQueueJob {
   @@map("task_queue_jobs")
 }
 
+model WorkerControl {
+  id          String   @id
+  queuePaused Boolean  @default(false) @map("queue_paused")
+  pausedAt    DateTime? @map("paused_at")
+  updatedAt   DateTime @updatedAt @map("updated_at")
+
+  @@map("worker_control")
+}
+
 model TaskRun {
   id               String       @id @default(uuid())
   taskId           String       @map("task_id")

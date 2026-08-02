@@ -30,9 +30,11 @@ async function loadRunWorkerTask() {
 
 describe('Studio API routes', () => {
   it('exposes worker status endpoint', async () => {
+    let queuePaused = false;
     const repository = {
       getWorkerStatus: vi.fn(async () => ({
         state: 'idle',
+        queuePaused,
         queuedTaskCount: 0,
         activeTaskCount: 0,
         activeIteration: {
@@ -46,6 +48,14 @@ describe('Studio API routes', () => {
         },
         updatedAt: new Date().toISOString()
       })),
+      setWorkerQueuePaused: vi.fn(async (paused: boolean) => {
+        queuePaused = paused;
+        return {
+          queuePaused,
+          pausedAt: paused ? new Date().toISOString() : undefined,
+          updatedAt: new Date().toISOString()
+        };
+      }),
       getRecentWorkerEvents: vi.fn(async () => []),
       getOperationalMetrics: vi.fn(async () => ({
         generatedAt: new Date().toISOString(),
@@ -108,6 +118,16 @@ describe('Studio API routes', () => {
         })
       })
     );
+
+    const pauseResponse = await app.inject({
+      method: 'PUT',
+      url: '/api/worker/queue',
+      payload: { paused: true }
+    });
+
+    expect(pauseResponse.statusCode).toBe(200);
+    expect(repository.setWorkerQueuePaused).toHaveBeenCalledWith(true);
+    expect(pauseResponse.json()).toEqual(expect.objectContaining({ queuePaused: true }));
 
     const eventsResponse = await app.inject({
       method: 'GET',
