@@ -25,6 +25,7 @@ export function toProject(project: Project): CoreProject {
     autoCompleteTask: project.autoCompleteTask,
     allowSafeOperationsWithoutApproval: project.allowSafeOperationsWithoutApproval,
     defaultTaskMode: project.defaultTaskMode,
+    aiProviderConnectionId: project.aiProviderConnectionId ?? undefined,
     isActive: project.isActive,
     createdAt: project.createdAt.toISOString(),
     updatedAt: project.updatedAt.toISOString()

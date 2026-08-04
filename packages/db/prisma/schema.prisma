@@ -45,6 +45,7 @@ enum TaskStatus {
 
 enum ProviderKind {
   codex
+  github_copilot
   openai
 }
 
@@ -130,7 +131,7 @@ model User {
   notificationSettings    NotificationSettings?
   notificationSubscriptions NotificationSubscription[]
   githubConnection        GitHubConnection?
-  aiProviderConnection    AiProviderConnection?
+  aiProviderConnections   AiProviderConnection[]
 
   @@map("users")
 }
@@ -149,6 +150,7 @@ model Project {
   autoCompleteTask      Boolean  @default(false) @map("auto_complete_task")
   allowSafeOperationsWithoutApproval Boolean @default(false) @map("allow_safe_operations_without_approval")
   defaultTaskMode       TaskMode @default(safe) @map("default_task_mode")
+  aiProviderConnectionId String?  @map("ai_provider_connection_id")
   isActive              Boolean  @default(true) @map("is_active")
   createdAt     DateTime @default(now()) @map("created_at")
   updatedAt     DateTime @updatedAt @map("updated_at")
@@ -157,6 +159,7 @@ model Project {
   auditLog      AuditLog[]
   roadmapCycles ProjectRoadmapCycle[]
   roadmapSteps  ProjectImplementationStep[]
+  aiProviderConnection AiProviderConnection? @relation(fields: [aiProviderConnectionId], references: [id], onDelete: SetNull)
 
   @@map("projects")
 }
@@ -192,7 +195,9 @@ model GitHubConnection {
 
 model AiProviderConnection {
   id                String       @id @default(uuid())
-  userId            String       @unique @map("user_id")
+  userId            String       @map("user_id")
+  name              String
+  isDefault         Boolean      @default(false) @map("is_default")
   provider          ProviderKind
   authMode          AiProviderAuthMode @default(api_key) @map("auth_mode")
   model             String
@@ -206,7 +211,10 @@ model AiProviderConnection {
   updatedAt         DateTime     @updatedAt @map("updated_at")
 
   user User @relation(fields: [userId], references: [id])
+  projects Project[]
 
+  @@unique([userId, name])
+  @@index([userId, isDefault])
   @@map("ai_provider_connections")
 }
 

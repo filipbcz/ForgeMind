@@ -37,6 +37,7 @@ const projectSchema = z.object({
   autoCompleteTask: z.boolean().optional().default(false),
   allowSafeOperationsWithoutApproval: z.boolean().optional().default(false),
   defaultTaskMode: z.enum(['safe', 'auto', 'full_auto']).optional().default('safe'),
+  aiProviderConnectionId: z.string().min(1).nullable().optional(),
   repositoryMode: z.enum(['existing', 'create']).optional().default('existing'),
   branchMode: z.enum(['existing', 'create']).optional().default('existing'),
   branchName: z.string().min(1).optional(),
@@ -130,6 +131,9 @@ const workerQueueControlSchema = z.object({
 
 const providerConnectSchema = z
   .object({
+    connectionId: z.string().min(1).optional(),
+    name: z.string().trim().min(1).max(80).optional(),
+    isDefault: z.boolean().optional(),
     provider: z.enum(['openai', 'codex']),
     authMode: z.enum(['api_key', 'codex_oauth']).optional().default('api_key'),
     apiKey: z.string().min(1).optional(),
@@ -155,7 +159,13 @@ const providerConnectSchema = z
 
 const codexOAuthCompleteSchema = z.object({
   loginId: z.string().min(1),
+  name: z.string().trim().min(1).max(80).optional(),
+  isDefault: z.boolean().optional(),
   model: z.string().min(1)
+});
+
+const codexOAuthStartSchema = z.object({
+  name: z.string().trim().min(1).max(80).optional()
 });
 
 const githubConnectSchema = z.object({
@@ -302,6 +312,7 @@ export function registerRoutes(app: FastifyInstance, repository: ForgeMindReposi
 
   app.get('/api/providers/status', async (_request) => {
     const githubConnection = await readGitHubConnection(repository);
+    const providerConnections = await listAIProviderConnections(repository);
     const providerConnection = await readAIProviderConnection(repository);
     const envProvider = process.env.FORGEMIND_PROVIDER === 'openai' || process.env.FORGEMIND_PROVIDER === 'codex'
       ? process.env.FORGEMIND_PROVIDER
@@ -311,6 +322,8 @@ export function registerRoutes(app: FastifyInstance, repository: ForgeMindReposi
     return {
       currentProvider,
       currentModel,
+      currentConnectionId: providerConnection?.id ?? null,
+      connections: providerConnections,
       fallbackProvider: process.env.FORGEMIND_FALLBACK_PROVIDER ?? null,
       githubAdapter: githubConnection ? 'app' : getGitHubAdapterEnvStatus().adapter,
       availableProviders: ['openai', 'codex'],
@@ -336,6 +349,8 @@ export function registerRoutes(app: FastifyInstance, repository: ForgeMindReposi
       }
     };
   });
+
+  app.get('/api/providers/connections', async () => listAIProviderConnections(repository));
 
   app.get('/api/github/status', async () => {
     const connection = await readGitHubConnection(repository);
@@ -367,9 +382,10 @@ export function registerRoutes(app: FastifyInstance, repository: ForgeMindReposi
     };
   });
 
-  app.post('/api/providers/codex/oauth/start', async (_request, reply) => {
+  app.post('/api/providers/codex/oauth/start', async (request, reply) => {
     try {
-      const login = await startCodexOAuthBrowserLogin();
+      const input = codexOAuthStartSchema.parse(request.body ?? {});
+      const login = await startCodexOAuthBrowserLogin({ name: input.name });
       return reply.code(202).send({
         loginId: login.loginId,
         authFlow: login.authFlow,
@@ -548,6 +564,8 @@ export function registerRoutes(app: FastifyInstance, repository: ForgeMindReposi
 
       const currentUser = await repository.getCurrentUser();
       const connection = await saveAIProviderConnection(repository, {
+        name: input.name,
+        isDefault: input.isDefault,
         provider: 'codex',
         authMode: 'codex_oauth',
         model: input.model,
@@ -560,6 +578,9 @@ export function registerRoutes(app: FastifyInstance, repository: ForgeMindReposi
         eventType: 'provider_connected',
         payload: {
           provider: 'codex',
+          connectionId: connection.id,
+          name: connection.name,
+          isDefault: connection.isDefault,
           credentialSource: connection.credentialSource,
           authMode: connection.authMode,
           model: connection.model,
@@ -572,6 +593,8 @@ export function registerRoutes(app: FastifyInstance, repository: ForgeMindReposi
       return reply.send({
         ok: true,
         completed: true,
+        connectionId: connection.id,
+        name: connection.name,
         provider: 'codex',
         model: connection.model,
         persistent: true,
@@ -604,6 +627,9 @@ export function registerRoutes(app: FastifyInstance, repository: ForgeMindReposi
 
       const currentUser = await repository.getCurrentUser();
       const connection = await saveAIProviderConnection(repository, {
+        connectionId: input.connectionId,
+        name: input.name,
+        isDefault: input.isDefault,
         provider: input.provider,
         authMode: input.authMode,
         apiKey: input.apiKey,
@@ -617,6 +643,9 @@ export function registerRoutes(app: FastifyInstance, repository: ForgeMindReposi
         eventType: 'provider_connected',
         payload: {
           provider: input.provider,
+          connectionId: connection.id,
+          name: connection.name,
+          isDefault: connection.isDefault,
           credentialSource: connection.credentialSource,
           authMode: connection.authMode,
           apiKeyFingerprint: connection.apiKeyFingerprint ?? null,
@@ -629,12 +658,28 @@ export function registerRoutes(app: FastifyInstance, repository: ForgeMindReposi
 
       return reply.send({
         ok: true,
+        connectionId: connection.id,
+        name: connection.name,
         provider: input.provider,
         model: connection.model,
         authMode: connection.authMode,
         persistent: true,
         estimate
       });
+    } catch (error) {
+      return sendBadRequest(reply, error);
+    }
+  });
+
+  app.delete('/api/providers/connections/:id', async (request, reply) => {
+    try {
+      const { id } = idParamsSchema.parse(request.params);
+      const deleted = await deleteAIProviderConnection(repository, id);
+      if (!deleted) {
+        return sendNotFound(reply, `AI provider connection "${id}" not found`);
+      }
+
+      return reply.send({ ok: true, connectionId: id });
     } catch (error) {
       return sendBadRequest(reply, error);
     }
@@ -669,7 +714,8 @@ export function registerRoutes(app: FastifyInstance, repository: ForgeMindReposi
           autoMergePullRequest: input.autoMergePullRequest,
           autoCompleteTask: input.autoCompleteTask,
           allowSafeOperationsWithoutApproval: input.allowSafeOperationsWithoutApproval,
-          defaultTaskMode: input.defaultTaskMode
+          defaultTaskMode: input.defaultTaskMode,
+          aiProviderConnectionId: input.aiProviderConnectionId
         })
       );
     } catch (error) {
@@ -1324,8 +1370,14 @@ function buildTaskPrompt(input: z.infer<typeof createTaskSchema>): string {
   return lines.join('\n');
 }
 
-async function generateRoadmapPlan(repository: ForgeMindRepository, project: { id: string; name: string; brief?: string }, objective: string) {
-  const connection = await readAIProviderConnectionSecret(repository);
+async function generateRoadmapPlan(
+  repository: ForgeMindRepository,
+  project: { id: string; name: string; brief?: string; aiProviderConnectionId?: string },
+  objective: string
+) {
+  const connection = project.aiProviderConnectionId
+    ? await readAIProviderConnectionSecretById(repository, project.aiProviderConnectionId)
+    : await readAIProviderConnectionSecret(repository);
   if (!connection) {
     throw new Error('Connect an AI provider before generating implementation steps.');
   }
@@ -1625,11 +1677,32 @@ async function readAIProviderConnection(repository: ForgeMindRepository) {
   return maybeRepository.getAIProviderConnection ? maybeRepository.getAIProviderConnection() : undefined;
 }
 
+async function listAIProviderConnections(repository: ForgeMindRepository) {
+  const maybeRepository = repository as ForgeMindRepository & {
+    listAIProviderConnections?: ForgeMindRepository['listAIProviderConnections'];
+  };
+  if (maybeRepository.listAIProviderConnections) {
+    return maybeRepository.listAIProviderConnections();
+  }
+
+  const connection = await readAIProviderConnection(repository);
+  return connection ? [connection] : [];
+}
+
 async function readAIProviderConnectionSecret(repository: ForgeMindRepository) {
   const maybeRepository = repository as ForgeMindRepository & {
     getAIProviderConnectionSecret?: ForgeMindRepository['getAIProviderConnectionSecret'];
   };
   return maybeRepository.getAIProviderConnectionSecret ? maybeRepository.getAIProviderConnectionSecret() : undefined;
+}
+
+async function readAIProviderConnectionSecretById(repository: ForgeMindRepository, connectionId: string) {
+  const maybeRepository = repository as ForgeMindRepository & {
+    getAIProviderConnectionSecretById?: ForgeMindRepository['getAIProviderConnectionSecretById'];
+  };
+  return maybeRepository.getAIProviderConnectionSecretById
+    ? maybeRepository.getAIProviderConnectionSecretById(connectionId)
+    : readAIProviderConnectionSecret(repository);
 }
 
 async function readGitHubConnectionSecret(repository: ForgeMindRepository) {
@@ -1656,6 +1729,9 @@ async function saveGitHubConnection(
 async function saveAIProviderConnection(
   repository: ForgeMindRepository,
   input: {
+    connectionId?: string;
+    name?: string;
+    isDefault?: boolean;
     provider: AIProviderConnectionKind;
     authMode?: 'api_key' | 'codex_oauth';
     apiKey?: string;
@@ -1672,6 +1748,17 @@ async function saveAIProviderConnection(
   }
 
   return maybeRepository.upsertAIProviderConnection(input);
+}
+
+async function deleteAIProviderConnection(repository: ForgeMindRepository, connectionId: string) {
+  const maybeRepository = repository as ForgeMindRepository & {
+    deleteAIProviderConnection?: ForgeMindRepository['deleteAIProviderConnection'];
+  };
+  if (!maybeRepository.deleteAIProviderConnection) {
+    throw new Error('Persistent AI provider connection storage is not available.');
+  }
+
+  return maybeRepository.deleteAIProviderConnection(connectionId);
 }
 
 async function removeGitHubConnection(repository: ForgeMindRepository) {

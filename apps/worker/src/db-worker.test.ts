@@ -41,7 +41,10 @@ function createClaimedTask(queueReason = 'task_started') {
 const repositoryMock = {
   recoverStuckQueueJobs: vi.fn(async () => ({ recoveredCount: 0, queueJobIds: [] })),
   getGitHubConnectionSecret: vi.fn(async () => undefined),
+  getAIProviderConnectionSecret: vi.fn(async () => undefined),
+  getAIProviderConnectionSecretById: vi.fn(async () => undefined),
   claimNextSubmittedTask: vi.fn(async (): Promise<unknown> => createClaimedTask()),
+  updateTaskRunProvider: vi.fn(async () => undefined),
   recordProviderUsage: vi.fn(async () => undefined),
   transitionTask: vi.fn(async () => undefined),
   createApproval: vi.fn(async () => ({ id: 'approval_1' })),
@@ -511,6 +514,107 @@ describe('db-worker policy enforcement', () => {
       delete process.env.FORGEMIND_FALLBACK_PROVIDER;
     } else {
       process.env.FORGEMIND_FALLBACK_PROVIDER = previousFallback;
+    }
+  });
+
+  it('uses fallback connection when primary and fallback provider kinds are the same', async () => {
+    const previousPrimaryConnection = process.env.FORGEMIND_PROVIDER_CONNECTION_ID;
+    const previousFallbackConnection = process.env.FORGEMIND_FALLBACK_PROVIDER_CONNECTION_ID;
+    process.env.FORGEMIND_PROVIDER_CONNECTION_ID = 'conn_primary';
+    process.env.FORGEMIND_FALLBACK_PROVIDER_CONNECTION_ID = 'conn_fallback';
+
+    repositoryMock.getAIProviderConnectionSecretById.mockImplementation(async (connectionId: string) => {
+      if (connectionId === 'conn_primary') {
+        return {
+          id: 'conn_primary',
+          userId: 'user_1',
+          name: 'Primary Codex',
+          isDefault: false,
+          credentialSource: 'api_key',
+          provider: 'codex',
+          authMode: 'api_key',
+          model: 'gpt-5.5',
+          apiKeyFingerprint: 'fp_primary',
+          connectedAt: new Date().toISOString(),
+          updatedAt: new Date().toISOString(),
+          apiKey: 'key_primary'
+        };
+      }
+
+      if (connectionId === 'conn_fallback') {
+        return {
+          id: 'conn_fallback',
+          userId: 'user_1',
+          name: 'Fallback Codex',
+          isDefault: false,
+          credentialSource: 'api_key',
+          provider: 'codex',
+          authMode: 'api_key',
+          model: 'gpt-5.5-mini',
+          apiKeyFingerprint: 'fp_fallback',
+          connectedAt: new Date().toISOString(),
+          updatedAt: new Date().toISOString(),
+          apiKey: 'key_fallback'
+        };
+      }
+
+      return undefined;
+    });
+
+    createProviderMock.mockImplementation(() => ({
+      estimateCost: vi.fn(async () => {
+        if (process.env.CODEX_API_KEY === 'key_fallback') {
+          return {
+            inputTokens: 40,
+            outputTokens: 25,
+            estimatedCostUsd: 0.03
+          };
+        }
+        throw new Error('Primary connection timed out');
+      }),
+      plan: vi.fn(),
+      implement: vi.fn(),
+      review: vi.fn(),
+      kind: 'codex',
+      supportsLocalRepo: () => true,
+      supportsGitHubNativeFlow: () => false
+    }));
+
+    runWorkerTaskMock.mockResolvedValueOnce({
+      taskId: 'task_1',
+      status: 'ready_for_user_review',
+      issueUrl: 'https://github.com/demo/repo/issues/1',
+      branchName: 'ai/1-task',
+      workspacePath: 'C:/tmp/worker',
+      validation: {
+        command: 'node --version',
+        exitCode: 0,
+        stdout: '',
+        stderr: '',
+        passed: true
+      },
+      summary: 'done',
+      approvals: [],
+      completedAt: new Date().toISOString()
+    });
+
+    const { runDatabaseWorkerOnce } = await import('./db-worker.js');
+    const result = await runDatabaseWorkerOnce();
+
+    expect(result).toEqual(expect.objectContaining({ claimed: true, taskId: 'task_1' }));
+    expect(createProviderMock).toHaveBeenCalledTimes(2);
+    expect(createProviderMock).toHaveBeenNthCalledWith(1, 'codex');
+    expect(createProviderMock).toHaveBeenNthCalledWith(2, 'codex');
+
+    if (previousPrimaryConnection === undefined) {
+      delete process.env.FORGEMIND_PROVIDER_CONNECTION_ID;
+    } else {
+      process.env.FORGEMIND_PROVIDER_CONNECTION_ID = previousPrimaryConnection;
+    }
+    if (previousFallbackConnection === undefined) {
+      delete process.env.FORGEMIND_FALLBACK_PROVIDER_CONNECTION_ID;
+    } else {
+      process.env.FORGEMIND_FALLBACK_PROVIDER_CONNECTION_ID = previousFallbackConnection;
     }
   });
 

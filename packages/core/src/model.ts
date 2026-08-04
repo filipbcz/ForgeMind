@@ -1,6 +1,6 @@
 import type { IsoDateString, JsonValue } from '@forgemind/shared';
 
-export type ProviderKind = 'codex' | 'openai';
+export type ProviderKind = 'codex' | 'github_copilot' | 'openai';
 
 export type TaskMode = 'safe' | 'auto' | 'full_auto';
 
@@ -103,6 +103,7 @@ export interface Project {
   autoCompleteTask?: boolean;
   allowSafeOperationsWithoutApproval?: boolean;
   defaultTaskMode?: TaskMode;
+  aiProviderConnectionId?: string;
   isActive: boolean;
   createdAt: IsoDateString;
   updatedAt: IsoDateString;

@@ -41,12 +41,13 @@ interface PlannedValidationCheckSnapshot {
 
 export async function runDatabaseWorkerOnce(options: { deferInterruptSignals?: boolean } = {}) {
   const repository = createRepository(getPrismaClient());
-  const aiProviderConnection = await readAIProviderConnectionSecret(repository);
-  applyAIProviderConnectionEnv(aiProviderConnection);
+  const defaultAIProviderConnection = await readAIProviderConnectionSecret(repository);
   const providerOverride = process.env.FORGEMIND_PROVIDER as ProviderKind | undefined;
   const fallbackProviderOverride = process.env.FORGEMIND_FALLBACK_PROVIDER as ProviderKind | undefined;
-  const providerKind = providerOverride ?? aiProviderConnection?.provider ?? 'codex';
-  const providerModel = resolveProviderModel(providerKind, aiProviderConnection);
+  const providerConnectionIdOverride = process.env.FORGEMIND_PROVIDER_CONNECTION_ID?.trim() || undefined;
+  const fallbackProviderConnectionIdOverride = process.env.FORGEMIND_FALLBACK_PROVIDER_CONNECTION_ID?.trim() || undefined;
+  const providerKind = providerOverride ?? defaultAIProviderConnection?.provider ?? 'codex';
+  const providerModel = resolveProviderModel(providerKind, defaultAIProviderConnection);
   const claimTimeoutMinutes = Number(process.env.FORGEMIND_QUEUE_CLAIM_TIMEOUT_MINUTES ?? 2);
   const recovery = await repository.recoverStuckQueueJobs(claimTimeoutMinutes);
   const claimed = await repository.claimNextSubmittedTask(providerKind, providerModel);
@@ -106,12 +107,33 @@ export async function runDatabaseWorkerOnce(options: { deferInterruptSignals?: b
     : await createGitHubAdapterFromEnv();
   const projectConfig = parseProjectConfig(claimed.project.configYaml);
   const limits = resolveLimits(claimed.project.configYaml, claimed.task.maxIterations);
-  const selection = resolveProviderSelection(projectConfig, providerOverride ?? aiProviderConnection?.provider, fallbackProviderOverride);
+  const selection = await resolveProviderSelection({
+    repository,
+    projectConfig,
+    projectProviderConnectionId: claimed.project.aiProviderConnectionId,
+    defaultConnection: defaultAIProviderConnection,
+    providerOverride,
+    fallbackProviderOverride,
+    providerConnectionIdOverride,
+    fallbackProviderConnectionIdOverride
+  });
+  const selectedProviderModel = resolveProviderModel(selection.primary.kind, selection.primary.connection);
+  if (claimed.taskRun.provider !== selection.primary.kind || claimed.taskRun.model !== selectedProviderModel) {
+    await repository.updateTaskRunProvider({
+      taskRunId: claimed.taskRun.id,
+      provider: selection.primary.kind,
+      model: selectedProviderModel
+    });
+    claimed.taskRun.provider = selection.primary.kind;
+    claimed.taskRun.model = selectedProviderModel;
+  }
+  const primaryRuntimeProvider = buildRuntimeProvider(selection.primary.kind, selection.primary.connection);
+  const fallbackRuntimeProvider = selection.fallback
+    ? buildRuntimeProvider(selection.fallback.kind, selection.fallback.connection)
+    : undefined;
   const { provider, getLastProviderKind } = createPolicyAwareProvider({
-    primaryKind: selection.primary,
-    primaryProvider: createProvider(selection.primary),
-    fallbackKind: selection.fallback,
-    fallbackProvider: selection.fallback ? createProvider(selection.fallback) : undefined
+    primary: primaryRuntimeProvider,
+    fallback: fallbackRuntimeProvider
   });
   const resumeContext = await resolveTaskResumeContext(
     repository,
@@ -163,7 +185,7 @@ export async function runDatabaseWorkerOnce(options: { deferInterruptSignals?: b
     const result = await runWorkerTask({
       project: claimed.project,
       task: claimed.task,
-      providerKind: selection.primary,
+      providerKind: selection.primary.kind,
       provider,
       verifyCommand,
       workspaceRoot,
@@ -470,38 +492,67 @@ export async function runDatabaseWorkerOnce(options: { deferInterruptSignals?: b
   }
 }
 
+interface RuntimeProvider {
+  kind: ProviderKind;
+  contextId: string;
+  provider: AIProvider;
+  activate: () => void;
+}
+
+function buildRuntimeProvider(kind: ProviderKind, connection?: AIProviderConnectionSecret): RuntimeProvider {
+  const contextId = connection?.id ?? `${kind}:env`;
+  const activate = () => {
+    if (connection) {
+      applyAIProviderConnectionEnv(connection);
+    }
+  };
+  activate();
+
+  return {
+    kind,
+    contextId,
+    provider: createProvider(kind),
+    activate
+  };
+}
+
 function createPolicyAwareProvider(input: {
-  primaryKind: ProviderKind;
-  primaryProvider: AIProvider;
-  fallbackKind?: ProviderKind;
-  fallbackProvider?: AIProvider;
+  primary: RuntimeProvider;
+  fallback?: RuntimeProvider;
 }): { provider: AIProvider; getLastProviderKind: () => ProviderKind } {
-  let lastProviderKind: ProviderKind = input.primaryKind;
+  let lastProviderKind: ProviderKind = input.primary.kind;
 
   const callWithFallback = async <T>(operation: string, action: (provider: AIProvider) => Promise<T>): Promise<T> => {
     try {
-      const result = await action(input.primaryProvider);
-      lastProviderKind = input.primaryKind;
+      input.primary.activate();
+      const result = await action(input.primary.provider);
+      lastProviderKind = input.primary.kind;
       return result;
     } catch (primaryError) {
-      if (input.fallbackProvider && input.fallbackKind && input.fallbackKind !== input.primaryKind) {
+      const fallback = input.fallback;
+      const shouldUseFallback = Boolean(
+        fallback
+        && (fallback.kind !== input.primary.kind || fallback.contextId !== input.primary.contextId)
+      );
+      if (fallback && shouldUseFallback) {
         try {
-          const result = await action(input.fallbackProvider);
-          lastProviderKind = input.fallbackKind;
+          fallback.activate();
+          const result = await action(fallback.provider);
+          lastProviderKind = fallback.kind;
           return result;
         } catch (fallbackError) {
-          throw new ProviderExecutionError(operation, toErrorMessage(fallbackError), input.fallbackKind);
+          throw new ProviderExecutionError(operation, toErrorMessage(fallbackError), fallback.kind);
         }
       }
 
-      throw new ProviderExecutionError(operation, toErrorMessage(primaryError), input.primaryKind);
+      throw new ProviderExecutionError(operation, toErrorMessage(primaryError), input.primary.kind);
     }
   };
 
   const provider: AIProvider = {
-    kind: input.primaryKind,
-    supportsLocalRepo: () => input.primaryProvider.supportsLocalRepo(),
-    supportsGitHubNativeFlow: () => input.primaryProvider.supportsGitHubNativeFlow(),
+    kind: input.primary.kind,
+    supportsLocalRepo: () => input.primary.provider.supportsLocalRepo(),
+    supportsGitHubNativeFlow: () => input.primary.provider.supportsGitHubNativeFlow(),
     async plan(planInput) {
       return callWithFallback('plan', (provider) => provider.plan(planInput));
     },
@@ -538,6 +589,80 @@ async function readAIProviderConnectionSecret(repository: {
   return repository.getAIProviderConnectionSecret ? repository.getAIProviderConnectionSecret() : undefined;
 }
 
+async function readAIProviderConnectionSecretById(
+  repository: {
+    getAIProviderConnectionSecretById?: (connectionId: string) => Promise<AIProviderConnectionSecret | undefined>;
+  },
+  connectionId: string
+): Promise<AIProviderConnectionSecret | undefined> {
+  return repository.getAIProviderConnectionSecretById ? repository.getAIProviderConnectionSecretById(connectionId) : undefined;
+}
+
+async function resolveProviderSelection(input: {
+  repository: {
+    getAIProviderConnectionSecretById?: (connectionId: string) => Promise<AIProviderConnectionSecret | undefined>;
+  };
+  projectConfig: AgentConfig | undefined;
+  projectProviderConnectionId?: string;
+  defaultConnection?: AIProviderConnectionSecret;
+  providerOverride?: ProviderKind;
+  fallbackProviderOverride?: ProviderKind;
+  providerConnectionIdOverride?: string;
+  fallbackProviderConnectionIdOverride?: string;
+}): Promise<{
+  primary: { kind: ProviderKind; connection?: AIProviderConnectionSecret };
+  fallback?: { kind: ProviderKind; connection?: AIProviderConnectionSecret };
+}> {
+  const primaryConnectionId = input.providerConnectionIdOverride
+    ?? input.projectConfig?.ai.primary_connection_id?.trim()
+    ?? input.projectProviderConnectionId;
+  const primaryConnection = primaryConnectionId
+    ? await readAIProviderConnectionSecretById(input.repository, primaryConnectionId)
+    : input.defaultConnection;
+
+  if (primaryConnectionId && !primaryConnection) {
+    throw new Error(`Primary provider connection "${primaryConnectionId}" does not exist.`);
+  }
+
+  const primaryKind = input.providerOverride
+    ?? primaryConnection?.provider
+    ?? input.projectConfig?.ai.primary_provider
+    ?? 'codex';
+  const normalizedPrimaryConnection = primaryConnection?.provider === primaryKind ? primaryConnection : undefined;
+
+  const fallbackConnectionId = input.fallbackProviderConnectionIdOverride
+    ?? input.projectConfig?.ai.fallback_connection_id?.trim();
+  const fallbackConnection = fallbackConnectionId
+    ? await readAIProviderConnectionSecretById(input.repository, fallbackConnectionId)
+    : undefined;
+
+  if (fallbackConnectionId && !fallbackConnection) {
+    throw new Error(`Fallback provider connection "${fallbackConnectionId}" does not exist.`);
+  }
+
+  const fallbackKind = input.fallbackProviderOverride
+    ?? fallbackConnection?.provider
+    ?? input.projectConfig?.ai.fallback_provider;
+
+  if (!fallbackKind) {
+    return { primary: { kind: primaryKind, connection: normalizedPrimaryConnection } };
+  }
+
+  const normalizedFallbackConnection = fallbackConnection?.provider === fallbackKind ? fallbackConnection : undefined;
+  const hasDistinctFallback =
+    fallbackKind !== primaryKind
+    || (normalizedFallbackConnection?.id ?? null) !== (normalizedPrimaryConnection?.id ?? null);
+
+  if (!hasDistinctFallback) {
+    return { primary: { kind: primaryKind, connection: normalizedPrimaryConnection } };
+  }
+
+  return {
+    primary: { kind: primaryKind, connection: normalizedPrimaryConnection },
+    fallback: { kind: fallbackKind, connection: normalizedFallbackConnection }
+  };
+}
+
 function applyAIProviderConnectionEnv(connection: AIProviderConnectionSecret | undefined) {
   if (!connection) {
     return;
@@ -569,12 +694,20 @@ function resolveProviderModel(provider: ProviderKind, connection: AIProviderConn
     return connection.model;
   }
 
+  if (provider === 'github_copilot' && process.env.COPILOT_MODEL) {
+    return process.env.COPILOT_MODEL;
+  }
+
   if (provider === 'openai' && process.env.OPENAI_MODEL) {
     return process.env.OPENAI_MODEL;
   }
 
   if (provider === 'codex' && process.env.CODEX_MODEL) {
     return process.env.CODEX_MODEL;
+  }
+
+  if (provider === 'github_copilot') {
+    return 'gpt-5.4';
   }
 
   return provider;
@@ -632,24 +765,6 @@ function mapApprovalReasonToType(reason: string): ApprovalType {
   if (/\bbudget\b/.test(normalized)) return 'budget_increase';
   if (/\bconfig\b|\bconfiguration\b/.test(normalized)) return 'config_change';
   return 'risky_refactor';
-}
-
-function resolveProviderSelection(
-  projectConfig: AgentConfig | undefined,
-  providerOverride: ProviderKind | undefined,
-  fallbackOverride: ProviderKind | undefined
-): { primary: ProviderKind; fallback?: ProviderKind } {
-  const primary = providerOverride ?? projectConfig?.ai.primary_provider ?? 'codex';
-  const fallback = fallbackOverride ?? projectConfig?.ai.fallback_provider;
-
-  if (!fallback || fallback === primary) {
-    return { primary };
-  }
-
-  return {
-    primary,
-    fallback
-  };
 }
 
 function resolveVerifyCommand(configYaml?: string): string | undefined {

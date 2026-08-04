@@ -18,6 +18,7 @@
   },
   "dependencies": {
     "@forgemind/core": "0.1.0",
+    "@github/copilot-sdk": "^1.0.8",
     "execa": "^9.6.0"
   }
 }

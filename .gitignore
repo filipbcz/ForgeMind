@@ -8,6 +8,7 @@ coverage/
 .env
 .env.*
 !.env.example
+infra/deploy/server.env
 .forgemind/
 *.log
 *.tsbuildinfo

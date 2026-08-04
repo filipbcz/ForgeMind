@@ -32,11 +32,18 @@ Create `/opt/forgemind/shared/server.env` from `infra/deploy/server.env.example`
 - `POSTGRES_PASSWORD` in both `POSTGRES_PASSWORD` and `DATABASE_URL`
 - `FORGEMIND_CREDENTIAL_KEY`
 - `GITHUB_CALLBACK_URL` when GitHub login is configured
+- `VAPID_PUBLIC_KEY` and `VAPID_PRIVATE_KEY` when push notifications are enabled
 
 Generate the credential key with:
 
 ```bash
 openssl rand -base64 32
+```
+
+Generate the VAPID pair with:
+
+```bash
+node -e "const webpush = require('web-push'); console.log(JSON.stringify(webpush.generateVAPIDKeys(), null, 2));"
 ```
 
 Do not commit `server.env`.

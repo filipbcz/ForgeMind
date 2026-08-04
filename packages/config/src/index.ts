@@ -21,9 +21,11 @@ export const agentConfigSchema = z.object({
     allow_ai_auto_improvements: z.boolean().default(true)
   }),
   ai: z.object({
-    primary_provider: z.enum(['codex', 'openai']).default('codex'),
-    fallback_provider: z.enum(['codex', 'openai']).optional(),
-    reviewer_provider: z.enum(['codex', 'openai']).default('codex'),
+    primary_provider: z.enum(['codex', 'github_copilot', 'openai']).default('codex'),
+    fallback_provider: z.enum(['codex', 'github_copilot', 'openai']).optional(),
+    primary_connection_id: z.string().min(1).optional(),
+    fallback_connection_id: z.string().min(1).optional(),
+    reviewer_provider: z.enum(['codex', 'github_copilot', 'openai']).default('codex'),
     model_profile: z.enum(['fast', 'balanced', 'deep']).default('balanced')
   }),
   limits: z.object({

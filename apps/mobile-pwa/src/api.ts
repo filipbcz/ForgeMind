@@ -21,6 +21,7 @@ import type {
   NotificationSubscriptionRequest,
   ProviderConnectRequest,
   ProviderConnectResponse,
+  ProviderConnectionApi,
   ProviderStatusApi,
   ProjectApi,
   ProjectRoadmapApi,
@@ -203,6 +204,10 @@ export async function fetchProviderStatus(): Promise<ProviderStatusApi> {
   return request<ProviderStatusApi>('/api/providers/status');
 }
 
+export async function fetchProviderConnections(): Promise<ProviderConnectionApi[]> {
+  return request<ProviderConnectionApi[]>('/api/providers/connections');
+}
+
 export async function fetchGitHubAdapterStatus(): Promise<GitHubAdapterStatusApi> {
   return request<GitHubAdapterStatusApi>('/api/github/status');
 }
@@ -245,14 +250,25 @@ export async function connectProvider(input: ProviderConnectRequest): Promise<Pr
   });
 }
 
-export async function startCodexOAuth(): Promise<CodexOAuthStartResponse> {
-  return request<CodexOAuthStartResponse>('/api/providers/codex/oauth/start', {
-    method: 'POST',
-    body: '{}'
+export async function deleteProviderConnection(connectionId: string): Promise<{ ok: boolean; connectionId: string }> {
+  return request<{ ok: boolean; connectionId: string }>(`/api/providers/connections/${connectionId}`, {
+    method: 'DELETE'
   });
 }
 
-export async function completeCodexOAuth(input: { loginId: string; model: string }): Promise<CodexOAuthCompleteResponse> {
+export async function startCodexOAuth(input: { name?: string } = {}): Promise<CodexOAuthStartResponse> {
+  return request<CodexOAuthStartResponse>('/api/providers/codex/oauth/start', {
+    method: 'POST',
+    body: JSON.stringify(input)
+  });
+}
+
+export async function completeCodexOAuth(input: {
+  loginId: string;
+  model: string;
+  name?: string;
+  isDefault?: boolean;
+}): Promise<CodexOAuthCompleteResponse> {
   return request<CodexOAuthCompleteResponse>('/api/providers/codex/oauth/complete', {
     method: 'POST',
     body: JSON.stringify(input)

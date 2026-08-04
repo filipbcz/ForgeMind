@@ -37,11 +37,11 @@ export function resolveCodexHome(): string {
   return join(findWorkspaceRoot(), '.forgemind', 'codex');
 }
 
-export async function startCodexOAuthBrowserLogin(): Promise<PendingCodexLogin> {
-  const codexHome = resolveCodexHome();
+export async function startCodexOAuthBrowserLogin(input: { name?: string } = {}): Promise<PendingCodexLogin> {
+  const loginId = randomUUID();
+  const codexHome = resolveCodexHomeForLogin(loginId, input.name);
   await ensureCodexHome(codexHome);
 
-  const loginId = randomUUID();
   const child = spawn(resolveCodexBinary(), ['login'], {
     cwd: codexHome,
     env: {
@@ -127,6 +127,19 @@ export async function startCodexOAuthBrowserLogin(): Promise<PendingCodexLogin> 
       }
     });
   });
+}
+
+function resolveCodexHomeForLogin(loginId: string, name?: string): string {
+  if (process.env.FORGEMIND_CODEX_HOME?.trim()) {
+    return resolve(process.env.FORGEMIND_CODEX_HOME);
+  }
+
+  const safeName = (name?.trim() || 'codex')
+    .toLowerCase()
+    .replace(/[^a-z0-9-]+/g, '-')
+    .replace(/^-+|-+$/g, '')
+    .slice(0, 48) || 'codex';
+  return join(findWorkspaceRoot(), '.forgemind', 'codex', `${safeName}-${loginId.slice(0, 8)}`);
 }
 
 export async function readCodexOAuthStatus(codexHome = resolveCodexHome()): Promise<CodexOAuthStatus> {

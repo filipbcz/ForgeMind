@@ -34,6 +34,7 @@ import {
   decideProjectRoadmapExtension as decideProjectRoadmapExtensionRequest,
   createProject as createProjectRequest,
   createTask as createTaskRequest,
+  deleteProviderConnection,
   deleteProject as deleteProjectRequest,
   disconnectGitHubAdapter,
   fetchGitHubAdapterStatus,
@@ -605,12 +606,20 @@ export function App() {
     }
   });
 
+  const providerDeleteMutation = useMutation({
+    mutationFn: deleteProviderConnection,
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['provider-status'] });
+      queryClient.invalidateQueries({ queryKey: ['projects'] });
+    }
+  });
+
   const codexOAuthStartMutation = useMutation({
-    mutationFn: startCodexOAuth
+    mutationFn: (input: { name?: string }) => startCodexOAuth(input)
   });
 
   const codexOAuthCompleteMutation = useMutation({
-    mutationFn: (input: { loginId: string; model: string }) => completeCodexOAuth(input),
+    mutationFn: (input: { loginId: string; model: string; name?: string; isDefault?: boolean }) => completeCodexOAuth(input),
     onSuccess: (result) => {
       if (result.completed) {
         queryClient.invalidateQueries({ queryKey: ['provider-status'] });
@@ -866,6 +875,7 @@ export function App() {
             tasks={tasks}
             selectedProjectId={selectedProject?.id}
             onSelectProject={setSelectedProjectId}
+            providerStatus={providerStatus}
             roadmap={projectRoadmapQuery.data}
             roadmapLoading={projectRoadmapQuery.isLoading}
             roadmapError={
@@ -920,7 +930,12 @@ export function App() {
             onGitHubAdapterDisconnect={() => githubAdapterDisconnectMutation.mutate()}
             providerStatus={providerStatus}
             providerLoading={providerStatusQuery.isLoading}
-            providerBusy={providerConnectMutation.isPending || codexOAuthStartMutation.isPending || codexOAuthCompleteMutation.isPending}
+            providerBusy={
+              providerConnectMutation.isPending
+              || codexOAuthStartMutation.isPending
+              || codexOAuthCompleteMutation.isPending
+              || providerDeleteMutation.isPending
+            }
             providerError={
               providerConnectMutation.error
                 ? formatUiError(providerConnectMutation.error)
@@ -928,17 +943,29 @@ export function App() {
                   ? formatUiError(codexOAuthStartMutation.error)
                   : codexOAuthCompleteMutation.error
                     ? formatUiError(codexOAuthCompleteMutation.error)
-                    : undefined
+                    : providerDeleteMutation.error
+                      ? formatUiError(providerDeleteMutation.error)
+                      : undefined
             }
             onProviderConnect={(input) => providerConnectMutation.mutate(input)}
-            onCodexOAuthStart={() => codexOAuthStartMutation.mutateAsync()}
-            onCodexOAuthComplete={(loginId, model) => codexOAuthCompleteMutation.mutateAsync({ loginId, model })}
+            onProviderDelete={(connectionId) => providerDeleteMutation.mutate(connectionId)}
+            onCodexOAuthStart={(name) => codexOAuthStartMutation.mutateAsync({ name })}
+            onCodexOAuthComplete={(loginId, model, name, isDefault) => codexOAuthCompleteMutation.mutateAsync({ loginId, model, name, isDefault })}
             notificationSettings={notificationSettings}
             notificationsLoading={notificationSettingsQuery.isLoading}
             notificationsBusy={
               subscribeNotificationsMutation.isPending ||
               unsubscribeNotificationsMutation.isPending ||
               updateNotificationSettingsMutation.isPending
+            }
+            notificationsError={
+              subscribeNotificationsMutation.error
+                ? formatUiError(subscribeNotificationsMutation.error)
+                : unsubscribeNotificationsMutation.error
+                  ? formatUiError(unsubscribeNotificationsMutation.error)
+                  : updateNotificationSettingsMutation.error
+                    ? formatUiError(updateNotificationSettingsMutation.error)
+                    : undefined
             }
             onSubscribeNotifications={() => subscribeNotificationsMutation.mutate()}
             onUnsubscribeNotifications={() => unsubscribeNotificationsMutation.mutate()}
@@ -2253,6 +2280,7 @@ function ProjectsPanel(props: {
   tasks: TaskSummary[];
   selectedProjectId?: string;
   onSelectProject: (projectId: string) => void;
+  providerStatus?: ProviderStatusApi;
   roadmap?: ProjectRoadmapApi;
   roadmapLoading: boolean;
   roadmapError?: string;
@@ -2291,6 +2319,7 @@ function ProjectsPanel(props: {
     selectedProject?.allowSafeOperationsWithoutApproval ?? false
   );
   const [defaultTaskMode, setDefaultTaskMode] = useState<CreateTaskRequest['mode']>(selectedProject?.defaultTaskMode ?? 'safe');
+  const [aiProviderConnectionId, setAiProviderConnectionId] = useState(selectedProject?.aiProviderConnectionId ?? '');
   const [deleteConfirmation, setDeleteConfirmation] = useState('');
   const [deleteGitHubRepository, setDeleteGitHubRepository] = useState(false);
   const latestCycle = props.roadmap?.cycles.at(-1);
@@ -2311,13 +2340,15 @@ function ProjectsPanel(props: {
     setAutoCompleteTask(selectedProject?.autoCompleteTask ?? false);
     setAllowSafeOperationsWithoutApproval(selectedProject?.allowSafeOperationsWithoutApproval ?? false);
     setDefaultTaskMode(selectedProject?.defaultTaskMode ?? 'safe');
+    setAiProviderConnectionId(selectedProject?.aiProviderConnectionId ?? '');
   }, [
     selectedProject?.id,
     selectedProject?.autoCreatePullRequest,
     selectedProject?.autoMergePullRequest,
     selectedProject?.autoCompleteTask,
     selectedProject?.allowSafeOperationsWithoutApproval,
-    selectedProject?.defaultTaskMode
+    selectedProject?.defaultTaskMode,
+    selectedProject?.aiProviderConnectionId
   ]);
 
   useEffect(() => {
@@ -2469,10 +2500,23 @@ function ProjectsPanel(props: {
                   autoMergePullRequest,
                   autoCompleteTask,
                   allowSafeOperationsWithoutApproval,
-                  defaultTaskMode
+                  defaultTaskMode,
+                  aiProviderConnectionId: aiProviderConnectionId || null
                 });
               }}
             >
+              <label className="wide">
+                Primarni AI provider connection
+                <select value={aiProviderConnectionId} onChange={(event) => setAiProviderConnectionId(event.target.value)}>
+                  <option value="">Vychozi podle projektu / env</option>
+                  {props.providerStatus?.connections.map((connection) => (
+                    <option key={connection.id} value={connection.id}>
+                      {connection.name} ({connection.provider}/{connection.model}){connection.isDefault ? ' - default' : ''}
+                    </option>
+                  ))}
+                </select>
+                <small>Uložený provider connection, který se použije jako primární pro tento projekt.</small>
+              </label>
               <label className="wide">
                 Vychozi rezim tasku
                 <select value={defaultTaskMode} onChange={(event) => setDefaultTaskMode(event.target.value as CreateTaskRequest['mode'])}>
@@ -2693,6 +2737,7 @@ function SettingsPanel({
   notificationSettings,
   notificationsLoading,
   notificationsBusy,
+  notificationsError,
   onSubscribeNotifications,
   onUnsubscribeNotifications,
   onUpdateNotificationSettings
@@ -2714,6 +2759,7 @@ function SettingsPanel({
   notificationSettings?: NotificationSettingsApi;
   notificationsLoading: boolean;
   notificationsBusy: boolean;
+  notificationsError?: string;
   onSubscribeNotifications: () => void;
   onUnsubscribeNotifications: () => void;
   onUpdateNotificationSettings: (input: Partial<NotificationSettingsApi['settings']>) => void;
@@ -2936,10 +2982,14 @@ function SettingsPanel({
         </div>
         {notificationsLoading ? <p>Nacitam nastaveni notifikaci...</p> : null}
         {!notificationsLoading && !notificationSettings ? <p>Notifikace nejsou dostupne.</p> : null}
+        {notificationsError ? <div className="error-banner">{notificationsError}</div> : null}
         {notificationSettings ? (
           <>
             <MetricBlock label="Aktivni subscription" value={String(notificationSettings.subscriptions.length)} />
             <MetricBlock label="Push enabled" value={notificationSettings.settings.pushEnabled ? 'Ano' : 'Ne'} />
+            {!notificationSettings.settings.pushEnabled ? (
+              <p>Push notifikace jsou vypnuté. Pro zapnutí je potřeba dostupný VAPID public key na API serveru.</p>
+            ) : null}
             <div className="actions">
               <button className="primary-action" type="button" onClick={onSubscribeNotifications} disabled={notificationsBusy}>
                 Zapnout push

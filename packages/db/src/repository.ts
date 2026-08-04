@@ -52,6 +52,7 @@ export interface CreateProjectInput {
   autoCompleteTask?: boolean;
   allowSafeOperationsWithoutApproval?: boolean;
   defaultTaskMode?: TaskMode;
+  aiProviderConnectionId?: string | null;
 }
 
 export interface UpdateProjectInput {
@@ -67,6 +68,7 @@ export interface UpdateProjectInput {
   autoCompleteTask?: boolean;
   allowSafeOperationsWithoutApproval?: boolean;
   defaultTaskMode?: TaskMode;
+  aiProviderConnectionId?: string | null;
   isActive?: boolean;
 }
 
@@ -113,7 +115,10 @@ export type AIProviderConnectionKind = Extract<ProviderKind, 'openai' | 'codex'>
 export type AIProviderAuthMode = 'api_key' | 'codex_oauth';
 
 export interface AIProviderConnectionSnapshot {
+  id: string;
   userId: string;
+  name: string;
+  isDefault: boolean;
   credentialSource: 'api_key' | 'codex_oauth';
   provider: AIProviderConnectionKind;
   authMode: AIProviderAuthMode;
@@ -420,30 +425,45 @@ export class ForgeMindRepository {
     return true;
   }
 
+  async listAIProviderConnections(userId = LOCAL_USER_ID): Promise<AIProviderConnectionSnapshot[]> {
+    const connections = await this.prisma.aiProviderConnection.findMany({
+      where: { userId },
+      orderBy: [{ isDefault: 'desc' }, { createdAt: 'asc' }]
+    });
+
+    return connections.map(toAIProviderConnectionSnapshot);
+  }
+
   async getAIProviderConnection(userId = LOCAL_USER_ID): Promise<AIProviderConnectionSnapshot | undefined> {
+    const connection = await this.findDefaultAIProviderConnection(userId);
+    return connection ? toAIProviderConnectionSnapshot(connection) : undefined;
+  }
+
+  async getAIProviderConnectionById(connectionId: string): Promise<AIProviderConnectionSnapshot | undefined> {
     const connection = await this.prisma.aiProviderConnection.findUnique({
-      where: { userId }
+      where: { id: connectionId }
     });
 
     return connection ? toAIProviderConnectionSnapshot(connection) : undefined;
   }
 
   async getAIProviderConnectionSecret(userId = LOCAL_USER_ID): Promise<AIProviderConnectionSecret | undefined> {
+    const connection = await this.findDefaultAIProviderConnection(userId);
+    return connection ? this.toAIProviderConnectionSecret(connection) : undefined;
+  }
+
+  async getAIProviderConnectionSecretById(connectionId: string): Promise<AIProviderConnectionSecret | undefined> {
     const connection = await this.prisma.aiProviderConnection.findUnique({
-      where: { userId }
+      where: { id: connectionId }
     });
 
-    if (!connection) {
-      return undefined;
-    }
-
-    return {
-      ...toAIProviderConnectionSnapshot(connection),
-      apiKey: connection.apiKeyCiphertext ? await decryptSecret(connection.apiKeyCiphertext) : undefined
-    };
+    return connection ? this.toAIProviderConnectionSecret(connection) : undefined;
   }
 
   async upsertAIProviderConnection(input: {
+    connectionId?: string;
+    name?: string;
+    isDefault?: boolean;
     provider: AIProviderConnectionKind;
     authMode?: AIProviderAuthMode;
     model: string;
@@ -462,29 +482,51 @@ export class ForgeMindRepository {
 
     const apiKeyCiphertext = input.apiKey ? await encryptSecret(input.apiKey) : null;
     const apiKeyFingerprint = input.apiKey ? fingerprintSecret(input.apiKey) : null;
-    const connection = await this.prisma.aiProviderConnection.upsert({
-      where: { userId },
-      update: {
-        provider: input.provider,
-        authMode,
-        model: input.model,
-        apiKeyCiphertext,
-        apiKeyFingerprint,
-        codexHome: input.codexHome,
-        accountSummary: input.accountSummary,
-        lastCheckedAt: now
-      },
-      create: {
-        userId,
-        provider: input.provider,
-        authMode,
-        model: input.model,
-        apiKeyCiphertext,
-        apiKeyFingerprint,
-        codexHome: input.codexHome,
-        accountSummary: input.accountSummary,
-        lastCheckedAt: now
+    const existingCount = await this.prisma.aiProviderConnection.count({ where: { userId } });
+    const isDefault = input.isDefault ?? existingCount === 0;
+    const name = await this.resolveAIProviderConnectionName(userId, input.name ?? buildAIProviderConnectionName(input.provider, authMode, input.model), input.connectionId);
+    const connection = await this.prisma.$transaction(async (tx) => {
+      if (isDefault) {
+        await tx.aiProviderConnection.updateMany({
+          where: { userId },
+          data: { isDefault: false }
+        });
       }
+
+      if (input.connectionId) {
+        return tx.aiProviderConnection.update({
+          where: { id: input.connectionId },
+          data: {
+            userId,
+            name,
+            isDefault,
+            provider: input.provider,
+            authMode,
+            model: input.model,
+            apiKeyCiphertext,
+            apiKeyFingerprint,
+            codexHome: input.codexHome,
+            accountSummary: input.accountSummary,
+            lastCheckedAt: now
+          }
+        });
+      }
+
+      return tx.aiProviderConnection.create({
+        data: {
+          userId,
+          name,
+          isDefault,
+          provider: input.provider,
+          authMode,
+          model: input.model,
+          apiKeyCiphertext,
+          apiKeyFingerprint,
+          codexHome: input.codexHome,
+          accountSummary: input.accountSummary,
+          lastCheckedAt: now
+        }
+      });
     });
 
     await this.writeAudit({
@@ -493,6 +535,9 @@ export class ForgeMindRepository {
       eventType: 'ai_provider_connection_saved',
       payload: {
         credentialSource: connection.authMode === 'codex_oauth' ? 'codex_oauth' : 'api_key',
+        connectionId: connection.id,
+        name: connection.name,
+        isDefault: connection.isDefault,
         provider: connection.provider,
         authMode: connection.authMode,
         model: connection.model,
@@ -503,6 +548,77 @@ export class ForgeMindRepository {
     });
 
     return toAIProviderConnectionSnapshot(connection);
+  }
+
+  async deleteAIProviderConnection(connectionId: string, userId = LOCAL_USER_ID): Promise<boolean> {
+    const existing = await this.prisma.aiProviderConnection.findFirst({
+      where: { id: connectionId, userId },
+      select: { id: true, name: true, provider: true, isDefault: true }
+    });
+    if (!existing) return false;
+
+    await this.prisma.aiProviderConnection.delete({ where: { id: connectionId } });
+
+    if (existing.isDefault) {
+      const next = await this.prisma.aiProviderConnection.findFirst({
+        where: { userId },
+        orderBy: { createdAt: 'asc' }
+      });
+      if (next) {
+        await this.prisma.aiProviderConnection.update({
+          where: { id: next.id },
+          data: { isDefault: true }
+        });
+      }
+    }
+
+    await this.writeAudit({
+      actorType: 'user',
+      actorId: userId,
+      eventType: 'ai_provider_connection_deleted',
+      payload: {
+        connectionId,
+        name: existing.name,
+        provider: existing.provider
+      }
+    });
+
+    return true;
+  }
+
+  private async findDefaultAIProviderConnection(userId: string): Promise<AiProviderConnection | null> {
+    return this.prisma.aiProviderConnection.findFirst({
+      where: { userId },
+      orderBy: [{ isDefault: 'desc' }, { createdAt: 'asc' }]
+    });
+  }
+
+  private async toAIProviderConnectionSecret(connection: AiProviderConnection): Promise<AIProviderConnectionSecret> {
+    return {
+      ...toAIProviderConnectionSnapshot(connection),
+      apiKey: connection.apiKeyCiphertext ? await decryptSecret(connection.apiKeyCiphertext) : undefined
+    };
+  }
+
+  private async resolveAIProviderConnectionName(userId: string, requestedName: string, connectionId?: string): Promise<string> {
+    const baseName = requestedName.trim() || 'AI provider';
+    const existing = await this.prisma.aiProviderConnection.findMany({
+      where: { userId },
+      select: { id: true, name: true }
+    });
+    const names = new Set(existing.filter((connection) => connection.id !== connectionId).map((connection) => connection.name));
+    if (!names.has(baseName)) {
+      return baseName;
+    }
+
+    for (let index = 2; index < 1000; index += 1) {
+      const candidate = `${baseName} ${index}`;
+      if (!names.has(candidate)) {
+        return candidate;
+      }
+    }
+
+    throw new Error('Unable to allocate a unique AI provider connection name.');
   }
 
   async listProjects(): Promise<Project[]> {
@@ -536,7 +652,8 @@ export class ForgeMindRepository {
         autoMergePullRequest,
         autoCompleteTask,
         allowSafeOperationsWithoutApproval: input.allowSafeOperationsWithoutApproval,
-        defaultTaskMode: input.defaultTaskMode
+        defaultTaskMode: input.defaultTaskMode,
+        aiProviderConnectionId: input.aiProviderConnectionId
       }
     });
 
@@ -587,6 +704,7 @@ export class ForgeMindRepository {
         autoCompleteTask,
         allowSafeOperationsWithoutApproval,
         defaultTaskMode,
+        aiProviderConnectionId: input.aiProviderConnectionId,
         isActive: input.isActive
       }
     });
@@ -607,6 +725,7 @@ export class ForgeMindRepository {
         autoCompleteTask: updated.autoCompleteTask,
         allowSafeOperationsWithoutApproval: updated.allowSafeOperationsWithoutApproval,
         defaultTaskMode: updated.defaultTaskMode,
+        aiProviderConnectionId: updated.aiProviderConnectionId,
         isActive: updated.isActive,
         hasConfigYaml: Boolean(updated.configYaml),
         hasBrief: Boolean(updated.brief)
@@ -2225,6 +2344,16 @@ export class ForgeMindRepository {
     });
   }
 
+  async updateTaskRunProvider(input: { taskRunId: string; provider: ProviderKind; model: string }): Promise<void> {
+    await this.prisma.taskRun.update({
+      where: { id: input.taskRunId },
+      data: {
+        provider: input.provider,
+        model: input.model
+      }
+    });
+  }
+
   async failTask(taskId: string, errorMessage: string, status: TaskStatus = 'failed'): Promise<void> {
     const task = await this.prisma.task.update({
       where: { id: taskId },
@@ -2577,7 +2706,10 @@ function toGitHubConnectionSnapshot(connection: GitHubConnection): GitHubConnect
 function toAIProviderConnectionSnapshot(connection: AiProviderConnection): AIProviderConnectionSnapshot {
   const authMode = connection.authMode as AIProviderAuthMode;
   return {
+    id: connection.id,
     userId: connection.userId,
+    name: connection.name,
+    isDefault: connection.isDefault,
     credentialSource: authMode === 'codex_oauth' ? 'codex_oauth' : 'api_key',
     provider: connection.provider as AIProviderConnectionKind,
     authMode,
@@ -2589,6 +2721,12 @@ function toAIProviderConnectionSnapshot(connection: AiProviderConnection): AIPro
     lastCheckedAt: connection.lastCheckedAt?.toISOString(),
     updatedAt: connection.updatedAt.toISOString()
   };
+}
+
+function buildAIProviderConnectionName(provider: AIProviderConnectionKind, authMode: AIProviderAuthMode, model: string): string {
+  const providerName = provider === 'codex' ? 'Codex' : 'OpenAI';
+  const authName = authMode === 'codex_oauth' ? 'OAuth' : 'API key';
+  return `${providerName} ${authName} ${model}`.trim();
 }
 
 function parseDiffStat(value: Prisma.JsonValue): { filesChanged: number; insertions: number; deletions: number } {

@@ -27,6 +27,8 @@ Projektova konfigurace se nacita z agent.config.yaml pres packages/config (parse
 
 - primary_provider: codex | github_copilot | openai | local | mock
 - fallback_provider: codex | github_copilot | openai | local | mock (optional)
+- primary_connection_id: string (optional, ID ulozeneho provider connection)
+- fallback_connection_id: string (optional, ID ulozeneho fallback provider connection)
 - reviewer_provider: codex | github_copilot | openai | local | mock
 - model_profile: fast | balanced | deep
 

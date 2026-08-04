@@ -36,6 +36,7 @@ export interface ProjectApi {
   autoCompleteTask: boolean;
   allowSafeOperationsWithoutApproval: boolean;
   defaultTaskMode: 'safe' | 'auto' | 'full_auto';
+  aiProviderConnectionId?: string;
   isActive: boolean;
   createdAt: string;
   updatedAt: string;
@@ -350,6 +351,8 @@ export interface GitHubBranchApi {
 export interface ProviderStatusApi {
   currentProvider: 'openai' | 'codex' | string | null;
   currentModel: string | null;
+  currentConnectionId: string | null;
+  connections: ProviderConnectionApi[];
   fallbackProvider: 'openai' | 'codex' | string | null;
   githubAdapter: string;
   availableProviders: string[];
@@ -375,7 +378,27 @@ export interface ProviderStatusApi {
   };
 }
 
+export interface ProviderConnectionApi {
+  id: string;
+  userId: string;
+  name: string;
+  isDefault: boolean;
+  credentialSource: 'api_key' | 'codex_oauth' | string;
+  provider: 'openai' | 'codex';
+  authMode: 'api_key' | 'codex_oauth';
+  model: string;
+  apiKeyFingerprint?: string;
+  codexHome?: string;
+  accountSummary?: string;
+  connectedAt: string;
+  lastCheckedAt?: string;
+  updatedAt: string;
+}
+
 export interface ProviderConnectRequest {
+  connectionId?: string;
+  name?: string;
+  isDefault?: boolean;
   provider: 'openai' | 'codex';
   authMode?: 'api_key' | 'codex_oauth';
   apiKey?: string;
@@ -384,6 +407,8 @@ export interface ProviderConnectRequest {
 
 export interface ProviderConnectResponse {
   ok: boolean;
+  connectionId: string;
+  name: string;
   provider: string;
   model: string;
   authMode: 'api_key' | 'codex_oauth';
@@ -406,6 +431,8 @@ export interface CodexOAuthStartResponse {
 export interface CodexOAuthCompleteResponse {
   ok: boolean;
   completed: boolean;
+  connectionId?: string;
+  name?: string;
   provider?: string;
   model?: string;
   authMode?: 'codex_oauth';
@@ -443,6 +470,7 @@ export interface CreateProjectRequest {
   autoCompleteTask?: boolean;
   allowSafeOperationsWithoutApproval?: boolean;
   defaultTaskMode?: TaskApi['mode'];
+  aiProviderConnectionId?: string | null;
   repositoryMode?: 'existing' | 'create';
   branchMode?: 'existing' | 'create';
   branchName?: string;
@@ -463,6 +491,7 @@ export interface UpdateProjectRequest {
   autoCompleteTask?: boolean;
   allowSafeOperationsWithoutApproval?: boolean;
   defaultTaskMode?: TaskApi['mode'];
+  aiProviderConnectionId?: string | null;
   isActive?: boolean;
 }
 
