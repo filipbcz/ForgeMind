@@ -134,13 +134,13 @@ const providerConnectSchema = z
     connectionId: z.string().min(1).optional(),
     name: z.string().trim().min(1).max(80).optional(),
     isDefault: z.boolean().optional(),
-    provider: z.enum(['openai', 'codex']),
+    provider: z.enum(['openai', 'codex', 'github_copilot']),
     authMode: z.enum(['api_key', 'codex_oauth']).optional().default('api_key'),
     apiKey: z.string().min(1).optional(),
     model: z.string().min(1)
   })
   .superRefine((input, context) => {
-    if (input.authMode === 'api_key' && !input.apiKey) {
+    if (input.authMode === 'api_key' && input.provider !== 'github_copilot' && !input.apiKey) {
       context.addIssue({
         code: z.ZodIssueCode.custom,
         path: ['apiKey'],
@@ -314,7 +314,9 @@ export function registerRoutes(app: FastifyInstance, repository: ForgeMindReposi
     const githubConnection = await readGitHubConnection(repository);
     const providerConnections = await listAIProviderConnections(repository);
     const providerConnection = await readAIProviderConnection(repository);
-    const envProvider = process.env.FORGEMIND_PROVIDER === 'openai' || process.env.FORGEMIND_PROVIDER === 'codex'
+    const envProvider = process.env.FORGEMIND_PROVIDER === 'openai'
+      || process.env.FORGEMIND_PROVIDER === 'codex'
+      || process.env.FORGEMIND_PROVIDER === 'github_copilot'
       ? process.env.FORGEMIND_PROVIDER
       : null;
     const currentProvider = providerConnection?.provider ?? envProvider;
@@ -326,7 +328,7 @@ export function registerRoutes(app: FastifyInstance, repository: ForgeMindReposi
       connections: providerConnections,
       fallbackProvider: process.env.FORGEMIND_FALLBACK_PROVIDER ?? null,
       githubAdapter: githubConnection ? 'app' : getGitHubAdapterEnvStatus().adapter,
-      availableProviders: ['openai', 'codex'],
+      availableProviders: ['openai', 'codex', 'github_copilot'],
       persistent: Boolean(providerConnection),
       credentialSource: providerConnection?.credentialSource ?? (currentProvider ? 'env' : 'none'),
       authMode: providerConnection?.authMode ?? null,
@@ -337,15 +339,25 @@ export function registerRoutes(app: FastifyInstance, repository: ForgeMindReposi
       lastCheckedAt: providerConnection?.lastCheckedAt ?? null,
       configured: {
         openai: providerConnection?.provider === 'openai' || Boolean(process.env.OPENAI_API_KEY),
-        codex: providerConnection?.provider === 'codex' || Boolean(process.env.CODEX_API_KEY)
+        codex: providerConnection?.provider === 'codex' || Boolean(process.env.CODEX_API_KEY),
+        github_copilot:
+          providerConnection?.provider === 'github_copilot'
+          || Boolean(process.env.COPILOT_GITHUB_TOKEN)
+          || Boolean(process.env.GH_TOKEN)
+          || Boolean(process.env.GITHUB_TOKEN)
       },
       models: {
         openai: providerConnection?.provider === 'openai' ? providerConnection.model : (process.env.OPENAI_MODEL ?? null),
-        codex: providerConnection?.provider === 'codex' ? providerConnection.model : (process.env.CODEX_MODEL ?? null)
+        codex: providerConnection?.provider === 'codex' ? providerConnection.model : (process.env.CODEX_MODEL ?? null),
+        github_copilot:
+          providerConnection?.provider === 'github_copilot'
+            ? providerConnection.model
+            : (process.env.COPILOT_MODEL ?? null)
       },
       apiBaseUrls: {
         openai: process.env.OPENAI_API_BASE_URL ?? null,
-        codex: process.env.CODEX_API_BASE_URL ?? null
+        codex: process.env.CODEX_API_BASE_URL ?? null,
+        github_copilot: null
       }
     };
   });
@@ -1800,6 +1812,13 @@ function applyProviderConnectionEnv(input: {
     delete process.env.CODEX_AUTH_MODE;
     process.env.CODEX_MODEL = input.model;
   }
+
+  if (input.provider === 'github_copilot') {
+    if (input.apiKey) {
+      process.env.COPILOT_GITHUB_TOKEN = input.apiKey;
+    }
+    process.env.COPILOT_MODEL = input.model;
+  }
 }
 
 function resolveProviderEnvModel(provider: string): string | null {
@@ -1809,6 +1828,10 @@ function resolveProviderEnvModel(provider: string): string | null {
 
   if (provider === 'codex') {
     return process.env.CODEX_MODEL ?? null;
+  }
+
+  if (provider === 'github_copilot') {
+    return process.env.COPILOT_MODEL ?? 'gpt-5.4';
   }
 
   return null;

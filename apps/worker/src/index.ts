@@ -4,6 +4,7 @@ import { disconnectPrisma } from '@forgemind/db';
 import { runWorkerDaemon } from './daemon.js';
 import { runDatabaseWorkerOnce } from './db-worker.js';
 
+await loadLocalEnvironmentDefaults();
 await loadLocalDatabaseUrl();
 
 if (!process.env.DATABASE_URL) {
@@ -28,12 +29,45 @@ async function loadLocalDatabaseUrl() {
   }
 
   const root = await resolveWorkspaceRoot();
-  for (const fileName of ['.env', '.env.example']) {
+  for (const fileName of ['.env', 'infra/deploy/server.env', '.env.example', 'infra/deploy/server.env.example']) {
     const value = await readEnvValue(join(root, fileName), 'DATABASE_URL');
     if (value) {
       process.env.DATABASE_URL = value;
       return;
     }
+  }
+}
+
+async function loadLocalEnvironmentDefaults() {
+  const root = await resolveWorkspaceRoot();
+  for (const fileName of ['.env', 'infra/deploy/server.env']) {
+    await loadEnvFile(join(root, fileName));
+  }
+}
+
+async function loadEnvFile(path: string) {
+  try {
+    const content = await readFile(path, 'utf8');
+    for (const rawLine of content.split(/\r?\n/)) {
+      const line = rawLine.trim();
+      if (!line || line.startsWith('#')) {
+        continue;
+      }
+
+      const separator = line.indexOf('=');
+      if (separator <= 0) {
+        continue;
+      }
+
+      const key = line.slice(0, separator).trim();
+      if (!key || process.env[key] !== undefined) {
+        continue;
+      }
+
+      process.env[key] = stripEnvQuotes(line.slice(separator + 1).trim());
+    }
+  } catch {
+    // Ignore missing local env files.
   }
 }
 

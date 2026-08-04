@@ -349,11 +349,11 @@ export interface GitHubBranchApi {
 }
 
 export interface ProviderStatusApi {
-  currentProvider: 'openai' | 'codex' | string | null;
+  currentProvider: 'openai' | 'codex' | 'github_copilot' | string | null;
   currentModel: string | null;
   currentConnectionId: string | null;
   connections: ProviderConnectionApi[];
-  fallbackProvider: 'openai' | 'codex' | string | null;
+  fallbackProvider: 'openai' | 'codex' | 'github_copilot' | string | null;
   githubAdapter: string;
   availableProviders: string[];
   persistent: boolean;
@@ -367,14 +367,17 @@ export interface ProviderStatusApi {
   configured: {
     openai: boolean;
     codex: boolean;
+    github_copilot?: boolean;
   };
   models: {
     openai: string | null;
     codex: string | null;
+    github_copilot?: string | null;
   };
   apiBaseUrls: {
     openai: string | null;
     codex: string | null;
+    github_copilot?: string | null;
   };
 }
 
@@ -384,7 +387,7 @@ export interface ProviderConnectionApi {
   name: string;
   isDefault: boolean;
   credentialSource: 'api_key' | 'codex_oauth' | string;
-  provider: 'openai' | 'codex';
+  provider: 'openai' | 'codex' | 'github_copilot';
   authMode: 'api_key' | 'codex_oauth';
   model: string;
   apiKeyFingerprint?: string;
@@ -399,7 +402,7 @@ export interface ProviderConnectRequest {
   connectionId?: string;
   name?: string;
   isDefault?: boolean;
-  provider: 'openai' | 'codex';
+  provider: 'openai' | 'codex' | 'github_copilot';
   authMode?: 'api_key' | 'codex_oauth';
   apiKey?: string;
   model: string;

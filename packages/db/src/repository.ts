@@ -111,7 +111,7 @@ export interface GitHubConnectionSecret extends GitHubConnectionSnapshot {
   token: string;
 }
 
-export type AIProviderConnectionKind = Extract<ProviderKind, 'openai' | 'codex'>;
+export type AIProviderConnectionKind = Extract<ProviderKind, 'openai' | 'codex' | 'github_copilot'>;
 export type AIProviderAuthMode = 'api_key' | 'codex_oauth';
 
 export interface AIProviderConnectionSnapshot {

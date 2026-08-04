@@ -687,6 +687,13 @@ function applyAIProviderConnectionEnv(connection: AIProviderConnectionSecret | u
     }
     process.env.CODEX_MODEL = connection.model;
   }
+
+  if (connection.provider === 'github_copilot') {
+    if (connection.apiKey) {
+      process.env.COPILOT_GITHUB_TOKEN = connection.apiKey;
+    }
+    process.env.COPILOT_MODEL = connection.model;
+  }
 }
 
 function resolveProviderModel(provider: ProviderKind, connection: AIProviderConnectionSecret | undefined): string {

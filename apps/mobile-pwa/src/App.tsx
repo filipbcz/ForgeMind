@@ -2858,7 +2858,12 @@ function SettingsPanel({
                 ...previous,
                 provider,
                 authMode: provider === 'codex' ? previous.authMode ?? 'api_key' : 'api_key',
-                model: provider === 'codex' && previous.model === 'gpt-4o-mini' ? 'gpt-5.5' : previous.model
+                model:
+                  provider === 'codex' && previous.model === 'gpt-4o-mini'
+                    ? 'gpt-5.5'
+                    : provider === 'github_copilot' && previous.model === 'gpt-4o-mini'
+                      ? 'gpt-5.4'
+                      : previous.model
               }));
               if (provider !== 'codex') {
                 setCodexOAuthLogin(undefined);
@@ -2867,6 +2872,7 @@ function SettingsPanel({
           >
             <option value="openai">openai</option>
             <option value="codex">codex</option>
+            <option value="github_copilot">github_copilot</option>
           </select>
         </label>
         {providerForm.provider === 'codex' ? (
@@ -2889,10 +2895,10 @@ function SettingsPanel({
         ) : null}
         {providerForm.authMode !== 'codex_oauth' ? (
           <label>
-            API key
+            {providerForm.provider === 'github_copilot' ? 'GitHub token (optional)' : 'API key'}
             <input
               type="password"
-              placeholder="paste provider api key"
+              placeholder={providerForm.provider === 'github_copilot' ? 'gho_... nebo github_pat_...' : 'paste provider api key'}
               value={providerForm.apiKey ?? ''}
               onChange={(event) => setProviderForm((previous) => ({ ...previous, apiKey: event.target.value }))}
             />
@@ -2901,7 +2907,13 @@ function SettingsPanel({
         <label>
           Model
           <input
-            placeholder={providerForm.provider === 'codex' ? 'gpt-5.5' : 'gpt-4o-mini'}
+            placeholder={
+              providerForm.provider === 'codex'
+                ? 'gpt-5.5'
+                : providerForm.provider === 'github_copilot'
+                  ? 'gpt-5.4'
+                  : 'gpt-4o-mini'
+            }
             value={providerForm.model}
             onChange={(event) => setProviderForm((previous) => ({ ...previous, model: event.target.value }))}
           />
@@ -2960,12 +2972,12 @@ function SettingsPanel({
             className="primary-action"
             type="button"
             hidden={providerForm.authMode === 'codex_oauth'}
-            disabled={providerBusy || !(providerForm.apiKey ?? '').trim() || !providerForm.model.trim()}
+            disabled={providerBusy || !providerForm.model.trim()}
             onClick={() =>
               onProviderConnect({
                 provider: providerForm.provider,
                 authMode: 'api_key',
-                apiKey: providerForm.apiKey?.trim(),
+                apiKey: providerForm.apiKey?.trim() || undefined,
                 model: providerForm.model.trim()
               })
             }
