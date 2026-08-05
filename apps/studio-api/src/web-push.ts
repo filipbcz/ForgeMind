@@ -1,17 +1,18 @@
 import webpush from 'web-push';
 import type { NotificationDispatcher, NotificationSubscription, PushNotificationPayload } from './notifications.js';
+import { resolveRuntimeEnvVar } from './runtime-env.js';
 
 const DEFAULT_SUBJECT = 'mailto:ops@forgemind.local';
 
 export function createWebPushDispatcher(): NotificationDispatcher | undefined {
-  const publicKey = process.env.VAPID_PUBLIC_KEY;
-  const privateKey = process.env.VAPID_PRIVATE_KEY;
+  const publicKey = resolveRuntimeEnvVar('VAPID_PUBLIC_KEY');
+  const privateKey = resolveRuntimeEnvVar('VAPID_PRIVATE_KEY');
 
   if (!publicKey || !privateKey) {
     return undefined;
   }
 
-  webpush.setVapidDetails(process.env.VAPID_SUBJECT ?? DEFAULT_SUBJECT, publicKey, privateKey);
+  webpush.setVapidDetails(resolveRuntimeEnvVar('VAPID_SUBJECT') ?? DEFAULT_SUBJECT, publicKey, privateKey);
 
   return {
     async send(subscription: NotificationSubscription, payload: PushNotificationPayload) {

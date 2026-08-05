@@ -23,6 +23,7 @@ import type { AIProviderConnectionKind, ForgeMindRepository } from '@forgemind/d
 import { parseGitHubWebhookPayload, projectGitHubWebhookEvent, verifyGitHubWebhookSignature } from './webhook.js';
 import type { NotificationService } from './notifications.js';
 import type { TaskMode } from '@forgemind/core';
+import { resolveRuntimeEnvVar } from './runtime-env.js';
 
 const projectSchema = z.object({
   name: z.string().min(2),
@@ -693,6 +694,9 @@ export function registerRoutes(app: FastifyInstance, repository: ForgeMindReposi
 
       return reply.send({ ok: true, connectionId: id });
     } catch (error) {
+      if (error instanceof Error && /foreign key|constraint/i.test(error.message)) {
+        return reply.code(409).send({ error: 'Provider connection is still referenced. Unassign it from projects and try again.' });
+      }
       return sendBadRequest(reply, error);
     }
   });
@@ -1268,7 +1272,7 @@ export function registerRoutes(app: FastifyInstance, repository: ForgeMindReposi
   });
 
   app.get('/api/notifications/vapid-public-key', async (_request, reply) => {
-    const publicKey = process.env.VAPID_PUBLIC_KEY;
+    const publicKey = resolveRuntimeEnvVar('VAPID_PUBLIC_KEY');
     if (!publicKey) {
       return reply.code(503).send({ error: 'VAPID_PUBLIC_KEY is not configured.' });
     }

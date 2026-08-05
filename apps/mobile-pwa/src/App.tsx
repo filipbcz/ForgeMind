@@ -2781,6 +2781,14 @@ function SettingsPanel({
     token: '',
     apiBaseUrl: ''
   });
+  const providerModelOptions: Record<ProviderConnectRequest['provider'], string[]> = {
+    openai: ['gpt-5', 'gpt-5-mini', 'gpt-4o', 'gpt-4o-mini'],
+    codex: ['gpt-5.5', 'gpt-5-codex'],
+    github_copilot: ['gpt-5.4', 'gpt-4.1', 'claude-sonnet-4']
+  };
+  const customModelOption = '__custom_model__';
+  const currentProviderModelOptions = providerModelOptions[providerForm.provider];
+  const isKnownModelOption = currentProviderModelOptions.includes(providerForm.model.trim());
   const providerConnections = providerStatus?.connections ?? [];
 
   useEffect(() => {
@@ -3001,19 +3009,35 @@ function SettingsPanel({
           </label>
         ) : null}
         <label>
-          Model
-          <input
-            placeholder={
-              providerForm.provider === 'codex'
-                ? 'gpt-5.5'
-                : providerForm.provider === 'github_copilot'
-                  ? 'gpt-5.4'
-                  : 'gpt-4o-mini'
-            }
-            value={providerForm.model}
-            onChange={(event) => setProviderForm((previous) => ({ ...previous, model: event.target.value }))}
-          />
+          Model (doporučené)
+          <select
+            value={isKnownModelOption ? providerForm.model.trim() : customModelOption}
+            onChange={(event) => {
+              const value = event.target.value;
+              setProviderForm((previous) => ({
+                ...previous,
+                model: value === customModelOption ? '' : value
+              }));
+            }}
+          >
+            {currentProviderModelOptions.map((model) => (
+              <option key={model} value={model}>
+                {model}
+              </option>
+            ))}
+            <option value={customModelOption}>Vlastni model...</option>
+          </select>
         </label>
+        {!isKnownModelOption ? (
+          <label>
+            Vlastni model
+            <input
+              placeholder="Zadej model id"
+              value={providerForm.model}
+              onChange={(event) => setProviderForm((previous) => ({ ...previous, model: event.target.value }))}
+            />
+          </label>
+        ) : null}
         <label className="toggle-row wide">
           <input
             type="checkbox"

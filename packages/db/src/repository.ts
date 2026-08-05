@@ -557,7 +557,15 @@ export class ForgeMindRepository {
     });
     if (!existing) return false;
 
-    await this.prisma.aiProviderConnection.delete({ where: { id: connectionId } });
+    await this.prisma.$transaction(async (tx) => {
+      // Detach projects from this connection first so delete is safe on all DB constraints.
+      await tx.project.updateMany({
+        where: { aiProviderConnectionId: connectionId },
+        data: { aiProviderConnectionId: null }
+      });
+
+      await tx.aiProviderConnection.delete({ where: { id: connectionId } });
+    });
 
     if (existing.isDefault) {
       const next = await this.prisma.aiProviderConnection.findFirst({

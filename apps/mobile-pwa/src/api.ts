@@ -54,11 +54,14 @@ export function buildWebSocketUrl(taskId?: string): string {
 }
 
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
+  const hasBody = init?.body !== undefined && init?.body !== null;
+  const headers: HeadersInit = {
+    ...(hasBody ? { 'Content-Type': 'application/json' } : {}),
+    ...init?.headers
+  };
+
   const response = await fetch(`${API_URL}${path}`, {
-    headers: {
-      'Content-Type': 'application/json',
-      ...init?.headers
-    },
+    headers,
     ...init
   });
 
