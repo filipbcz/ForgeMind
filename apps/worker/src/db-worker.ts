@@ -496,23 +496,20 @@ interface RuntimeProvider {
   kind: ProviderKind;
   contextId: string;
   provider: AIProvider;
-  activate: () => void;
 }
 
 function buildRuntimeProvider(kind: ProviderKind, connection?: AIProviderConnectionSecret): RuntimeProvider {
   const contextId = connection?.id ?? `${kind}:env`;
-  const activate = () => {
-    if (connection) {
-      applyAIProviderConnectionEnv(connection);
-    }
-  };
-  activate();
 
   return {
     kind,
     contextId,
-    provider: createProvider(kind),
-    activate
+    provider: createProvider(kind, connection?.provider === kind ? {
+      apiKey: connection.apiKey,
+      authMode: connection.authMode,
+      codexHome: connection.codexHome,
+      model: connection.model
+    } : undefined)
   };
 }
 
@@ -524,7 +521,6 @@ function createPolicyAwareProvider(input: {
 
   const callWithFallback = async <T>(operation: string, action: (provider: AIProvider) => Promise<T>): Promise<T> => {
     try {
-      input.primary.activate();
       const result = await action(input.primary.provider);
       lastProviderKind = input.primary.kind;
       return result;
@@ -536,7 +532,6 @@ function createPolicyAwareProvider(input: {
       );
       if (fallback && shouldUseFallback) {
         try {
-          fallback.activate();
           const result = await action(fallback.provider);
           lastProviderKind = fallback.kind;
           return result;
@@ -661,39 +656,6 @@ async function resolveProviderSelection(input: {
     primary: { kind: primaryKind, connection: normalizedPrimaryConnection },
     fallback: { kind: fallbackKind, connection: normalizedFallbackConnection }
   };
-}
-
-function applyAIProviderConnectionEnv(connection: AIProviderConnectionSecret | undefined) {
-  if (!connection) {
-    return;
-  }
-
-  if (connection.provider === 'openai') {
-    if (connection.apiKey) {
-      process.env.OPENAI_API_KEY = connection.apiKey;
-    }
-    process.env.OPENAI_MODEL = connection.model;
-  }
-
-  if (connection.provider === 'codex') {
-    if (connection.authMode === 'codex_oauth') {
-      process.env.CODEX_AUTH_MODE = 'oauth';
-      if (connection.codexHome) {
-        process.env.CODEX_HOME = connection.codexHome;
-      }
-    } else if (connection.apiKey) {
-      process.env.CODEX_API_KEY = connection.apiKey;
-      delete process.env.CODEX_AUTH_MODE;
-    }
-    process.env.CODEX_MODEL = connection.model;
-  }
-
-  if (connection.provider === 'github_copilot') {
-    if (connection.apiKey) {
-      process.env.COPILOT_GITHUB_TOKEN = connection.apiKey;
-    }
-    process.env.COPILOT_MODEL = connection.model;
-  }
 }
 
 function resolveProviderModel(provider: ProviderKind, connection: AIProviderConnectionSecret | undefined): string {

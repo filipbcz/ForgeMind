@@ -10,17 +10,24 @@ import { OpenAIProvider } from './openai-provider.js';
 import { CodexProvider } from './codex-provider.js';
 import { GitHubCopilotProvider } from './github-copilot-provider.js';
 
-export function createProvider(kind: ProviderKind): AIProvider {
+export interface ProviderRuntimeConfig {
+  apiKey?: string;
+  authMode?: 'api_key' | 'codex_oauth';
+  codexHome?: string;
+  model?: string;
+}
+
+export function createProvider(kind: ProviderKind, config?: ProviderRuntimeConfig): AIProvider {
   if (kind === 'openai') {
-    return new OpenAIProvider();
+    return new OpenAIProvider(config);
   }
 
   if (kind === 'codex') {
-    return new CodexProvider();
+    return new CodexProvider(config);
   }
 
   if (kind === 'github_copilot') {
-    return new GitHubCopilotProvider();
+    return new GitHubCopilotProvider(config);
   }
 
   throw new Error(`Provider "${kind}" is not implemented.`);

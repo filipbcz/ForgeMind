@@ -501,8 +501,8 @@ describe('db-worker policy enforcement', () => {
     const result = await runDatabaseWorkerOnce();
 
     expect(result).toEqual(expect.objectContaining({ claimed: true, taskId: 'task_1' }));
-    expect(createProviderMock).toHaveBeenCalledWith('openai');
-    expect(createProviderMock).toHaveBeenCalledWith('codex');
+    expect(createProviderMock).toHaveBeenCalledWith('openai', undefined);
+    expect(createProviderMock).toHaveBeenCalledWith('codex', undefined);
     expect(repositoryMock.recordProviderUsage).not.toHaveBeenCalled();
 
     if (previousProvider === undefined) {
@@ -561,9 +561,9 @@ describe('db-worker policy enforcement', () => {
       return undefined;
     });
 
-    createProviderMock.mockImplementation(() => ({
+    createProviderMock.mockImplementation((_kind: string, config?: { apiKey?: string }) => ({
       estimateCost: vi.fn(async () => {
-        if (process.env.CODEX_API_KEY === 'key_fallback') {
+        if (config?.apiKey === 'key_fallback') {
           return {
             inputTokens: 40,
             outputTokens: 25,
@@ -603,8 +603,8 @@ describe('db-worker policy enforcement', () => {
 
     expect(result).toEqual(expect.objectContaining({ claimed: true, taskId: 'task_1' }));
     expect(createProviderMock).toHaveBeenCalledTimes(2);
-    expect(createProviderMock).toHaveBeenNthCalledWith(1, 'codex');
-    expect(createProviderMock).toHaveBeenNthCalledWith(2, 'codex');
+    expect(createProviderMock).toHaveBeenNthCalledWith(1, 'codex', expect.objectContaining({ apiKey: 'key_primary', model: 'gpt-5.5' }));
+    expect(createProviderMock).toHaveBeenNthCalledWith(2, 'codex', expect.objectContaining({ apiKey: 'key_fallback', model: 'gpt-5.5-mini' }));
 
     if (previousPrimaryConnection === undefined) {
       delete process.env.FORGEMIND_PROVIDER_CONNECTION_ID;

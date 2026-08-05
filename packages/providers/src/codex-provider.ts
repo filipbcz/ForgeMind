@@ -21,6 +21,7 @@ import type {
 import { normalizeValidationChecks } from './provider.js';
 import { emitCapturedUsage, normalizeTokenBreakdown } from './provider-usage.js';
 import { buildReviewPrompt } from './review-prompt.js';
+import type { ProviderRuntimeConfig } from './index.js';
 
 const DEFAULT_CODEX_API_URL = 'https://api.openai.com/v1/responses';
 const DEFAULT_CODEX_MODEL = 'gpt-5.5';
@@ -123,15 +124,24 @@ export class CodexProvider implements AIProvider {
   readonly kind: ProviderKind = 'codex';
 
   private readonly apiKey?: string;
+  private readonly apiBaseUrl: string;
   private readonly authMode: 'api_key' | 'oauth';
+  private readonly commandEnv: NodeJS.ProcessEnv;
+  private readonly model: string;
+  private oauthSessionVerified = false;
 
-  constructor() {
-    this.authMode = process.env.CODEX_AUTH_MODE === 'oauth' ? 'oauth' : 'api_key';
-    const key = process.env.CODEX_API_KEY;
+  constructor(config?: ProviderRuntimeConfig) {
+    this.authMode = config?.authMode === 'codex_oauth' || (!config?.authMode && process.env.CODEX_AUTH_MODE === 'oauth')
+      ? 'oauth'
+      : 'api_key';
+    const key = config?.apiKey ?? process.env.CODEX_API_KEY;
     if (this.authMode === 'api_key' && !key) {
       throw new Error('CODEX_API_KEY is required for Codex provider.');
     }
     this.apiKey = key;
+    this.apiBaseUrl = process.env.CODEX_API_BASE_URL ?? DEFAULT_CODEX_API_URL;
+    this.commandEnv = config?.codexHome ? { ...process.env, CODEX_HOME: config.codexHome } : process.env;
+    this.model = config?.model?.trim() || (process.env.CODEX_MODEL ?? DEFAULT_CODEX_MODEL);
   }
 
   async plan(input: PlanInput): Promise<PlanResult> {
@@ -493,6 +503,8 @@ export class CodexProvider implements AIProvider {
     sandbox: 'read-only' | 'workspace-write';
     onActivity?: ProviderActivityHandler;
   }): Promise<string> {
+    await this.verifyOAuthSession();
+
     const tempDir = await mkdtemp(join(tmpdir(), 'forgemind-codex-'));
     const schemaPath = join(tempDir, 'schema.json');
     const outputPath = join(tempDir, 'last-message.json');
@@ -501,7 +513,7 @@ export class CodexProvider implements AIProvider {
     const args = buildCodexExecArgs({
       sandbox: input.sandbox,
       bypassSandbox: input.sandbox === 'read-only' && process.env.FORGEMIND_CODEX_BYPASS_READ_ONLY_SANDBOX === 'true',
-      model: process.env.CODEX_MODEL ?? DEFAULT_CODEX_MODEL,
+      model: this.model,
       schemaPath,
       outputPath,
       repositoryPath: input.repositoryPath
@@ -515,12 +527,13 @@ export class CodexProvider implements AIProvider {
       });
       const execution = await runCodexProcess(args, input.prompt, {
         cwd: input.repositoryPath,
+        env: this.commandEnv,
         onActivity: input.onActivity
       });
       if (execution.totalTokens !== undefined) {
         await emitCapturedUsage(input.onActivity, {
           provider: 'codex',
-          model: process.env.CODEX_MODEL ?? DEFAULT_CODEX_MODEL,
+          model: this.model,
           totalTokens: execution.totalTokens,
           source: 'actual_total'
         });
@@ -536,6 +549,26 @@ export class CodexProvider implements AIProvider {
     }
   }
 
+  private async verifyOAuthSession(): Promise<void> {
+    if (this.authMode !== 'oauth' || this.oauthSessionVerified) {
+      return;
+    }
+
+    try {
+      const { stdout, stderr } = await execFileAsync(resolveCodexBinary(), ['login', 'status'], {
+        env: this.commandEnv,
+        timeout: 15_000,
+        windowsHide: true
+      });
+      if (!/Logged in using ChatGPT/i.test(`${stdout}\n${stderr}`)) {
+        throw new Error('Codex CLI reported no active ChatGPT login.');
+      }
+      this.oauthSessionVerified = true;
+    } catch {
+      throw new Error('Codex OAuth session is not active. Reconnect Codex in Settings before retrying this task.');
+    }
+  }
+
   private async requestResponses(
     messages: Array<{ role: 'system' | 'user' | 'assistant'; content: string }>
   ): Promise<{ content: string; usage?: ProviderUsageMeasurement }> {
@@ -543,14 +576,14 @@ export class CodexProvider implements AIProvider {
       throw new Error('CODEX_API_KEY is required for Codex API key provider mode.');
     }
 
-    const response = await fetch(process.env.CODEX_API_BASE_URL ?? DEFAULT_CODEX_API_URL, {
+    const response = await fetch(this.apiBaseUrl, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
         Authorization: `Bearer ${this.apiKey}`
       },
       body: JSON.stringify({
-        model: process.env.CODEX_MODEL ?? DEFAULT_CODEX_MODEL,
+        model: this.model,
         input: messages.map((message) => ({
           role: message.role,
           content: [{ type: 'input_text', text: message.content }]
@@ -591,7 +624,7 @@ export class CodexProvider implements AIProvider {
       content,
       usage: normalizeTokenBreakdown({
         provider: 'codex',
-        model: process.env.CODEX_MODEL ?? DEFAULT_CODEX_MODEL,
+        model: this.model,
         inputTokens: data.usage?.input_tokens,
         outputTokens: data.usage?.output_tokens,
         cachedTokens: data.usage?.input_tokens_details?.cached_tokens,
@@ -634,6 +667,7 @@ export function buildCodexExecArgs(input: {
 export interface CodexProcessOptions {
   cwd?: string;
   binary?: string;
+  env?: NodeJS.ProcessEnv;
   inactivityTimeoutMs?: number;
   maxRuntimeMs?: number;
   onActivity?: ProviderActivityHandler;
@@ -677,7 +711,7 @@ export async function runCodexProcess(
   return await new Promise<CodexProcessResult>((resolve, reject) => {
     const child = spawn(options.binary ?? resolveCodexBinary(), args, {
       cwd: options.cwd ?? process.cwd(),
-      env: process.env,
+      env: options.env ?? process.env,
       stdio: ['pipe', 'pipe', 'pipe'],
       windowsHide: true
     });

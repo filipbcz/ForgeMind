@@ -2924,6 +2924,7 @@ function SettingsPanel({
                     {connection.isDefault ? ' · default' : ''}
                     {connection.credentialSource ? ` · ${connection.credentialSource}` : ''}
                   </small>
+                  {connection.available === false ? <small>OAuth session vyzaduje znovu prihlasit.</small> : null}
                 </div>
                 <div className="actions">
                   <button className="secondary-action" type="button" onClick={() => editProviderConnection(connection)}>

@@ -18,6 +18,7 @@ import type {
 } from './provider.js';
 import { normalizeValidationChecks } from './provider.js';
 import { emitCapturedUsage } from './provider-usage.js';
+import type { ProviderRuntimeConfig } from './index.js';
 
 type CopilotClientLike = {
   createSession(options: Record<string, unknown>): Promise<{
@@ -42,9 +43,11 @@ export class GitHubCopilotProvider implements AIProvider {
 
   private readonly model: string;
   private readonly baseDirectory: string;
+  private readonly token?: string;
 
-  constructor() {
-    this.model = process.env.COPILOT_MODEL?.trim() || 'gpt-5.4';
+  constructor(config?: ProviderRuntimeConfig) {
+    this.model = config?.model?.trim() || process.env.COPILOT_MODEL?.trim() || 'gpt-5.4';
+    this.token = config?.apiKey;
     this.baseDirectory = join(tmpdir(), 'forgemind', 'copilot', randomUUID());
   }
 
@@ -215,6 +218,8 @@ export class GitHubCopilotProvider implements AIProvider {
     const client = new CopilotClient({
       mode: 'empty',
       baseDirectory: this.baseDirectory,
+      gitHubToken: this.token,
+      useLoggedInUser: !this.token,
       sessionIdleTimeoutSeconds: 900
     });
     const session = await client.createSession({

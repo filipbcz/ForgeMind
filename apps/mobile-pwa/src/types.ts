@@ -393,6 +393,7 @@ export interface ProviderConnectionApi {
   apiKeyFingerprint?: string;
   codexHome?: string;
   accountSummary?: string;
+  available?: boolean;
   connectedAt: string;
   lastCheckedAt?: string;
   updatedAt: string;

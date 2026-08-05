@@ -315,6 +315,18 @@ export function registerRoutes(app: FastifyInstance, repository: ForgeMindReposi
     const githubConnection = await readGitHubConnection(repository);
     const providerConnections = await listAIProviderConnections(repository);
     const providerConnection = await readAIProviderConnection(repository);
+    const connections = await Promise.all(providerConnections.map(async (connection) => {
+      if (connection.provider !== 'codex' || connection.authMode !== 'codex_oauth') {
+        return { ...connection, available: true };
+      }
+
+      const status = await readCodexOAuthStatus(connection.codexHome);
+      return {
+        ...connection,
+        available: status.loggedIn,
+        accountSummary: status.accountSummary ?? connection.accountSummary
+      };
+    }));
     const envProvider = process.env.FORGEMIND_PROVIDER === 'openai'
       || process.env.FORGEMIND_PROVIDER === 'codex'
       || process.env.FORGEMIND_PROVIDER === 'github_copilot'
@@ -326,7 +338,7 @@ export function registerRoutes(app: FastifyInstance, repository: ForgeMindReposi
       currentProvider,
       currentModel,
       currentConnectionId: providerConnection?.id ?? null,
-      connections: providerConnections,
+      connections,
       fallbackProvider: process.env.FORGEMIND_FALLBACK_PROVIDER ?? null,
       githubAdapter: githubConnection ? 'app' : getGitHubAdapterEnvStatus().adapter,
       availableProviders: ['openai', 'codex', 'github_copilot'],
@@ -340,7 +352,10 @@ export function registerRoutes(app: FastifyInstance, repository: ForgeMindReposi
       lastCheckedAt: providerConnection?.lastCheckedAt ?? null,
       configured: {
         openai: providerConnection?.provider === 'openai' || Boolean(process.env.OPENAI_API_KEY),
-        codex: providerConnection?.provider === 'codex' || Boolean(process.env.CODEX_API_KEY),
+        codex:
+          providerConnection?.provider === 'codex'
+            ? providerConnection.authMode !== 'codex_oauth' || connections.some((connection) => connection.id === providerConnection.id && connection.available)
+            : Boolean(process.env.CODEX_API_KEY),
         github_copilot:
           providerConnection?.provider === 'github_copilot'
           || Boolean(process.env.COPILOT_GITHUB_TOKEN)
@@ -561,15 +576,11 @@ export function registerRoutes(app: FastifyInstance, repository: ForgeMindReposi
         throw new Error(completed.errorOutput || completed.status.rawOutput || 'Codex OAuth login did not complete successfully.');
       }
 
-      process.env.FORGEMIND_PROVIDER = 'codex';
-      applyProviderConnectionEnv({
-        provider: 'codex',
+      const provider = createProvider('codex', {
         authMode: 'codex_oauth',
         model: input.model,
         codexHome: completed.status.codexHome
       });
-
-      const provider = createProvider('codex');
       const estimate = await provider.estimateCost({
         prompt: 'Provider connection check prompt.',
         repositorySizeHint: 'small'
@@ -629,10 +640,12 @@ export function registerRoutes(app: FastifyInstance, repository: ForgeMindReposi
         }
       }
 
-      process.env.FORGEMIND_PROVIDER = input.provider;
-      applyProviderConnectionEnv(input);
-
-      const provider = createProvider(input.provider);
+      const provider = createProvider(input.provider, {
+        apiKey: input.apiKey,
+        authMode: input.authMode,
+        model: input.model,
+        codexHome: input.authMode === 'codex_oauth' ? resolveCodexHome() : undefined
+      });
       const estimate = await provider.estimateCost({
         prompt: 'Provider connection check prompt.',
         repositorySizeHint: 'small'
@@ -1398,15 +1411,12 @@ async function generateRoadmapPlan(
     throw new Error('Connect an AI provider before generating implementation steps.');
   }
 
-  applyProviderConnectionEnv({
-    provider: connection.provider,
-    authMode: connection.authMode,
+  const provider = createProvider(connection.provider, {
     apiKey: connection.apiKey,
+    authMode: connection.authMode,
     model: connection.model,
     codexHome: connection.codexHome
   });
-
-  const provider = createProvider(connection.provider);
   const existingRoadmap = await repository.getProjectRoadmap(project.id);
   const completedSteps = existingRoadmap?.steps.filter((step) => step.status === 'completed').map((step) => step.title) ?? [];
   return provider.plan({
@@ -1786,43 +1796,6 @@ async function removeGitHubConnection(repository: ForgeMindRepository) {
   }
 
   return maybeRepository.deleteGitHubConnection();
-}
-
-function applyProviderConnectionEnv(input: {
-  provider: AIProviderConnectionKind;
-  authMode?: 'api_key' | 'codex_oauth';
-  apiKey?: string;
-  model: string;
-  codexHome?: string;
-}) {
-  if (input.authMode === 'codex_oauth') {
-    process.env.CODEX_AUTH_MODE = 'oauth';
-    process.env.CODEX_HOME = input.codexHome ?? resolveCodexHome();
-    process.env.CODEX_MODEL = input.model;
-    return;
-  }
-
-  if (input.provider === 'openai') {
-    if (input.apiKey) {
-      process.env.OPENAI_API_KEY = input.apiKey;
-    }
-    process.env.OPENAI_MODEL = input.model;
-  }
-
-  if (input.provider === 'codex') {
-    if (input.apiKey) {
-      process.env.CODEX_API_KEY = input.apiKey;
-    }
-    delete process.env.CODEX_AUTH_MODE;
-    process.env.CODEX_MODEL = input.model;
-  }
-
-  if (input.provider === 'github_copilot') {
-    if (input.apiKey) {
-      process.env.COPILOT_GITHUB_TOKEN = input.apiKey;
-    }
-    process.env.COPILOT_MODEL = input.model;
-  }
 }
 
 function resolveProviderEnvModel(provider: string): string | null {

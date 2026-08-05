@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from 'vitest';
-import { buildCodexImplementationPrompt, isNoisyWorkspaceActivityPath, parseCodexCliTotalTokens, runCodexProcess } from './codex-provider.js';
+import { buildCodexImplementationPrompt, CodexProvider, isNoisyWorkspaceActivityPath, parseCodexCliTotalTokens, runCodexProcess } from './codex-provider.js';
 
 describe('Codex process activity timeouts', () => {
   it('parses the actual total token count emitted by Codex CLI', () => {
@@ -36,6 +36,32 @@ describe('Codex process activity timeouts', () => {
     expect(prompt).toContain('Omit criteria that cannot be verified automatically');
     expect(prompt).not.toContain('manual checks');
     expect(prompt).not.toContain('Parent objective');
+  });
+
+  it('fails before execution when the configured OAuth session is not active', async () => {
+    const previousAuthMode = process.env.CODEX_AUTH_MODE;
+    const previousBinary = process.env.FORGEMIND_CODEX_CLI_PATH;
+    process.env.CODEX_AUTH_MODE = 'oauth';
+    process.env.FORGEMIND_CODEX_CLI_PATH = process.execPath;
+
+    const provider = new CodexProvider();
+    await expect(provider.plan({
+      taskId: 'task_1',
+      title: 'Task',
+      prompt: 'Prompt',
+      repositoryPath: process.cwd()
+    })).rejects.toThrow('Codex OAuth session is not active. Reconnect Codex in Settings before retrying this task.');
+
+    if (previousAuthMode === undefined) {
+      delete process.env.CODEX_AUTH_MODE;
+    } else {
+      process.env.CODEX_AUTH_MODE = previousAuthMode;
+    }
+    if (previousBinary === undefined) {
+      delete process.env.FORGEMIND_CODEX_CLI_PATH;
+    } else {
+      process.env.FORGEMIND_CODEX_CLI_PATH = previousBinary;
+    }
   });
 
   it('keeps an active process alive past the inactivity timeout', async () => {

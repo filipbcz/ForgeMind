@@ -13,6 +13,7 @@ import type {
 import { normalizeValidationChecks } from './provider.js';
 import { emitCapturedUsage, normalizeTokenBreakdown } from './provider-usage.js';
 import { buildReviewPrompt } from './review-prompt.js';
+import type { ProviderRuntimeConfig } from './index.js';
 
 const DEFAULT_OPENAI_API_URL = 'https://api.openai.com/v1/chat/completions';
 const DEFAULT_OPENAI_MODEL = 'gpt-4o-mini';
@@ -85,13 +86,17 @@ export class OpenAIProvider implements AIProvider {
   readonly kind: ProviderKind = 'openai';
 
   protected readonly apiKey: string;
+  private readonly apiBaseUrl: string;
+  private readonly model: string;
 
-  constructor() {
-    const key = process.env.OPENAI_API_KEY;
+  constructor(config?: ProviderRuntimeConfig) {
+    const key = config?.apiKey ?? process.env.OPENAI_API_KEY;
     if (!key) {
       throw new Error('OPENAI_API_KEY is required for OpenAI provider.');
     }
     this.apiKey = key;
+    this.apiBaseUrl = process.env.OPENAI_API_BASE_URL ?? DEFAULT_OPENAI_API_URL;
+    this.model = config?.model?.trim() || (process.env.OPENAI_MODEL ?? DEFAULT_OPENAI_MODEL);
   }
 
   async plan(input: PlanInput): Promise<PlanResult> {
@@ -255,14 +260,14 @@ export class OpenAIProvider implements AIProvider {
   protected async requestChat(
     messages: Array<{ role: 'system' | 'user' | 'assistant'; content: string }>
   ): Promise<{ content: string; usage?: import('./provider.js').ProviderUsageMeasurement }> {
-    const response = await fetch(process.env.OPENAI_API_BASE_URL ?? DEFAULT_OPENAI_API_URL, {
+    const response = await fetch(this.apiBaseUrl, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
         Authorization: `Bearer ${this.apiKey}`
       },
       body: JSON.stringify({
-        model: process.env.OPENAI_MODEL ?? DEFAULT_OPENAI_MODEL,
+        model: this.model,
         messages,
         temperature: 0.2,
         max_tokens: 800
@@ -287,7 +292,7 @@ export class OpenAIProvider implements AIProvider {
       content: data.choices?.[0]?.message?.content?.trim() ?? '',
       usage: normalizeTokenBreakdown({
         provider: 'openai',
-        model: process.env.OPENAI_MODEL ?? DEFAULT_OPENAI_MODEL,
+        model: this.model,
         inputTokens: data.usage?.prompt_tokens,
         outputTokens: data.usage?.completion_tokens,
         cachedTokens: data.usage?.prompt_tokens_details?.cached_tokens,
