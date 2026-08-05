@@ -84,6 +84,7 @@ import type {
   GitHubRepositoryOwnerApi,
   NotificationSettingsApi,
   ProviderConnectRequest,
+  ProviderConnectionApi,
   ProviderStatusApi,
   ProjectSummary,
   RealtimeMessage,
@@ -2732,6 +2733,7 @@ function SettingsPanel({
   providerBusy,
   providerError,
   onProviderConnect,
+  onProviderDelete,
   onCodexOAuthStart,
   onCodexOAuthComplete,
   notificationSettings,
@@ -2754,6 +2756,7 @@ function SettingsPanel({
   providerBusy: boolean;
   providerError?: string;
   onProviderConnect: (input: ProviderConnectRequest) => void;
+  onProviderDelete: (connectionId: string) => void;
   onCodexOAuthStart: () => Promise<CodexOAuthStartResponse>;
   onCodexOAuthComplete: (loginId: string, model: string) => Promise<unknown>;
   notificationSettings?: NotificationSettingsApi;
@@ -2765,16 +2768,64 @@ function SettingsPanel({
   onUpdateNotificationSettings: (input: Partial<NotificationSettingsApi['settings']>) => void;
 }) {
   const [providerForm, setProviderForm] = useState<ProviderConnectRequest>({
+    connectionId: undefined,
+    name: '',
     provider: 'openai',
     authMode: 'api_key',
     apiKey: '',
-    model: 'gpt-4o-mini'
+    model: 'gpt-4o-mini',
+    isDefault: false
   });
   const [codexOAuthLogin, setCodexOAuthLogin] = useState<CodexOAuthStartResponse | undefined>();
   const [githubAdapterForm, setGitHubAdapterForm] = useState<GitHubAdapterConnectRequest>({
     token: '',
     apiBaseUrl: ''
   });
+  const providerConnections = providerStatus?.connections ?? [];
+
+  useEffect(() => {
+    if (!providerForm.connectionId) {
+      return;
+    }
+
+    if (!providerConnections.some((connection) => connection.id === providerForm.connectionId)) {
+      setProviderForm({
+        connectionId: undefined,
+        name: '',
+        provider: 'openai',
+        authMode: 'api_key',
+        apiKey: '',
+        model: 'gpt-4o-mini',
+        isDefault: false
+      });
+    }
+  }, [providerConnections, providerForm.connectionId]);
+
+  function resetProviderForm() {
+    setProviderForm({
+      connectionId: undefined,
+      name: '',
+      provider: 'openai',
+      authMode: 'api_key',
+      apiKey: '',
+      model: 'gpt-4o-mini',
+      isDefault: false
+    });
+    setCodexOAuthLogin(undefined);
+  }
+
+  function editProviderConnection(connection: ProviderConnectionApi) {
+    setProviderForm({
+      connectionId: connection.id,
+      name: connection.name,
+      provider: connection.provider,
+      authMode: connection.authMode,
+      apiKey: '',
+      model: connection.model,
+      isDefault: connection.isDefault
+    });
+    setCodexOAuthLogin(undefined);
+  }
 
   return (
     <section className="settings-grid">
@@ -2836,7 +2887,7 @@ function SettingsPanel({
       <article className="project-row">
         <div>
           <h2>AI provider pripojeni</h2>
-          <p>Vyber provider, dopln model a prihlaseni.</p>
+          <p>Sprava pripojeni, zmena vychoziho provideru a mazani starych connectionu.</p>
         </div>
         {providerLoading ? <p>Nacitam provider status...</p> : null}
         {providerStatus ? (
@@ -2848,6 +2899,43 @@ function SettingsPanel({
           </>
         ) : null}
         {providerError ? <div className="error-banner">{providerError}</div> : null}
+        <div className="provider-connection-list wide">
+          {providerConnections.length ? (
+            providerConnections.map((connection) => (
+              <article
+                key={connection.id}
+                className={connection.id === providerForm.connectionId ? 'provider-connection-card selected' : 'provider-connection-card'}
+              >
+                <div className="provider-connection-summary">
+                  <strong>{connection.name}</strong>
+                  <small>
+                    {connection.provider} · {connection.model}
+                  </small>
+                  <small>
+                    {connection.authMode}
+                    {connection.isDefault ? ' · default' : ''}
+                    {connection.credentialSource ? ` · ${connection.credentialSource}` : ''}
+                  </small>
+                </div>
+                <div className="actions">
+                  <button className="secondary-action" type="button" onClick={() => editProviderConnection(connection)}>
+                    Upravit
+                  </button>
+                  <button className="danger-action" type="button" onClick={() => onProviderDelete(connection.id)} disabled={providerBusy}>
+                    Smazat
+                  </button>
+                </div>
+              </article>
+            ))
+          ) : (
+            <p className="empty-state wide">Zatim neni pridany zadny provider connection.</p>
+          )}
+        </div>
+        <div className="actions wide">
+          <button className="secondary-action" type="button" onClick={resetProviderForm}>
+            Novy connection
+          </button>
+        </div>
         <label>
           Provider
           <select
@@ -2893,6 +2981,14 @@ function SettingsPanel({
             </select>
           </label>
         ) : null}
+        <label>
+          Nazev connectionu
+          <input
+            placeholder="Personal OpenAI / Copilot / Codex"
+            value={providerForm.name ?? ''}
+            onChange={(event) => setProviderForm((previous) => ({ ...previous, name: event.target.value }))}
+          />
+        </label>
         {providerForm.authMode !== 'codex_oauth' ? (
           <label>
             {providerForm.provider === 'github_copilot' ? 'GitHub token (optional)' : 'API key'}
@@ -2917,6 +3013,17 @@ function SettingsPanel({
             value={providerForm.model}
             onChange={(event) => setProviderForm((previous) => ({ ...previous, model: event.target.value }))}
           />
+        </label>
+        <label className="toggle-row wide">
+          <input
+            type="checkbox"
+            checked={Boolean(providerForm.isDefault)}
+            onChange={(event) => setProviderForm((previous) => ({ ...previous, isDefault: event.target.checked }))}
+          />
+          <span>
+            <strong>Nastavit jako default</strong>
+            <small>Tento connection se pouzije jako vychozi provider pro projekty bez vlastni volby.</small>
+          </span>
         </label>
         {codexOAuthLogin ? (
           <div className="oauth-panel wide">
@@ -2975,6 +3082,9 @@ function SettingsPanel({
             disabled={providerBusy || !providerForm.model.trim()}
             onClick={() =>
               onProviderConnect({
+                connectionId: providerForm.connectionId,
+                name: providerForm.name?.trim() || undefined,
+                isDefault: providerForm.isDefault,
                 provider: providerForm.provider,
                 authMode: 'api_key',
                 apiKey: providerForm.apiKey?.trim() || undefined,
@@ -2982,8 +3092,13 @@ function SettingsPanel({
               })
             }
           >
-            Pripojit provider
+            {providerForm.connectionId ? 'Ulozit zmeny' : 'Pripojit provider'}
           </button>
+          {providerForm.connectionId ? (
+            <button className="secondary-action" type="button" disabled={providerBusy} onClick={resetProviderForm}>
+              Zrusit editaci
+            </button>
+          ) : null}
         </div>
       </article>
 

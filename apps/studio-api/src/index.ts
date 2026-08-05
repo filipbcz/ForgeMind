@@ -51,7 +51,12 @@ async function loadEnvFile(path: string) {
     }
 
     const key = line.slice(0, separator).trim();
-    if (!key || process.env[key] !== undefined) {
+    if (!key) {
+      continue;
+    }
+
+    const currentValue = process.env[key];
+    if (currentValue !== undefined && currentValue.trim() !== '') {
       continue;
     }
 

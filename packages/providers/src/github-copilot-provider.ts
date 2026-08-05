@@ -1,4 +1,7 @@
 import { randomUUID } from 'node:crypto';
+import { mkdir } from 'node:fs/promises';
+import { join } from 'node:path';
+import { tmpdir } from 'node:os';
 import type { ProviderKind } from '@forgemind/core';
 import type {
   AIProvider,
@@ -38,9 +41,11 @@ export class GitHubCopilotProvider implements AIProvider {
   readonly kind: ProviderKind = 'github_copilot';
 
   private readonly model: string;
+  private readonly baseDirectory: string;
 
   constructor() {
     this.model = process.env.COPILOT_MODEL?.trim() || 'gpt-5.4';
+    this.baseDirectory = join(tmpdir(), 'forgemind', 'copilot', randomUUID());
   }
 
   async plan(input: PlanInput): Promise<PlanResult> {
@@ -206,7 +211,12 @@ export class GitHubCopilotProvider implements AIProvider {
   private async createSession(): Promise<{ client: CopilotClientLike; session: { sendAndWait(input: { prompt: string }): Promise<{ data?: { content?: string } } | undefined>; on?(eventName: string, handler: (event: any) => void): void } }> {
     const sdk = await import('@github/copilot-sdk');
     const CopilotClient = sdk.CopilotClient as unknown as new (options?: Record<string, unknown>) => CopilotClientLike;
-    const client = new CopilotClient({ mode: 'empty' });
+    await mkdir(this.baseDirectory, { recursive: true });
+    const client = new CopilotClient({
+      mode: 'empty',
+      baseDirectory: this.baseDirectory,
+      sessionIdleTimeoutSeconds: 900
+    });
     const session = await client.createSession({
       sessionId: `forgemind-${randomUUID()}`,
       model: this.model,

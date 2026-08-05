@@ -1448,6 +1448,39 @@ a {
   background: white;
 }
 
+.provider-connection-list {
+  display: grid;
+  gap: 10px;
+}
+
+.provider-connection-card {
+  border: 1px solid #dde5dd;
+  border-radius: 8px;
+  padding: 12px 14px;
+  background: #f9fbf8;
+  display: grid;
+  gap: 10px;
+}
+
+.provider-connection-card.selected {
+  border-color: #0f766e;
+  box-shadow: 0 0 0 3px #c8eee4;
+}
+
+.provider-connection-summary {
+  display: grid;
+  gap: 4px;
+}
+
+.provider-connection-summary strong,
+.provider-connection-summary small {
+  overflow-wrap: anywhere;
+}
+
+.provider-connection-summary small {
+  color: #69736c;
+}
+
 .repo-assignment-form {
   display: grid;
   grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
