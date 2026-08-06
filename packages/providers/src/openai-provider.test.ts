@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from 'vitest';
 import { listOpenAIModels, OpenAIProvider } from './openai-provider.js';
-import { CodexProvider, buildCodexExecArgs, resolveCodexBinary } from './codex-provider.js';
+import { CodexProvider, buildCodexExecArgs, normalizeCodexModels, resolveCodexBinary } from './codex-provider.js';
 
 function successfulResponse(body: unknown): Response {
   return {
@@ -32,6 +32,16 @@ describe('OpenAI provider', () => {
       { id: 'gpt-5-mini', name: 'gpt-5-mini (openai)' }
     ]);
     expect(fetch).toHaveBeenLastCalledWith(new URL('https://api.openai.com/v1/models'), {
+      headers: { Authorization: 'Bearer sk-test' }
+    });
+  });
+
+  it('appends the models path to an OpenAI-compatible API base URL', async () => {
+    vi.mocked(fetch).mockResolvedValueOnce(successfulResponse({ data: [] }));
+
+    await listOpenAIModels('sk-test', 'https://provider.example/v1');
+
+    expect(fetch).toHaveBeenLastCalledWith(new URL('https://provider.example/v1/models'), {
       headers: { Authorization: 'Bearer sk-test' }
     });
   });
@@ -126,6 +136,17 @@ describe('OpenAI provider', () => {
 });
 
 describe('Codex provider', () => {
+  it('normalizes visible Codex app-server models and keeps the default first', () => {
+    expect(normalizeCodexModels([
+      { id: 'hidden', displayName: 'Hidden', hidden: true },
+      { id: 'gpt-fast', displayName: 'GPT Fast' },
+      { id: 'gpt-default', model: 'gpt-default', displayName: 'GPT Default', isDefault: true }
+    ])).toEqual([
+      { id: 'gpt-default', name: 'GPT Default', isDefault: true },
+      { id: 'gpt-fast', name: 'GPT Fast', isDefault: false }
+    ]);
+  });
+
   it('should construct codex provider instance', () => {
     process.env.CODEX_API_KEY = 'test-key';
     const codex = new CodexProvider();

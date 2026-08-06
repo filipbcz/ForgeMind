@@ -21,11 +21,16 @@ const DEFAULT_OPENAI_MODEL = 'gpt-4o-mini';
 export interface ProviderModelOption {
   id: string;
   name: string;
+  isDefault?: boolean;
 }
 
 export async function listOpenAIModels(apiKey: string, apiBaseUrl = process.env.OPENAI_API_BASE_URL ?? DEFAULT_OPENAI_API_URL): Promise<ProviderModelOption[]> {
   const url = new URL(apiBaseUrl);
-  url.pathname = url.pathname.replace(/\/chat\/completions\/?$/, '/models');
+  if (/\/(?:chat\/completions|responses)\/?$/.test(url.pathname)) {
+    url.pathname = url.pathname.replace(/\/(?:chat\/completions|responses)\/?$/, '/models');
+  } else if (!/\/models\/?$/.test(url.pathname)) {
+    url.pathname = `${url.pathname.replace(/\/$/, '')}/models`;
+  }
   const response = await fetch(url, {
     headers: { Authorization: `Bearer ${apiKey}` }
   });

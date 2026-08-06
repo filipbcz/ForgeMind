@@ -136,7 +136,15 @@ Each deployment prints `docker system df` and a runtime-base cache hit or miss s
 
 Configure GitHub and the AI provider in the deployed ForgeMind UI. Encrypted credentials use `FORGEMIND_CREDENTIAL_KEY` and are stored in PostgreSQL.
 
-Codex browser OAuth is started by the API container and stores its state in the persistent `codex_home` volume. A browser running on another computer may not be able to complete a CLI callback bound to localhost; in that topology use an API-key provider unless a public callback bridge is configured.
+Codex browser OAuth is started by the API container and stores its state in the persistent `codex_home` volume. The production stack exposes its callback relay only on the server loopback interface (`127.0.0.1:1455`); it is not publicly reachable and port `1455` must not be opened in UFW or the OCI security list.
+
+When the browser runs on another computer, start this tunnel before opening the Codex OAuth authorization URL, then keep it running until the browser reports success:
+
+```powershell
+ssh -N -o ExitOnForwardFailure=yes -L 1455:127.0.0.1:1455 ubuntu@myrunning.duckdns.org
+```
+
+The browser's fixed `http://localhost:1455/auth/callback` redirect is forwarded through SSH to the loopback-only relay, which forwards it to the Codex CLI listener inside the API container.
 
 ## Operations
 

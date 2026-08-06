@@ -28,6 +28,8 @@ services:
   api:
     image: ${FORGEMIND_RUNTIME_IMAGE:-ghcr.io/filipbcz/forgemind-runtime:main}
     restart: unless-stopped
+    ports:
+      - "127.0.0.1:1455:1455"
     env_file:
       - ${FORGEMIND_ENV_FILE:-/opt/forgemind/shared/server.env}
     depends_on:
@@ -42,6 +44,15 @@ services:
       timeout: 5s
       retries: 10
       start_period: 20s
+
+  codex-oauth-relay:
+    image: ${FORGEMIND_RUNTIME_IMAGE:-ghcr.io/filipbcz/forgemind-runtime:main}
+    restart: unless-stopped
+    depends_on:
+      api:
+        condition: service_started
+    network_mode: "service:api"
+    command: ["node", "infra/codex-oauth-relay.mjs"]
 
   worker:
     image: ${FORGEMIND_RUNTIME_IMAGE:-ghcr.io/filipbcz/forgemind-runtime:main}

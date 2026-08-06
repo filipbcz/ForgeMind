@@ -666,6 +666,19 @@ describe('Studio API routes', () => {
       });
       expect(statusResponse.statusCode).toBe(200);
       expect(statusResponse.json().availableProviders).toContain('openai');
+      expect(statusResponse.json().availableProviders).not.toContain('github_copilot');
+
+      const frozenCopilotResponse = await app.inject({
+        method: 'POST',
+        url: '/api/providers/connect',
+        payload: {
+          provider: 'github_copilot',
+          apiKey: 'github-token',
+          model: 'copilot-model'
+        }
+      });
+      expect(frozenCopilotResponse.statusCode).toBe(400);
+      expect(frozenCopilotResponse.json().error).toContain('frozen');
 
       const connectResponse = await app.inject({
         method: 'POST',

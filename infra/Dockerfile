@@ -70,6 +70,7 @@ RUN npx prisma generate --schema packages/db/prisma/schema.prisma
 FROM runtime-base AS runtime
 
 COPY packages/db/prisma packages/db/prisma
+COPY infra/codex-oauth-relay.mjs infra/codex-oauth-relay.mjs
 COPY --from=build /app/apps/studio-api/dist apps/studio-api/dist
 COPY --from=build /app/apps/worker/dist apps/worker/dist
 COPY --from=build /app/packages/config/dist packages/config/dist

@@ -21,4 +21,4 @@ Aktualni implementace:
 - Worker umi primarni i fallback provider navazat na konkretni ulozene provider connection pres `FORGEMIND_PROVIDER_CONNECTION_ID` a `FORGEMIND_FALLBACK_PROVIDER_CONNECTION_ID` nebo pres `ai.primary_connection_id` a `ai.fallback_connection_id` v `agent.config.yaml`.
 - Fallback muze byt i stejny provider typ (napr. `codex`) pokud pouziva odlisny connection kontext.
 
-`github_copilot` je dnes dostupny pres Copilot SDK. `local` zustava rezervovana hodnota kontraktu pro dalsi fazi. `createProvider()` je stale odmita, dokud nebude mit vlastni adapter a testy.
+`github_copilot` je zakonzervovany: existujici connectiony a runtime zustavaji funkcni, ale Studio nenabizi ani nepovoluje vytvareni novych connectionu. `local` zustava rezervovana hodnota kontraktu pro dalsi fazi.

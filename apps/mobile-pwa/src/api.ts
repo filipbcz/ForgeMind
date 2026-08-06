@@ -6,6 +6,7 @@ import type {
   CreateProjectRequest,
   CreateTaskRequest,
   CodexOAuthCompleteResponse,
+  CodexOAuthStatusResponse,
   CodexOAuthStartResponse,
   DecideProjectRoadmapExtensionRequest,
   DeleteProjectRequest,
@@ -22,6 +23,7 @@ import type {
   ProviderConnectRequest,
   ProviderConnectResponse,
   ProviderConnectionApi,
+  ProviderModelsRequest,
   ProviderModelsResponse,
   ProviderStatusApi,
   ProjectApi,
@@ -254,7 +256,7 @@ export async function connectProvider(input: ProviderConnectRequest): Promise<Pr
   });
 }
 
-export async function fetchProviderModels(input: Pick<ProviderConnectRequest, 'provider' | 'apiKey'>): Promise<ProviderModelsResponse> {
+export async function fetchProviderModels(input: ProviderModelsRequest): Promise<ProviderModelsResponse> {
   return request<ProviderModelsResponse>('/api/providers/models', {
     method: 'POST',
     body: JSON.stringify(input)
@@ -284,6 +286,19 @@ export async function completeCodexOAuth(input: {
     method: 'POST',
     body: JSON.stringify(input)
   });
+}
+
+export async function fetchCodexOAuthStatus(loginId: string): Promise<CodexOAuthStatusResponse> {
+  return request<CodexOAuthStatusResponse>(`/api/providers/codex/oauth/${loginId}/status`);
+}
+
+export function codexOAuthAuthorizeUrl(loginId: string, name?: string): string {
+  const url = new URL(`${API_URL}/api/providers/codex/oauth/authorize`);
+  url.searchParams.set('loginId', loginId);
+  if (name) {
+    url.searchParams.set('name', name);
+  }
+  return url.toString();
 }
 
 export async function fetchNotificationSettings(): Promise<NotificationSettingsApi> {

@@ -3,6 +3,7 @@ import { existsSync, readdirSync, statSync, watch, type FSWatcher } from 'node:f
 import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { createInterface } from 'node:readline';
 import { promisify } from 'node:util';
 import type { ProviderKind } from '@forgemind/core';
 import type {
@@ -22,6 +23,7 @@ import { normalizeValidationChecks } from './provider.js';
 import { emitCapturedUsage, normalizeTokenBreakdown } from './provider-usage.js';
 import { buildReviewPrompt } from './review-prompt.js';
 import type { ProviderRuntimeConfig } from './index.js';
+import type { ProviderModelOption } from './openai-provider.js';
 
 const DEFAULT_CODEX_API_URL = 'https://api.openai.com/v1/responses';
 const DEFAULT_CODEX_MODEL = 'gpt-5.5';
@@ -42,6 +44,103 @@ const APPROVAL_TYPES = [
   'nginx_config_change',
   'write_outside_repo'
 ];
+
+interface CodexAppServerModel {
+  id?: string;
+  model?: string;
+  displayName?: string;
+  hidden?: boolean;
+  isDefault?: boolean;
+}
+
+export async function listCodexModels(input: {
+  codexHome: string;
+  binary?: string;
+  timeoutMs?: number;
+}): Promise<ProviderModelOption[]> {
+  const child = spawn(input.binary ?? resolveCodexBinary(), ['app-server'], {
+    cwd: input.codexHome,
+    env: { ...process.env, CODEX_HOME: input.codexHome },
+    stdio: ['pipe', 'pipe', 'pipe'],
+    windowsHide: true
+  });
+  const lines = createInterface({ input: child.stdout! });
+  let stderr = '';
+  let settled = false;
+
+  return await new Promise<ProviderModelOption[]>((resolve, reject) => {
+    const timeout = setTimeout(() => finish(new Error('Codex model listing timed out.')), input.timeoutMs ?? 20_000);
+
+    const finish = (error?: Error, models?: ProviderModelOption[]) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timeout);
+      lines.close();
+      child.kill();
+      if (error) reject(error);
+      else resolve(models ?? []);
+    };
+
+    const send = (message: unknown) => child.stdin?.write(`${JSON.stringify(message)}\n`);
+
+    child.stderr?.on('data', (chunk: Buffer) => {
+      stderr = appendCappedOutput(stderr, chunk.toString('utf8'), 8_000);
+    });
+    child.on('error', (error) => finish(error));
+    child.on('close', (code) => {
+      if (!settled) {
+        finish(new Error(stripAnsi(stderr).trim() || `Codex app-server exited with code ${code}.`));
+      }
+    });
+    lines.on('line', (line) => {
+      let message: { id?: number; result?: unknown; error?: { message?: string } };
+      try {
+        message = JSON.parse(line) as typeof message;
+      } catch {
+        return;
+      }
+
+      if (message.id === 1) {
+        if (message.error) {
+          finish(new Error(message.error.message ?? 'Codex app-server initialization failed.'));
+          return;
+        }
+        send({ method: 'initialized', params: {} });
+        send({ method: 'model/list', id: 2, params: { limit: 100, includeHidden: false } });
+        return;
+      }
+
+      if (message.id === 2) {
+        if (message.error) {
+          finish(new Error(message.error.message ?? 'Codex model listing failed.'));
+          return;
+        }
+        const result = message.result as { data?: CodexAppServerModel[] } | undefined;
+        finish(undefined, normalizeCodexModels(result?.data ?? []));
+      }
+    });
+
+    send({
+      method: 'initialize',
+      id: 1,
+      params: {
+        clientInfo: { name: 'forgemind', title: 'ForgeMind', version: '0.1.0' }
+      }
+    });
+  });
+}
+
+export function normalizeCodexModels(models: CodexAppServerModel[]): ProviderModelOption[] {
+  return models
+    .filter((model) => !model.hidden && Boolean(model.model ?? model.id))
+    .map((model) => ({
+      id: (model.model ?? model.id)!,
+      name: model.displayName?.trim() || (model.model ?? model.id)!,
+      isDefault: model.isDefault === true
+    }))
+    .filter((model, index, all) => all.findIndex((candidate) => candidate.id === model.id) === index)
+    .sort((left, right) => Number(right.isDefault) - Number(left.isDefault) || left.name.localeCompare(right.name));
+}
 
 function validationChecksJsonSchema(): Record<string, unknown> {
   return {

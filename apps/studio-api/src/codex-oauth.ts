@@ -37,8 +37,8 @@ export function resolveCodexHome(): string {
   return join(findWorkspaceRoot(), '.forgemind', 'codex');
 }
 
-export async function startCodexOAuthBrowserLogin(input: { name?: string } = {}): Promise<PendingCodexLogin> {
-  const loginId = randomUUID();
+export async function startCodexOAuthBrowserLogin(input: { loginId?: string; name?: string } = {}): Promise<PendingCodexLogin> {
+  const loginId = input.loginId ?? randomUUID();
   const codexHome = resolveCodexHomeForLogin(loginId, input.name);
   await ensureCodexHome(codexHome);
 
@@ -58,10 +58,11 @@ export async function startCodexOAuthBrowserLogin(input: { name?: string } = {})
     let resolved = false;
     const startedAt = new Date().toISOString();
     const timeout = setTimeout(() => {
-      if (!resolved) {
-        resolvePending();
-      }
-    }, 2_000);
+      if (resolved) return;
+      resolved = true;
+      child.kill();
+      rejectStart(new Error(stripAnsi(stderr || stdout).trim() || 'Codex did not provide an OAuth authorization URL within 15 seconds.'));
+    }, 15_000);
 
     const resolvePending = (exitCode: number | null = null) => {
       if (resolved) return;
@@ -74,7 +75,7 @@ export async function startCodexOAuthBrowserLogin(input: { name?: string } = {})
         codexHome,
         authFlow: 'browser',
         startedAt,
-        loginUrl: extractFirstUrl(`${output}\n${errorOutput}`),
+        loginUrl: extractCodexAuthorizationUrl(`${output}\n${errorOutput}`),
         output,
         errorOutput,
         exitCode,
@@ -86,10 +87,24 @@ export async function startCodexOAuthBrowserLogin(input: { name?: string } = {})
 
     child.stdout?.on('data', (chunk: Buffer) => {
       stdout += chunk.toString('utf8');
+      const pending = pendingLogins.get(loginId);
+      if (pending) {
+        pending.output = stripAnsi(stdout);
+        pending.loginUrl = pending.loginUrl ?? extractCodexAuthorizationUrl(`${stdout}\n${stderr}`);
+      } else if (!resolved && extractCodexAuthorizationUrl(`${stdout}\n${stderr}`)) {
+        resolvePending();
+      }
     });
 
     child.stderr?.on('data', (chunk: Buffer) => {
       stderr += chunk.toString('utf8');
+      const pending = pendingLogins.get(loginId);
+      if (pending) {
+        pending.errorOutput = stripAnsi(stderr);
+        pending.loginUrl = pending.loginUrl ?? extractCodexAuthorizationUrl(`${stdout}\n${stderr}`);
+      } else if (!resolved && extractCodexAuthorizationUrl(`${stdout}\n${stderr}`)) {
+        resolvePending();
+      }
     });
 
     child.on('error', (error) => {
@@ -130,16 +145,12 @@ export async function startCodexOAuthBrowserLogin(input: { name?: string } = {})
 }
 
 function resolveCodexHomeForLogin(loginId: string, name?: string): string {
-  if (process.env.FORGEMIND_CODEX_HOME?.trim()) {
-    return resolve(process.env.FORGEMIND_CODEX_HOME);
-  }
-
   const safeName = (name?.trim() || 'codex')
     .toLowerCase()
     .replace(/[^a-z0-9-]+/g, '-')
     .replace(/^-+|-+$/g, '')
     .slice(0, 48) || 'codex';
-  return join(findWorkspaceRoot(), '.forgemind', 'codex', `${safeName}-${loginId.slice(0, 8)}`);
+  return join(resolveCodexHome(), `${safeName}-${loginId.slice(0, 8)}`);
 }
 
 export async function readCodexOAuthStatus(codexHome = resolveCodexHome()): Promise<CodexOAuthStatus> {
@@ -175,6 +186,20 @@ export async function readCodexOAuthStatus(codexHome = resolveCodexHome()): Prom
 }
 
 export async function completeCodexOAuthBrowserLogin(loginId: string) {
+  const status = await readCodexOAuthBrowserLoginStatus(loginId);
+  const pending = pendingLogins.get(loginId);
+  if (!pending) {
+    throw new Error('Codex OAuth login was not found or has expired.');
+  }
+
+  if (status.status.loggedIn) {
+    pendingLogins.delete(loginId);
+  }
+
+  return status;
+}
+
+export async function readCodexOAuthBrowserLoginStatus(loginId: string) {
   const pending = pendingLogins.get(loginId);
   if (!pending) {
     throw new Error('Codex OAuth login was not found or has expired.');
@@ -182,10 +207,6 @@ export async function completeCodexOAuthBrowserLogin(loginId: string) {
 
   const status = await readCodexOAuthStatus(pending.codexHome);
   const completed = status.loggedIn || (pending.exitCode !== null && pending.exitCode !== undefined);
-  if (status.loggedIn) {
-    pendingLogins.delete(loginId);
-  }
-
   return {
     ...pending,
     completed,
@@ -243,8 +264,16 @@ function stripAnsi(value: string): string {
   return value.replace(/\u001b\[[0-9;]*m/g, '').replace(/\r/g, '');
 }
 
-function extractFirstUrl(value: string): string | undefined {
-  return value.match(/https?:\/\/[^\s)]+/)?.[0];
+export function extractCodexAuthorizationUrl(value: string): string | undefined {
+  const urls = value.match(/https?:\/\/[^\s)]+/g) ?? [];
+  return urls.find((url) => {
+    try {
+      const parsed = new URL(url);
+      return parsed.protocol === 'https:' && parsed.hostname !== 'localhost' && parsed.hostname !== '127.0.0.1';
+    } catch {
+      return false;
+    }
+  });
 }
 
 function resolveCodexBinaryFromSystem(): string | undefined {

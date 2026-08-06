@@ -427,10 +427,20 @@ export interface ProviderConnectResponse {
 export interface ProviderModelOption {
   id: string;
   name: string;
+  isDefault?: boolean;
+}
+
+export interface ProviderModelsRequest {
+  provider: ProviderConnectRequest['provider'];
+  apiKey?: string;
+  connectionId?: string;
+  loginId?: string;
 }
 
 export interface ProviderModelsResponse {
   provider: ProviderConnectRequest['provider'];
+  connectionId?: string;
+  loginId?: string;
   models: ProviderModelOption[];
 }
 
@@ -456,6 +466,16 @@ export interface CodexOAuthCompleteResponse {
   startedAt?: string;
   loginUrl?: string;
   codexHome?: string;
+}
+
+export interface CodexOAuthStatusResponse {
+  completed: boolean;
+  success: boolean;
+  errorOutput?: string;
+  status: {
+    loggedIn: boolean;
+    rawOutput?: string;
+  };
 }
 
 export interface CreateTaskRequest {

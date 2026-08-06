@@ -476,14 +476,20 @@ export class ForgeMindRepository {
     await this.ensureLocalUser();
     const now = new Date();
     const authMode = input.authMode ?? 'api_key';
-    if (authMode === 'api_key' && !input.apiKey) {
+    const existingConnection = input.connectionId
+      ? await this.prisma.aiProviderConnection.findFirst({ where: { id: input.connectionId, userId } })
+      : null;
+    if (input.connectionId && !existingConnection) {
+      throw new Error('AI provider connection was not found.');
+    }
+    if (authMode === 'api_key' && !input.apiKey && !existingConnection?.apiKeyCiphertext) {
       throw new Error('AI provider API key is required for api_key auth mode.');
     }
 
-    const apiKeyCiphertext = input.apiKey ? await encryptSecret(input.apiKey) : null;
-    const apiKeyFingerprint = input.apiKey ? fingerprintSecret(input.apiKey) : null;
+    const apiKeyCiphertext = input.apiKey ? await encryptSecret(input.apiKey) : existingConnection?.apiKeyCiphertext ?? null;
+    const apiKeyFingerprint = input.apiKey ? fingerprintSecret(input.apiKey) : existingConnection?.apiKeyFingerprint ?? null;
     const existingCount = await this.prisma.aiProviderConnection.count({ where: { userId } });
-    const isDefault = input.isDefault ?? existingCount === 0;
+    const isDefault = input.isDefault ?? existingConnection?.isDefault ?? existingCount === 0;
     const name = await this.resolveAIProviderConnectionName(userId, input.name ?? buildAIProviderConnectionName(input.provider, authMode, input.model), input.connectionId);
     const connection = await this.prisma.$transaction(async (tx) => {
       if (isDefault) {
@@ -505,8 +511,8 @@ export class ForgeMindRepository {
             model: input.model,
             apiKeyCiphertext,
             apiKeyFingerprint,
-            codexHome: input.codexHome,
-            accountSummary: input.accountSummary,
+            codexHome: input.codexHome ?? existingConnection?.codexHome,
+            accountSummary: input.accountSummary ?? existingConnection?.accountSummary,
             lastCheckedAt: now
           }
         });

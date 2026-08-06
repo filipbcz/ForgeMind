@@ -1523,6 +1523,24 @@ a {
   min-width: auto;
 }
 
+.project-row label.toggle-row {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+}
+
+.project-row label.toggle-row span {
+  display: grid;
+  gap: 4px;
+  min-width: 0;
+}
+
+.project-row label.toggle-row small {
+  color: #617067;
+  font-weight: 400;
+  line-height: 1.45;
+}
+
 .oauth-panel {
   display: grid;
   gap: 6px;
