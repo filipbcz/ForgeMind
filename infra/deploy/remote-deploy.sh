@@ -79,18 +79,25 @@ else
   echo "Migration checksum unchanged; skipping database migrations."
 fi
 
-"${compose[@]}" up -d --remove-orphans api worker web
+"${compose[@]}" up -d --remove-orphans api codex-oauth-relay worker web
 
 API_CONTAINER="$("${compose[@]}" ps -q api)"
+OAUTH_RELAY_CONTAINER="$("${compose[@]}" ps -q codex-oauth-relay)"
 
 if [ -z "${API_CONTAINER}" ]; then
   echo "Studio API container was not created." >&2
   exit 1
 fi
 
+if [ -z "${OAUTH_RELAY_CONTAINER}" ]; then
+  echo "Codex OAuth relay container was not created." >&2
+  exit 1
+fi
+
 for attempt in $(seq 1 60); do
   STATUS="$(docker inspect --format='{{if .State.Health}}{{.State.Health.Status}}{{else}}{{.State.Status}}{{end}}' "${API_CONTAINER}")"
-  if [ "${STATUS}" = "healthy" ]; then
+  OAUTH_RELAY_STATUS="$(docker inspect --format='{{.State.Status}}' "${OAUTH_RELAY_CONTAINER}")"
+  if [ "${STATUS}" = "healthy" ] && [ "${OAUTH_RELAY_STATUS}" = "running" ]; then
     echo "Deployment finished successfully."
     "${compose[@]}" ps
     echo "Docker storage after deployment:"
@@ -101,6 +108,6 @@ for attempt in $(seq 1 60); do
   sleep 2
 done
 
-echo "Studio API did not become healthy in time." >&2
-"${compose[@]}" logs --tail=200 api worker
+echo "Studio API or Codex OAuth relay did not become ready in time." >&2
+"${compose[@]}" logs --tail=200 api codex-oauth-relay worker
 exit 1
