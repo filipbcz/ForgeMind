@@ -22,6 +22,7 @@ import type {
   ProviderConnectRequest,
   ProviderConnectResponse,
   ProviderConnectionApi,
+  ProviderModelsResponse,
   ProviderStatusApi,
   ProjectApi,
   ProjectRoadmapApi,
@@ -248,6 +249,13 @@ export async function disconnectGitHubAdapter(): Promise<{ ok: boolean; status: 
 
 export async function connectProvider(input: ProviderConnectRequest): Promise<ProviderConnectResponse> {
   return request<ProviderConnectResponse>('/api/providers/connect', {
+    method: 'POST',
+    body: JSON.stringify(input)
+  });
+}
+
+export async function fetchProviderModels(input: Pick<ProviderConnectRequest, 'provider' | 'apiKey'>): Promise<ProviderModelsResponse> {
+  return request<ProviderModelsResponse>('/api/providers/models', {
     method: 'POST',
     body: JSON.stringify(input)
   });

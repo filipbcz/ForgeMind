@@ -18,6 +18,28 @@ import type { ProviderRuntimeConfig } from './index.js';
 const DEFAULT_OPENAI_API_URL = 'https://api.openai.com/v1/chat/completions';
 const DEFAULT_OPENAI_MODEL = 'gpt-4o-mini';
 
+export interface ProviderModelOption {
+  id: string;
+  name: string;
+}
+
+export async function listOpenAIModels(apiKey: string, apiBaseUrl = process.env.OPENAI_API_BASE_URL ?? DEFAULT_OPENAI_API_URL): Promise<ProviderModelOption[]> {
+  const url = new URL(apiBaseUrl);
+  url.pathname = url.pathname.replace(/\/chat\/completions\/?$/, '/models');
+  const response = await fetch(url, {
+    headers: { Authorization: `Bearer ${apiKey}` }
+  });
+  if (!response.ok) {
+    throw new Error(`OpenAI model listing failed with ${response.status}: ${await response.text()}`);
+  }
+
+  const payload = (await response.json()) as { data?: Array<{ id?: string; owned_by?: string }> };
+  return (payload.data ?? [])
+    .filter((model): model is { id: string; owned_by?: string } => Boolean(model.id))
+    .map((model) => ({ id: model.id, name: model.owned_by ? `${model.id} (${model.owned_by})` : model.id }))
+    .sort((left, right) => left.id.localeCompare(right.id));
+}
+
 function normalizeFileUpdates(result: ImplementResult, fallback: ImplementResult): ImplementResult['fileUpdates'] {
   if (Array.isArray(result.fileUpdates) && result.fileUpdates.length > 0) {
     return result.fileUpdates

@@ -424,6 +424,16 @@ export interface ProviderConnectResponse {
   };
 }
 
+export interface ProviderModelOption {
+  id: string;
+  name: string;
+}
+
+export interface ProviderModelsResponse {
+  provider: ProviderConnectRequest['provider'];
+  models: ProviderModelOption[];
+}
+
 export interface CodexOAuthStartResponse {
   loginId: string;
   authFlow: 'browser';

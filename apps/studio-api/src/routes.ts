@@ -1,6 +1,6 @@
 import type { FastifyInstance } from 'fastify';
 import { z } from 'zod';
-import { createProvider } from '@forgemind/providers';
+import { createProvider, GitHubCopilotProvider, listOpenAIModels } from '@forgemind/providers';
 import type { PlanResult } from '@forgemind/providers';
 import {
   checkGitHubConnection,
@@ -167,6 +167,11 @@ const codexOAuthCompleteSchema = z.object({
 
 const codexOAuthStartSchema = z.object({
   name: z.string().trim().min(1).max(80).optional()
+});
+
+const providerModelsSchema = z.object({
+  provider: z.enum(['openai', 'codex', 'github_copilot']),
+  apiKey: z.string().min(1).optional()
 });
 
 const githubConnectSchema = z.object({
@@ -379,6 +384,29 @@ export function registerRoutes(app: FastifyInstance, repository: ForgeMindReposi
   });
 
   app.get('/api/providers/connections', async () => listAIProviderConnections(repository));
+
+  app.post('/api/providers/models', async (request, reply) => {
+    try {
+      const input = providerModelsSchema.parse(request.body ?? {});
+      if (input.provider === 'openai') {
+        if (!input.apiKey) {
+          throw new Error('Enter an OpenAI API key before loading models.');
+        }
+        return { provider: input.provider, models: await listOpenAIModels(input.apiKey) };
+      }
+
+      if (input.provider === 'github_copilot') {
+        const provider = new GitHubCopilotProvider({ apiKey: input.apiKey });
+        return { provider: input.provider, models: await provider.listModels() };
+      }
+
+      return reply.code(409).send({
+        error: 'The installed Codex CLI does not expose an account model list. Enter the Codex model ID configured for this account.'
+      });
+    } catch (error) {
+      return sendBadRequest(reply, error);
+    }
+  });
 
   app.get('/api/github/status', async () => {
     const connection = await readGitHubConnection(repository);

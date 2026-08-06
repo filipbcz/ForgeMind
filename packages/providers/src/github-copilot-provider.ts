@@ -19,12 +19,14 @@ import type {
 import { normalizeValidationChecks } from './provider.js';
 import { emitCapturedUsage } from './provider-usage.js';
 import type { ProviderRuntimeConfig } from './index.js';
+import type { ProviderModelOption } from './openai-provider.js';
 
 type CopilotClientLike = {
   createSession(options: Record<string, unknown>): Promise<{
     sendAndWait(input: { prompt: string }): Promise<{ data?: { content?: string } } | undefined>;
     on(eventName: string, handler: (event: any) => void): void;
   }>;
+  listModels(): Promise<Array<{ id: string; name?: string }>>;
   stop(): Promise<unknown>;
 };
 
@@ -183,6 +185,19 @@ export class GitHubCopilotProvider implements AIProvider {
     return true;
   }
 
+  async listModels(): Promise<ProviderModelOption[]> {
+    const client = await this.createClient();
+    try {
+      const models = await client.listModels();
+      return models
+        .filter((model) => Boolean(model.id))
+        .map((model) => ({ id: model.id, name: model.name?.trim() || model.id }))
+        .sort((left, right) => left.id.localeCompare(right.id));
+    } finally {
+      await client.stop().catch(() => undefined);
+    }
+  }
+
   private async requestText(prompt: string, onActivity: ProviderActivityHandler | undefined, operation: string): Promise<string> {
     const { client, session } = await this.createSession();
     try {
@@ -212,16 +227,7 @@ export class GitHubCopilotProvider implements AIProvider {
   }
 
   private async createSession(): Promise<{ client: CopilotClientLike; session: { sendAndWait(input: { prompt: string }): Promise<{ data?: { content?: string } } | undefined>; on?(eventName: string, handler: (event: any) => void): void } }> {
-    const sdk = await import('@github/copilot-sdk');
-    const CopilotClient = sdk.CopilotClient as unknown as new (options?: Record<string, unknown>) => CopilotClientLike;
-    await mkdir(this.baseDirectory, { recursive: true });
-    const client = new CopilotClient({
-      mode: 'empty',
-      baseDirectory: this.baseDirectory,
-      gitHubToken: this.token,
-      useLoggedInUser: !this.token,
-      sessionIdleTimeoutSeconds: 900
-    });
+    const client = await this.createClient();
     const session = await client.createSession({
       sessionId: `forgemind-${randomUUID()}`,
       model: this.model,
@@ -229,6 +235,19 @@ export class GitHubCopilotProvider implements AIProvider {
     });
 
     return { client, session };
+  }
+
+  private async createClient(): Promise<CopilotClientLike> {
+    const sdk = await import('@github/copilot-sdk');
+    const CopilotClient = sdk.CopilotClient as unknown as new (options?: Record<string, unknown>) => CopilotClientLike;
+    await mkdir(this.baseDirectory, { recursive: true });
+    return new CopilotClient({
+      mode: 'empty',
+      baseDirectory: this.baseDirectory,
+      gitHubToken: this.token,
+      useLoggedInUser: !this.token,
+      sessionIdleTimeoutSeconds: 900
+    });
   }
 }
 

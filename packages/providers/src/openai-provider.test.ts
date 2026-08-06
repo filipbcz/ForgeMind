@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from 'vitest';
-import { OpenAIProvider } from './openai-provider.js';
+import { listOpenAIModels, OpenAIProvider } from './openai-provider.js';
 import { CodexProvider, buildCodexExecArgs, resolveCodexBinary } from './codex-provider.js';
 
 function successfulResponse(body: unknown): Response {
@@ -19,6 +19,23 @@ vi.stubGlobal('fetch', vi.fn(async () => ({
 })) as unknown as typeof fetch);
 
 describe('OpenAI provider', () => {
+  it('lists the models returned by the configured OpenAI account', async () => {
+    vi.mocked(fetch).mockResolvedValueOnce(successfulResponse({
+      data: [
+        { id: 'gpt-5-mini', owned_by: 'openai' },
+        { id: 'gpt-5' }
+      ]
+    }));
+
+    await expect(listOpenAIModels('sk-test', 'https://api.openai.com/v1/chat/completions')).resolves.toEqual([
+      { id: 'gpt-5', name: 'gpt-5' },
+      { id: 'gpt-5-mini', name: 'gpt-5-mini (openai)' }
+    ]);
+    expect(fetch).toHaveBeenLastCalledWith(new URL('https://api.openai.com/v1/models'), {
+      headers: { Authorization: 'Bearer sk-test' }
+    });
+  });
+
   it('should construct openai provider instance', () => {
     process.env.OPENAI_API_KEY = 'test-key';
     const openai = new OpenAIProvider();

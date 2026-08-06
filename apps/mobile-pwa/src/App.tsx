@@ -43,6 +43,7 @@ import {
   fetchGitHubRepositoryOwners,
   fetchNotificationSettings,
   fetchProjectRoadmap,
+  fetchProviderModels,
   fetchProviderStatus,
   fetchNotificationVapidPublicKey,
   fetchApprovals,
@@ -85,6 +86,7 @@ import type {
   NotificationSettingsApi,
   ProviderConnectRequest,
   ProviderConnectionApi,
+  ProviderModelsResponse,
   ProviderStatusApi,
   ProjectSummary,
   RealtimeMessage,
@@ -615,6 +617,10 @@ export function App() {
     }
   });
 
+  const providerModelsMutation = useMutation({
+    mutationFn: (input: Pick<ProviderConnectRequest, 'provider' | 'apiKey'>) => fetchProviderModels(input)
+  });
+
   const codexOAuthStartMutation = useMutation({
     mutationFn: (input: { name?: string }) => startCodexOAuth(input)
   });
@@ -937,6 +943,8 @@ export function App() {
               || codexOAuthCompleteMutation.isPending
               || providerDeleteMutation.isPending
             }
+            providerModels={providerModelsMutation.data}
+            providerModelsLoading={providerModelsMutation.isPending}
             providerError={
               providerConnectMutation.error
                 ? formatUiError(providerConnectMutation.error)
@@ -946,10 +954,13 @@ export function App() {
                     ? formatUiError(codexOAuthCompleteMutation.error)
                     : providerDeleteMutation.error
                       ? formatUiError(providerDeleteMutation.error)
+                      : providerModelsMutation.error
+                        ? formatUiError(providerModelsMutation.error)
                       : undefined
             }
             onProviderConnect={(input) => providerConnectMutation.mutate(input)}
             onProviderDelete={(connectionId) => providerDeleteMutation.mutate(connectionId)}
+            onProviderModelsLoad={(input) => providerModelsMutation.mutate(input)}
             onCodexOAuthStart={(name) => codexOAuthStartMutation.mutateAsync({ name })}
             onCodexOAuthComplete={(loginId, model, name, isDefault) => codexOAuthCompleteMutation.mutateAsync({ loginId, model, name, isDefault })}
             notificationSettings={notificationSettings}
@@ -2731,9 +2742,12 @@ function SettingsPanel({
   providerStatus,
   providerLoading,
   providerBusy,
+  providerModels,
+  providerModelsLoading,
   providerError,
   onProviderConnect,
   onProviderDelete,
+  onProviderModelsLoad,
   onCodexOAuthStart,
   onCodexOAuthComplete,
   notificationSettings,
@@ -2754,11 +2768,14 @@ function SettingsPanel({
   providerStatus?: ProviderStatusApi;
   providerLoading: boolean;
   providerBusy: boolean;
+  providerModels?: ProviderModelsResponse;
+  providerModelsLoading: boolean;
   providerError?: string;
   onProviderConnect: (input: ProviderConnectRequest) => void;
   onProviderDelete: (connectionId: string) => void;
-  onCodexOAuthStart: () => Promise<CodexOAuthStartResponse>;
-  onCodexOAuthComplete: (loginId: string, model: string) => Promise<unknown>;
+  onProviderModelsLoad: (input: Pick<ProviderConnectRequest, 'provider' | 'apiKey'>) => void;
+  onCodexOAuthStart: (name?: string) => Promise<CodexOAuthStartResponse>;
+  onCodexOAuthComplete: (loginId: string, model: string, name?: string, isDefault?: boolean) => Promise<unknown>;
   notificationSettings?: NotificationSettingsApi;
   notificationsLoading: boolean;
   notificationsBusy: boolean;
@@ -2773,7 +2790,7 @@ function SettingsPanel({
     provider: 'openai',
     authMode: 'api_key',
     apiKey: '',
-    model: 'gpt-4o-mini',
+    model: '',
     isDefault: false
   });
   const [codexOAuthLogin, setCodexOAuthLogin] = useState<CodexOAuthStartResponse | undefined>();
@@ -2781,15 +2798,32 @@ function SettingsPanel({
     token: '',
     apiBaseUrl: ''
   });
-  const providerModelOptions: Record<ProviderConnectRequest['provider'], string[]> = {
-    openai: ['gpt-5', 'gpt-5-mini', 'gpt-4o', 'gpt-4o-mini'],
-    codex: ['gpt-5.5', 'gpt-5-codex'],
-    github_copilot: ['gpt-5.4', 'gpt-4.1', 'claude-sonnet-4']
-  };
-  const customModelOption = '__custom_model__';
-  const currentProviderModelOptions = providerModelOptions[providerForm.provider];
-  const isKnownModelOption = currentProviderModelOptions.includes(providerForm.model.trim());
+  const currentProviderModelOptions = providerModels?.provider === providerForm.provider ? providerModels.models : [];
   const providerConnections = providerStatus?.connections ?? [];
+  const oauthTunnelCommand = typeof window !== 'undefined' && window.location.hostname !== 'localhost'
+    ? `ssh -N -L 1455:127.0.0.1:1455 ubuntu@${window.location.hostname}`
+    : undefined;
+
+  useEffect(() => {
+    if (!codexOAuthLogin) {
+      return;
+    }
+
+    const pollId = window.setInterval(() => {
+      void onCodexOAuthComplete(
+        codexOAuthLogin.loginId,
+        providerForm.model.trim(),
+        providerForm.name?.trim() || undefined,
+        providerForm.isDefault
+      ).then((result) => {
+        if (result.completed) {
+          setCodexOAuthLogin(undefined);
+        }
+      }).catch(() => undefined);
+    }, 2_000);
+
+    return () => window.clearInterval(pollId);
+  }, [codexOAuthLogin, onCodexOAuthComplete, providerForm.isDefault, providerForm.model, providerForm.name]);
 
   useEffect(() => {
     if (!providerForm.connectionId) {
@@ -2803,7 +2837,7 @@ function SettingsPanel({
         provider: 'openai',
         authMode: 'api_key',
         apiKey: '',
-        model: 'gpt-4o-mini',
+        model: '',
         isDefault: false
       });
     }
@@ -2816,7 +2850,7 @@ function SettingsPanel({
       provider: 'openai',
       authMode: 'api_key',
       apiKey: '',
-      model: 'gpt-4o-mini',
+      model: '',
       isDefault: false
     });
     setCodexOAuthLogin(undefined);
@@ -2955,12 +2989,7 @@ function SettingsPanel({
                 ...previous,
                 provider,
                 authMode: provider === 'codex' ? previous.authMode ?? 'api_key' : 'api_key',
-                model:
-                  provider === 'codex' && previous.model === 'gpt-4o-mini'
-                    ? 'gpt-5.5'
-                    : provider === 'github_copilot' && previous.model === 'gpt-4o-mini'
-                      ? 'gpt-5.4'
-                      : previous.model
+                model: ''
               }));
               if (provider !== 'codex') {
                 setCodexOAuthLogin(undefined);
@@ -3009,36 +3038,45 @@ function SettingsPanel({
             />
           </label>
         ) : null}
-        <label>
-          Model (doporučené)
-          <select
-            value={isKnownModelOption ? providerForm.model.trim() : customModelOption}
-            onChange={(event) => {
-              const value = event.target.value;
-              setProviderForm((previous) => ({
-                ...previous,
-                model: value === customModelOption ? '' : value
-              }));
-            }}
-          >
-            {currentProviderModelOptions.map((model) => (
-              <option key={model} value={model}>
-                {model}
-              </option>
-            ))}
-            <option value={customModelOption}>Vlastni model...</option>
-          </select>
-        </label>
-        {!isKnownModelOption ? (
+        {providerForm.provider !== 'codex' && currentProviderModelOptions.length > 0 ? (
           <label>
-            Vlastni model
+            Model
+            <select
+              value={providerForm.model}
+              onChange={(event) => setProviderForm((previous) => ({ ...previous, model: event.target.value }))}
+            >
+              <option value="">Vyberte model</option>
+              {currentProviderModelOptions.map((model) => (
+                <option key={model.id} value={model.id}>
+                  {model.name}
+                </option>
+              ))}
+            </select>
+          </label>
+        ) : (
+          <label>
+            {providerForm.provider === 'codex' ? 'Codex model ID' : 'Model ID'}
             <input
-              placeholder="Zadej model id"
+              placeholder={providerForm.provider === 'codex' ? 'Model configured for this Codex account' : 'Load models or enter model ID'}
               value={providerForm.model}
               onChange={(event) => setProviderForm((previous) => ({ ...previous, model: event.target.value }))}
             />
           </label>
-        ) : null}
+        )}
+        {providerForm.provider === 'codex' ? (
+          <small className="wide">Codex CLI neposkytuje seznam modelu pro prihlaseny ChatGPT ucet. Zadejte model ID podporovany timto uctem.</small>
+        ) : (
+          <div className="actions wide">
+            <button
+              className="secondary-action"
+              type="button"
+              disabled={providerModelsLoading || (providerForm.provider === 'openai' && !providerForm.apiKey?.trim())}
+              onClick={() => onProviderModelsLoad({ provider: providerForm.provider, apiKey: providerForm.apiKey?.trim() || undefined })}
+            >
+              {providerModelsLoading ? 'Nacitam modely...' : 'Nacist dostupne modely'}
+            </button>
+          </div>
+        )}
         <label className="toggle-row wide">
           <input
             type="checkbox"
@@ -3052,14 +3090,20 @@ function SettingsPanel({
         </label>
         {codexOAuthLogin ? (
           <div className="oauth-panel wide">
-            <span>Codex browser OAuth</span>
-            <strong>Login spusten</strong>
+            <span>Codex OAuth</span>
+            <strong>Dokoncete prihlaseni v otevrenem okne.</strong>
+            {oauthTunnelCommand ? (
+              <>
+                <small>Pred potvrzenim OAuth spustte na pocitaci s prohlizecem tento SSH tunel:</small>
+                <code>{oauthTunnelCommand}</code>
+              </>
+            ) : null}
             {codexOAuthLogin.loginUrl ? (
               <a href={codexOAuthLogin.loginUrl} target="_blank" rel="noreferrer">
-                {codexOAuthLogin.loginUrl}
+                Otevrit autorizaci Codex
               </a>
             ) : null}
-            <small>{codexOAuthLogin.codexHome}</small>
+            <small>Po potvrzeni se connection overi a ulozi automaticky.</small>
           </div>
         ) : null}
         <div className="actions">
@@ -3069,34 +3113,21 @@ function SettingsPanel({
                 className="primary-action"
                 type="button"
                 disabled={providerBusy || !providerForm.model.trim()}
-                onClick={async () => setCodexOAuthLogin(await onCodexOAuthStart())}
-              >
-                Otevrit browser OAuth
-              </button>
-              <button
-                className="secondary-action"
-                type="button"
-                disabled={providerBusy || !codexOAuthLogin || !providerForm.model.trim()}
-                onClick={async () => {
-                  if (!codexOAuthLogin) return;
-                  await onCodexOAuthComplete(codexOAuthLogin.loginId, providerForm.model.trim());
+                onClick={() => {
+                  const authorizationWindow = window.open('about:blank', '_blank');
+                  void onCodexOAuthStart(providerForm.name?.trim() || undefined)
+                    .then((login) => {
+                      setCodexOAuthLogin(login);
+                      if (login.loginUrl) {
+                        authorizationWindow?.location.replace(login.loginUrl);
+                      } else {
+                        authorizationWindow?.close();
+                      }
+                    })
+                    .catch(() => authorizationWindow?.close());
                 }}
               >
-                Dokoncit OAuth
-              </button>
-              <button
-                className="secondary-action"
-                type="button"
-                disabled={providerBusy || !providerForm.model.trim()}
-                onClick={() =>
-                  onProviderConnect({
-                    provider: 'codex',
-                    authMode: 'codex_oauth',
-                    model: providerForm.model.trim()
-                  })
-                }
-              >
-                Pouzit existujici OAuth
+                Otevrit OAuth Codex
               </button>
             </>
           ) : null}
