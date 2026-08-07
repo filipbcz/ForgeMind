@@ -634,7 +634,7 @@ export function App() {
   });
 
   const codexOAuthCompleteMutation = useMutation({
-    mutationFn: (input: { loginId: string; model: string; name?: string; isDefault?: boolean }) => completeCodexOAuth(input),
+    mutationFn: (input: { loginId: string; connectionId?: string; model: string; name?: string; isDefault?: boolean }) => completeCodexOAuth(input),
     onSuccess: (result) => {
       if (result.completed) {
         queryClient.invalidateQueries({ queryKey: ['provider-status'] });
@@ -975,7 +975,7 @@ export function App() {
               window.open(codexOAuthAuthorizeUrl(loginId, name), '_blank', 'noopener');
               return { loginId, authFlow: 'browser', startedAt: new Date().toISOString(), codexHome: '' };
             }}
-            onCodexOAuthComplete={(loginId, model, name, isDefault) => codexOAuthCompleteMutation.mutateAsync({ loginId, model, name, isDefault })}
+            onCodexOAuthComplete={(loginId, connectionId, model, name, isDefault) => codexOAuthCompleteMutation.mutateAsync({ loginId, connectionId, model, name, isDefault })}
             notificationSettings={notificationSettings}
             notificationsLoading={notificationSettingsQuery.isLoading}
             notificationsBusy={
@@ -2860,7 +2860,7 @@ function SettingsPanel({
   onProviderDelete: (connectionId: string) => void;
   onProviderModelsLoad: (input: ProviderModelsRequest) => Promise<ProviderModelsResponse>;
   onCodexOAuthStart: (name?: string) => CodexOAuthStartResponse;
-  onCodexOAuthComplete: (loginId: string, model: string, name?: string, isDefault?: boolean) => Promise<unknown>;
+  onCodexOAuthComplete: (loginId: string, connectionId: string | undefined, model: string, name?: string, isDefault?: boolean) => Promise<unknown>;
   notificationSettings?: NotificationSettingsApi;
   notificationsLoading: boolean;
   notificationsBusy: boolean;
@@ -2927,6 +2927,7 @@ function SettingsPanel({
           setProviderForm((previous) => ({ ...previous, model: selectedModel }));
           await onCodexOAuthComplete(
             codexOAuthLogin.loginId,
+            providerForm.connectionId,
             selectedModel,
             providerForm.name?.trim() || undefined,
             providerForm.isDefault
@@ -2940,7 +2941,7 @@ function SettingsPanel({
     }, 2_000);
 
     return () => window.clearInterval(pollId);
-  }, [codexOAuthLogin, onCodexOAuthComplete, onProviderModelsLoad, providerForm.isDefault, providerForm.name]);
+  }, [codexOAuthLogin, onCodexOAuthComplete, onProviderModelsLoad, providerForm.connectionId, providerForm.isDefault, providerForm.name]);
 
   useEffect(() => {
     if (!providerForm.connectionId) {
@@ -3250,7 +3251,7 @@ function SettingsPanel({
               <button
                 className="primary-action"
                 type="button"
-                disabled={providerBusy || Boolean(providerForm.connectionId)}
+                disabled={providerBusy}
                 onClick={() => {
                   oauthCompletionStarted.current = false;
                   setCodexOAuthError(undefined);

@@ -282,6 +282,7 @@ export async function startCodexOAuth(input: { name?: string } = {}): Promise<Co
 
 export async function completeCodexOAuth(input: {
   loginId: string;
+  connectionId?: string;
   model: string;
   name?: string;
   isDefault?: boolean;

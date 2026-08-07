@@ -1123,7 +1123,10 @@ function getCodexBinaryCandidates(env: NodeJS.ProcessEnv): string[] {
   }
 
   if (env.LOCALAPPDATA) {
-    candidates.push(join(env.LOCALAPPDATA, 'Programs', 'Codex', 'codex.exe'));
+    candidates.push(
+      join(env.LOCALAPPDATA, 'OpenAI', 'Codex', 'bin', 'codex.exe'),
+      join(env.LOCALAPPDATA, 'Programs', 'Codex', 'codex.exe')
+    );
   }
 
   candidates.push(...getVsCodeCodexBinaryCandidates(env));

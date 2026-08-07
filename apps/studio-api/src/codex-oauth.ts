@@ -277,14 +277,12 @@ export function extractCodexAuthorizationUrl(value: string): string | undefined 
 }
 
 function resolveCodexBinaryFromSystem(): string | undefined {
-  const fromWhere = resolveCodexBinaryWithWhere();
-  if (fromWhere) {
-    return fromWhere;
-  }
-
   const localAppData = process.env.LOCALAPPDATA?.trim();
   const userProfile = process.env.USERPROFILE?.trim();
   const candidates = [
+    localAppData
+      ? join(localAppData, 'OpenAI', 'Codex', 'bin', 'codex.exe')
+      : undefined,
     localAppData
       ? join(localAppData, 'Programs', 'OpenAI', 'Codex', 'codex.exe')
       : undefined,
@@ -307,7 +305,7 @@ function resolveCodexBinaryFromSystem(): string | undefined {
     }
   }
 
-  return undefined;
+  return resolveCodexBinaryWithWhere();
 }
 
 function resolveCodexBinaryWithWhere(): string | undefined {
@@ -316,14 +314,19 @@ function resolveCodexBinaryWithWhere(): string | undefined {
       encoding: 'utf8',
       windowsHide: true
     });
-    const match = stdout
-      .split(/\r?\n/)
-      .map((line) => line.trim())
-      .find((line) => line.length > 0 && existsSync(line));
-    return match || undefined;
+    return selectCodexBinaryFromWhereOutput(stdout);
   } catch {
     return undefined;
   }
+}
+
+export function selectCodexBinaryFromWhereOutput(output: string): string | undefined {
+  const candidates = output
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter((line) => line.length > 0 && existsSync(line));
+
+  return candidates.find((candidate) => /\.exe$/i.test(candidate)) ?? candidates[0];
 }
 
 function resolveCodexBinaryFromVsCodeExtensions(extensionsRoot: string): string | undefined {

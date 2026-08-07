@@ -175,6 +175,7 @@ const providerConnectSchema = z
 
 const codexOAuthCompleteSchema = z.object({
   loginId: z.string().min(1),
+  connectionId: z.string().uuid().optional(),
   name: z.string().trim().min(1).max(80).optional(),
   isDefault: z.boolean().optional(),
   model: z.string().min(1)
@@ -673,6 +674,19 @@ export function registerRoutes(app: FastifyInstance, repository: ForgeMindReposi
   app.post('/api/providers/codex/oauth/complete', async (request, reply) => {
     try {
       const input = codexOAuthCompleteSchema.parse(request.body ?? {});
+      const existingConnection = input.connectionId
+        ? await readAIProviderConnectionSecretById(repository, input.connectionId)
+        : undefined;
+      if (input.connectionId && !existingConnection) {
+        throw new Error('AI provider connection was not found.');
+      }
+      if (
+        existingConnection
+        && (existingConnection.provider !== 'codex' || existingConnection.authMode !== 'codex_oauth')
+      ) {
+        throw new Error('Only an existing Codex OAuth connection can be signed in again.');
+      }
+
       const completed = await completeCodexOAuthBrowserLogin(input.loginId);
       if (!completed.completed) {
         return reply.code(202).send({
@@ -702,6 +716,7 @@ export function registerRoutes(app: FastifyInstance, repository: ForgeMindReposi
 
       const currentUser = await repository.getCurrentUser();
       const connection = await saveAIProviderConnection(repository, {
+        connectionId: input.connectionId,
         name: input.name,
         isDefault: input.isDefault,
         provider: 'codex',
