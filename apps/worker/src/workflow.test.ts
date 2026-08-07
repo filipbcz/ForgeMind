@@ -8,6 +8,7 @@ import {
   compactTaskExecutionPrompt,
   createRoadmapTaskPlan,
   getMissingSystemValidationTool,
+  inferRepositoryInstallCommand,
   isInspectionOnlyValidationCommand,
   isReviewSummaryOnlyPath,
   isValidationCommandDefinitionFailure,
@@ -181,6 +182,18 @@ function createGitHubStub(overrides: Partial<GitHubAdapter> = {}): GitHubAdapter
 }
 
 describe('worker workflow', () => {
+  it('infers a frozen dependency install from the repository lockfile', async () => {
+    const workspacePath = join(tmpdir(), `forgemind-worker-install-${randomUUID()}`);
+    await mkdir(workspacePath, { recursive: true });
+    await writeFile(join(workspacePath, 'package.json'), '{"private":true}\n', 'utf8');
+    await writeFile(join(workspacePath, 'package-lock.json'), '{"lockfileVersion":3}\n', 'utf8');
+
+    await expect(inferRepositoryInstallCommand(workspacePath)).resolves.toBe('npm ci');
+
+    await mkdir(join(workspacePath, 'node_modules'));
+    await expect(inferRepositoryInstallCommand(workspacePath)).resolves.toBeUndefined();
+  });
+
   it('runs the local provider workflow end-to-end without GitHub operations', async () => {
     const workspaceRoot = join(tmpdir(), `forgemind-worker-test-${randomUUID()}`);
     let capturedReviewInput: ReviewInput | undefined;
@@ -338,6 +351,99 @@ describe('worker workflow', () => {
     expect(result.status).toBe('completed');
     expect(createPullRequest).toHaveBeenCalledWith(expect.objectContaining({ draft: false }));
     expect(mergePullRequest).toHaveBeenCalledWith(expect.objectContaining({ defaultBranch: 'main' }), 4321);
+  }, 10000);
+
+  it('feeds failed GitHub Actions output back to AI and merges only after the corrected commit passes', async () => {
+    const workspaceRoot = join(tmpdir(), `forgemind-worker-ci-retry-${randomUUID()}`);
+    let implementationAttempt = 0;
+    const implement = vi.fn(async (input: ImplementInput): Promise<ImplementResult> => {
+      implementationAttempt += 1;
+      return {
+        summary: implementationAttempt === 1 ? 'Initial implementation' : 'Windows CI correction',
+        changedFiles: ['status.txt'],
+        diffStat: { filesChanged: 1, insertions: 1, deletions: implementationAttempt === 1 ? 0 : 1 },
+        requestedApprovals: [],
+        fileUpdates: [{ path: 'status.txt', content: implementationAttempt === 1 ? 'initial\n' : 'corrected\n' }]
+      };
+    });
+    const waitForChecks = vi.fn()
+      .mockResolvedValueOnce({
+        status: 'failure',
+        summary: 'Native build: telemetry.cpp(101): error C2589: illegal token',
+        failures: [{
+          name: 'Native build',
+          detailsUrl: 'https://github.com/demo/demo/actions/runs/1/job/2',
+          output: 'telemetry.cpp(101): error C2589: illegal token'
+        }]
+      })
+      .mockResolvedValueOnce({
+        status: 'success',
+        summary: '1 GitHub check(s) passed.',
+        failures: []
+      });
+    const createPullRequest = vi.fn(createGitHubStub().createDraftPullRequest);
+    const mergePullRequest = vi.fn(async () => ({
+      merged: true,
+      sha: 'merge-sha',
+      message: 'Pull Request successfully merged'
+    }));
+    const statuses: string[] = [];
+
+    const result = await runWorkerTask({
+      project: {
+        ...gitEnabledProject,
+        configYaml: gitProjectConfig.replace('auto_push: false', 'auto_push: true'),
+        autoCreatePullRequest: true,
+        autoMergePullRequest: true,
+        autoCompleteTask: true
+      },
+      task: { ...demoTask, id: `task_${randomUUID()}`, maxIterations: 3 },
+      provider: createProviderStub({ implement }),
+      github: createGitHubStub({ createDraftPullRequest: createPullRequest, mergePullRequest, waitForChecks }),
+      verifyCommand: 'node --version',
+      workspaceRoot,
+      hooks: {
+        async onStatus(status) {
+          statuses.push(status);
+        }
+      }
+    });
+
+    expect(result.status).toBe('completed');
+    expect(implement).toHaveBeenCalledTimes(2);
+    expect(implement.mock.calls[1]?.[0].previousValidationError).toContain('error C2589');
+    expect(createPullRequest).toHaveBeenCalledOnce();
+    expect(waitForChecks).toHaveBeenCalledTimes(2);
+    expect(mergePullRequest).toHaveBeenCalledOnce();
+    expect(statuses).toContain('running_ai');
+  }, 15000);
+
+  it('checkpoints GitHub Checks API failures for delivery-only retry', async () => {
+    const workspaceRoot = join(tmpdir(), `forgemind-worker-ci-api-failure-${randomUUID()}`);
+    const onGitHubOperationFailed = vi.fn();
+
+    await expect(runWorkerTask({
+      project: {
+        ...gitEnabledProject,
+        configYaml: gitProjectConfig.replace('auto_push: false', 'auto_push: true'),
+        autoCreatePullRequest: true
+      },
+      task: { ...demoTask, id: `task_${randomUUID()}` },
+      provider: createProviderStub(),
+      github: createGitHubStub({
+        async waitForChecks() {
+          throw new Error('GitHub Checks API unavailable');
+        }
+      }),
+      verifyCommand: 'node --version',
+      workspaceRoot,
+      hooks: { onGitHubOperationFailed }
+    })).rejects.toThrow('GitHub Checks API unavailable');
+
+    expect(onGitHubOperationFailed).toHaveBeenCalledWith(expect.objectContaining({
+      operation: 'wait_for_checks',
+      errorMessage: 'GitHub Checks API unavailable'
+    }));
   }, 10000);
 
   it('keeps a task ready for review when GitHub does not confirm the automatic merge', async () => {
@@ -1479,6 +1585,40 @@ describe('worker workflow', () => {
       '',
       'Acceptance Criteria:',
       '- GET /api/leaderboard works.'
+    ].join('\n'));
+  });
+
+  it('keeps the compact project contract with the current roadmap step', () => {
+    expect(compactTaskExecutionPrompt([
+      'Project: Flying',
+      'Parent objective:',
+      'A very long brief that is intentionally omitted from every implementation call.',
+      '',
+      'Project contract:',
+      'Summary: Czech offline simulator.',
+      'Global invariants:',
+      '- Use real Czech runway data.',
+      'Requirements covered by this work item:',
+      '- REQ-RUNWAYS: Import runway thresholds.',
+      '',
+      'Current implementation step:',
+      'Import runway thresholds.',
+      '',
+      'Acceptance Criteria:',
+      '- Import tests pass.'
+    ].join('\n'))).toBe([
+      'Project contract:',
+      'Summary: Czech offline simulator.',
+      'Global invariants:',
+      '- Use real Czech runway data.',
+      'Requirements covered by this work item:',
+      '- REQ-RUNWAYS: Import runway thresholds.',
+      '',
+      'Current implementation step:',
+      'Import runway thresholds.',
+      '',
+      'Acceptance Criteria:',
+      '- Import tests pass.'
     ].join('\n'));
   });
 

@@ -31,6 +31,7 @@ export interface ProjectApi {
   defaultBranch: string;
   configYaml?: string;
   brief?: string;
+  projectContract?: ProjectContractApi;
   autoCreatePullRequest: boolean;
   autoMergePullRequest: boolean;
   autoCompleteTask: boolean;
@@ -42,7 +43,38 @@ export interface ProjectApi {
   updatedAt: string;
 }
 
-export type ProjectRoadmapCycleStatus = 'active' | 'awaiting_extension_approval' | 'completed';
+export interface ProjectContractApi {
+  version: number;
+  sourceBriefHash?: string;
+  summary: string;
+  invariants: string[];
+  prohibitedSubstitutes: string[];
+  requirements: Array<{
+    id: string;
+    title: string;
+    description: string;
+    acceptanceCriteria: string[];
+  }>;
+  releaseCriteria: string[];
+}
+
+export type ProjectRoadmapCycleStatus = 'active' | 'verifying' | 'partial' | 'blocked' | 'awaiting_extension_approval' | 'completed';
+
+export interface ProjectAuditJobApi {
+  id: string;
+  projectId: string;
+  cycleId: string;
+  triggerTaskId?: string;
+  requirementIds: string[];
+  status: 'pending' | 'claimed' | 'succeeded' | 'blocked' | 'failed';
+  attemptCount: number;
+  nextAttemptAt?: string;
+  errorMessage?: string;
+  createdAt: string;
+  updatedAt: string;
+  claimedAt?: string;
+  finishedAt?: string;
+}
 export type ProjectImplementationStepStatus = 'pending' | 'running' | 'completed' | 'cancelled';
 
 export interface ProjectRoadmapCycleApi {
@@ -65,6 +97,8 @@ export interface ProjectImplementationStepApi {
   title: string;
   description: string;
   acceptanceCriteria: string[];
+  requirementIds: string[];
+  deliverables: string[];
   status: ProjectImplementationStepStatus;
   taskId?: string;
   createdAt: string;
@@ -76,6 +110,41 @@ export interface ProjectRoadmapApi {
   projectId: string;
   cycles: ProjectRoadmapCycleApi[];
   steps: ProjectImplementationStepApi[];
+  evidence: AcceptanceEvidenceApi[];
+  capabilities: ProjectCapabilityApi[];
+  auditJobs: ProjectAuditJobApi[];
+}
+
+export interface AcceptanceEvidenceApi {
+  id: string;
+  projectId: string;
+  cycleId: string;
+  stepId?: string;
+  taskId?: string;
+  taskRunId?: string;
+  requirementId: string;
+  criterionKey: string;
+  criterion: string;
+  source: 'validation_command' | 'github_check' | 'repository_audit' | 'artifact';
+  status: 'passed' | 'failed' | 'blocked';
+  evidenceKey: string;
+  contractVersion: number;
+  commitSha?: string;
+  command?: string;
+  exitCode?: number;
+  detailsUrl?: string;
+  payload: Record<string, unknown>;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface ProjectCapabilityApi {
+  requirement: ProjectContractApi['requirements'][number];
+  status: 'pending' | 'implementing' | 'verifying' | 'partial' | 'blocked' | 'satisfied';
+  workItemIds: string[];
+  evidence: AcceptanceEvidenceApi[];
+  satisfiedCriteria: number;
+  totalCriteria: number;
 }
 
 export interface TaskApi {

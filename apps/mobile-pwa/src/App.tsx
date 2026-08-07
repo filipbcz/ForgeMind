@@ -60,6 +60,7 @@ import {
   generateProjectRoadmap as generateProjectRoadmapRequest,
   resolveApproval as resolveApprovalRequest,
   retryTask as retryTaskRequest,
+  retryProjectAudit,
   setWorkerQueuePaused,
   subscribeNotification,
   startTask as startTaskRequest,
@@ -311,6 +312,10 @@ export function App() {
         queryClient.invalidateQueries({ queryKey: ['worker-status'] });
         queryClient.invalidateQueries({ queryKey: ['worker-events'] });
 
+        if (event.projectId) {
+          queryClient.invalidateQueries({ queryKey: ['projects', event.projectId, 'roadmap'] });
+        }
+
         if (event.taskId) {
           queryClient.setQueryData<AuditEventApi[]>(
             ['tasks', event.taskId, 'logs'],
@@ -533,6 +538,11 @@ export function App() {
       invalidateProjectData(roadmap.projectId);
       queryClient.invalidateQueries({ queryKey: ['tasks'] });
     }
+  });
+
+  const retryProjectAuditMutation = useMutation({
+    mutationFn: retryProjectAudit,
+    onSuccess: (roadmap) => invalidateProjectData(roadmap.projectId)
   });
 
   const startTaskMutation = useMutation({
@@ -900,6 +910,7 @@ export function App() {
             assigningRepository={assignProjectRepositoryMutation.isPending}
             generatingRoadmap={generateProjectRoadmapMutation.isPending}
             decidingExtension={decideProjectRoadmapExtensionMutation.isPending}
+            retryingAudit={retryProjectAuditMutation.isPending}
             deletingProject={deleteProjectMutation.isPending}
             deleteProjectError={deleteProjectMutation.error ? formatUiError(deleteProjectMutation.error) : undefined}
             onCreateProject={createProject}
@@ -911,6 +922,7 @@ export function App() {
             }}
             onGenerateRoadmap={(projectId, input) => generateProjectRoadmapMutation.mutate({ projectId, input })}
             onDecideExtension={(projectId, input) => decideProjectRoadmapExtensionMutation.mutate({ projectId, input })}
+            onRetryAudit={(projectId) => retryProjectAuditMutation.mutate(projectId)}
             onDeleteProject={(projectId, input) => {
               deleteProjectMutation.reset();
               deleteProjectMutation.mutate({ projectId, input });
@@ -2307,6 +2319,7 @@ function ProjectsPanel(props: {
   assigningRepository: boolean;
   generatingRoadmap: boolean;
   decidingExtension: boolean;
+  retryingAudit: boolean;
   deletingProject: boolean;
   deleteProjectError?: string;
   onCreateProject: (formData: FormData) => void;
@@ -2315,6 +2328,7 @@ function ProjectsPanel(props: {
   onUpdateProjectAutomation: (projectId: string, input: UpdateProjectRequest) => void;
   onGenerateRoadmap: (projectId: string, input?: GenerateProjectRoadmapRequest) => void;
   onDecideExtension: (projectId: string, input: DecideProjectRoadmapExtensionRequest) => void;
+  onRetryAudit: (projectId: string) => void;
   onDeleteProject: (projectId: string, input: DeleteProjectRequest) => void;
   githubRepositories: GitHubRepositoryApi[];
   githubRepositoriesLoading: boolean;
@@ -2619,6 +2633,52 @@ function ProjectsPanel(props: {
             {!props.roadmapLoading && !latestCycle ? <p>Zatim bez roadmap cyklu.</p> : null}
             {latestCycle ? (
               <>
+                {selectedProject.projectContract ? (
+                  <div className="project-contract-summary">
+                    <strong>Projektovy kontrakt v{selectedProject.projectContract.version}</strong>
+                    <p>{selectedProject.projectContract.summary}</p>
+                    <small>
+                      {selectedProject.projectContract.requirements.length} pozadavku | {selectedProject.projectContract.releaseCriteria.length} release kriterii
+                    </small>
+                  </div>
+                ) : null}
+                {(props.roadmap?.capabilities ?? []).length > 0 ? (
+                  <div className="capability-list">
+                    {(props.roadmap?.capabilities ?? []).map((capability) => (
+                      <div className="capability-row" key={capability.requirement.id}>
+                        <div>
+                          <strong>{capability.requirement.id}: {capability.requirement.title}</strong>
+                          <p>{capability.requirement.description}</p>
+                        </div>
+                        <span data-status={capability.status}>{capability.status}</span>
+                        <small>
+                          Audit {capability.satisfiedCriteria}/{capability.totalCriteria} | evidence {capability.evidence.length} | work itemy {capability.workItemIds.length}
+                        </small>
+                        {capability.evidence.length > 0 ? (
+                          <details>
+                            <summary>Dukazy</summary>
+                            <ul>
+                              {capability.evidence.map((evidence) => (
+                                <li key={evidence.id}>
+                                  <strong>{evidence.status}</strong> | {evidence.source} | {evidence.criterion}
+                                  {evidence.command ? <code>{evidence.command}</code> : null}
+                                </li>
+                              ))}
+                            </ul>
+                          </details>
+                        ) : null}
+                        {capability.workItemIds.length > 0 ? (
+                          <small>
+                            {(props.roadmap?.steps ?? [])
+                              .filter((step) => capability.workItemIds.includes(step.id))
+                              .map((step) => `${step.title} (${step.status})`)
+                              .join(' | ')}
+                          </small>
+                        ) : null}
+                      </div>
+                    ))}
+                  </div>
+                ) : null}
                 <div className="project-row">
                   <div>
                     <strong>Cyklus {latestCycle.cycleNumber}</strong>
@@ -2626,6 +2686,28 @@ function ProjectsPanel(props: {
                   </div>
                   <MetricBlock label="Status" value={latestCycle.status} />
                 </div>
+                {props.roadmap?.auditJobs.find((job) => job.cycleId === latestCycle.id) ? (() => {
+                  const auditJob = props.roadmap!.auditJobs.find((job) => job.cycleId === latestCycle.id)!;
+                  return (
+                    <div className={auditJob.status === 'failed' || auditJob.status === 'blocked' ? 'error-banner' : 'success-banner'}>
+                      Audit projektu: {auditJob.status} | pokus {auditJob.attemptCount}
+                      {auditJob.errorMessage ? <pre>{auditJob.errorMessage}</pre> : null}
+                      {auditJob.status === 'failed' || auditJob.status === 'blocked' ? (
+                        <div className="actions">
+                          <button
+                            className="secondary-action"
+                            type="button"
+                            disabled={props.retryingAudit}
+                            onClick={() => props.onRetryAudit(selectedProject.id)}
+                          >
+                            <RotateCcw size={16} />
+                            Opakovat pouze audit
+                          </button>
+                        </div>
+                      ) : null}
+                    </div>
+                  );
+                })() : null}
                 <div className="timeline">
                   {cycleSteps.map((step) => {
                     const task = step.taskId ? props.tasks.find((item) => item.id === step.taskId) : undefined;
@@ -2633,7 +2715,9 @@ function ProjectsPanel(props: {
                       <div className="timeline-row" key={step.id}>
                         <span>{step.sequenceNumber}.</span>
                         <strong>{step.title}</strong>
-                        <small>{step.status}{task ? ` | ${task.title}` : ''}</small>
+                        <small>
+                          {step.status}{step.requirementIds.length ? ` | ${step.requirementIds.join(', ')}` : ''}{task ? ` | ${task.title}` : ''}
+                        </small>
                       </div>
                     );
                   })}

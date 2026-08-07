@@ -2,12 +2,13 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { parseAgentConfigYaml, toCoreLimits, type AgentConfig } from '@forgemind/config';
 import { DEFAULT_LIMITS, evaluateLimits, requiresApproval, type Limits, type LimitUsage } from '@forgemind/core';
-import { advanceRoadmapAfterTaskCompletion, createRepository, getPrismaClient, type AIProviderConnectionSecret } from '@forgemind/db';
+import { advanceRoadmapAfterTaskCompletion, createRepository, getPrismaClient, startNextRoadmapStep, type AIProviderConnectionSecret, type ForgeMindRepository } from '@forgemind/db';
 import { GitHubAppAdapter, createGitHubAdapterFromEnv } from '@forgemind/github';
 import { createProvider, type AIProvider } from '@forgemind/providers';
-import type { ApprovalType, ProviderKind, TaskStatus } from '@forgemind/core';
+import type { AcceptanceEvidence, ApprovalType, Project, ProjectContract, ProviderKind, TaskStatus } from '@forgemind/core';
 import { toErrorMessage, type JsonValue } from '@forgemind/shared';
-import { runWorkerTask, type WorkerTaskResume } from './workflow.js';
+import { runWorkerTask, type WorkerTaskResult, type WorkerTaskResume } from './workflow.js';
+import { buildTargetedRepositoryContext, prepareCapabilityAuditWorkspace, runCapabilityAudit, runReleaseAudit } from './capability-audit.js';
 
 type ApprovedLimitSignal = 'diff_lines_limit_reached' | 'changed_files_limit_reached';
 
@@ -50,13 +51,24 @@ export async function runDatabaseWorkerOnce(options: { deferInterruptSignals?: b
   const providerModel = resolveProviderModel(providerKind, defaultAIProviderConnection);
   const claimTimeoutMinutes = Number(process.env.FORGEMIND_QUEUE_CLAIM_TIMEOUT_MINUTES ?? 2);
   const recovery = await repository.recoverStuckQueueJobs(claimTimeoutMinutes);
+  const recoveredProjectAudits = await repository.recoverStuckProjectAudits(claimTimeoutMinutes);
+  const auditResult = await runNextProjectAudit({
+    repository,
+    defaultConnection: defaultAIProviderConnection,
+    providerOverride,
+    fallbackProviderOverride,
+    providerConnectionIdOverride,
+    fallbackProviderConnectionIdOverride
+  });
+  if (auditResult) return auditResult;
   const claimed = await repository.claimNextSubmittedTask(providerKind, providerModel);
 
   if (!claimed) {
     return {
       claimed: false,
-      message: 'No submitted task found.',
-      recoveredQueueJobs: recovery.recoveredCount
+      message: 'No submitted task or project audit found.',
+      recoveredQueueJobs: recovery.recoveredCount,
+      recoveredProjectAudits
     };
   }
   const stopQueueHeartbeat = startQueueClaimHeartbeat(repository, claimed.queueJobId, claimTimeoutMinutes);
@@ -145,7 +157,7 @@ export async function runDatabaseWorkerOnce(options: { deferInterruptSignals?: b
   try {
     costEstimate = await provider.estimateCost({ prompt: claimed.task.prompt, repositorySizeHint: 'small' });
   } catch (error) {
-    const message = toErrorMessage(error);
+    const message = sanitizeAuditErrorMessage(toErrorMessage(error));
     await repository.failTask(claimed.task.id, message, 'provider_failed');
     await repository.finishTaskRun({
       taskRunId: claimed.taskRun.id,
@@ -373,6 +385,13 @@ export async function runDatabaseWorkerOnce(options: { deferInterruptSignals?: b
       }
     });
 
+    await recordTaskAcceptanceEvidence(repository, {
+      project: claimed.project,
+      taskId: claimed.task.id,
+      taskRunId: claimed.taskRun.id,
+      result
+    });
+
     if (result.status === 'needs_approval') {
       const approvalTypes = normalizeRuntimeApprovals(result.approvals);
       await repository.transitionTask(claimed.task.id, 'needs_approval', { approvals: approvalTypes });
@@ -492,6 +511,276 @@ export async function runDatabaseWorkerOnce(options: { deferInterruptSignals?: b
   }
 }
 
+async function runNextProjectAudit(input: {
+  repository: ForgeMindRepository;
+  defaultConnection?: AIProviderConnectionSecret;
+  providerOverride?: ProviderKind;
+  fallbackProviderOverride?: ProviderKind;
+  providerConnectionIdOverride?: string;
+  fallbackProviderConnectionIdOverride?: string;
+}) {
+  const claimed = await input.repository.claimNextProjectAudit();
+  if (!claimed) return undefined;
+
+  const stopAuditHeartbeat = startProjectAuditHeartbeat(
+    input.repository,
+    claimed.job.id,
+    Number(process.env.FORGEMIND_QUEUE_CLAIM_TIMEOUT_MINUTES ?? 2)
+  );
+  let cleanup: (() => Promise<void>) | undefined;
+  try {
+    const contract = claimed.project.projectContract;
+    if (!contract) throw new Error('Project contract is required before the completion audit can run.');
+    const githubConnection = await input.repository.getGitHubConnectionSecret();
+    const github = githubConnection
+      ? new GitHubAppAdapter({ token: githubConnection.token, apiBaseUrl: githubConnection.apiBaseUrl })
+      : await createGitHubAdapterFromEnv();
+    const projectConfig = parseProjectConfig(claimed.project.configYaml);
+    const selection = await resolveProviderSelection({
+      repository: input.repository,
+      projectConfig,
+      projectProviderConnectionId: claimed.project.aiProviderConnectionId,
+      defaultConnection: input.defaultConnection,
+      providerOverride: input.providerOverride,
+      fallbackProviderOverride: input.fallbackProviderOverride,
+      providerConnectionIdOverride: input.providerConnectionIdOverride,
+      fallbackProviderConnectionIdOverride: input.fallbackProviderConnectionIdOverride
+    });
+    const { provider, getLastProviderKind } = createPolicyAwareProvider({
+      primary: buildRuntimeProvider(selection.primary.kind, selection.primary.connection),
+      fallback: selection.fallback ? buildRuntimeProvider(selection.fallback.kind, selection.fallback.connection) : undefined
+    });
+    const triggerTask = claimed.job.triggerTaskId
+      ? await input.repository.getTask(claimed.job.triggerTaskId)
+      : undefined;
+    const workspace = await prepareCapabilityAuditWorkspace({
+      workspaceRoot: resolveWorkerWorkspaceRoot(),
+      project: claimed.project,
+      github,
+      preferredBranch: triggerTask?.branchName
+    });
+    cleanup = workspace.cleanup;
+
+    let lastActivityAt = 0;
+    const onActivity = async (activity: { kind: string; message: string; elapsedMs: number }) => {
+      const now = Date.now();
+      if (activity.kind !== 'lifecycle' && now - lastActivityAt < 2_000) return;
+      lastActivityAt = now;
+      await input.repository.writeAudit({
+        actorType: 'agent',
+        eventType: 'project_audit_activity',
+        projectId: claimed.project.id,
+        taskId: claimed.job.triggerTaskId,
+        payload: {
+          auditJobId: claimed.job.id,
+          cycleId: claimed.cycle.id,
+          kind: activity.kind,
+          message: activity.message.slice(0, 4_000),
+          elapsedMs: activity.elapsedMs
+        }
+      });
+    };
+
+    const targetRequirementIds = new Set(
+      claimed.job.requirementIds.length > 0
+        ? claimed.job.requirementIds
+        : contract.requirements.map((requirement) => requirement.id)
+    );
+    for (const requirement of contract.requirements.filter((item) => targetRequirementIds.has(item.id))) {
+      const roadmap = await input.repository.getProjectRoadmap(claimed.project.id);
+      const capability = roadmap?.capabilities.find((item) => item.requirement.id === requirement.id);
+      if (capability?.status === 'satisfied') continue;
+
+      const workItems = (roadmap?.steps ?? []).filter((step) =>
+        step.cycleId === claimed.cycle.id && step.requirementIds.includes(requirement.id)
+      );
+      const audit = await runCapabilityAudit({
+        repository: input.repository,
+        provider,
+        project: claimed.project,
+        cycleId: claimed.cycle.id,
+        requirement,
+        workItems,
+        workspacePath: workspace.workspacePath,
+        commitSha: workspace.commitSha,
+        repositoryContext: await buildTargetedRepositoryContext(workspace.workspacePath, [
+          requirement.id,
+          requirement.title,
+          requirement.description,
+          ...requirement.acceptanceCriteria
+        ]),
+        onActivity
+      });
+
+      if (audit.verdict === 'blocked') {
+        await input.repository.finalizeProjectAudit(claimed.job.id, 'blocked', audit.summary);
+        return { claimed: true, kind: 'project_audit', projectId: claimed.project.id, status: 'blocked', provider: getLastProviderKind() };
+      }
+      if (audit.verdict === 'partial') {
+        const created = await input.repository.appendProjectImplementationSteps({
+          projectId: claimed.project.id,
+          cycleId: claimed.cycle.id,
+          steps: audit.gapWorkItems.map((step) => ({
+            title: step.title,
+            description: formatGapStepDescription(step),
+            acceptanceCriteria: step.acceptanceCriteria,
+            requirementIds: step.requirementIds,
+            deliverables: step.deliverables
+          }))
+        });
+        if (created.length === 0) {
+          const message = 'Capability audit found a gap but did not produce a new, traceable work item.';
+          await input.repository.finalizeProjectAudit(claimed.job.id, 'blocked', message);
+          return { claimed: true, kind: 'project_audit', projectId: claimed.project.id, status: 'blocked', provider: getLastProviderKind() };
+        }
+        await input.repository.finalizeProjectAudit(claimed.job.id, 'succeeded');
+        const nextTask = await startNextRoadmapStep(input.repository, claimed.project.id, claimed.cycle.id);
+        return {
+          claimed: true,
+          kind: 'project_audit',
+          projectId: claimed.project.id,
+          status: 'gaps_scheduled',
+          gapStepCount: created.length,
+          nextTaskId: nextTask?.id,
+          provider: getLastProviderKind()
+        };
+      }
+    }
+
+    const finalRoadmap = await input.repository.getProjectRoadmap(claimed.project.id);
+    const remainingSteps = finalRoadmap?.steps.filter((step) =>
+      step.cycleId === claimed.cycle.id && (step.status === 'pending' || step.status === 'running')
+    ) ?? [];
+    if (remainingSteps.length > 0) {
+      await input.repository.updateProjectRoadmapCycleStatus(claimed.cycle.id, 'active');
+      await input.repository.finalizeProjectAudit(claimed.job.id, 'succeeded');
+      const nextTask = await startNextRoadmapStep(input.repository, claimed.project.id, claimed.cycle.id);
+      return {
+        claimed: true,
+        kind: 'project_audit',
+        projectId: claimed.project.id,
+        status: 'capabilities_satisfied',
+        nextTaskId: nextTask?.id,
+        provider: getLastProviderKind()
+      };
+    }
+    const allSatisfied = Boolean(finalRoadmap?.capabilities.length)
+      && finalRoadmap!.capabilities.every((capability) => capability.status === 'satisfied');
+    if (!allSatisfied) throw new Error('Capability audit finished without satisfying every project requirement.');
+
+    if (!hasSatisfiedReleaseAudit(finalRoadmap?.evidence ?? [], contract, workspace.commitSha)) {
+      const releaseAudit = await runReleaseAudit({
+        repository: input.repository,
+        provider,
+        project: claimed.project,
+        cycleId: claimed.cycle.id,
+        workspacePath: workspace.workspacePath,
+        commitSha: workspace.commitSha,
+        repositoryContext: workspace.repositoryContext,
+        onActivity
+      });
+      if (releaseAudit.verdict === 'blocked') {
+        await input.repository.finalizeProjectAudit(claimed.job.id, 'blocked', releaseAudit.summary);
+        return { claimed: true, kind: 'project_audit', projectId: claimed.project.id, status: 'blocked', provider: getLastProviderKind() };
+      }
+      if (releaseAudit.verdict === 'partial') {
+        const created = await input.repository.appendProjectImplementationSteps({
+          projectId: claimed.project.id,
+          cycleId: claimed.cycle.id,
+          steps: releaseAudit.gapWorkItems.map((step) => ({
+            title: step.title,
+            description: formatGapStepDescription(step),
+            acceptanceCriteria: step.acceptanceCriteria,
+            requirementIds: step.requirementIds,
+            deliverables: step.deliverables
+          }))
+        });
+        if (created.length === 0) {
+          const message = 'Release audit found a gap but did not produce a new, traceable work item.';
+          await input.repository.finalizeProjectAudit(claimed.job.id, 'blocked', message);
+          return { claimed: true, kind: 'project_audit', projectId: claimed.project.id, status: 'blocked', provider: getLastProviderKind() };
+        }
+        await input.repository.finalizeProjectAudit(claimed.job.id, 'succeeded');
+        const nextTask = await startNextRoadmapStep(input.repository, claimed.project.id, claimed.cycle.id);
+        return {
+          claimed: true,
+          kind: 'project_audit',
+          projectId: claimed.project.id,
+          status: 'release_gaps_scheduled',
+          gapStepCount: created.length,
+          nextTaskId: nextTask?.id,
+          provider: getLastProviderKind()
+        };
+      }
+    }
+
+    const extensionPlan = await provider.plan({
+      taskId: `project-extension:${claimed.cycle.id}`,
+      title: `Next extension for ${claimed.project.name}`,
+      prompt: [
+        `Project contract version ${contract.version} has passed its independent release audit.`,
+        `Completed objective: ${claimed.cycle.objective}`,
+        `Contract summary: ${contract.summary}`,
+        'Propose only the single next most valuable optional extension. Do not repeat completed scope and do not implement anything.'
+      ].join('\n'),
+      repositoryPath: workspace.workspacePath,
+      onActivity
+    });
+    const extensionProposal = extensionPlan.summary.trim() || extensionPlan.steps[0]?.trim();
+    if (!extensionProposal) throw new Error('AI provider did not return a project extension proposal.');
+    await input.repository.updateProjectRoadmapCycleStatus(claimed.cycle.id, 'completed');
+    await input.repository.setProjectRoadmapCycleExtensionProposal(claimed.cycle.id, {
+      proposal: extensionProposal,
+      status: 'awaiting_extension_approval'
+    });
+    await input.repository.finalizeProjectAudit(claimed.job.id, 'succeeded');
+    return { claimed: true, kind: 'project_audit', projectId: claimed.project.id, status: 'awaiting_extension_approval', provider: getLastProviderKind() };
+  } catch (error) {
+    const message = sanitizeAuditErrorMessage(toErrorMessage(error));
+    const finalized = await input.repository.finalizeProjectAudit(claimed.job.id, 'failed', message);
+    return {
+      claimed: true,
+      kind: 'project_audit',
+      projectId: claimed.project.id,
+      status: finalized.retryScheduled ? 'retry_scheduled' : 'failed',
+      errorMessage: message
+    };
+  } finally {
+    stopAuditHeartbeat();
+    await cleanup?.();
+  }
+}
+
+function formatGapStepDescription(step: {
+  description: string;
+  inScope: string[];
+  outOfScope: string[];
+}): string {
+  return [
+    step.description,
+    step.inScope.length > 0 ? `In scope:\n${step.inScope.map((item) => `- ${item}`).join('\n')}` : '',
+    step.outOfScope.length > 0 ? `Out of scope:\n${step.outOfScope.map((item) => `- ${item}`).join('\n')}` : ''
+  ].filter(Boolean).join('\n\n');
+}
+
+function sanitizeAuditErrorMessage(message: string): string {
+  return message.replace(/https:\/\/[^@\s]+@/gi, 'https://[credential-redacted]@');
+}
+
+function hasSatisfiedReleaseAudit(evidence: AcceptanceEvidence[], contract: ProjectContract, commitSha: string): boolean {
+  const passedCriteria = new Set(evidence
+    .filter((item) =>
+      item.source === 'repository_audit'
+      && item.status === 'passed'
+      && item.contractVersion === contract.version
+      && item.commitSha === commitSha
+      && item.criterion.startsWith('Release: ')
+    )
+    .map((item) => item.criterion.slice('Release: '.length).replace(/\s+/g, ' ').trim().toLowerCase()));
+  return [...contract.invariants, ...contract.releaseCriteria]
+    .every((criterion) => passedCriteria.has(criterion.replace(/\s+/g, ' ').trim().toLowerCase()));
+}
+
 interface RuntimeProvider {
   kind: ProviderKind;
   contextId: string;
@@ -556,6 +845,18 @@ function createPolicyAwareProvider(input: {
     },
     async review(reviewInput) {
       return callWithFallback('review', (provider) => provider.review(reviewInput));
+    },
+    async auditCapability(auditInput) {
+      return callWithFallback('audit_capability', (provider) => {
+        if (!provider.auditCapability) throw new Error('Configured provider does not support capability audits.');
+        return provider.auditCapability(auditInput);
+      });
+    },
+    async auditRelease(auditInput) {
+      return callWithFallback('audit_release', (provider) => {
+        if (!provider.auditRelease) throw new Error('Configured provider does not support release audits.');
+        return provider.auditRelease(auditInput);
+      });
     },
     async estimateCost(costInput) {
       return callWithFallback('estimate_cost', (provider) => provider.estimateCost(costInput));
@@ -921,6 +1222,20 @@ function startQueueClaimHeartbeat(
     stopped = true;
     clearInterval(timer);
   };
+}
+
+function startProjectAuditHeartbeat(
+  repository: { refreshProjectAuditClaim?: (auditJobId: string) => Promise<boolean> },
+  auditJobId: string,
+  claimTimeoutMinutes: number
+): () => void {
+  if (typeof repository.refreshProjectAuditClaim !== 'function') return () => undefined;
+  const heartbeatIntervalMs = Math.max(5_000, Math.min(30_000, claimTimeoutMinutes * 20_000));
+  const timer = setInterval(() => {
+    void repository.refreshProjectAuditClaim!(auditJobId).catch(() => undefined);
+  }, heartbeatIntervalMs);
+  timer.unref();
+  return () => clearInterval(timer);
 }
 
 function installWorkerInterruptionRecovery(input: {
@@ -1431,6 +1746,74 @@ function findLastIteration<T extends { phase: string }>(iterations: T[], phase: 
   }
 
   return undefined;
+}
+
+export async function recordTaskAcceptanceEvidence(
+  repository: ForgeMindRepository,
+  input: { project: Project; taskId: string; taskRunId: string; result: WorkerTaskResult }
+): Promise<void> {
+  const contract = input.project.projectContract;
+  if (!contract) return;
+
+  try {
+    const step = await repository.getImplementationStepByTaskId(input.taskId);
+    if (!step || step.requirementIds.length === 0) return;
+
+    for (const check of input.result.validation.checkResults ?? []) {
+      if (!check.criterion?.trim()) continue;
+      await repository.recordAcceptanceEvidence({
+        projectId: input.project.id,
+        cycleId: step.cycleId,
+        stepId: step.id,
+        taskId: input.taskId,
+        taskRunId: input.taskRunId,
+        requirementIds: step.requirementIds,
+        criterion: check.criterion,
+        source: 'validation_command',
+        status: check.passed ? 'passed' : 'failed',
+        evidenceIdentity: check.command,
+        contractVersion: contract.version,
+        commitSha: input.result.commitSha,
+        command: check.command,
+        exitCode: check.exitCode,
+        payload: {
+          rationale: check.rationale ?? null,
+          stdout: limitEvidenceText(check.stdout),
+          stderr: limitEvidenceText(check.stderr)
+        }
+      });
+    }
+
+    if (input.result.githubChecks?.status === 'success' && input.result.commitSha) {
+      await repository.recordAcceptanceEvidence({
+        projectId: input.project.id,
+        cycleId: step.cycleId,
+        stepId: step.id,
+        taskId: input.taskId,
+        taskRunId: input.taskRunId,
+        requirementIds: step.requirementIds,
+        criterion: `GitHub checks pass for work item: ${step.title}`,
+        source: 'github_check',
+        status: 'passed',
+        evidenceIdentity: `github-checks:${input.result.commitSha}`,
+        contractVersion: contract.version,
+        commitSha: input.result.commitSha,
+        payload: { summary: limitEvidenceText(input.result.githubChecks.summary) }
+      });
+    }
+  } catch (error) {
+    await repository.writeAudit({
+      actorType: 'system',
+      eventType: 'acceptance_evidence_record_failed',
+      projectId: input.project.id,
+      taskId: input.taskId,
+      payload: { errorMessage: toErrorMessage(error), taskRunId: input.taskRunId }
+    });
+  }
+}
+
+function limitEvidenceText(value: string, maxLength = 4_000): string {
+  return value.length <= maxLength ? value : `${value.slice(0, maxLength)}\n[evidence output truncated]`;
 }
 
 function buildIterationErrorFingerprint(phase: string, validationResult: unknown): string | undefined {

@@ -5,6 +5,7 @@ export interface RoadmapAdvanceResult {
   advanced: boolean;
   completedStep?: ProjectImplementationStep;
   nextTask?: ForgeTask;
+  auditQueued?: boolean;
   completedCycle?: ProjectRoadmapCycle;
   project?: Project;
 }
@@ -36,12 +37,64 @@ export async function advanceRoadmapAfterTaskCompletion(
   }
 
   const nextStep = cycleSteps.find((candidate) => candidate.status === 'pending');
-  if (!nextStep) {
-    const completedCycle = cycle.status === 'completed'
-      ? cycle
-      : await repository.updateProjectRoadmapCycleStatus(cycle.id, 'completed');
-    return { advanced: true, completedStep, completedCycle, project };
+  const auditableRequirementIds = project.projectContract?.requirements
+    .filter((requirement) => {
+      const requirementSteps = cycleSteps.filter((step) => (step.requirementIds ?? []).includes(requirement.id));
+      const capability = roadmap.capabilities?.find((item) => item.requirement.id === requirement.id);
+      return requirementSteps.length > 0
+        && requirementSteps.every((step) => step.status === 'completed')
+        && capability?.status !== 'satisfied';
+    })
+    .map((requirement) => requirement.id) ?? [];
+  if (auditableRequirementIds.length > 0) {
+    const audit = await repository.enqueueProjectAudit({
+      projectId: project.id,
+      cycleId: cycle.id,
+      triggerTaskId: taskId,
+      requirementIds: auditableRequirementIds
+    });
+    return { advanced: true, completedStep, auditQueued: audit.enqueued, project };
   }
+  if (!nextStep) {
+    if (!project.projectContract) {
+      const completedCycle = cycle.status === 'completed'
+        ? cycle
+        : await repository.updateProjectRoadmapCycleStatus(cycle.id, 'completed');
+      return { advanced: true, completedStep, completedCycle, project };
+    }
+    if (cycle.status === 'completed' || cycle.status === 'awaiting_extension_approval') {
+      return { advanced: linkedStep.status !== 'completed', completedStep, completedCycle: cycle, project };
+    }
+    const audit = await repository.enqueueProjectAudit({
+      projectId: project.id,
+      cycleId: cycle.id,
+      triggerTaskId: taskId,
+      requirementIds: project.projectContract.requirements.map((requirement) => requirement.id)
+    });
+    return { advanced: true, completedStep, auditQueued: audit.enqueued, project };
+  }
+
+  const nextTask = await startNextRoadmapStep(repository, project.id, cycle.id);
+  return { advanced: Boolean(nextTask), completedStep, nextTask, project };
+}
+
+export async function startNextRoadmapStep(
+  repository: ForgeMindRepository,
+  projectId: string,
+  cycleId: string
+): Promise<ForgeTask | undefined> {
+  const [roadmap, project] = await Promise.all([
+    repository.getProjectRoadmap(projectId),
+    repository.getProject(projectId)
+  ]);
+  const cycle = roadmap?.cycles.find((candidate) => candidate.id === cycleId);
+  if (!roadmap || !project || !cycle) return undefined;
+  const cycleSteps = roadmap.steps
+    .filter((candidate) => candidate.cycleId === cycleId)
+    .sort((left, right) => left.sequenceNumber - right.sequenceNumber);
+  if (cycleSteps.some((candidate) => candidate.status === 'running')) return undefined;
+  const nextStep = cycleSteps.find((candidate) => candidate.status === 'pending');
+  if (!nextStep) return undefined;
 
   const currentIndex = cycleSteps.findIndex((candidate) => candidate.id === nextStep.id);
   const completedSteps = cycleSteps
@@ -58,6 +111,9 @@ export async function advanceRoadmapAfterTaskCompletion(
       stepTitle: nextStep.title,
       stepDescription: nextStep.description,
       acceptanceCriteria: nextStep.acceptanceCriteria,
+      requirementIds: nextStep.requirementIds,
+      deliverables: nextStep.deliverables,
+      projectContract: project.projectContract,
       completedSteps,
       futureSteps
     }),
@@ -82,7 +138,7 @@ export async function advanceRoadmapAfterTaskCompletion(
     payload: { reason: 'roadmap_step_started' }
   });
 
-  return { advanced: true, completedStep, nextTask: startedTask, project };
+  return startedTask;
 }
 
 export function buildRoadmapStepTaskPrompt(input: {
@@ -91,6 +147,9 @@ export function buildRoadmapStepTaskPrompt(input: {
   stepTitle: string;
   stepDescription: string;
   acceptanceCriteria: string[];
+  requirementIds?: string[];
+  deliverables?: string[];
+  projectContract?: Project['projectContract'];
   completedSteps: string[];
   futureSteps: string[];
 }): string {
@@ -99,6 +158,27 @@ export function buildRoadmapStepTaskPrompt(input: {
     '',
     'Parent objective:',
     input.objective,
+  ];
+
+  if (input.projectContract) {
+    const requirements = input.projectContract.requirements.filter((requirement) =>
+      (input.requirementIds ?? []).includes(requirement.id)
+    );
+    lines.push(
+      '',
+      'Project contract:',
+      `Summary: ${input.projectContract.summary}`,
+      'Global invariants:',
+      ...input.projectContract.invariants.map((item) => `- ${item}`),
+      ...(input.projectContract.prohibitedSubstitutes.length > 0
+        ? ['Prohibited substitutes:', ...input.projectContract.prohibitedSubstitutes.map((item) => `- ${item}`)]
+        : []),
+      'Requirements covered by this work item:',
+      ...requirements.map((requirement) => `- ${requirement.id}: ${requirement.title} - ${requirement.description}`)
+    );
+  }
+
+  lines.push(
     '',
     'Current implementation step:',
     input.stepTitle,
@@ -111,7 +191,11 @@ export function buildRoadmapStepTaskPrompt(input: {
     '- Do not implement work assigned to future roadmap steps.',
     '- Reuse existing functionality. If part of this step is already satisfied, verify it instead of rewriting it.',
     '- Keep unrelated repository files unchanged.'
-  ];
+  );
+
+  if (input.deliverables?.length) {
+    lines.push('', 'Required deliverables:', ...input.deliverables.map((deliverable) => `- ${deliverable}`));
+  }
 
   if (input.completedSteps.length > 0) {
     lines.push('', 'Already completed roadmap steps (existing repository context):');

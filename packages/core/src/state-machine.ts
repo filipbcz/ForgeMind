@@ -24,7 +24,7 @@ const transitions: Record<TaskStatus, TaskStatus[]> = {
   reviewing: ['improving', 'running_ai', 'creating_pr', 'needs_approval', 'failed', 'cancelled'],
   improving: ['running_ai', 'validating', 'needs_approval', 'failed', 'cancelled'],
   needs_approval: ['running_ai', 'creating_pr', 'approval_rejected', 'cancelled'],
-  creating_pr: ['ready_for_user_review', 'failed', 'cancelled'],
+  creating_pr: ['running_ai', 'ready_for_user_review', 'validation_failed', 'failed', 'cancelled'],
   ready_for_user_review: ['completed', 'running_ai', 'cancelled'],
   completed: [],
   failed: [],

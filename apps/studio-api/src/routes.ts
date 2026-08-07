@@ -1,4 +1,5 @@
 import type { FastifyInstance } from 'fastify';
+import { createHash } from 'node:crypto';
 import { z } from 'zod';
 import { createProvider, GitHubCopilotProvider, listCodexModels, listOpenAIModels } from '@forgemind/providers';
 import type { PlanResult } from '@forgemind/providers';
@@ -22,7 +23,7 @@ import { advanceRoadmapAfterTaskCompletion, buildRoadmapStepTaskPrompt } from '@
 import type { AIProviderConnectionKind, ForgeMindRepository } from '@forgemind/db';
 import { parseGitHubWebhookPayload, projectGitHubWebhookEvent, verifyGitHubWebhookSignature } from './webhook.js';
 import type { NotificationService } from './notifications.js';
-import type { TaskMode } from '@forgemind/core';
+import type { ProjectContract, TaskMode } from '@forgemind/core';
 import { resolveRuntimeEnvVar } from './runtime-env.js';
 
 const projectSchema = z.object({
@@ -92,6 +93,20 @@ const retrySchema = z.object({
 
 const roadmapGenerateSchema = z.object({
   objective: z.string().min(20).optional()
+});
+
+const projectContractPlanSchema = z.object({
+  version: z.number().int().positive(),
+  summary: z.string().trim().min(1),
+  invariants: z.array(z.string().trim().min(1)).min(1),
+  prohibitedSubstitutes: z.array(z.string().trim().min(1)),
+  requirements: z.array(z.object({
+    id: z.string().trim().regex(/^REQ-[A-Z0-9-]+$/),
+    title: z.string().trim().min(1),
+    description: z.string().trim().min(1),
+    acceptanceCriteria: z.array(z.string().trim().min(1)).min(1)
+  })).min(1),
+  releaseCriteria: z.array(z.string().trim().min(1)).min(1)
 });
 
 const roadmapExtensionApprovalSchema = z.object({
@@ -1000,6 +1015,29 @@ export function registerRoutes(app: FastifyInstance, repository: ForgeMindReposi
     return roadmap ? roadmap : sendNotFound(reply, `Project "${id}" not found`);
   });
 
+  app.post('/api/projects/:id/audit/retry', async (request, reply) => {
+    try {
+      const { id } = idParamsSchema.parse(request.params);
+      const roadmap = await repository.getProjectRoadmap(id);
+      if (!roadmap) return sendNotFound(reply, `Project "${id}" not found`);
+      const cycle = [...roadmap.cycles].sort((left, right) => right.cycleNumber - left.cycleNumber)[0];
+      if (!cycle) return reply.code(409).send({ error: 'The project does not have a roadmap cycle to audit.' });
+      const auditJob = roadmap.auditJobs.find((job) => job.cycleId === cycle.id);
+      if (!auditJob || (auditJob.status !== 'failed' && auditJob.status !== 'blocked')) {
+        return reply.code(409).send({ error: 'Only a failed or blocked project audit can be retried.' });
+      }
+      await repository.enqueueProjectAudit({
+        projectId: id,
+        cycleId: cycle.id,
+        triggerTaskId: auditJob.triggerTaskId,
+        requirementIds: auditJob.requirementIds
+      });
+      return (await repository.getProjectRoadmap(id))!;
+    } catch (error) {
+      return sendBadRequest(reply, error);
+    }
+  });
+
   app.post('/api/projects/:id/implementation-steps/start-next', async (request, reply) => {
     try {
       const { id } = idParamsSchema.parse(request.params);
@@ -1048,7 +1086,12 @@ export function registerRoutes(app: FastifyInstance, repository: ForgeMindReposi
       }
 
       const plan = await generateRoadmapPlan(repository, project, objective);
-      const stepBlueprints = toImplementationStepBlueprints(plan);
+      const projectContract = toProjectContract(
+        plan,
+        buildContractSource(project.brief, objective),
+        (project.projectContract?.version ?? 0) + 1
+      );
+      const stepBlueprints = toImplementationStepBlueprints(plan, projectContract);
       if (stepBlueprints.length === 0) {
         throw new Error('AI provider did not return any implementation steps.');
       }
@@ -1056,12 +1099,13 @@ export function registerRoutes(app: FastifyInstance, repository: ForgeMindReposi
       const roadmap = await repository.createProjectRoadmapCycle({
         projectId: project.id,
         objective,
+        projectContract,
         steps: stepBlueprints
       });
 
       const firstStep = findFirstPendingStepForLatestCycle(roadmap);
       if (firstStep) {
-        await createAndStartRoadmapTask(repository, dispatcher, project, firstStep, objective);
+        await createAndStartRoadmapTask(repository, dispatcher, { ...project, projectContract }, firstStep, objective);
       }
 
       return reply.code(201).send((await repository.getProjectRoadmap(project.id))!);
@@ -1100,7 +1144,12 @@ export function registerRoutes(app: FastifyInstance, repository: ForgeMindReposi
       }
 
       const plan = await generateRoadmapPlan(repository, project, objective);
-      const stepBlueprints = toImplementationStepBlueprints(plan);
+      const projectContract = toProjectContract(
+        plan,
+        buildContractSource(project.brief, objective),
+        (project.projectContract?.version ?? 0) + 1
+      );
+      const stepBlueprints = toImplementationStepBlueprints(plan, projectContract);
       if (stepBlueprints.length === 0) {
         throw new Error('AI provider did not return any implementation steps.');
       }
@@ -1108,12 +1157,13 @@ export function registerRoutes(app: FastifyInstance, repository: ForgeMindReposi
       const nextRoadmap = await repository.createProjectRoadmapCycle({
         projectId: project.id,
         objective,
+        projectContract,
         steps: stepBlueprints
       });
 
       const firstStep = findFirstPendingStepForLatestCycle(nextRoadmap);
       if (firstStep) {
-        await createAndStartRoadmapTask(repository, dispatcher, project, firstStep, objective);
+        await createAndStartRoadmapTask(repository, dispatcher, { ...project, projectContract }, firstStep, objective);
       }
 
       return (await repository.getProjectRoadmap(id))!;
@@ -1552,7 +1602,11 @@ async function generateRoadmapPlan(
       completedSteps.length > 0 ? `Already completed implementation steps:\n${completedSteps.map((step) => `- ${step}`).join('\n')}` : undefined,
       '',
       'Return concrete implementation steps that can be executed one by one as individual engineering tasks in implementationSteps.',
-      'Each implementationSteps item must contain title, a distinct implementation-focused description, acceptanceCriteria, inScope, and outOfScope.',
+      'Also return projectContract with version 1, summary, global invariants, prohibited substitutes, atomic requirements, and release criteria.',
+      'Every requirement id must use REQ-UPPERCASE format and describe one independently verifiable product capability, not an implementation layer.',
+      'Each implementationSteps item must contain title, a distinct implementation-focused description, acceptanceCriteria, inScope, outOfScope, requirementIds, and concrete deliverables.',
+      'Each implementation step must fit one focused pull request and cover at most three contract requirements. Split broad epics into multiple steps.',
+      'Every contract requirement must be referenced by at least one implementation step. Placeholder data, declarations, documentation, interfaces, or pass-valued evidence do not satisfy production capabilities unless explicitly required.',
       'Give every step only its own verifiable acceptance criteria. Do not copy project-wide acceptance criteria to every step.',
       'Steps must not overlap. Do not include work assigned to a later step, and do not recreate already completed capabilities.',
       'A documentation or scope-definition step must change documentation only and must not implement application code.',
@@ -1563,20 +1617,54 @@ async function generateRoadmapPlan(
   });
 }
 
-export function toImplementationStepBlueprints(plan: PlanResult): Array<{ title: string; description: string; acceptanceCriteria: string[] }> {
+export function toProjectContract(plan: PlanResult, source = '', version?: number): ProjectContract {
+  const contract = projectContractPlanSchema.parse(plan.projectContract);
+  const ids = contract.requirements.map((requirement) => requirement.id);
+  if (new Set(ids).size !== ids.length) {
+    throw new Error('AI provider returned duplicate project contract requirement ids.');
+  }
+  return {
+    ...contract,
+    version: version ?? contract.version,
+    sourceBriefHash: createHash('sha256').update(normalizeContractSource(source)).digest('hex')
+  };
+}
+
+function buildContractSource(brief: string | undefined, objective: string): string {
+  return [brief?.trim(), objective.trim()].filter(Boolean).join('\n\n');
+}
+
+function normalizeContractSource(value: string): string {
+  return value.replace(/\r\n/g, '\n').trim();
+}
+
+export function toImplementationStepBlueprints(
+  plan: PlanResult,
+  projectContract: ProjectContract
+): Array<{ title: string; description: string; acceptanceCriteria: string[]; requirementIds: string[]; deliverables: string[] }> {
   if (!Array.isArray(plan.implementationSteps) || plan.implementationSteps.length === 0) {
     throw new Error('AI provider did not return structured implementationSteps for the project roadmap.');
   }
 
-  return plan.implementationSteps.map((step, index) => {
+  const blueprints = plan.implementationSteps.map((step, index) => {
     const title = step.title.trim();
     const description = step.description.trim();
     const acceptanceCriteria = step.acceptanceCriteria.map((criterion) => criterion.trim()).filter(Boolean);
     const inScope = step.inScope.map((item) => item.trim()).filter(Boolean);
     const outOfScope = step.outOfScope.map((item) => item.trim()).filter(Boolean);
+    const requirementIds = step.requirementIds.map((item) => item.trim()).filter(Boolean);
+    const deliverables = step.deliverables.map((item) => item.trim()).filter(Boolean);
 
-    if (!title || !description || acceptanceCriteria.length === 0 || inScope.length === 0) {
+    if (!title || !description || acceptanceCriteria.length === 0 || inScope.length === 0 || requirementIds.length === 0 || deliverables.length === 0) {
       throw new Error(`AI provider returned an incomplete implementation step at position ${index + 1}.`);
+    }
+    if (requirementIds.length > 3 || deliverables.length > 3 || acceptanceCriteria.length > 5 || inScope.length > 5) {
+      throw new Error(`AI provider returned an oversized implementation step at position ${index + 1}; split it into focused work items.`);
+    }
+    const knownRequirementIds = new Set(projectContract.requirements.map((requirement) => requirement.id));
+    const unknownRequirementId = requirementIds.find((id) => !knownRequirementIds.has(id));
+    if (unknownRequirementId) {
+      throw new Error(`Implementation step ${index + 1} references unknown requirement "${unknownRequirementId}".`);
     }
 
     return {
@@ -1588,9 +1676,19 @@ export function toImplementationStepBlueprints(plan: PlanResult): Array<{ title:
         ...inScope.map((item) => `- ${item}`),
         ...(outOfScope.length > 0 ? ['', 'Out of scope:', ...outOfScope.map((item) => `- ${item}`)] : [])
       ].join('\n'),
-      acceptanceCriteria
+      acceptanceCriteria,
+      requirementIds,
+      deliverables
     };
   });
+
+  const coveredRequirementIds = new Set(plan.implementationSteps.flatMap((step) => step.requirementIds));
+  const missingRequirement = projectContract.requirements.find((requirement) => !coveredRequirementIds.has(requirement.id));
+  if (missingRequirement) {
+    throw new Error(`Roadmap does not cover project contract requirement "${missingRequirement.id}".`);
+  }
+
+  return blueprints;
 }
 
 export function findFirstPendingStepForLatestCycle<T extends {
@@ -1612,13 +1710,15 @@ export function findFirstPendingStepForLatestCycle<T extends {
 async function createAndStartRoadmapTask(
   repository: ForgeMindRepository,
   dispatcher: ReturnType<typeof createTaskDispatchService>,
-  project: { id: string; name: string; defaultTaskMode?: TaskMode },
+  project: { id: string; name: string; defaultTaskMode?: TaskMode; projectContract?: ProjectContract },
   step: {
     id: string;
     cycleId: string;
     title: string;
     description: string;
     acceptanceCriteria: string[];
+    requirementIds: string[];
+    deliverables: string[];
   },
   objective: string
 ) {
@@ -1638,6 +1738,9 @@ async function createAndStartRoadmapTask(
       stepTitle: step.title,
       stepDescription: step.description,
       acceptanceCriteria: step.acceptanceCriteria,
+      requirementIds: step.requirementIds,
+      deliverables: step.deliverables,
+      projectContract: project.projectContract,
       completedSteps,
       futureSteps
     }),

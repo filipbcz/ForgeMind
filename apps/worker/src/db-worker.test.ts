@@ -3,6 +3,16 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 const createProviderMock = vi.fn();
 const runWorkerTaskMock = vi.fn();
 const advanceRoadmapAfterTaskCompletionMock = vi.fn(async () => ({ advanced: false }));
+const startNextRoadmapStepMock = vi.fn(async () => undefined);
+const runCapabilityAuditMock = vi.fn();
+const runReleaseAuditMock = vi.fn();
+const prepareCapabilityAuditWorkspaceMock = vi.fn(async () => ({
+  workspacePath: 'C:/tmp/audit',
+  commitSha: 'abcdef1',
+  repositoryContext: 'src/index.ts',
+  cleanup: vi.fn(async () => undefined)
+}));
+const buildTargetedRepositoryContextMock = vi.fn(async () => 'src/index.ts');
 
 function createClaimedTask(queueReason = 'task_started') {
   return {
@@ -40,10 +50,18 @@ function createClaimedTask(queueReason = 'task_started') {
 
 const repositoryMock = {
   recoverStuckQueueJobs: vi.fn(async () => ({ recoveredCount: 0, queueJobIds: [] })),
+  recoverStuckProjectAudits: vi.fn(async () => 0),
   getGitHubConnectionSecret: vi.fn(async () => undefined),
   getAIProviderConnectionSecret: vi.fn(async () => undefined),
   getAIProviderConnectionSecretById: vi.fn(async () => undefined),
   claimNextSubmittedTask: vi.fn(async (): Promise<unknown> => createClaimedTask()),
+  claimNextProjectAudit: vi.fn(async () => undefined),
+  getTask: vi.fn(async () => undefined),
+  getProjectRoadmap: vi.fn(async () => undefined),
+  finalizeProjectAudit: vi.fn(async () => ({ retryScheduled: false })),
+  appendProjectImplementationSteps: vi.fn(async () => []),
+  updateProjectRoadmapCycleStatus: vi.fn(async () => undefined),
+  setProjectRoadmapCycleExtensionProposal: vi.fn(async () => undefined),
   updateTaskRunProvider: vi.fn(async () => undefined),
   recordProviderUsage: vi.fn(async () => undefined),
   transitionTask: vi.fn(async () => undefined),
@@ -88,6 +106,7 @@ const repositoryMock = {
 
 vi.mock('@forgemind/db', () => ({
   advanceRoadmapAfterTaskCompletion: advanceRoadmapAfterTaskCompletionMock,
+  startNextRoadmapStep: startNextRoadmapStepMock,
   createRepository: vi.fn(() => repositoryMock),
   getPrismaClient: vi.fn(() => ({}))
 }));
@@ -105,6 +124,13 @@ vi.mock('@forgemind/providers', () => ({
 
 vi.mock('./workflow.js', () => ({
   runWorkerTask: runWorkerTaskMock
+}));
+
+vi.mock('./capability-audit.js', () => ({
+  buildTargetedRepositoryContext: buildTargetedRepositoryContextMock,
+  prepareCapabilityAuditWorkspace: prepareCapabilityAuditWorkspaceMock,
+  runCapabilityAudit: runCapabilityAuditMock,
+  runReleaseAudit: runReleaseAuditMock
 }));
 
 describe('db-worker policy enforcement', () => {
@@ -1650,5 +1676,57 @@ describe('db-worker policy enforcement', () => {
     });
     expect(repositoryMock.transitionTask).toHaveBeenNthCalledWith(2, 'task_1', 'completed');
     expect(advanceRoadmapAfterTaskCompletionMock).toHaveBeenCalledWith(repositoryMock, 'task_1');
+  });
+
+  it('runs capability and release audits before completing a roadmap cycle', async () => {
+    const contract = {
+      version: 1,
+      summary: 'Demo project',
+      invariants: ['Use persisted data.'],
+      prohibitedSubstitutes: ['Static fixtures.'],
+      requirements: [{ id: 'REQ-DEMO', title: 'Demo', description: 'Demo works.', acceptanceCriteria: ['Integration works.'] }],
+      releaseCriteria: ['Build passes.']
+    };
+    const project = {
+      id: 'project_1', name: 'Demo', slug: 'demo', githubOwner: 'demo', githubRepo: 'repo', defaultBranch: 'main',
+      projectContract: contract, isActive: true, createdAt: '', updatedAt: ''
+    };
+    const capability = {
+      requirement: contract.requirements[0], status: 'satisfied', workItemIds: ['step_1'], evidence: [], satisfiedCriteria: 1, totalCriteria: 1
+    };
+    repositoryMock.claimNextSubmittedTask.mockResolvedValueOnce(undefined);
+    repositoryMock.claimNextProjectAudit.mockResolvedValueOnce({
+      job: { id: 'audit_1', projectId: project.id, cycleId: 'cycle_1', triggerTaskId: 'task_1', requirementIds: ['REQ-DEMO'], status: 'claimed', attemptCount: 1 },
+      project,
+      cycle: { id: 'cycle_1', projectId: project.id, cycleNumber: 1, objective: 'Build Demo', status: 'verifying' }
+    });
+    repositoryMock.getProjectRoadmap
+      .mockResolvedValueOnce({ projectId: project.id, cycles: [], steps: [], evidence: [], capabilities: [] })
+      .mockResolvedValueOnce({ projectId: project.id, cycles: [], steps: [], evidence: [], capabilities: [capability] });
+    runCapabilityAuditMock.mockResolvedValueOnce({ verdict: 'satisfied', summary: 'Done', criteria: [], gapWorkItems: [] });
+    runReleaseAuditMock.mockResolvedValueOnce({ verdict: 'satisfied', summary: 'Ready', criteria: [], gapWorkItems: [] });
+    createProviderMock.mockReturnValue({
+      kind: 'codex',
+      supportsLocalRepo: () => true,
+      supportsGitHubNativeFlow: () => false,
+      estimateCost: vi.fn(),
+      plan: vi.fn(async () => ({ summary: 'Add export support.', steps: [], acceptanceCriteria: [], validationChecks: [] })),
+      implement: vi.fn(),
+      review: vi.fn(),
+      auditCapability: vi.fn(),
+      auditRelease: vi.fn()
+    });
+
+    const { runDatabaseWorkerOnce } = await import('./db-worker.js');
+    const result = await runDatabaseWorkerOnce();
+
+    expect(result).toMatchObject({ claimed: true, kind: 'project_audit', status: 'awaiting_extension_approval' });
+    expect(runCapabilityAuditMock).toHaveBeenCalledTimes(1);
+    expect(runReleaseAuditMock).toHaveBeenCalledTimes(1);
+    expect(repositoryMock.updateProjectRoadmapCycleStatus).toHaveBeenCalledWith('cycle_1', 'completed');
+    expect(repositoryMock.setProjectRoadmapCycleExtensionProposal).toHaveBeenCalledWith('cycle_1', {
+      proposal: 'Add export support.',
+      status: 'awaiting_extension_approval'
+    });
   });
 });

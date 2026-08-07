@@ -1,4 +1,4 @@
-import type { ApprovalType, ProviderKind } from '@forgemind/core';
+import type { AcceptanceEvidenceSource, AcceptanceEvidenceStatus, ApprovalType, ProjectContract, ProjectContractRequirement, ProviderKind } from '@forgemind/core';
 
 export interface ProviderActivity {
   kind: 'lifecycle' | 'stdout' | 'stderr' | 'workspace';
@@ -35,6 +35,7 @@ export interface PlanResult {
   steps: string[];
   acceptanceCriteria: string[];
   implementationSteps?: ImplementationStepPlan[];
+  projectContract?: ProjectContract;
   validationChecks?: ValidationCheck[];
   providerPrompt?: string;
   providerResponse?: string;
@@ -46,6 +47,8 @@ export interface ImplementationStepPlan {
   acceptanceCriteria: string[];
   inScope: string[];
   outOfScope: string[];
+  requirementIds: string[];
+  deliverables: string[];
 }
 
 export interface ValidationCheck {
@@ -131,6 +134,66 @@ export interface ReviewResult {
   providerResponse?: string;
 }
 
+export interface CapabilityAuditInput {
+  projectId: string;
+  contractVersion: number;
+  contractSummary: string;
+  invariants: string[];
+  prohibitedSubstitutes: string[];
+  requirement: ProjectContractRequirement;
+  completedWorkItems: Array<{
+    id: string;
+    title: string;
+    deliverables: string[];
+    acceptanceCriteria: string[];
+  }>;
+  evidence: Array<{
+    criterion: string;
+    source: AcceptanceEvidenceSource;
+    status: AcceptanceEvidenceStatus;
+    command?: string;
+    commitSha?: string;
+    summary?: string;
+  }>;
+  repositoryPath: string;
+  repositoryContext?: string;
+  commitSha?: string;
+  onActivity?: ProviderActivityHandler;
+}
+
+export interface CapabilityAuditCriterionResult {
+  criterion: string;
+  status: 'passed' | 'failed' | 'blocked';
+  evidence: string[];
+  gaps: string[];
+}
+
+export interface CapabilityAuditResult {
+  verdict: 'satisfied' | 'partial' | 'blocked';
+  summary: string;
+  criteria: CapabilityAuditCriterionResult[];
+  gapWorkItems: ImplementationStepPlan[];
+  providerPrompt?: string;
+  providerResponse?: string;
+}
+
+export interface ReleaseAuditInput {
+  projectId: string;
+  contract: ProjectContract;
+  satisfiedCapabilities: Array<{
+    requirementId: string;
+    title: string;
+    satisfiedCriteria: number;
+    totalCriteria: number;
+  }>;
+  repositoryPath: string;
+  repositoryContext?: string;
+  commitSha: string;
+  onActivity?: ProviderActivityHandler;
+}
+
+export type ReleaseAuditResult = CapabilityAuditResult;
+
 export interface CostEstimateInput {
   prompt: string;
   repositorySizeHint?: 'small' | 'medium' | 'large';
@@ -147,6 +210,8 @@ export interface AIProvider {
   plan(input: PlanInput): Promise<PlanResult>;
   implement(input: ImplementInput): Promise<ImplementResult>;
   review(input: ReviewInput): Promise<ReviewResult>;
+  auditCapability?(input: CapabilityAuditInput): Promise<CapabilityAuditResult>;
+  auditRelease?(input: ReleaseAuditInput): Promise<ReleaseAuditResult>;
   estimateCost(input: CostEstimateInput): Promise<CostEstimateResult>;
   supportsLocalRepo(): boolean;
   supportsGitHubNativeFlow(): boolean;

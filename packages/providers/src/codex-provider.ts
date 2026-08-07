@@ -8,12 +8,16 @@ import { promisify } from 'node:util';
 import type { ProviderKind } from '@forgemind/core';
 import type {
   AIProvider,
+  CapabilityAuditInput,
+  CapabilityAuditResult,
   CostEstimateInput,
   CostEstimateResult,
   ImplementInput,
   ImplementResult,
   PlanInput,
   PlanResult,
+  ReleaseAuditInput,
+  ReleaseAuditResult,
   ProviderActivityHandler,
   ProviderUsageMeasurement,
   ReviewInput,
@@ -22,6 +26,7 @@ import type {
 import { normalizeValidationChecks } from './provider.js';
 import { emitCapturedUsage, normalizeTokenBreakdown } from './provider-usage.js';
 import { buildReviewPrompt } from './review-prompt.js';
+import { buildCapabilityAuditPrompt, buildReleaseAuditPrompt, normalizeCapabilityAuditResult, normalizeReleaseAuditResult, parseCapabilityAuditContent } from './audit-prompt.js';
 import type { ProviderRuntimeConfig } from './index.js';
 import type { ProviderModelOption } from './openai-provider.js';
 
@@ -159,6 +164,76 @@ function validationChecksJsonSchema(): Record<string, unknown> {
   };
 }
 
+function projectContractJsonSchema(): Record<string, unknown> {
+  return {
+    type: 'object',
+    additionalProperties: false,
+    required: ['version', 'summary', 'invariants', 'prohibitedSubstitutes', 'requirements', 'releaseCriteria'],
+    properties: {
+      version: { type: 'number' },
+      summary: { type: 'string' },
+      invariants: { type: 'array', items: { type: 'string' } },
+      prohibitedSubstitutes: { type: 'array', items: { type: 'string' } },
+      requirements: {
+        type: 'array',
+        items: {
+          type: 'object',
+          additionalProperties: false,
+          required: ['id', 'title', 'description', 'acceptanceCriteria'],
+          properties: {
+            id: { type: 'string' },
+            title: { type: 'string' },
+            description: { type: 'string' },
+            acceptanceCriteria: { type: 'array', items: { type: 'string' } }
+          }
+        }
+      },
+      releaseCriteria: { type: 'array', items: { type: 'string' } }
+    }
+  };
+}
+
+function capabilityAuditJsonSchema(): Record<string, unknown> {
+  const gapWorkItem = {
+    type: 'object',
+    additionalProperties: false,
+    required: ['title', 'description', 'acceptanceCriteria', 'inScope', 'outOfScope', 'requirementIds', 'deliverables'],
+    properties: {
+      title: { type: 'string' },
+      description: { type: 'string' },
+      acceptanceCriteria: { type: 'array', items: { type: 'string' } },
+      inScope: { type: 'array', items: { type: 'string' } },
+      outOfScope: { type: 'array', items: { type: 'string' } },
+      requirementIds: { type: 'array', items: { type: 'string' } },
+      deliverables: { type: 'array', items: { type: 'string' } }
+    }
+  };
+  return {
+    type: 'object',
+    additionalProperties: false,
+    required: ['verdict', 'summary', 'criteria', 'gapWorkItems'],
+    properties: {
+      verdict: { type: 'string', enum: ['satisfied', 'partial', 'blocked'] },
+      summary: { type: 'string' },
+      criteria: {
+        type: 'array',
+        items: {
+          type: 'object',
+          additionalProperties: false,
+          required: ['criterion', 'status', 'evidence', 'gaps'],
+          properties: {
+            criterion: { type: 'string' },
+            status: { type: 'string', enum: ['passed', 'failed', 'blocked'] },
+            evidence: { type: 'array', items: { type: 'string' } },
+            gaps: { type: 'array', items: { type: 'string' } }
+          }
+        }
+      },
+      gapWorkItems: { type: 'array', items: gapWorkItem }
+    }
+  };
+}
+
 function parseJsonContent<T>(content: string, fallback: T): T {
   try {
     const jsonStart = content.indexOf('{');
@@ -253,8 +328,8 @@ export class CodexProvider implements AIProvider {
         role: 'system',
         content: input.previousValidationError
           ? 'Revise only the supplied failed validation check. Return JSON with a short summary, empty steps and implementationSteps arrays, the supplied acceptanceCriteria, and replacement validationChecks for that failed check only. Do not repeat successful or unrelated checks and do not propose implementation work. Reply with JSON only.'
-          : 'You are Codex. Return JSON with summary, steps, acceptanceCriteria, validationChecks, and implementationSteps. ' +
-            'For ordinary task plans, implementationSteps must be an empty array. When the request asks for a project roadmap, it must contain objects with title, description, acceptanceCriteria, inScope, and outOfScope. ' +
+          : 'You are Codex. Return JSON with summary, steps, acceptanceCriteria, validationChecks, implementationSteps, and optional projectContract. ' +
+            'For ordinary task plans, implementationSteps must be an empty array and projectContract must be omitted. When the request asks for a project roadmap, include a projectContract and implementationSteps with title, description, acceptanceCriteria, inScope, outOfScope, requirementIds, and deliverables. ' +
             'validationChecks must contain only executable command checks. Omit criteria that cannot be verified automatically. ' +
             'Commands must verify a criterion through their exit code and must not use shell redirection, fallback chains, or inspection-only git diff/status/log commands. ' +
             'Use { "kind": "command", "command": "...", "criterion": "...", "rationale": "..." }. Reply with JSON only.'
@@ -397,6 +472,61 @@ export class CodexProvider implements AIProvider {
     };
   }
 
+  async auditCapability(input: CapabilityAuditInput): Promise<CapabilityAuditResult> {
+    const providerPrompt = buildCapabilityAuditPrompt(
+      this.authMode === 'oauth' ? { ...input, repositoryContext: undefined } : input
+    );
+    if (this.authMode === 'oauth') {
+      return this.auditCapabilityWithCli(input, providerPrompt);
+    }
+    if (!input.repositoryContext?.trim()) {
+      throw new Error('Codex API capability audit requires a targeted repository packet.');
+    }
+    const messages: Array<{ role: 'system' | 'user' | 'assistant'; content: string }> = [
+      {
+        role: 'system',
+        content: 'You are an independent read-only capability auditor. Inspect only for contract satisfaction and return strict JSON.'
+      },
+      { role: 'user', content: providerPrompt }
+    ];
+    const response = await this.requestResponses(messages);
+    await emitCapturedUsage(input.onActivity, response.usage);
+    const result = normalizeCapabilityAuditResult(input, parseCapabilityAuditContent(response.content));
+    return {
+      ...result,
+      providerPrompt: serializeMessages(messages),
+      providerResponse: response.content
+    };
+  }
+
+  async auditRelease(input: ReleaseAuditInput): Promise<ReleaseAuditResult> {
+    const providerPrompt = buildReleaseAuditPrompt(
+      this.authMode === 'oauth' ? { ...input, repositoryContext: undefined } : input
+    );
+    if (this.authMode === 'oauth') {
+      const content = await this.runCodexExec({
+        repositoryPath: input.repositoryPath,
+        sandbox: 'read-only',
+        onActivity: input.onActivity,
+        schema: capabilityAuditJsonSchema(),
+        prompt: providerPrompt
+      });
+      return { ...normalizeReleaseAuditResult(input, parseCapabilityAuditContent(content)), providerPrompt, providerResponse: content };
+    }
+    if (!input.repositoryContext?.trim()) throw new Error('Codex API release audit requires a targeted repository packet.');
+    const messages: Array<{ role: 'system' | 'user' | 'assistant'; content: string }> = [
+      { role: 'system', content: 'You are an independent read-only release auditor. Inspect integration and contract satisfaction, then return strict JSON.' },
+      { role: 'user', content: providerPrompt }
+    ];
+    const response = await this.requestResponses(messages);
+    await emitCapturedUsage(input.onActivity, response.usage);
+    return {
+      ...normalizeReleaseAuditResult(input, parseCapabilityAuditContent(response.content)),
+      providerPrompt: serializeMessages(messages),
+      providerResponse: response.content
+    };
+  }
+
   async estimateCost(input: CostEstimateInput): Promise<CostEstimateResult> {
     const words = input.prompt.trim().split(/\s+/).filter(Boolean).length;
     const multiplier = input.repositorySizeHint === 'large' ? 4 : input.repositorySizeHint === 'medium' ? 2 : 1;
@@ -460,16 +590,19 @@ export class CodexProvider implements AIProvider {
             items: {
               type: 'object',
               additionalProperties: false,
-              required: ['title', 'description', 'acceptanceCriteria', 'inScope', 'outOfScope'],
+              required: ['title', 'description', 'acceptanceCriteria', 'inScope', 'outOfScope', 'requirementIds', 'deliverables'],
               properties: {
                 title: { type: 'string' },
                 description: { type: 'string' },
                 acceptanceCriteria: { type: 'array', items: { type: 'string' } },
                 inScope: { type: 'array', items: { type: 'string' } },
-                outOfScope: { type: 'array', items: { type: 'string' } }
+                outOfScope: { type: 'array', items: { type: 'string' } },
+                requirementIds: { type: 'array', items: { type: 'string' } },
+                deliverables: { type: 'array', items: { type: 'string' } }
               }
             }
           },
+          projectContract: projectContractJsonSchema(),
           validationChecks: validationChecksJsonSchema()
         }
       },
@@ -593,6 +726,18 @@ export class CodexProvider implements AIProvider {
       providerPrompt,
       providerResponse: content
     };
+  }
+
+  private async auditCapabilityWithCli(input: CapabilityAuditInput, providerPrompt: string): Promise<CapabilityAuditResult> {
+    const content = await this.runCodexExec({
+      repositoryPath: input.repositoryPath,
+      sandbox: 'read-only',
+      onActivity: input.onActivity,
+      schema: capabilityAuditJsonSchema(),
+      prompt: providerPrompt
+    });
+    const result = normalizeCapabilityAuditResult(input, parseCapabilityAuditContent(content));
+    return { ...result, providerPrompt, providerResponse: content };
   }
 
   private async runCodexExec(input: {

@@ -5,12 +5,16 @@ import { tmpdir } from 'node:os';
 import type { ProviderKind } from '@forgemind/core';
 import type {
   AIProvider,
+  CapabilityAuditInput,
+  CapabilityAuditResult,
   CostEstimateInput,
   CostEstimateResult,
   ImplementInput,
   ImplementResult,
   PlanInput,
   PlanResult,
+  ReleaseAuditInput,
+  ReleaseAuditResult,
   ReviewInput,
   ReviewResult,
   ProviderUsageMeasurement,
@@ -163,6 +167,14 @@ export class GitHubCopilotProvider implements AIProvider {
       providerPrompt: messages,
       providerResponse: content
     };
+  }
+
+  async auditCapability(_input: CapabilityAuditInput): Promise<CapabilityAuditResult> {
+    throw new Error('GitHub Copilot capability audit is not supported. Configure a Codex or OpenAI provider for roadmap audits.');
+  }
+
+  async auditRelease(_input: ReleaseAuditInput): Promise<ReleaseAuditResult> {
+    throw new Error('GitHub Copilot release audit is not supported. Configure a Codex or OpenAI provider for roadmap audits.');
   }
 
   async estimateCost(input: CostEstimateInput): Promise<CostEstimateResult> {

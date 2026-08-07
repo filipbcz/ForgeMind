@@ -33,6 +33,25 @@ export interface MergePullRequestResult {
   message: string;
 }
 
+export interface GitHubCheckFailure {
+  name: string;
+  detailsUrl?: string;
+  output: string;
+}
+
+export interface GitHubChecksResult {
+  status: 'success' | 'failure' | 'not_configured' | 'timeout';
+  summary: string;
+  failures: GitHubCheckFailure[];
+}
+
+export interface WaitForGitHubChecksOptions {
+  timeoutMs?: number;
+  discoveryTimeoutMs?: number;
+  pollIntervalMs?: number;
+  onProgress?: (message: string) => Promise<void> | void;
+}
+
 export interface GitHubAdapter {
   createIssue(input: CreateIssueInput): Promise<CreateIssueResult>;
   getRemoteUrl?(project: Project): string | undefined;
@@ -42,6 +61,7 @@ export interface GitHubAdapter {
   mergePullRequest?(project: Project, pullRequestNumber: number): Promise<MergePullRequestResult>;
   commentOnIssue(project: Project, issueNumber: number, body: string): Promise<void>;
   readCheckStatus(project: Project, ref: string): Promise<'pending' | 'success' | 'failure'>;
+  waitForChecks?(project: Project, ref: string, options?: WaitForGitHubChecksOptions): Promise<GitHubChecksResult>;
 }
 
 export interface GitHubAppAdapterOptions {
@@ -166,6 +186,24 @@ interface GitHubMergePullResponse {
 
 interface GitHubStatusResponse {
   state: 'error' | 'failure' | 'pending' | 'success';
+}
+
+interface GitHubCheckRunsResponse {
+  total_count: number;
+  check_runs: GitHubCheckRunResponse[];
+}
+
+interface GitHubCheckRunResponse {
+  id: number;
+  name: string;
+  status: 'queued' | 'in_progress' | 'completed' | 'waiting' | 'requested' | 'pending';
+  conclusion: string | null;
+  details_url?: string | null;
+  output?: {
+    title?: string | null;
+    summary?: string | null;
+    text?: string | null;
+  };
 }
 
 interface GitHubRepositoryResponse {
@@ -321,6 +359,119 @@ export class GitHubAppAdapter implements GitHubAdapter {
     return 'failure';
   }
 
+  async waitForChecks(project: Project, ref: string, options: WaitForGitHubChecksOptions = {}): Promise<GitHubChecksResult> {
+    const repository = requireProjectRepository(project);
+    const startedAt = Date.now();
+    const timeoutMs = options.timeoutMs ?? readPositiveIntegerEnv('FORGEMIND_GITHUB_CHECKS_TIMEOUT_MS', 30 * 60_000);
+    const discoveryTimeoutMs = Math.min(
+      timeoutMs,
+      options.discoveryTimeoutMs ?? readPositiveIntegerEnv('FORGEMIND_GITHUB_CHECKS_DISCOVERY_TIMEOUT_MS', 30_000)
+    );
+    const pollIntervalMs = options.pollIntervalMs ?? readPositiveIntegerEnv('FORGEMIND_GITHUB_CHECKS_POLL_INTERVAL_MS', 10_000);
+    let lastProgress = '';
+
+    while (Date.now() - startedAt < timeoutMs) {
+      const checks = await this.request<GitHubCheckRunsResponse>(
+        'GET',
+        `/repos/${repository.owner}/${repository.repo}/commits/${encodeURIComponent(ref)}/check-runs?filter=latest&per_page=100`
+      );
+      const runs = checks.check_runs ?? [];
+
+      if (runs.length === 0) {
+        if (Date.now() - startedAt >= discoveryTimeoutMs) {
+          return {
+            status: 'not_configured',
+            summary: 'No GitHub checks were discovered for the pushed commit.',
+            failures: []
+          };
+        }
+        lastProgress = await reportCheckProgress(options, lastProgress, 'Waiting for GitHub checks to start.');
+        await delay(pollIntervalMs);
+        continue;
+      }
+
+      const pending = runs.filter((run) => run.status !== 'completed');
+      if (pending.length > 0) {
+        lastProgress = await reportCheckProgress(
+          options,
+          lastProgress,
+          `GitHub checks are running (${runs.length - pending.length}/${runs.length} completed).`
+        );
+        await delay(pollIntervalMs);
+        continue;
+      }
+
+      const failedRuns = runs.filter((run) => !isSuccessfulCheckConclusion(run.conclusion));
+      if (failedRuns.length === 0) {
+        return {
+          status: 'success',
+          summary: `${runs.length} GitHub check(s) passed.`,
+          failures: []
+        };
+      }
+
+      const failures = await Promise.all(failedRuns.map((run) => this.describeCheckFailure(repository, run)));
+      return {
+        status: 'failure',
+        summary: compactCheckOutput(failures.map((failure) => `${failure.name}: ${failure.output}`).join('\n\n')),
+        failures
+      };
+    }
+
+    return {
+      status: 'timeout',
+      summary: `GitHub checks did not finish within ${Math.ceil(timeoutMs / 60_000)} minute(s).`,
+      failures: []
+    };
+  }
+
+  private async describeCheckFailure(
+    repository: { owner: string; repo: string },
+    run: GitHubCheckRunResponse
+  ): Promise<GitHubCheckFailure> {
+    const fallback = compactCheckOutput([
+      run.output?.title,
+      run.output?.summary,
+      run.output?.text,
+      run.conclusion ? `Conclusion: ${run.conclusion}` : undefined
+    ].filter((value): value is string => Boolean(value)).join('\n'));
+    const jobId = parseActionsJobId(run.details_url);
+    let output = fallback;
+
+    if (jobId) {
+      try {
+        const log = await this.requestText('GET', `/repos/${repository.owner}/${repository.repo}/actions/jobs/${jobId}/logs`);
+        output = compactCheckOutput(log) || fallback;
+      } catch (error) {
+        output = `${fallback}\nUnable to read the failed job log: ${toSafeGitHubError(error)}`.trim();
+      }
+    }
+
+    return {
+      name: run.name,
+      detailsUrl: run.details_url ?? undefined,
+      output: output || `GitHub check concluded with ${run.conclusion ?? 'an unknown failure'}.`
+    };
+  }
+
+  private async requestText(method: string, path: string): Promise<string> {
+    const response = await fetch(`${this.apiBaseUrl}${path}`, {
+      method,
+      headers: {
+        Accept: 'application/vnd.github+json',
+        Authorization: `Bearer ${this.options.token}`,
+        'User-Agent': 'ForgeMind-GitHubAppAdapter',
+        'X-GitHub-Api-Version': '2022-11-28'
+      }
+    });
+
+    if (!response.ok) {
+      throw new Error(`GitHub API ${method} ${path} failed with ${response.status}: ${await response.text()}`);
+    }
+
+    return response.text();
+  }
+
   private async request<T = unknown>(method: string, path: string, body?: unknown): Promise<T> {
     const response = await fetch(`${this.apiBaseUrl}${path}`, {
       method,
@@ -345,6 +496,61 @@ export class GitHubAppAdapter implements GitHubAdapter {
 
     return response.json() as Promise<T>;
   }
+}
+
+function isSuccessfulCheckConclusion(conclusion: string | null): boolean {
+  return conclusion === 'success' || conclusion === 'neutral' || conclusion === 'skipped';
+}
+
+function parseActionsJobId(detailsUrl: string | null | undefined): string | undefined {
+  return detailsUrl?.match(/\/actions\/runs\/\d+\/job\/(\d+)/)?.[1];
+}
+
+function compactCheckOutput(raw: string): string {
+  const lines = raw
+    .replace(/\u001b\[[0-9;]*m/g, '')
+    .split(/\r?\n/)
+    .map((line) => line.trimEnd())
+    .filter(Boolean);
+  if (lines.length === 0) return '';
+
+  const errorPattern = /(^|\b)(error|failed|failure|fatal|exception|undefined reference|process completed with exit code|C\d{4})(\b|:)/i;
+  const selected = new Set<number>();
+  for (let index = 0; index < lines.length; index += 1) {
+    if (!errorPattern.test(lines[index] ?? '')) continue;
+    for (let context = Math.max(0, index - 2); context <= Math.min(lines.length - 1, index + 2); context += 1) {
+      selected.add(context);
+    }
+  }
+
+  const compacted = (selected.size > 0
+    ? Array.from(selected).sort((left, right) => left - right).map((index) => lines[index]!)
+    : lines.slice(-40))
+    .slice(-80)
+    .join('\n');
+  return compacted.length <= 8_000 ? compacted : compacted.slice(compacted.length - 8_000);
+}
+
+async function reportCheckProgress(
+  options: WaitForGitHubChecksOptions,
+  previous: string,
+  message: string
+): Promise<string> {
+  if (message !== previous) await options.onProgress?.(message);
+  return message;
+}
+
+function readPositiveIntegerEnv(name: string, fallback: number): number {
+  const parsed = Number.parseInt(process.env[name] ?? '', 10);
+  return Number.isFinite(parsed) && parsed >= 0 ? parsed : fallback;
+}
+
+function delay(ms: number): Promise<void> {
+  return new Promise((resolvePromise) => setTimeout(resolvePromise, Math.max(0, ms)));
+}
+
+function toSafeGitHubError(error: unknown): string {
+  return error instanceof Error ? error.message.slice(0, 1_000) : String(error).slice(0, 1_000);
 }
 
 export async function createGitHubAdapterFromEnv(): Promise<GitHubAdapter> {

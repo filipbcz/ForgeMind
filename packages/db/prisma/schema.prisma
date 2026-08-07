@@ -145,6 +145,7 @@ model Project {
   defaultBranch String   @default("main") @map("default_branch")
   configYaml    String?  @map("config_yaml")
   brief                 String?
+  projectContract       Json?    @map("project_contract")
   autoCreatePullRequest Boolean  @default(true) @map("auto_create_pull_request")
   autoMergePullRequest  Boolean  @default(false) @map("auto_merge_pull_request")
   autoCompleteTask      Boolean  @default(false) @map("auto_complete_task")
@@ -159,6 +160,8 @@ model Project {
   auditLog      AuditLog[]
   roadmapCycles ProjectRoadmapCycle[]
   roadmapSteps  ProjectImplementationStep[]
+  acceptanceEvidence AcceptanceEvidence[]
+  auditJobs      ProjectAuditJob[]
   aiProviderConnection AiProviderConnection? @relation(fields: [aiProviderConnectionId], references: [id], onDelete: SetNull)
 
   @@map("projects")
@@ -166,8 +169,19 @@ model Project {
 
 enum ProjectRoadmapCycleStatus {
   active
+  verifying
+  partial
+  blocked
   awaiting_extension_approval
   completed
+}
+
+enum ProjectAuditJobStatus {
+  pending
+  claimed
+  succeeded
+  blocked
+  failed
 }
 
 enum ProjectImplementationStepStatus {
@@ -175,6 +189,19 @@ enum ProjectImplementationStepStatus {
   running
   completed
   cancelled
+}
+
+enum AcceptanceEvidenceSource {
+  validation_command
+  github_check
+  repository_audit
+  artifact
+}
+
+enum AcceptanceEvidenceStatus {
+  passed
+  failed
+  blocked
 }
 
 model GitHubConnection {
@@ -277,6 +304,7 @@ model Task {
   providerUsage  ProviderUsage[]
   auditLog       AuditLog[]
   roadmapSteps   ProjectImplementationStep[]
+  acceptanceEvidence AcceptanceEvidence[]
 
   @@index([projectId, status])
   @@map("tasks")
@@ -295,6 +323,8 @@ model ProjectRoadmapCycle {
 
   project Project @relation(fields: [projectId], references: [id])
   steps   ProjectImplementationStep[]
+  acceptanceEvidence AcceptanceEvidence[]
+  auditJobs ProjectAuditJob[]
 
   @@unique([projectId, cycleNumber])
   @@index([projectId, status])
@@ -309,6 +339,8 @@ model ProjectImplementationStep {
   title              String
   description        String
   acceptanceCriteria Json                            @map("acceptance_criteria")
+  requirementIds     Json                            @default("[]") @map("requirement_ids")
+  deliverables       Json                            @default("[]")
   status             ProjectImplementationStepStatus @default(pending)
   taskId             String?                         @unique @map("task_id")
   createdAt          DateTime                        @default(now()) @map("created_at")
@@ -318,10 +350,67 @@ model ProjectImplementationStep {
   project Project             @relation(fields: [projectId], references: [id])
   cycle   ProjectRoadmapCycle @relation(fields: [cycleId], references: [id])
   task    Task?               @relation(fields: [taskId], references: [id])
+  acceptanceEvidence AcceptanceEvidence[]
 
   @@unique([cycleId, sequenceNumber])
   @@index([projectId, status])
   @@map("project_implementation_steps")
+}
+
+model AcceptanceEvidence {
+  id              String                   @id @default(uuid())
+  projectId       String                   @map("project_id")
+  cycleId         String                   @map("cycle_id")
+  stepId          String?                  @map("step_id")
+  taskId          String?                  @map("task_id")
+  taskRunId       String?                  @map("task_run_id")
+  requirementId   String                   @map("requirement_id")
+  criterionKey    String                   @map("criterion_key")
+  criterion       String
+  source          AcceptanceEvidenceSource
+  status          AcceptanceEvidenceStatus
+  evidenceKey     String                   @map("evidence_key")
+  contractVersion Int                      @map("contract_version")
+  commitSha       String?                  @map("commit_sha")
+  command         String?
+  exitCode        Int?                     @map("exit_code")
+  detailsUrl      String?                  @map("details_url")
+  payloadJson     Json                     @map("payload_json")
+  createdAt       DateTime                 @default(now()) @map("created_at")
+  updatedAt       DateTime                 @updatedAt @map("updated_at")
+
+  project Project                    @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  cycle   ProjectRoadmapCycle        @relation(fields: [cycleId], references: [id], onDelete: Cascade)
+  step    ProjectImplementationStep? @relation(fields: [stepId], references: [id], onDelete: SetNull)
+  task    Task?                      @relation(fields: [taskId], references: [id], onDelete: SetNull)
+  taskRun TaskRun?                   @relation(fields: [taskRunId], references: [id], onDelete: SetNull)
+
+  @@unique([cycleId, requirementId, criterionKey, source, evidenceKey])
+  @@index([projectId, cycleId, requirementId])
+  @@index([taskId])
+  @@map("acceptance_evidence")
+}
+
+model ProjectAuditJob {
+  id            String                @id @default(uuid())
+  projectId     String                @map("project_id")
+  cycleId       String                @unique @map("cycle_id")
+  triggerTaskId String?               @map("trigger_task_id")
+  requirementIds Json                 @default("[]") @map("requirement_ids")
+  status        ProjectAuditJobStatus @default(pending)
+  attemptCount  Int                   @default(0) @map("attempt_count")
+  nextAttemptAt DateTime?             @map("next_attempt_at")
+  errorMessage  String?               @map("error_message")
+  createdAt     DateTime              @default(now()) @map("created_at")
+  updatedAt     DateTime              @updatedAt @map("updated_at")
+  claimedAt     DateTime?             @map("claimed_at")
+  finishedAt    DateTime?             @map("finished_at")
+
+  project Project             @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  cycle   ProjectRoadmapCycle @relation(fields: [cycleId], references: [id], onDelete: Cascade)
+
+  @@index([status, nextAttemptAt, createdAt])
+  @@map("project_audit_jobs")
 }
 
 model TaskQueueJob {
@@ -374,6 +463,7 @@ model TaskRun {
   task           Task            @relation(fields: [taskId], references: [id])
   iterations     TaskIteration[]
   providerUsage  ProviderUsage[]
+  acceptanceEvidence AcceptanceEvidence[]
 
   @@index([taskId, status])
   @@map("task_runs")

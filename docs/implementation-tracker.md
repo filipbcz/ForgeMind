@@ -1,5 +1,10 @@
 # ForgeMind - Implementacni tracker
 
+## Aktivni plan kvality roadmapy
+
+Aktualni navazujici prace se ridi dokumentem `docs/roadmap-quality-implementation-plan.md`.
+Plan oddeluje dokonceni tasku, work itemu, kontraktni capability a celeho projektu. Etapy 1-6 a migracni kod etapy 7 jsou implementovane; zbyva aplikace migraci a rizeny produkcni rollout.
+
 Posledni aktualizace: 2026-07-03
 Zdroj pozadavku: README.md
 
@@ -136,6 +141,8 @@ Aktivne resime: Zadny - roadmap kroky 13-22 jsou uzavrene.
 	Overeni: `npm run build`, `npm test` a rucni parity review bez otevreneho kritickeho gapu.
 
 ## Prubezny log
+
+- 2026-08-07: Implementovan verzovany projektovy kontrakt, trasovatelne work itemy, acceptance evidence, read-only capability a release audit, perzistentni audit job s retry/heartbeat, prioritni gap work itemy a completion gate. GUI rozlisuje task, capability a audit a umoznuje opakovat pouze failed/blocked audit. Overeno cilenymi testy a `npm run build`; produkcni migrace a realny rollout zatim nebyly spusteny.
 
 - 2026-07-03: Krok 1 hotov. Doplneno overeni podpisu v webhook utilite i API route vrstve, testy prosly: `npx vitest run apps/studio-api/src/webhook.test.ts apps/studio-api/src/routes.test.ts`.
 - 2026-07-03: Krok 2 hotov. Doplneny testy createIssue a createBranch (vcetne fallbacku i chybove vetve), testy prosly: `npx vitest run packages/github/src/index.test.ts`.

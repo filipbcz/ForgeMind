@@ -98,6 +98,7 @@ export interface Project {
   defaultBranch: string;
   configYaml?: string;
   brief?: string;
+  projectContract?: ProjectContract;
   autoCreatePullRequest?: boolean;
   autoMergePullRequest?: boolean;
   autoCompleteTask?: boolean;
@@ -109,7 +110,85 @@ export interface Project {
   updatedAt: IsoDateString;
 }
 
-export type ProjectRoadmapCycleStatus = 'active' | 'awaiting_extension_approval' | 'completed';
+export interface ProjectContractRequirement {
+  id: string;
+  title: string;
+  description: string;
+  acceptanceCriteria: string[];
+}
+
+export interface ProjectContract {
+  version: number;
+  sourceBriefHash?: string;
+  summary: string;
+  invariants: string[];
+  prohibitedSubstitutes: string[];
+  requirements: ProjectContractRequirement[];
+  releaseCriteria: string[];
+}
+
+export type AcceptanceEvidenceSource = 'validation_command' | 'github_check' | 'repository_audit' | 'artifact';
+export type AcceptanceEvidenceStatus = 'passed' | 'failed' | 'blocked';
+
+export interface AcceptanceEvidence {
+  id: string;
+  projectId: string;
+  cycleId: string;
+  stepId?: string;
+  taskId?: string;
+  taskRunId?: string;
+  requirementId: string;
+  criterionKey: string;
+  criterion: string;
+  source: AcceptanceEvidenceSource;
+  status: AcceptanceEvidenceStatus;
+  evidenceKey: string;
+  contractVersion: number;
+  commitSha?: string;
+  command?: string;
+  exitCode?: number;
+  detailsUrl?: string;
+  payload: Record<string, unknown>;
+  createdAt: IsoDateString;
+  updatedAt: IsoDateString;
+}
+
+export type ProjectCapabilityStatus = 'pending' | 'implementing' | 'verifying' | 'partial' | 'blocked' | 'satisfied';
+
+export interface ProjectCapability {
+  requirement: ProjectContractRequirement;
+  status: ProjectCapabilityStatus;
+  workItemIds: string[];
+  evidence: AcceptanceEvidence[];
+  satisfiedCriteria: number;
+  totalCriteria: number;
+}
+
+export type ProjectRoadmapCycleStatus =
+  | 'active'
+  | 'verifying'
+  | 'partial'
+  | 'blocked'
+  | 'awaiting_extension_approval'
+  | 'completed';
+
+export type ProjectAuditJobStatus = 'pending' | 'claimed' | 'succeeded' | 'blocked' | 'failed';
+
+export interface ProjectAuditJob {
+  id: string;
+  projectId: string;
+  cycleId: string;
+  triggerTaskId?: string;
+  requirementIds: string[];
+  status: ProjectAuditJobStatus;
+  attemptCount: number;
+  nextAttemptAt?: IsoDateString;
+  errorMessage?: string;
+  createdAt: IsoDateString;
+  updatedAt: IsoDateString;
+  claimedAt?: IsoDateString;
+  finishedAt?: IsoDateString;
+}
 
 export type ProjectImplementationStepStatus = 'pending' | 'running' | 'completed' | 'cancelled';
 
@@ -133,6 +212,8 @@ export interface ProjectImplementationStep {
   title: string;
   description: string;
   acceptanceCriteria: string[];
+  requirementIds: string[];
+  deliverables: string[];
   status: ProjectImplementationStepStatus;
   taskId?: string;
   createdAt: IsoDateString;

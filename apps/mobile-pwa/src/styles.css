@@ -225,6 +225,13 @@ a {
   margin-bottom: 16px;
 }
 
+.error-banner pre,
+.success-banner pre {
+  margin: 0.5rem 0 0;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
 .success-banner {
   color: #166534;
   background: #dcfce7;
@@ -1030,6 +1037,75 @@ a {
   border-radius: 8px;
   display: grid;
   overflow: hidden;
+}
+
+.project-contract-summary {
+  margin-bottom: 14px;
+  padding: 10px 12px;
+  border-left: 3px solid #16877c;
+  background: #f2f8f5;
+}
+
+.project-contract-summary p {
+  margin: 4px 0;
+  color: #39433d;
+}
+
+.project-contract-summary small {
+  color: #69736c;
+}
+
+.capability-list {
+  display: grid;
+  margin-bottom: 14px;
+  border-top: 1px solid #dde5dd;
+}
+
+.capability-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 4px 12px;
+  padding: 10px 0;
+  border-bottom: 1px solid #dde5dd;
+}
+
+.capability-row p,
+.capability-row small {
+  margin: 3px 0 0;
+  color: #69736c;
+}
+
+.capability-row span {
+  font-size: 0.78rem;
+  font-weight: 700;
+  text-transform: uppercase;
+}
+
+.capability-row span[data-status="satisfied"] { color: #197544; }
+.capability-row span[data-status="partial"],
+.capability-row span[data-status="blocked"] { color: #a1392d; }
+.capability-row span[data-status="implementing"],
+.capability-row span[data-status="verifying"] { color: #087f75; }
+
+.capability-row small {
+  grid-column: 1 / -1;
+}
+
+.capability-row details {
+  grid-column: 1 / -1;
+  min-width: 0;
+}
+
+.capability-row details ul {
+  margin: 8px 0 0;
+  padding-left: 20px;
+}
+
+.capability-row details code {
+  display: block;
+  margin-top: 3px;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
 }
 
 .timeline-row {

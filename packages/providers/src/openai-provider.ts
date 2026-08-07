@@ -1,18 +1,23 @@
 import type { ProviderKind } from '@forgemind/core';
 import type {
   AIProvider,
+  CapabilityAuditInput,
+  CapabilityAuditResult,
   CostEstimateInput,
   CostEstimateResult,
   ImplementInput,
   ImplementResult,
   PlanInput,
   PlanResult,
+  ReleaseAuditInput,
+  ReleaseAuditResult,
   ReviewInput,
   ReviewResult
 } from './provider.js';
 import { normalizeValidationChecks } from './provider.js';
 import { emitCapturedUsage, normalizeTokenBreakdown } from './provider-usage.js';
 import { buildReviewPrompt } from './review-prompt.js';
+import { buildCapabilityAuditPrompt, buildReleaseAuditPrompt, normalizeCapabilityAuditResult, normalizeReleaseAuditResult, parseCapabilityAuditContent } from './audit-prompt.js';
 import type { ProviderRuntimeConfig } from './index.js';
 
 const DEFAULT_OPENAI_API_URL = 'https://api.openai.com/v1/chat/completions';
@@ -132,8 +137,8 @@ export class OpenAIProvider implements AIProvider {
         role: 'system',
         content: input.previousValidationError
           ? 'Revise only the supplied failed validation check. Return JSON with a short summary, empty steps and implementationSteps arrays, the supplied acceptanceCriteria, and replacement validationChecks for that failed check only. Do not repeat successful or unrelated checks and do not propose implementation work. Respond only with JSON.'
-          : 'You are an AI project planner. Provide a JSON object with summary, steps, acceptanceCriteria, validationChecks, and implementationSteps. ' +
-            'For ordinary task plans, implementationSteps must be an empty array. When the request asks for a project roadmap, it must contain objects with title, description, acceptanceCriteria, inScope, and outOfScope. ' +
+          : 'You are an AI project planner. Provide a JSON object with summary, steps, acceptanceCriteria, validationChecks, implementationSteps, and optional projectContract. ' +
+            'For ordinary task plans, implementationSteps must be an empty array and projectContract must be omitted. When the request asks for a project roadmap, include a projectContract and implementationSteps with title, description, acceptanceCriteria, inScope, outOfScope, requirementIds, and deliverables. ' +
             'validationChecks must contain only executable command checks. Omit criteria that cannot be verified automatically. ' +
             'Commands must verify a criterion through their exit code and must not use shell redirection, fallback chains, or inspection-only git diff/status/log commands. ' +
             'Use { "kind": "command", "command": "...", "criterion": "...", "rationale": "..." }. Respond only with JSON.'
@@ -261,6 +266,44 @@ export class OpenAIProvider implements AIProvider {
       }),
       providerPrompt: serializeMessages(messages),
       providerResponse: content
+    };
+  }
+
+  async auditCapability(input: CapabilityAuditInput): Promise<CapabilityAuditResult> {
+    if (!input.repositoryContext?.trim()) {
+      throw new Error('OpenAI capability audit requires a targeted repository packet.');
+    }
+    const providerPrompt = buildCapabilityAuditPrompt(input);
+    const messages: Array<{ role: 'system' | 'user' | 'assistant'; content: string }> = [
+      {
+        role: 'system',
+        content: 'You are an independent capability auditor. Use only the supplied contract, execution evidence, and targeted repository packet. Return strict JSON.'
+      },
+      { role: 'user', content: providerPrompt }
+    ];
+    const response = await this.requestChat(messages);
+    await emitCapturedUsage(input.onActivity, response.usage);
+    const result = normalizeCapabilityAuditResult(input, parseCapabilityAuditContent(response.content));
+    return {
+      ...result,
+      providerPrompt: serializeMessages(messages),
+      providerResponse: response.content
+    };
+  }
+
+  async auditRelease(input: ReleaseAuditInput): Promise<ReleaseAuditResult> {
+    if (!input.repositoryContext?.trim()) throw new Error('OpenAI release audit requires a targeted repository packet.');
+    const providerPrompt = buildReleaseAuditPrompt(input);
+    const messages: Array<{ role: 'system' | 'user' | 'assistant'; content: string }> = [
+      { role: 'system', content: 'You are an independent release auditor. Use the contract and targeted repository packet. Return strict JSON.' },
+      { role: 'user', content: providerPrompt }
+    ];
+    const response = await this.requestChat(messages);
+    await emitCapturedUsage(input.onActivity, response.usage);
+    return {
+      ...normalizeReleaseAuditResult(input, parseCapabilityAuditContent(response.content)),
+      providerPrompt: serializeMessages(messages),
+      providerResponse: response.content
     };
   }
 

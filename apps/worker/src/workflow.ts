@@ -1,4 +1,4 @@
-import { mkdir, readFile, readdir, unlink, writeFile } from 'node:fs/promises';
+import { access, mkdir, readFile, readdir, unlink, writeFile } from 'node:fs/promises';
 import { dirname, isAbsolute, join, resolve } from 'node:path';
 import { simpleGit, type SimpleGit, type StatusResult } from 'simple-git';
 import type {
@@ -16,6 +16,8 @@ import {
   renderIssueBody,
   renderPullRequestBody,
   slugifyBranchSegment,
+  type GitHubCheckFailure,
+  type GitHubChecksResult,
   type GitHubAdapter
 } from '@forgemind/github';
 import { createProvider, type AIProvider, type ImplementResult, type PlanResult, type ValidationCheck } from '@forgemind/providers';
@@ -42,7 +44,7 @@ export interface WorkerTaskInput {
   hooks?: WorkerTaskHooks;
 }
 
-type GitHubOperation = 'create_issue' | 'create_branch' | 'commit_and_push' | 'create_draft_pr' | 'create_pull_request' | 'merge_pr' | 'comment_on_issue';
+type GitHubOperation = 'create_issue' | 'create_branch' | 'commit_and_push' | 'create_draft_pr' | 'create_pull_request' | 'wait_for_checks' | 'merge_pr' | 'comment_on_issue';
 
 export interface WorkerTaskResume {
   kind: 'approved_large_diff' | 'approved_operation' | 'approved_review' | 'validation_retry' | 'worker_interrupted' | 'phase_retry';
@@ -105,6 +107,8 @@ export interface WorkerTaskResult {
   pullRequestUrl?: string;
   workspacePath: string;
   validation: ValidationResult;
+  commitSha?: string;
+  githubChecks?: GitHubChecksResult;
   summary: string;
   approvals: ApprovalType[];
   completedAt: string;
@@ -232,9 +236,10 @@ export async function runWorkerTask(input: WorkerTaskInput): Promise<WorkerTaskR
       elapsedMs: 0
     });
   }
+  const installCommand = config.installCommand ?? await inferRepositoryInstallCommand(workspacePath);
   let validationChecks = await resolveValidationChecks({
     plan,
-    installCommand: config.installCommand,
+    installCommand,
     explicitVerifyCommand: config.verifyCommand
   });
   if (!input.resume || rerunPlanning) {
@@ -317,6 +322,12 @@ export async function runWorkerTask(input: WorkerTaskInput): Promise<WorkerTaskR
     : undefined;
   const resumeDelivery = input.resume?.resumeFrom === 'delivery';
   const completedOperations = new Set(input.resume?.completedOperations ?? []);
+  const deliveryState: DeliveryState = {
+    pullRequest: resolveExistingTaskPullRequest(input.task),
+    skipCommitFromResume: completedOperations.has('commit'),
+    skipPushFromResume: completedOperations.has('commit_and_push'),
+    issueCommented: completedOperations.has('comment_on_issue')
+  };
   const firstAttempt = Math.max(1, Math.min(input.task.maxIterations, input.resume?.attempt ?? 1));
 
   for (let attempt = firstAttempt; attempt <= input.task.maxIterations; attempt += 1) {
@@ -384,7 +395,7 @@ export async function runWorkerTask(input: WorkerTaskInput): Promise<WorkerTaskR
     if (!isResumedImplementation && !config.verifyCommand?.trim()) {
       validationChecks = await resolveValidationChecks({
         plan: { ...plan, validationChecks: implementation.validationChecks },
-        installCommand: config.installCommand
+        installCommand
       });
     }
 
@@ -721,10 +732,8 @@ export async function runWorkerTask(input: WorkerTaskInput): Promise<WorkerTaskR
           safeImprovements: [],
           riskyChanges: normalizeRuntimeApprovals(reviewResume.riskyChanges ?? [])
         };
-        break;
-      }
-
-      await input.hooks?.onStatus?.('reviewing', { attempt });
+      } else {
+        await input.hooks?.onStatus?.('reviewing', { attempt });
       const reviewStartedAt = Date.now();
       await emitTaskActivity(input.hooks, {
         phase: 'review',
@@ -798,12 +807,17 @@ export async function runWorkerTask(input: WorkerTaskInput): Promise<WorkerTaskR
         diffStat: implementation.diffStat,
         validationResult: { blockers: review.blockers, riskyChanges: review.riskyChanges, attempt }
       });
+      }
 
       if (review.blockers.length === 0) {
-        const reviewRiskApprovals = filterApprovedApprovals(
-          evaluateRuntimeApprovals(review.riskyChanges, config.mode, config.approvalRequiredFor, config.allowSafeOperationsWithoutApproval),
-          attemptApprovedApprovals
-        );
+        const resumedApprovedReview = reviewResume
+          && (reviewResume.kind === 'approved_review' || resumeDelivery);
+        const reviewRiskApprovals = resumedApprovedReview
+          ? []
+          : filterApprovedApprovals(
+              evaluateRuntimeApprovals(review.riskyChanges, config.mode, config.approvalRequiredFor, config.allowSafeOperationsWithoutApproval),
+              attemptApprovedApprovals
+            );
         if (reviewRiskApprovals.length > 0) {
           return {
             taskId: input.task.id,
@@ -818,7 +832,78 @@ export async function runWorkerTask(input: WorkerTaskInput): Promise<WorkerTaskR
           };
         }
 
-        break;
+        const delivery = await deliverWorkerAttempt({
+          input,
+          config,
+          github,
+          git,
+          issue,
+          branchName,
+          workspacePath,
+          plan,
+          implementation,
+          validation,
+          review,
+          usageSummary,
+          attempt,
+          completedAttempts,
+          retryReasons,
+          appliedSafeImprovements,
+          resolvedReviewBlockers,
+          state: deliveryState
+        });
+
+        if (delivery.kind === 'completed') {
+          return delivery.result;
+        }
+
+        validation = delivery.validation;
+        await input.hooks?.onIterationStarted?.({
+          phase: 'validation',
+          prompt: validation.command,
+          attempt
+        });
+        await input.hooks?.onIteration?.({
+          phase: 'validation',
+          prompt: validation.command,
+          resultSummary: 'GitHub Actions validation failed.',
+          diffStat: implementation.diffStat,
+          validationResult: {
+            command: validation.command,
+            exitCode: validation.exitCode,
+            stdout: validation.stdout,
+            stderr: validation.stderr,
+            passed: false,
+            attempt,
+            githubChecks: delivery.failures.map((failure) => ({
+              name: failure.name,
+              detailsUrl: failure.detailsUrl ?? null,
+              output: failure.output
+            }))
+          }
+        });
+
+        if (attempt === input.task.maxIterations) {
+          return {
+            taskId: input.task.id,
+            status: 'validation_failed',
+            issueUrl: issue.issueUrl,
+            branchName,
+            pullRequestUrl: deliveryState.pullRequest?.pullRequestUrl,
+            workspacePath,
+            validation,
+            summary: `GitHub Actions failed after ${attempt} attempt(s).`,
+            approvals: [],
+            completedAt: nowIso()
+          };
+        }
+
+        retryReasons.push(`GitHub Actions retry before attempt ${attempt + 1}: ${delivery.validation.stderr}`);
+        await input.hooks?.onStatus?.('running_ai', {
+          attempt: attempt + 1,
+          retryReason: delivery.validation.stderr
+        });
+        continue;
       }
 
       for (const blocker of review.blockers) {
@@ -872,38 +957,95 @@ export async function runWorkerTask(input: WorkerTaskInput): Promise<WorkerTaskR
     });
   }
 
-  if (!implementation || !validation || !review) {
-    throw new Error('Worker completed without implementation, validation, or review result.');
-  }
+  throw new Error('Worker exhausted all implementation attempts without a deliverable result.');
+}
 
-  if (git) {
-    if (!completedOperations.has('commit')) {
-      const commitStartedAt = Date.now();
-      await emitTaskActivity(input.hooks, {
-        phase: 'git',
-        state: 'started',
-      title: 'Vytvářím Git commit',
-        detail: `AI: ${input.task.title}`,
-        operation: 'commit'
-      });
-      await stageAndCommitChanges(git, `AI: ${input.task.title}`);
-      await emitTaskActivity(input.hooks, {
-        phase: 'git',
-        state: 'completed',
-      title: 'Git commit je připravený',
-        operation: 'commit',
-        elapsedMs: Date.now() - commitStartedAt
-      });
-    }
-    if (config.autoPush && !completedOperations.has('commit_and_push')) {
-      await runGitHubOperation(
-        input.hooks,
-        'commit_and_push',
-        { branchName, workspacePath },
-        async () => github!.commitAndPush(input.project, branchName, `AI: ${input.task.title}`, workspacePath)
-      );
-    }
+interface DeliveryState {
+  pullRequest?: { pullRequestNumber: number; pullRequestUrl: string };
+  skipCommitFromResume: boolean;
+  skipPushFromResume: boolean;
+  issueCommented: boolean;
+}
+
+type DeliveryAttemptOutcome =
+  | { kind: 'completed'; result: WorkerTaskResult }
+  | { kind: 'ci_failure'; validation: ValidationResult; failures: GitHubCheckFailure[] };
+
+async function deliverWorkerAttempt(input: {
+  input: WorkerTaskInput;
+  config: WorkerConfig;
+  github?: GitHubAdapter;
+  git: SimpleGit;
+  issue: { issueNumber: number; issueUrl: string };
+  branchName: string;
+  workspacePath: string;
+  plan: PlanResult;
+  implementation: ImplementResult;
+  validation: ValidationResult;
+  review: {
+    summary: string;
+    blockers: string[];
+    safeImprovements: string[];
+    riskyChanges: ApprovalType[];
+  };
+  usageSummary: string;
+  attempt: number;
+  completedAttempts: number;
+  retryReasons: string[];
+  appliedSafeImprovements: Set<string>;
+  resolvedReviewBlockers: Set<string>;
+  state: DeliveryState;
+}): Promise<DeliveryAttemptOutcome> {
+  const {
+    config,
+    github,
+    git,
+    issue,
+    branchName,
+    workspacePath,
+    plan,
+    implementation,
+    validation,
+    review,
+    usageSummary,
+    attempt,
+    completedAttempts,
+    retryReasons,
+    appliedSafeImprovements,
+    resolvedReviewBlockers,
+    state
+  } = input;
+  const taskInput = input.input;
+
+  if (!state.skipCommitFromResume) {
+    const commitStartedAt = Date.now();
+    await emitTaskActivity(taskInput.hooks, {
+      phase: 'git',
+      state: 'started',
+      title: 'Vytvarim Git commit',
+      detail: `AI: ${taskInput.task.title}`,
+      operation: 'commit'
+    });
+    await stageAndCommitChanges(git, `AI: ${taskInput.task.title}`);
+    await emitTaskActivity(taskInput.hooks, {
+      phase: 'git',
+      state: 'completed',
+      title: 'Git commit je pripraveny',
+      operation: 'commit',
+      elapsedMs: Date.now() - commitStartedAt
+    });
   }
+  state.skipCommitFromResume = false;
+
+  if (config.autoPush && !state.skipPushFromResume) {
+    await runGitHubOperation(
+      taskInput.hooks,
+      'commit_and_push',
+      { branchName, workspacePath },
+      async () => github!.commitAndPush(taskInput.project, branchName, `AI: ${taskInput.task.title}`, workspacePath)
+    );
+  }
+  state.skipPushFromResume = false;
 
   const pullRequestBody = renderPullRequestBody({
     summary: `${implementation.summary}\n\n${review.summary}`,
@@ -917,75 +1059,189 @@ export async function runWorkerTask(input: WorkerTaskInput): Promise<WorkerTaskR
     executionNotes: [`Total implementation attempts: ${completedAttempts || 1}`, ...retryReasons]
   });
 
-  let pr;
   if (config.createPullRequest) {
-    const existingPullRequest = resolveExistingTaskPullRequest(input.task);
-    await input.hooks?.onStatus?.('creating_pr', existingPullRequest ? { ...existingPullRequest, reused: true } : undefined);
-    pr = existingPullRequest;
-    if (!existingPullRequest) {
-      pr = await runGitHubOperation(input.hooks, config.autoMergePullRequest ? 'create_pull_request' : 'create_draft_pr', { branchName }, async () => {
-        return github!.createDraftPullRequest({
-          project: input.project,
+    await taskInput.hooks?.onStatus?.('creating_pr', state.pullRequest ? { ...state.pullRequest, reused: true } : undefined);
+    if (!state.pullRequest) {
+      state.pullRequest = await runGitHubOperation(
+        taskInput.hooks,
+        config.autoMergePullRequest ? 'create_pull_request' : 'create_draft_pr',
+        { branchName },
+        async () => github!.createDraftPullRequest({
+          project: taskInput.project,
           task: {
-            ...input.task,
+            ...taskInput.task,
             branchName
           },
-          title: `[AI] ${input.task.title}`,
+          title: `[AI] ${taskInput.task.title}`,
           body: pullRequestBody,
           draft: !config.autoMergePullRequest
-        });
-      });
-      await input.hooks?.onPullRequest?.(pr);
+        })
+      );
+      await taskInput.hooks?.onPullRequest?.(state.pullRequest);
     }
   }
 
-  if (config.createIssue && !completedOperations.has('comment_on_issue')) {
+  if (config.createIssue && !state.issueCommented) {
     await runGitHubOperation(
-      input.hooks,
+      taskInput.hooks,
       'comment_on_issue',
       { issueNumber: issue.issueNumber },
-      async () => github!.commentOnIssue(input.project, issue.issueNumber, renderIssueBody(input.task))
+      async () => github!.commentOnIssue(taskInput.project, issue.issueNumber, renderIssueBody(taskInput.task))
     );
+    state.issueCommented = true;
+  }
+
+  let githubChecks: GitHubChecksResult | undefined;
+  if (config.requireCiGreen && config.autoPush && state.pullRequest && github?.waitForChecks) {
+    const headSha = (await git.revparse(['HEAD'])).trim();
+    const checksStartedAt = Date.now();
+    await emitTaskActivity(taskInput.hooks, {
+      phase: 'github',
+      state: 'started',
+      title: 'Cekam na GitHub Actions',
+      detail: headSha,
+      operation: 'wait_for_checks',
+      attempt
+    });
+    let checks: GitHubChecksResult;
+    try {
+      checks = await github.waitForChecks(taskInput.project, headSha, {
+        onProgress: async (message) => emitTaskActivity(taskInput.hooks, {
+          phase: 'github',
+          state: 'progress',
+          title: 'GitHub Actions stale bezi',
+          detail: message,
+          operation: 'wait_for_checks',
+          attempt,
+          elapsedMs: Date.now() - checksStartedAt
+        })
+      });
+    } catch (error) {
+      const errorMessage = toErrorMessage(error);
+      await emitTaskActivity(taskInput.hooks, {
+        phase: 'github',
+        state: 'failed',
+        title: 'GitHub Actions se nepodarilo nacist',
+        detail: errorMessage,
+        operation: 'wait_for_checks',
+        attempt,
+        elapsedMs: Date.now() - checksStartedAt
+      });
+      await taskInput.hooks?.onGitHubOperationFailed?.({
+        operation: 'wait_for_checks',
+        errorMessage,
+        context: { headSha, pullRequestNumber: state.pullRequest.pullRequestNumber }
+      });
+      throw error;
+    }
+
+    if (checks.status === 'timeout') {
+      await emitTaskActivity(taskInput.hooks, {
+        phase: 'github',
+        state: 'failed',
+        title: 'Cekani na GitHub Actions vyprselo',
+        detail: checks.summary,
+        operation: 'wait_for_checks',
+        attempt,
+        elapsedMs: Date.now() - checksStartedAt
+      });
+      await taskInput.hooks?.onGitHubOperationFailed?.({
+        operation: 'wait_for_checks',
+        errorMessage: checks.summary,
+        context: { headSha, pullRequestNumber: state.pullRequest.pullRequestNumber }
+      });
+      throw new Error(checks.summary);
+    }
+
+    if (checks.status === 'failure') {
+      await emitTaskActivity(taskInput.hooks, {
+        phase: 'github',
+        state: 'failed',
+        title: 'GitHub Actions naslo chybu',
+        detail: checks.summary,
+        operation: 'wait_for_checks',
+        attempt,
+        elapsedMs: Date.now() - checksStartedAt
+      });
+      return {
+        kind: 'ci_failure',
+        validation: {
+          command: `github-actions ${headSha}`,
+          exitCode: 1,
+          stdout: '',
+          stderr: checks.summary,
+          passed: false,
+          failingCommand: 'github-actions'
+        },
+        failures: checks.failures
+      };
+    }
+
+    await emitTaskActivity(taskInput.hooks, {
+      phase: 'github',
+      state: 'completed',
+      title: checks.status === 'success' ? 'GitHub Actions proslo' : 'Repozitar nema automaticke GitHub checks',
+      detail: checks.summary,
+      operation: 'wait_for_checks',
+      attempt,
+      elapsedMs: Date.now() - checksStartedAt
+    });
+    githubChecks = checks;
   }
 
   let mergeConfirmed = false;
   let mergeFailure: string | undefined;
-  if (config.autoMergePullRequest && pr) {
+  if (config.autoMergePullRequest && state.pullRequest) {
     if (!github?.mergePullRequest) {
       mergeFailure = 'The configured GitHub adapter does not support pull request merge.';
     } else {
       const merge = await runGitHubOperation(
-        input.hooks,
+        taskInput.hooks,
         'merge_pr',
-        { pullRequestNumber: pr.pullRequestNumber, targetBranch: input.project.defaultBranch },
-        async () => github.mergePullRequest!(input.project, pr!.pullRequestNumber)
+        { pullRequestNumber: state.pullRequest.pullRequestNumber, targetBranch: taskInput.project.defaultBranch },
+        async () => github.mergePullRequest!(taskInput.project, state.pullRequest!.pullRequestNumber)
       );
       mergeConfirmed = merge.merged;
       if (!merge.merged) mergeFailure = merge.message;
     }
   }
 
-  await emitTaskActivity(input.hooks, {
+  await emitTaskActivity(taskInput.hooks, {
     phase: 'completion',
     state: 'completed',
-    title: config.autoCompleteTask && mergeConfirmed ? 'Task je dokončený' : 'Výsledek je připravený k převzetí',
-    detail: pr?.pullRequestUrl,
+    title: config.autoCompleteTask && mergeConfirmed ? 'Task je dokonceny' : 'Vysledek je pripraveny k prevzeti',
+    detail: state.pullRequest?.pullRequestUrl,
     operation: 'finish_task'
   });
+  const commitSha = await resolveHeadSha(git);
   return {
-    taskId: input.task.id,
-    status: config.autoCompleteTask && mergeConfirmed ? 'completed' : 'ready_for_user_review',
-    issueUrl: issue.issueUrl,
-    branchName,
-    pullRequestUrl: pr?.pullRequestUrl,
-    workspacePath,
-    validation,
-    summary: mergeFailure
-      ? `${review.summary}\n\nAutomatic merge was not completed: ${mergeFailure}`
-      : review.summary,
-    approvals: review.riskyChanges,
-    completedAt: nowIso()
+    kind: 'completed',
+    result: {
+      taskId: taskInput.task.id,
+      status: config.autoCompleteTask && mergeConfirmed ? 'completed' : 'ready_for_user_review',
+      issueUrl: issue.issueUrl,
+      branchName,
+      pullRequestUrl: state.pullRequest?.pullRequestUrl,
+      workspacePath,
+      validation,
+      commitSha,
+      githubChecks,
+      summary: mergeFailure
+        ? `${review.summary}\n\nAutomatic merge was not completed: ${mergeFailure}`
+        : review.summary,
+      approvals: review.riskyChanges,
+      completedAt: nowIso()
+    }
   };
+}
+
+async function resolveHeadSha(git: SimpleGit): Promise<string | undefined> {
+  try {
+    const sha = (await git.revparse(['HEAD'])).trim();
+    return /^[a-f0-9]{7,64}$/i.test(sha) ? sha : undefined;
+  } catch {
+    return undefined;
+  }
 }
 
 function resolveGitRemoteUrl(github: GitHubAdapter, project: Project): string | undefined {
@@ -1015,14 +1271,16 @@ function createResumePlan(resume: WorkerTaskResume, fallback?: PlanResult): Plan
 
 export function compactTaskExecutionPrompt(prompt: string): string {
   const normalized = prompt.trim();
+  const projectContractMarker = 'Project contract:';
   const currentStepMarker = 'Current implementation step:';
+  const contractIndex = normalized.lastIndexOf(projectContractMarker);
   const markerIndex = normalized.lastIndexOf(currentStepMarker);
 
   if (markerIndex < 0) {
     return normalized;
   }
 
-  return normalized.slice(markerIndex).trim();
+  return normalized.slice(contractIndex >= 0 && contractIndex < markerIndex ? contractIndex : markerIndex).trim();
 }
 
 export function createRoadmapTaskPlan(prompt: string): PlanResult | undefined {
@@ -1199,6 +1457,57 @@ async function resolveValidationChecks(input: {
     },
     ...checks
   ];
+}
+
+export async function inferRepositoryInstallCommand(workspacePath: string): Promise<string | undefined> {
+  if (!await pathExists(join(workspacePath, 'package.json')) || await pathExists(join(workspacePath, 'node_modules'))) {
+    return undefined;
+  }
+
+  if (
+    await pathExists(join(workspacePath, 'package-lock.json'))
+    || await pathExists(join(workspacePath, 'npm-shrinkwrap.json'))
+  ) {
+    return 'npm ci';
+  }
+
+  if (await pathExists(join(workspacePath, 'pnpm-lock.yaml'))) {
+    return 'corepack pnpm install --frozen-lockfile';
+  }
+
+  if (await pathExists(join(workspacePath, 'yarn.lock'))) {
+    const packageManager = await readPackageManager(workspacePath);
+    return packageManager?.startsWith('yarn@1.')
+      ? 'corepack yarn install --frozen-lockfile'
+      : 'corepack yarn install --immutable';
+  }
+
+  if (
+    await pathExists(join(workspacePath, 'bun.lock'))
+    || await pathExists(join(workspacePath, 'bun.lockb'))
+  ) {
+    return 'bun install --frozen-lockfile';
+  }
+
+  return undefined;
+}
+
+async function pathExists(path: string): Promise<boolean> {
+  try {
+    await access(path);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+async function readPackageManager(workspacePath: string): Promise<string | undefined> {
+  try {
+    const packageJson = JSON.parse(await readFile(join(workspacePath, 'package.json'), 'utf8')) as { packageManager?: unknown };
+    return typeof packageJson.packageManager === 'string' ? packageJson.packageManager : undefined;
+  } catch {
+    return undefined;
+  }
 }
 
 export function normalizeValidationChecks(value: unknown): ValidationCheck[] {
@@ -1381,6 +1690,11 @@ function describeGitHubOperation(operation: GitHubOperation) {
       completed: 'Pull request je připravený',
       failed: 'Vytvoření pull requestu selhalo'
     },
+    wait_for_checks: {
+      started: 'Čekám na GitHub Actions',
+      completed: 'GitHub Actions je dokončené',
+      failed: 'GitHub Actions selhalo'
+    },
     merge_pr: {
       started: 'Slučuji pull request',
       completed: 'Pull request je sloučený',
@@ -1408,6 +1722,7 @@ interface WorkerConfig {
   autoCompleteTask: boolean;
   createBranch: boolean;
   createIssue: boolean;
+  requireCiGreen: boolean;
   approvalRequiredFor: Set<ApprovalType>;
   allowSafeOperationsWithoutApproval: boolean;
   sandbox: {
@@ -1438,6 +1753,7 @@ function resolveWorkerConfig(project: Project, input: WorkerTaskInput): WorkerCo
     autoCompleteTask: project.autoCompleteTask ?? false,
     createBranch: config?.workflow.create_branch ?? true,
     createIssue: config?.workflow.create_issue ?? true,
+    requireCiGreen: config?.github.require_ci_green ?? true,
     approvalRequiredFor: new Set((config?.approval.required_for ?? []).filter(isApprovalType)),
     allowSafeOperationsWithoutApproval: project.allowSafeOperationsWithoutApproval ?? false,
     sandbox: {

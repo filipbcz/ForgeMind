@@ -1,4 +1,7 @@
 import {
+  type AcceptanceEvidence,
+  type AcceptanceEvidenceSource,
+  type AcceptanceEvidenceStatus,
   assertTaskTransition,
   type Approval,
   type ApprovalStatus,
@@ -8,22 +11,29 @@ import {
   type IterationPhase,
   type ProjectImplementationStep,
   type ProjectImplementationStepStatus,
+  type ProjectAuditJob,
+  type ProjectContract,
   type ProjectRoadmapCycle,
   type ProjectRoadmapCycleStatus,
   type Project,
+  type ProjectCapability,
   type ProviderKind,
   type RiskLevel,
   type TaskStatus
 } from '@forgemind/core';
+import { createHash } from 'node:crypto';
 import { parseAgentConfigYaml } from '@forgemind/config';
 import type { JsonValue } from '@forgemind/shared';
-import type { AiProviderConnection, AuditLog, GitHubConnection, Prisma, PrismaClient, QueueJobStatus, TaskMode } from '@prisma/client';
+import { Prisma } from '@prisma/client';
+import type { AiProviderConnection, AuditLog, GitHubConnection, PrismaClient, ProjectAuditJobStatus, QueueJobStatus, TaskMode } from '@prisma/client';
 import { decryptSecret, encryptSecret, fingerprintSecret } from './credentials.js';
 import {
   toApproval,
+  toAcceptanceEvidence,
   toAuditEvent,
   toPrismaJson,
   toProject,
+  toProjectAuditJob,
   toProjectImplementationStep,
   toProjectRoadmapCycle,
   toTask,
@@ -85,15 +95,58 @@ export interface ProjectRoadmapSnapshot {
   projectId: string;
   cycles: ProjectRoadmapCycle[];
   steps: ProjectImplementationStep[];
+  evidence: AcceptanceEvidence[];
+  capabilities: ProjectCapability[];
+  auditJobs: ProjectAuditJob[];
+}
+
+export interface ClaimedProjectAuditJob {
+  job: ProjectAuditJob;
+  project: Project;
+  cycle: ProjectRoadmapCycle;
+}
+
+export interface RecordAcceptanceEvidenceInput {
+  projectId: string;
+  cycleId: string;
+  stepId?: string;
+  taskId?: string;
+  taskRunId?: string;
+  requirementIds: string[];
+  criterion: string;
+  source: AcceptanceEvidenceSource;
+  status: AcceptanceEvidenceStatus;
+  evidenceIdentity: string;
+  contractVersion: number;
+  commitSha?: string;
+  command?: string;
+  exitCode?: number;
+  detailsUrl?: string;
+  payload?: JsonValue;
 }
 
 export interface CreateProjectRoadmapCycleInput {
   projectId: string;
   objective: string;
+  projectContract: ProjectContract;
   steps: Array<{
     title: string;
     description: string;
     acceptanceCriteria: string[];
+    requirementIds: string[];
+    deliverables: string[];
+  }>;
+}
+
+export interface AppendProjectImplementationStepsInput {
+  projectId: string;
+  cycleId: string;
+  steps: Array<{
+    title: string;
+    description: string;
+    acceptanceCriteria: string[];
+    requirementIds: string[];
+    deliverables: string[];
   }>;
 }
 
@@ -280,7 +333,9 @@ const WORKER_EVENT_PREFIXES = [
   'task_activity',
   'task_provider_activity',
   'task_worker_interrupted',
-  'task_failed'
+  'task_failed',
+  'project_audit_',
+  'project_release_'
 ] as const;
 
 const ACTIVE_TASK_STATUSES: ReadonlySet<TaskStatus> = new Set([
@@ -298,6 +353,7 @@ const ACTIVE_TASK_STATUSES: ReadonlySet<TaskStatus> = new Set([
 const ACTIVE_QUEUE_STATUSES = ['pending', 'claimed'] as const;
 const DEFAULT_QUEUE_MAX_ATTEMPTS = 3;
 const DEFAULT_QUEUE_BACKOFF_SECONDS = 30;
+const DEFAULT_AUDIT_JOB_MAX_ATTEMPTS = 3;
 const WORKER_QUEUE_CONTROL_ID = 'global';
 const WORKER_QUEUE_ADVISORY_LOCK_SQL = 'SELECT pg_advisory_xact_lock(742764962030481)::text AS "lock"';
 
@@ -713,6 +769,7 @@ export class ForgeMindRepository {
         defaultBranch: input.defaultBranch,
         configYaml: input.configYaml,
         brief: input.brief,
+        projectContract: shouldInvalidateProjectContract(existing.brief, input.brief) ? Prisma.DbNull : undefined,
         autoCreatePullRequest,
         autoMergePullRequest,
         autoCompleteTask,
@@ -903,12 +960,11 @@ export class ForgeMindRepository {
 
   async getProjectRoadmap(projectId: string): Promise<ProjectRoadmapSnapshot | undefined> {
     const project = await this.prisma.project.findUnique({
-      where: { id: projectId },
-      select: { id: true }
+      where: { id: projectId }
     });
     if (!project) return undefined;
 
-    const [cycles, steps] = await Promise.all([
+    const [cycles, steps, evidence, auditJobs] = await Promise.all([
       this.prisma.projectRoadmapCycle.findMany({
         where: { projectId },
         orderBy: [{ cycleNumber: 'asc' }, { createdAt: 'asc' }]
@@ -916,13 +972,28 @@ export class ForgeMindRepository {
       this.prisma.projectImplementationStep.findMany({
         where: { projectId },
         orderBy: [{ cycle: { cycleNumber: 'asc' } }, { sequenceNumber: 'asc' }, { createdAt: 'asc' }]
+      }),
+      this.prisma.acceptanceEvidence.findMany({
+        where: { projectId },
+        orderBy: [{ createdAt: 'asc' }]
+      }),
+      this.prisma.projectAuditJob.findMany({
+        where: { projectId },
+        orderBy: [{ createdAt: 'asc' }]
       })
     ]);
+
+    const mappedSteps = steps.map(toProjectImplementationStep);
+    const mappedEvidence = evidence.map(toAcceptanceEvidence);
+    const mappedProject = toProject(project);
 
     return {
       projectId,
       cycles: cycles.map(toProjectRoadmapCycle),
-      steps: steps.map(toProjectImplementationStep)
+      steps: mappedSteps,
+      evidence: mappedEvidence,
+      auditJobs: auditJobs.map(toProjectAuditJob),
+      capabilities: deriveProjectCapabilities(mappedProject, cycles.map(toProjectRoadmapCycle), mappedSteps, mappedEvidence)
     };
   }
 
@@ -934,10 +1005,15 @@ export class ForgeMindRepository {
     }
 
     await this.prisma.$transaction(async (tx) => {
+      await tx.project.update({
+        where: { id: input.projectId },
+        data: { projectContract: toPrismaJson(input.projectContract as unknown as JsonValue) }
+      });
+
       await tx.projectRoadmapCycle.updateMany({
         where: {
           projectId: input.projectId,
-          status: { in: ['active', 'awaiting_extension_approval'] }
+          status: { in: ['active', 'verifying', 'partial', 'blocked', 'awaiting_extension_approval'] }
         },
         data: {
           status: 'completed',
@@ -968,6 +1044,8 @@ export class ForgeMindRepository {
             title: step.title,
             description: step.description,
             acceptanceCriteria: toPrismaJson(step.acceptanceCriteria),
+            requirementIds: toPrismaJson(step.requirementIds),
+            deliverables: toPrismaJson(step.deliverables),
             status: 'pending'
           }))
         });
@@ -980,7 +1058,9 @@ export class ForgeMindRepository {
         projectId: input.projectId,
         payload: {
           objective: input.objective,
-          stepCount: input.steps.length
+          stepCount: input.steps.length,
+          contractVersion: input.projectContract.version,
+          requirementCount: input.projectContract.requirements.length
         }
       });
     });
@@ -1071,6 +1151,98 @@ export class ForgeMindRepository {
     return step ? toProjectImplementationStep(step) : undefined;
   }
 
+  async appendProjectImplementationSteps(input: AppendProjectImplementationStepsInput): Promise<ProjectImplementationStep[]> {
+    if (input.steps.length === 0) return [];
+
+    return this.prisma.$transaction(async (tx) => {
+      await tx.$queryRawUnsafe(WORKER_QUEUE_ADVISORY_LOCK_SQL);
+      const [project, cycle, existingSteps] = await Promise.all([
+        tx.project.findUnique({ where: { id: input.projectId } }),
+        tx.projectRoadmapCycle.findUnique({ where: { id: input.cycleId } }),
+        tx.projectImplementationStep.findMany({
+          where: { cycleId: input.cycleId },
+          orderBy: { sequenceNumber: 'asc' }
+        })
+      ]);
+      if (!project?.projectContract || !cycle || cycle.projectId !== input.projectId) {
+        throw new Error('Gap work items reference an unknown project contract or roadmap cycle.');
+      }
+
+      const contract = toProject(project).projectContract;
+      if (!contract) throw new Error('Project contract is required for gap work items.');
+      const requirementIds = new Set(contract.requirements.map((requirement) => requirement.id));
+      const existingKeys = new Set(existingSteps.map((step) => implementationStepIdentity({
+        title: step.title,
+        requirementIds: jsonStringArray(step.requirementIds),
+        deliverables: jsonStringArray(step.deliverables)
+      })));
+      const uniqueSteps = input.steps.filter((step) => {
+        if (step.requirementIds.length === 0 || step.requirementIds.some((id) => !requirementIds.has(id))) {
+          throw new Error(`Gap work item "${step.title}" has invalid requirement traceability.`);
+        }
+        const key = implementationStepIdentity(step);
+        if (existingKeys.has(key)) return false;
+        existingKeys.add(key);
+        return true;
+      });
+      if (uniqueSteps.length === 0) return [];
+
+      const firstPendingSequence = existingSteps.find((step) => step.status === 'pending')?.sequenceNumber;
+      const firstSequenceNumber = firstPendingSequence ?? ((existingSteps.at(-1)?.sequenceNumber ?? 0) + 1);
+      if (firstPendingSequence !== undefined) {
+        const shiftedSteps = existingSteps
+          .filter((step) => step.sequenceNumber >= firstPendingSequence)
+          .sort((left, right) => right.sequenceNumber - left.sequenceNumber);
+        for (const step of shiftedSteps) {
+          await tx.projectImplementationStep.update({
+            where: { id: step.id },
+            data: { sequenceNumber: step.sequenceNumber + uniqueSteps.length }
+          });
+        }
+      }
+      const invalidatedRequirementIds = Array.from(new Set(uniqueSteps.flatMap((step) => step.requirementIds)));
+      await tx.acceptanceEvidence.deleteMany({
+        where: {
+          cycleId: input.cycleId,
+          source: 'repository_audit',
+          OR: [
+            { requirementId: { in: invalidatedRequirementIds } },
+            { criterion: { startsWith: 'Release: ' } }
+          ]
+        }
+      });
+      const created: ProjectImplementationStep[] = [];
+      for (const [index, step] of uniqueSteps.entries()) {
+        const record = await tx.projectImplementationStep.create({
+          data: {
+            projectId: input.projectId,
+            cycleId: input.cycleId,
+            sequenceNumber: firstSequenceNumber + index,
+            title: step.title,
+            description: step.description,
+            acceptanceCriteria: toPrismaJson(step.acceptanceCriteria),
+            requirementIds: toPrismaJson(step.requirementIds),
+            deliverables: toPrismaJson(step.deliverables),
+            status: 'pending'
+          }
+        });
+        created.push(toProjectImplementationStep(record));
+      }
+
+      await tx.projectRoadmapCycle.update({
+        where: { id: input.cycleId },
+        data: { status: 'active', completedAt: null }
+      });
+      await this.writeAuditTx(tx, {
+        actorType: 'agent',
+        eventType: 'project_audit_gap_steps_created',
+        projectId: input.projectId,
+        payload: { cycleId: input.cycleId, stepIds: created.map((step) => step.id) }
+      });
+      return created;
+    });
+  }
+
   async assignTaskToImplementationStep(
     stepId: string,
     taskId: string,
@@ -1129,6 +1301,101 @@ export class ForgeMindRepository {
     });
 
     return toProjectImplementationStep(updated);
+  }
+
+  async recordAcceptanceEvidence(input: RecordAcceptanceEvidenceInput): Promise<AcceptanceEvidence[]> {
+    const [projectRecord, cycleRecord, stepRecord] = await Promise.all([
+      this.prisma.project.findUnique({ where: { id: input.projectId } }),
+      this.prisma.projectRoadmapCycle.findUnique({ where: { id: input.cycleId } }),
+      input.stepId ? this.prisma.projectImplementationStep.findUnique({ where: { id: input.stepId } }) : undefined
+    ]);
+    if (!projectRecord || !cycleRecord || cycleRecord.projectId !== input.projectId) {
+      throw new Error('Acceptance evidence references an invalid project roadmap cycle.');
+    }
+    if (stepRecord && (stepRecord.projectId !== input.projectId || stepRecord.cycleId !== input.cycleId)) {
+      throw new Error('Acceptance evidence references an invalid roadmap work item.');
+    }
+
+    const project = toProject(projectRecord);
+    if (!project.projectContract || project.projectContract.version !== input.contractVersion) {
+      throw new Error('Acceptance evidence does not match the active project contract version.');
+    }
+    const knownRequirements = new Set(project.projectContract.requirements.map((requirement) => requirement.id));
+    const stepRequirements = stepRecord ? new Set(toProjectImplementationStep(stepRecord).requirementIds) : undefined;
+    const requirementIds = Array.from(new Set(input.requirementIds));
+    if (requirementIds.length === 0 || requirementIds.some((id) => !knownRequirements.has(id) || (stepRequirements && !stepRequirements.has(id)))) {
+      throw new Error('Acceptance evidence contains an unknown or unrelated project requirement.');
+    }
+
+    const criterion = input.criterion.trim();
+    if (!criterion) throw new Error('Acceptance evidence criterion is required.');
+    const criterionKey = acceptanceCriterionKey(criterion);
+    const evidenceKey = acceptanceCriterionKey(input.evidenceIdentity);
+    const payload = toPrismaJson(input.payload ?? {});
+    const records = await this.prisma.$transaction(requirementIds.map((requirementId) =>
+      this.prisma.acceptanceEvidence.upsert({
+        where: {
+          cycleId_requirementId_criterionKey_source_evidenceKey: {
+            cycleId: input.cycleId,
+            requirementId,
+            criterionKey,
+            source: input.source,
+            evidenceKey
+          }
+        },
+        update: {
+          stepId: input.stepId,
+          taskId: input.taskId,
+          taskRunId: input.taskRunId,
+          status: input.status,
+          contractVersion: input.contractVersion,
+          commitSha: input.commitSha,
+          command: input.command,
+          exitCode: input.exitCode,
+          detailsUrl: input.detailsUrl,
+          payloadJson: payload
+        },
+        create: {
+          projectId: input.projectId,
+          cycleId: input.cycleId,
+          stepId: input.stepId,
+          taskId: input.taskId,
+          taskRunId: input.taskRunId,
+          requirementId,
+          criterionKey,
+          criterion,
+          source: input.source,
+          status: input.status,
+          evidenceKey,
+          contractVersion: input.contractVersion,
+          commitSha: input.commitSha,
+          command: input.command,
+          exitCode: input.exitCode,
+          detailsUrl: input.detailsUrl,
+          payloadJson: payload
+        }
+      })
+    ));
+
+    await this.writeAudit({
+      actorType: input.source === 'github_check' ? 'github' : 'system',
+      eventType: 'acceptance_evidence_recorded',
+      projectId: input.projectId,
+      taskId: input.taskId,
+      payload: {
+        cycleId: input.cycleId,
+        stepId: input.stepId ?? null,
+        requirementIds,
+        source: input.source,
+        status: input.status,
+        criterionKey,
+        evidenceKey,
+        contractVersion: input.contractVersion,
+        commitSha: input.commitSha ?? null
+      }
+    });
+
+    return records.map(toAcceptanceEvidence);
   }
 
   async getNotificationSettings(userId: string): Promise<NotificationSettingsSnapshot> {
@@ -1308,6 +1575,165 @@ export class ForgeMindRepository {
     });
 
     return { enqueued: true };
+  }
+
+  async enqueueProjectAudit(input: { projectId: string; cycleId: string; triggerTaskId?: string; requirementIds: string[] }): Promise<{ enqueued: boolean; job: ProjectAuditJob }> {
+    return this.prisma.$transaction(async (tx) => {
+      await tx.$queryRawUnsafe(WORKER_QUEUE_ADVISORY_LOCK_SQL);
+      const [cycle, project] = await Promise.all([
+        tx.projectRoadmapCycle.findUnique({ where: { id: input.cycleId } }),
+        tx.project.findUnique({ where: { id: input.projectId } })
+      ]);
+      if (!cycle || cycle.projectId !== input.projectId) throw new Error('Project audit references an unknown roadmap cycle.');
+      const contract = project ? toProject(project).projectContract : undefined;
+      const knownRequirementIds = new Set(contract?.requirements.map((requirement) => requirement.id) ?? []);
+      const requirementIds = Array.from(new Set(input.requirementIds));
+      if (!contract || requirementIds.length === 0 || requirementIds.some((id) => !knownRequirementIds.has(id))) {
+        throw new Error('Project audit must reference requirements from the active project contract.');
+      }
+
+      const existing = await tx.projectAuditJob.findUnique({ where: { cycleId: input.cycleId } });
+      if (existing && (existing.status === 'pending' || existing.status === 'claimed')) {
+        return { enqueued: false, job: toProjectAuditJob(existing) };
+      }
+
+      const now = new Date();
+      const job = await tx.projectAuditJob.upsert({
+        where: { cycleId: input.cycleId },
+        update: {
+          triggerTaskId: input.triggerTaskId,
+          requirementIds: toPrismaJson(requirementIds),
+          status: 'pending',
+          attemptCount: 0,
+          nextAttemptAt: now,
+          errorMessage: null,
+          claimedAt: null,
+          finishedAt: null
+        },
+        create: {
+          projectId: input.projectId,
+          cycleId: input.cycleId,
+          triggerTaskId: input.triggerTaskId,
+          requirementIds: toPrismaJson(requirementIds),
+          status: 'pending',
+          nextAttemptAt: now
+        }
+      });
+      await tx.projectRoadmapCycle.update({
+        where: { id: input.cycleId },
+        data: { status: 'verifying', completedAt: null }
+      });
+      await this.writeAuditTx(tx, {
+        actorType: 'system',
+        eventType: 'project_audit_enqueued',
+        projectId: input.projectId,
+        taskId: input.triggerTaskId,
+        payload: { auditJobId: job.id, cycleId: input.cycleId, requirementIds }
+      });
+      return { enqueued: true, job: toProjectAuditJob(job) };
+    });
+  }
+
+  async claimNextProjectAudit(): Promise<ClaimedProjectAuditJob | undefined> {
+    return this.prisma.$transaction(async (tx) => {
+      await tx.$queryRawUnsafe(WORKER_QUEUE_ADVISORY_LOCK_SQL);
+      const [workerControl] = await tx.$queryRawUnsafe<Array<{ queuePaused: boolean }>>(
+        'SELECT "queue_paused" AS "queuePaused" FROM "worker_control" WHERE "id" = $1',
+        WORKER_QUEUE_CONTROL_ID
+      );
+      if (workerControl?.queuePaused) return undefined;
+
+      const candidate = await tx.projectAuditJob.findFirst({
+        where: {
+          status: 'pending',
+          OR: [{ nextAttemptAt: null }, { nextAttemptAt: { lte: new Date() } }]
+        },
+        orderBy: [{ nextAttemptAt: 'asc' }, { createdAt: 'asc' }],
+        include: { project: true, cycle: true }
+      });
+      if (!candidate) return undefined;
+
+      const claimed = await tx.projectAuditJob.update({
+        where: { id: candidate.id },
+        data: { status: 'claimed', claimedAt: new Date(), attemptCount: { increment: 1 } }
+      });
+      await this.writeAuditTx(tx, {
+        actorType: 'agent',
+        eventType: 'project_audit_claimed',
+        projectId: candidate.projectId,
+        taskId: candidate.triggerTaskId ?? undefined,
+        payload: { auditJobId: candidate.id, cycleId: candidate.cycleId }
+      });
+      return {
+        job: toProjectAuditJob(claimed),
+        project: toProject(candidate.project),
+        cycle: toProjectRoadmapCycle(candidate.cycle)
+      };
+    });
+  }
+
+  async finalizeProjectAudit(
+    auditJobId: string,
+    status: Extract<ProjectAuditJobStatus, 'succeeded' | 'blocked' | 'failed'>,
+    errorMessage?: string
+  ): Promise<{ retryScheduled: boolean }> {
+    const job = await this.prisma.projectAuditJob.findUnique({ where: { id: auditJobId } });
+    if (!job || job.status !== 'claimed') return { retryScheduled: false };
+
+    if (status === 'failed') {
+      const maxAttempts = Math.max(1, Number(process.env.FORGEMIND_AUDIT_MAX_ATTEMPTS ?? DEFAULT_AUDIT_JOB_MAX_ATTEMPTS));
+      if (job.attemptCount < maxAttempts) {
+        const backoffSeconds = Math.max(1, Number(process.env.FORGEMIND_QUEUE_RETRY_BACKOFF_SECONDS ?? DEFAULT_QUEUE_BACKOFF_SECONDS));
+        const nextAttemptAt = new Date(Date.now() + backoffSeconds * (2 ** Math.max(0, job.attemptCount - 1)) * 1000);
+        await this.prisma.projectAuditJob.update({
+          where: { id: auditJobId },
+          data: { status: 'pending', claimedAt: null, nextAttemptAt, errorMessage }
+        });
+        await this.writeAudit({
+          actorType: 'system',
+          eventType: 'project_audit_retry_scheduled',
+          projectId: job.projectId,
+          taskId: job.triggerTaskId ?? undefined,
+          payload: { auditJobId, cycleId: job.cycleId, nextAttemptAt: nextAttemptAt.toISOString(), errorMessage: errorMessage ?? null }
+        });
+        return { retryScheduled: true };
+      }
+    }
+
+    await this.prisma.$transaction(async (tx) => {
+      await tx.projectAuditJob.update({
+        where: { id: auditJobId },
+        data: { status, claimedAt: null, nextAttemptAt: null, errorMessage, finishedAt: new Date() }
+      });
+      if (status === 'blocked' || status === 'failed') {
+        await tx.projectRoadmapCycle.update({
+          where: { id: job.cycleId },
+          data: { status: 'blocked', completedAt: null }
+        });
+      }
+      await this.writeAuditTx(tx, {
+        actorType: 'system',
+        eventType: `project_audit_${status}`,
+        projectId: job.projectId,
+        taskId: job.triggerTaskId ?? undefined,
+        payload: { auditJobId, cycleId: job.cycleId, errorMessage: errorMessage ?? null }
+      });
+    });
+    return { retryScheduled: false };
+  }
+
+  async recoverStuckProjectAudits(claimTimeoutMinutes = 2): Promise<number> {
+    const cutoff = new Date(Date.now() - Math.max(1, claimTimeoutMinutes) * 60_000);
+    const result = await this.prisma.projectAuditJob.updateMany({
+      where: { status: 'claimed', claimedAt: { lt: cutoff } },
+      data: {
+        status: 'pending',
+        claimedAt: null,
+        nextAttemptAt: new Date(),
+        errorMessage: 'Worker execution was interrupted; capability audit will resume.'
+      }
+    });
+    return result.count;
   }
 
   async recoverStuckQueueJobs(claimTimeoutMinutes = 2): Promise<QueueRecoveryResult> {
@@ -1553,6 +1979,14 @@ export class ForgeMindRepository {
     return result.count === 1;
   }
 
+  async refreshProjectAuditClaim(auditJobId: string): Promise<boolean> {
+    const result = await this.prisma.projectAuditJob.updateMany({
+      where: { id: auditJobId, status: 'claimed' },
+      data: { claimedAt: new Date() }
+    });
+    return result.count === 1;
+  }
+
   async interruptClaimedTask(input: {
     queueJobId: string;
     taskId: string;
@@ -1645,7 +2079,7 @@ export class ForgeMindRepository {
       status: 'claimed' as const,
       claimedAt: { gte: activeClaimCutoff }
     };
-    const [queueControl, queuedTaskCount, activeTaskCount, runningRun, lastCompletedRun] = await Promise.all([
+    const [queueControl, queuedTaskCount, activeTaskCount, queuedAuditCount, activeAuditCount, runningRun, lastCompletedRun] = await Promise.all([
       this.getWorkerQueueControl(),
       this.prisma.taskQueueJob.count({ where: { status: 'pending' } }),
       this.prisma.task.count({
@@ -1656,6 +2090,8 @@ export class ForgeMindRepository {
           }
         }
       }),
+      this.prisma.projectAuditJob.count({ where: { status: 'pending' } }),
+      this.prisma.projectAuditJob.count({ where: activeClaimFilter }),
       this.prisma.taskRun.findFirst({
         where: {
           status: 'running',
@@ -1685,11 +2121,11 @@ export class ForgeMindRepository {
     const activeIteration = parseActiveIterationAudit(activeIterationAudit);
 
     return {
-      state: runningRun ? 'running' : 'idle',
+      state: runningRun || activeAuditCount > 0 ? 'running' : 'idle',
       queuePaused: queueControl.queuePaused,
       queuePausedAt: queueControl.pausedAt,
-      queuedTaskCount,
-      activeTaskCount,
+      queuedTaskCount: queuedTaskCount + queuedAuditCount,
+      activeTaskCount: activeTaskCount + activeAuditCount,
       runningRun: runningRun
         ? {
             id: runningRun.id,
@@ -2741,6 +3177,79 @@ function buildAIProviderConnectionName(provider: AIProviderConnectionKind, authM
   const providerName = provider === 'codex' ? 'Codex' : 'OpenAI';
   const authName = authMode === 'codex_oauth' ? 'OAuth' : 'API key';
   return `${providerName} ${authName} ${model}`.trim();
+}
+
+export function deriveProjectCapabilities(
+  project: Project | undefined,
+  cycles: ProjectRoadmapCycle[],
+  steps: ProjectImplementationStep[],
+  evidence: AcceptanceEvidence[]
+): ProjectCapability[] {
+  const contract = project?.projectContract;
+  if (!contract) return [];
+  const latestCycle = [...cycles].sort((left, right) => right.cycleNumber - left.cycleNumber)[0];
+  if (!latestCycle) return [];
+
+  return contract.requirements.map((requirement) => {
+    const workItems = steps.filter((step) => step.cycleId === latestCycle.id && step.requirementIds.includes(requirement.id));
+    const currentEvidence = evidence.filter((item) =>
+      item.cycleId === latestCycle.id
+      && item.requirementId === requirement.id
+      && item.contractVersion === contract.version
+    );
+    const latestAuditByCriterion = new Map<string, AcceptanceEvidence>();
+    for (const item of currentEvidence.filter((candidate) => candidate.source === 'repository_audit')) {
+      const current = latestAuditByCriterion.get(item.criterionKey);
+      if (!current || current.updatedAt <= item.updatedAt) latestAuditByCriterion.set(item.criterionKey, item);
+    }
+    const criterionEvidence = requirement.acceptanceCriteria.map((criterion) => latestAuditByCriterion.get(acceptanceCriterionKey(criterion)));
+    const satisfiedCriteria = criterionEvidence.filter((item) => item?.status === 'passed').length;
+    const hasBlockedCriterion = criterionEvidence.some((item) => item?.status === 'blocked');
+    const hasFailedCriterion = criterionEvidence.some((item) => item?.status === 'failed');
+    let status: ProjectCapability['status'];
+    if (hasBlockedCriterion) {
+      status = 'blocked';
+    } else if (satisfiedCriteria === requirement.acceptanceCriteria.length) {
+      status = 'satisfied';
+    } else if (hasFailedCriterion) {
+      status = 'partial';
+    } else if (workItems.some((item) => item.status === 'running') || workItems.some((item) => item.status === 'completed')) {
+      status = workItems.every((item) => item.status === 'completed') ? 'verifying' : 'implementing';
+    } else {
+      status = 'pending';
+    }
+
+    return {
+      requirement,
+      status,
+      workItemIds: workItems.map((item) => item.id),
+      evidence: currentEvidence,
+      satisfiedCriteria,
+      totalCriteria: requirement.acceptanceCriteria.length
+    };
+  });
+}
+
+export function acceptanceCriterionKey(value: string): string {
+  return createHash('sha256').update(value.replace(/\s+/g, ' ').trim().toLowerCase()).digest('hex');
+}
+
+export function shouldInvalidateProjectContract(existingBrief: string | null, nextBrief: string | null | undefined): boolean {
+  if (nextBrief === undefined) return false;
+  const normalize = (value: string | null) => (value ?? '').replace(/\r\n/g, '\n').trim();
+  return normalize(existingBrief) !== normalize(nextBrief);
+}
+
+function implementationStepIdentity(input: { title: string; requirementIds: string[]; deliverables: string[] }): string {
+  return createHash('sha256').update(JSON.stringify({
+    title: input.title.replace(/\s+/g, ' ').trim().toLowerCase(),
+    requirementIds: [...input.requirementIds].sort(),
+    deliverables: input.deliverables.map((item) => item.replace(/\s+/g, ' ').trim().toLowerCase()).sort()
+  })).digest('hex');
+}
+
+function jsonStringArray(value: Prisma.JsonValue): string[] {
+  return Array.isArray(value) ? value.filter((item): item is string => typeof item === 'string') : [];
 }
 
 function parseDiffStat(value: Prisma.JsonValue): { filesChanged: number; insertions: number; deletions: number } {

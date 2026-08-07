@@ -1,14 +1,17 @@
 import type {
+  AcceptanceEvidence as CoreAcceptanceEvidence,
   Approval as CoreApproval,
   AuditEvent,
   ForgeTask,
+  ProjectAuditJob as CoreProjectAuditJob,
   ProjectImplementationStep as CoreProjectImplementationStep,
+  ProjectContract,
   ProjectRoadmapCycle as CoreProjectRoadmapCycle,
   Project as CoreProject,
   TaskRun as CoreTaskRun
 } from '@forgemind/core';
 import type { JsonValue } from '@forgemind/shared';
-import type { Approval, AuditLog, Prisma, Project, ProjectImplementationStep, ProjectRoadmapCycle, Task, TaskRun } from '@prisma/client';
+import type { AcceptanceEvidence, Approval, AuditLog, Prisma, Project, ProjectAuditJob, ProjectImplementationStep, ProjectRoadmapCycle, Task, TaskRun } from '@prisma/client';
 
 export function toProject(project: Project): CoreProject {
   return {
@@ -20,6 +23,7 @@ export function toProject(project: Project): CoreProject {
     defaultBranch: project.defaultBranch,
     configYaml: project.configYaml ?? undefined,
     brief: project.brief ?? undefined,
+    projectContract: toProjectContract(project.projectContract),
     autoCreatePullRequest: project.autoCreatePullRequest,
     autoMergePullRequest: project.autoMergePullRequest,
     autoCompleteTask: project.autoCompleteTask,
@@ -46,9 +50,35 @@ export function toProjectRoadmapCycle(cycle: ProjectRoadmapCycle): CoreProjectRo
   };
 }
 
+export function toProjectAuditJob(job: ProjectAuditJob): CoreProjectAuditJob {
+  return {
+    id: job.id,
+    projectId: job.projectId,
+    cycleId: job.cycleId,
+    triggerTaskId: job.triggerTaskId ?? undefined,
+    requirementIds: Array.isArray(job.requirementIds)
+      ? job.requirementIds.filter((item): item is string => typeof item === 'string')
+      : [],
+    status: job.status,
+    attemptCount: job.attemptCount,
+    nextAttemptAt: job.nextAttemptAt?.toISOString(),
+    errorMessage: job.errorMessage ?? undefined,
+    createdAt: job.createdAt.toISOString(),
+    updatedAt: job.updatedAt.toISOString(),
+    claimedAt: job.claimedAt?.toISOString(),
+    finishedAt: job.finishedAt?.toISOString()
+  };
+}
+
 export function toProjectImplementationStep(step: ProjectImplementationStep): CoreProjectImplementationStep {
   const acceptanceCriteria = Array.isArray(step.acceptanceCriteria)
     ? step.acceptanceCriteria.filter((item): item is string => typeof item === 'string')
+    : [];
+  const requirementIds = Array.isArray(step.requirementIds)
+    ? step.requirementIds.filter((item): item is string => typeof item === 'string')
+    : [];
+  const deliverables = Array.isArray(step.deliverables)
+    ? step.deliverables.filter((item): item is string => typeof item === 'string')
     : [];
 
   return {
@@ -59,11 +89,82 @@ export function toProjectImplementationStep(step: ProjectImplementationStep): Co
     title: step.title,
     description: step.description,
     acceptanceCriteria,
+    requirementIds,
+    deliverables,
     status: step.status,
     taskId: step.taskId ?? undefined,
     createdAt: step.createdAt.toISOString(),
     updatedAt: step.updatedAt.toISOString(),
     completedAt: step.completedAt?.toISOString()
+  };
+}
+
+export function toAcceptanceEvidence(evidence: AcceptanceEvidence): CoreAcceptanceEvidence {
+  const payload = evidence.payloadJson && typeof evidence.payloadJson === 'object' && !Array.isArray(evidence.payloadJson)
+    ? evidence.payloadJson as Record<string, unknown>
+    : {};
+  return {
+    id: evidence.id,
+    projectId: evidence.projectId,
+    cycleId: evidence.cycleId,
+    stepId: evidence.stepId ?? undefined,
+    taskId: evidence.taskId ?? undefined,
+    taskRunId: evidence.taskRunId ?? undefined,
+    requirementId: evidence.requirementId,
+    criterionKey: evidence.criterionKey,
+    criterion: evidence.criterion,
+    source: evidence.source,
+    status: evidence.status,
+    evidenceKey: evidence.evidenceKey,
+    contractVersion: evidence.contractVersion,
+    commitSha: evidence.commitSha ?? undefined,
+    command: evidence.command ?? undefined,
+    exitCode: evidence.exitCode ?? undefined,
+    detailsUrl: evidence.detailsUrl ?? undefined,
+    payload,
+    createdAt: evidence.createdAt.toISOString(),
+    updatedAt: evidence.updatedAt.toISOString()
+  };
+}
+
+function toProjectContract(value: Prisma.JsonValue | null): ProjectContract | undefined {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return undefined;
+  const contract = value as Record<string, Prisma.JsonValue>;
+  if (
+    typeof contract.version !== 'number'
+    || typeof contract.summary !== 'string'
+    || !Array.isArray(contract.invariants)
+    || !Array.isArray(contract.prohibitedSubstitutes)
+    || !Array.isArray(contract.requirements)
+    || !Array.isArray(contract.releaseCriteria)
+  ) return undefined;
+
+  const requirements = contract.requirements.flatMap((item) => {
+    if (!item || typeof item !== 'object' || Array.isArray(item)) return [];
+    const requirement = item as Record<string, Prisma.JsonValue>;
+    if (
+      typeof requirement.id !== 'string'
+      || typeof requirement.title !== 'string'
+      || typeof requirement.description !== 'string'
+      || !Array.isArray(requirement.acceptanceCriteria)
+    ) return [];
+    return [{
+      id: requirement.id,
+      title: requirement.title,
+      description: requirement.description,
+      acceptanceCriteria: requirement.acceptanceCriteria.filter((criterion): criterion is string => typeof criterion === 'string')
+    }];
+  });
+
+  if (requirements.length !== contract.requirements.length) return undefined;
+  return {
+    version: contract.version,
+    sourceBriefHash: typeof contract.sourceBriefHash === 'string' ? contract.sourceBriefHash : undefined,
+    summary: contract.summary,
+    invariants: contract.invariants.filter((item): item is string => typeof item === 'string'),
+    prohibitedSubstitutes: contract.prohibitedSubstitutes.filter((item): item is string => typeof item === 'string'),
+    requirements,
+    releaseCriteria: contract.releaseCriteria.filter((item): item is string => typeof item === 'string')
   };
 }
 

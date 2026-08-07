@@ -144,6 +144,10 @@ export async function fetchProjectRoadmap(projectId: string): Promise<ProjectRoa
   return request<ProjectRoadmapApi>(`/api/projects/${projectId}/roadmap`);
 }
 
+export async function retryProjectAudit(projectId: string): Promise<ProjectRoadmapApi> {
+  return request<ProjectRoadmapApi>(`/api/projects/${projectId}/audit/retry`, { method: 'POST' });
+}
+
 export async function generateProjectRoadmap(projectId: string, input: GenerateProjectRoadmapRequest = {}): Promise<ProjectRoadmapApi> {
   return request<ProjectRoadmapApi>(`/api/projects/${projectId}/implementation-steps/generate`, {
     method: 'POST',

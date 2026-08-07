@@ -29,6 +29,34 @@ async function loadRunWorkerTask() {
 }
 
 describe('Studio API routes', () => {
+  it('requeues only a failed project audit with its original requirement scope', async () => {
+    const roadmap = {
+      projectId: 'project_1',
+      cycles: [{ id: 'cycle_1', projectId: 'project_1', cycleNumber: 1, objective: 'Demo', status: 'blocked' }],
+      steps: [],
+      evidence: [],
+      capabilities: [],
+      auditJobs: [{
+        id: 'audit_1', projectId: 'project_1', cycleId: 'cycle_1', triggerTaskId: 'task_1',
+        requirementIds: ['REQ-DEMO'], status: 'blocked', attemptCount: 3, createdAt: '', updatedAt: ''
+      }]
+    };
+    const repository = {
+      getProjectRoadmap: vi.fn(async () => roadmap),
+      enqueueProjectAudit: vi.fn(async () => ({ enqueued: true, job: roadmap.auditJobs[0] }))
+    };
+    const app = Fastify();
+    registerRoutes(app, repository as never);
+
+    const response = await app.inject({ method: 'POST', url: '/api/projects/project_1/audit/retry' });
+
+    expect(response.statusCode).toBe(200);
+    expect(repository.enqueueProjectAudit).toHaveBeenCalledWith({
+      projectId: 'project_1', cycleId: 'cycle_1', triggerTaskId: 'task_1', requirementIds: ['REQ-DEMO']
+    });
+    await app.close();
+  });
+
   it('exposes worker status endpoint', async () => {
     let queuePaused = false;
     const repository = {
