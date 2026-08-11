@@ -814,6 +814,84 @@ a {
   margin: 0;
 }
 
+.project-specification-history {
+  margin-top: 18px;
+  padding-top: 16px;
+  border-top: 1px solid #dbe3de;
+}
+
+.project-specification-history h4 {
+  margin: 0;
+  font-size: 0.92rem;
+}
+
+.project-specification-content {
+  max-height: 360px;
+  margin: 10px 0 0;
+  padding: 12px;
+  overflow: auto;
+  border: 1px solid #dbe3de;
+  border-radius: 6px;
+  background: #f8faf8;
+  color: #233129;
+  font-family: inherit;
+  font-size: 0.86rem;
+  line-height: 1.55;
+  letter-spacing: 0;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.project-specification-versions {
+  margin-top: 18px;
+}
+
+.project-specification-version {
+  border-top: 1px solid #e2e8e4;
+}
+
+.project-specification-version:first-of-type {
+  margin-top: 8px;
+}
+
+.project-specification-version > summary {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto 20px;
+  align-items: center;
+  gap: 12px;
+  padding: 11px 0;
+  cursor: pointer;
+  list-style: none;
+}
+
+.project-specification-version > summary::-webkit-details-marker {
+  display: none;
+}
+
+.project-specification-version > summary > span:first-child {
+  display: grid;
+  gap: 2px;
+  min-width: 0;
+}
+
+.project-specification-version > summary small,
+.project-specification-version > summary > span:nth-child(2) {
+  color: #69736c;
+  font-size: 0.78rem;
+}
+
+.project-specification-version > summary > svg {
+  transition: transform 160ms ease;
+}
+
+.project-specification-version[open] > summary > svg {
+  transform: rotate(180deg);
+}
+
+.project-specification-version .project-specification-content {
+  margin: 0 0 12px;
+}
+
 .section-heading p {
   margin-top: 3px;
   color: #69736c;
@@ -1006,6 +1084,80 @@ a {
   gap: 10px;
 }
 
+.project-progress-panel {
+  display: grid;
+  grid-template-columns: 32px minmax(0, 1fr);
+  gap: 10px;
+  padding: 14px;
+  border: 1px solid #d9e2dc;
+  border-left: 3px solid #68736c;
+  border-radius: 8px;
+  background: #f8faf8;
+}
+
+.project-progress-panel.active {
+  border-left-color: #0f766e;
+  background: #f1f9f7;
+}
+
+.project-progress-panel.attention {
+  border-left-color: #a76516;
+  background: #fff8ed;
+}
+
+.project-progress-panel.completed {
+  border-left-color: #197544;
+  background: #f1f8f3;
+}
+
+.project-progress-icon {
+  display: grid;
+  place-items: center;
+  width: 32px;
+  height: 32px;
+  color: #56615a;
+}
+
+.project-progress-panel.active .project-progress-icon { color: #0f766e; }
+.project-progress-panel.attention .project-progress-icon { color: #a76516; }
+.project-progress-panel.completed .project-progress-icon { color: #197544; }
+
+.project-progress-content {
+  min-width: 0;
+  display: grid;
+  gap: 4px;
+}
+
+.project-progress-content > span,
+.project-progress-meter small {
+  color: #69736c;
+  font-size: 0.78rem;
+}
+
+.project-progress-content > strong,
+.project-progress-content p {
+  overflow-wrap: anywhere;
+}
+
+.project-progress-content p {
+  margin: 0;
+  color: #4c5750;
+}
+
+.project-progress-meter {
+  display: grid;
+  grid-template-columns: minmax(120px, 220px) minmax(0, 1fr);
+  gap: 10px;
+  align-items: center;
+  margin-top: 5px;
+}
+
+.project-progress-meter progress {
+  width: 100%;
+  height: 7px;
+  accent-color: #0f766e;
+}
+
 .technical-details h4 {
   margin: 8px 0 0;
 }
@@ -1039,6 +1191,73 @@ a {
   overflow: hidden;
 }
 
+.roadmap-cycle-list {
+  display: grid;
+  border-top: 1px solid #dbe3dc;
+}
+
+.roadmap-cycle {
+  min-width: 0;
+  border-bottom: 1px solid #dbe3dc;
+}
+
+.roadmap-cycle > summary {
+  min-height: 72px;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto 20px;
+  gap: 12px;
+  align-items: center;
+  padding: 12px 2px;
+  cursor: pointer;
+  list-style: none;
+}
+
+.roadmap-cycle > summary::-webkit-details-marker {
+  display: none;
+}
+
+.roadmap-cycle > summary > svg {
+  transition: transform 160ms ease;
+}
+
+.roadmap-cycle[open] > summary > svg {
+  transform: rotate(180deg);
+}
+
+.roadmap-cycle-title {
+  min-width: 0;
+  display: grid;
+  gap: 3px;
+}
+
+.roadmap-cycle-title small,
+.roadmap-cycle-title > span {
+  color: #69736c;
+  font-size: 0.78rem;
+}
+
+.roadmap-cycle-title strong,
+.roadmap-cycle-title > span {
+  overflow-wrap: anywhere;
+}
+
+.roadmap-cycle-body {
+  display: grid;
+  gap: 12px;
+  padding: 0 2px 16px;
+}
+
+.roadmap-cycle-body > p {
+  margin: 0;
+  color: #4c5750;
+  line-height: 1.5;
+  white-space: pre-wrap;
+}
+
+.roadmap-extension {
+  margin-top: 2px;
+}
+
 .project-contract-summary {
   margin-bottom: 14px;
   padding: 10px 12px;
@@ -1052,6 +1271,75 @@ a {
 }
 
 .project-contract-summary small {
+  color: #69736c;
+}
+
+.contract-history {
+  display: grid;
+  margin-bottom: 14px;
+  border-top: 1px solid #dde5dd;
+}
+
+.contract-history h4 {
+  margin: 12px 0 4px;
+}
+
+.contract-history > details {
+  border-bottom: 1px solid #dde5dd;
+}
+
+.contract-history > details > summary {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 12px;
+  align-items: center;
+  padding: 10px 0;
+  cursor: pointer;
+}
+
+.contract-history > details > summary > span:first-child {
+  display: grid;
+  gap: 2px;
+  min-width: 0;
+}
+
+.contract-history > details > summary small,
+.contract-requirements small,
+.contract-delta-summary small {
+  color: #69736c;
+}
+
+.contract-history-body,
+.contract-delta-summary,
+.contract-requirements,
+.contract-requirements > div {
+  display: grid;
+  gap: 6px;
+}
+
+.contract-history-body {
+  padding: 0 0 12px;
+}
+
+.contract-history-body p,
+.contract-delta-summary p,
+.contract-requirements p {
+  margin: 0;
+}
+
+.contract-delta-summary {
+  padding: 8px 10px;
+  background: #f2f8f5;
+  border-left: 3px solid #16877c;
+}
+
+.contract-requirements > div {
+  padding: 8px 0;
+  border-top: 1px solid #e6ebe7;
+}
+
+.contract-requirements > div[data-status='superseded'],
+.contract-requirements > div[data-status='removed'] {
   color: #69736c;
 }
 
@@ -1783,6 +2071,11 @@ a {
 
   .technical-summary {
     grid-template-columns: 1fr;
+  }
+
+  .project-progress-meter {
+    grid-template-columns: 1fr;
+    gap: 5px;
   }
 
   .settings-grid .project-row {

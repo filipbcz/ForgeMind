@@ -1,135 +1,154 @@
-import { describe, expect, it, vi } from 'vitest';
-import type { Project, ProjectImplementationStep } from '@forgemind/core';
-import { runCapabilityAudit, runReleaseAudit } from './capability-audit.js';
+import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { afterEach, describe, expect, it } from 'vitest';
+import { simpleGit } from 'simple-git';
+import {
+  buildTargetedRepositoryContext,
+  buildEvidenceLineageContext,
+  rebindTreeEquivalentEvidence,
+  selectCapabilityExecutionEvidence,
+  selectReleaseExecutionEvidence
+} from './capability-audit.js';
 
-const project: Project = {
-  id: 'project_1',
-  name: 'Demo',
-  slug: 'demo',
-  defaultBranch: 'main',
-  isActive: true,
-  createdAt: '2026-08-07T00:00:00.000Z',
-  updatedAt: '2026-08-07T00:00:00.000Z',
-  projectContract: {
-    version: 1,
-    sourceBriefHash: 'brief-hash',
-    summary: 'Demo',
-    invariants: ['Use persisted data.'],
-    prohibitedSubstitutes: ['Static fixtures.'],
-    requirements: [{ id: 'REQ-DEMO', title: 'Demo', description: 'Demo works.', acceptanceCriteria: ['The integration test passes.'] }],
-    releaseCriteria: ['Build passes.']
-  }
-};
+const temporaryDirectories: string[] = [];
 
-const workItem: ProjectImplementationStep = {
-  id: 'step_1',
-  projectId: project.id,
-  cycleId: 'cycle_1',
-  sequenceNumber: 1,
-  title: 'Build demo',
-  description: 'Build it.',
-  acceptanceCriteria: ['Work-item tests pass.'],
-  requirementIds: ['REQ-DEMO'],
-  deliverables: ['Demo implementation'],
-  status: 'completed',
-  taskId: 'task_1',
-  createdAt: project.createdAt,
-  updatedAt: project.updatedAt
-};
+afterEach(async () => {
+  await Promise.all(temporaryDirectories.splice(0).map((path) => rm(path, { recursive: true, force: true })));
+});
 
-describe('worker capability audit', () => {
-  it('persists normalized repository audit evidence at the audited commit', async () => {
-    const recordAcceptanceEvidence = vi.fn(async () => []);
-    const repository = {
-      getProjectRoadmap: vi.fn(async () => ({
-        projectId: project.id,
-        cycles: [{ id: 'cycle_1', projectId: project.id, cycleNumber: 1, objective: 'Demo', status: 'active' }],
-        steps: [workItem],
-        capabilities: [],
-        evidence: [{
-          id: 'evidence_1', projectId: project.id, cycleId: 'cycle_1', stepId: workItem.id, taskId: 'task_1', requirementId: 'REQ-DEMO',
-          criterionKey: 'key', criterion: 'Work-item tests pass.', source: 'validation_command', status: 'passed', evidenceKey: 'command',
-          contractVersion: 1, commitSha: 'abcdef1', command: 'npm test', exitCode: 0, payload: { stdout: 'passed' },
-          createdAt: project.createdAt, updatedAt: project.updatedAt
-        }]
-      })),
-      recordAcceptanceEvidence,
-      writeAudit: vi.fn()
-    };
-    const provider = {
-      auditCapability: vi.fn(async () => ({
-        verdict: 'satisfied' as const,
-        summary: 'Implemented.',
-        criteria: [{ criterion: 'The integration test passes.', status: 'passed' as const, evidence: ['src/demo.ts'], gaps: [] }],
-        gapWorkItems: []
-      }))
-    };
+describe('buildTargetedRepositoryContext', () => {
+  it('keeps production source in the bounded packet when tests are numerous and large', async () => {
+    const workspace = await mkdtemp(join(tmpdir(), 'forgemind-audit-context-'));
+    temporaryDirectories.push(workspace);
+    await mkdir(join(workspace, 'apps', 'web', 'src'), { recursive: true });
+    await mkdir(join(workspace, 'apps', 'web', 'test'), { recursive: true });
+    await writeFile(join(workspace, 'apps', 'web', 'src', 'App.tsx'), 'export const auditSourceMarker = "current-user-restoration";\n');
+    for (let index = 0; index < 20; index += 1) {
+      await writeFile(
+        join(workspace, 'apps', 'web', 'test', `auth-${index}.test.ts`),
+        `export const fixture${index} = ${JSON.stringify('test-content-'.repeat(700))};\n`
+      );
+    }
+    const git = simpleGit({ baseDir: workspace });
+    await git.init();
+    await git.add('.');
 
-    const result = await runCapabilityAudit({
-      repository: repository as never,
-      provider: provider as never,
-      project,
-      cycleId: 'cycle_1',
-      requirement: project.projectContract!.requirements[0]!,
-      workItems: [workItem],
-      workspacePath: 'C:/workspace',
-      commitSha: 'abcdef1'
-    });
+    const packet = await buildTargetedRepositoryContext(workspace, ['authenticated shell restores current user']);
 
-    expect(result.verdict).toBe('satisfied');
-    expect(recordAcceptanceEvidence).toHaveBeenCalledWith(expect.objectContaining({
-      source: 'repository_audit',
-      status: 'passed',
-      evidenceIdentity: 'repository-audit:abcdef1',
-      commitSha: 'abcdef1'
-    }));
+    expect(packet).toContain('--- apps/web/src/App.tsx ---');
+    expect(packet).toContain('current-user-restoration');
+    expect(packet.length).toBeLessThan(80_000);
   });
 
-  it('persists release evidence only after every capability is satisfied', async () => {
-    const recordAcceptanceEvidence = vi.fn(async () => []);
-    const repository = {
-      getProjectRoadmap: vi.fn(async () => ({
-        projectId: project.id,
-        cycles: [{ id: 'cycle_1', projectId: project.id, cycleNumber: 1, objective: 'Demo', status: 'verifying' }],
-        steps: [workItem],
-        evidence: [],
-        capabilities: [{
-          requirement: project.projectContract!.requirements[0]!,
-          status: 'satisfied',
-          workItemIds: [workItem.id],
-          evidence: [],
-          satisfiedCriteria: 1,
-          totalCriteria: 1
-        }]
-      })),
-      recordAcceptanceEvidence,
-      writeAudit: vi.fn()
-    };
-    const provider = {
-      auditRelease: vi.fn(async () => ({
-        verdict: 'satisfied' as const,
-        summary: 'Release ready.',
-        criteria: [
-          { criterion: 'Use persisted data.', status: 'passed' as const, evidence: ['src/store.ts'], gaps: [] },
-          { criterion: 'Build passes.', status: 'passed' as const, evidence: ['package.json build script'], gaps: [] }
-        ],
-        gapWorkItems: []
-      }))
-    };
+  it('keeps root manifest and lockfile content alongside source and tests', async () => {
+    const workspace = await mkdtemp(join(tmpdir(), 'forgemind-audit-context-'));
+    temporaryDirectories.push(workspace);
+    await mkdir(join(workspace, 'src'), { recursive: true });
+    await mkdir(join(workspace, 'tests'), { recursive: true });
+    await writeFile(join(workspace, 'package.json'), '{"name":"audit-manifest-marker"}\n');
+    await writeFile(join(workspace, 'package-lock.json'), '{"lockfileVersion":3,"auditLockMarker":true}\n');
+    await writeFile(join(workspace, 'src', 'index.ts'), 'export const sourceMarker = true;\n');
+    await writeFile(join(workspace, 'tests', 'index.test.ts'), 'export const testMarker = true;\n');
+    const git = simpleGit({ baseDir: workspace });
+    await git.init();
+    await git.add('.');
 
-    await expect(runReleaseAudit({
-      repository: repository as never,
-      provider: provider as never,
-      project,
-      cycleId: 'cycle_1',
-      workspacePath: 'C:/workspace',
-      commitSha: 'abcdef1'
-    })).resolves.toMatchObject({ verdict: 'satisfied' });
-    expect(recordAcceptanceEvidence).toHaveBeenCalledTimes(2);
-    expect(recordAcceptanceEvidence).toHaveBeenCalledWith(expect.objectContaining({
-      criterion: 'Release: Build passes.',
-      requirementIds: ['REQ-DEMO'],
-      evidenceIdentity: 'release-audit:abcdef1'
-    }));
+    const packet = await buildTargetedRepositoryContext(workspace);
+
+    expect(packet).toContain('audit-manifest-marker');
+    expect(packet).toContain('auditLockMarker');
+    expect(packet).toContain('sourceMarker');
+    expect(packet).toContain('testMarker');
+  });
+
+  it('includes focused evidence from the middle of a large test file', async () => {
+    const workspace = await mkdtemp(join(tmpdir(), 'forgemind-audit-context-'));
+    temporaryDirectories.push(workspace);
+    await mkdir(join(workspace, 'packages', 'db', 'test', 'integration'), { recursive: true });
+    const filler = Array.from({ length: 180 }, (_, index) => `const fixture${index} = ${JSON.stringify('x'.repeat(70))};`);
+    filler.splice(90, 0, 'test("WorkItem repository round trip preserves every field", async () => { /* workitem-round-trip-marker */ });');
+    await writeFile(join(workspace, 'packages', 'db', 'test', 'integration', 'identity.test.mjs'), `${filler.join('\n')}\n`);
+    const git = simpleGit({ baseDir: workspace });
+    await git.init();
+    await git.add('.');
+
+    const packet = await buildTargetedRepositoryContext(workspace, ['WorkItem repository round trip']);
+
+    expect(packet).toContain('workitem-round-trip-marker');
+    expect(packet).toContain('[focused excerpts]');
+    expect(packet.length).toBeLessThan(80_000);
+  });
+});
+
+describe('selectReleaseExecutionEvidence', () => {
+  it('adds current cross-cutting validation without leaking unrelated ancestor evidence', () => {
+    const selected = selectCapabilityExecutionEvidence([
+      { requirementId: 'build', source: 'validation_command', status: 'passed', criterion: 'Build', command: 'npm run build', commitSha: 'ancestor' },
+      { requirementId: 'docs', source: 'validation_command', status: 'passed', criterion: 'Regression', command: 'npm test', commitSha: 'current' },
+      { requirementId: 'docs', source: 'validation_command', status: 'passed', criterion: 'Docs only', command: 'npm run test:docs', commitSha: 'ancestor' }
+    ], 'build', 'current');
+
+    expect(selected.map((item) => item.command)).toEqual(['npm run build', 'npm test']);
+  });
+
+  it('keeps specialized ancestor checks while preferring the latest result for repeated commands', () => {
+    const selected = selectReleaseExecutionEvidence([
+      { source: 'validation_command', status: 'passed', criterion: 'Browser works', command: 'npm run test:browser', commitSha: 'ancestor' },
+      { source: 'validation_command', status: 'passed', criterion: 'Build works', command: 'npm run build', commitSha: 'ancestor' },
+      { source: 'validation_command', status: 'passed', criterion: 'Build still works', command: 'npm run build', commitSha: 'current' },
+      { source: 'validation_command', status: 'passed', criterion: 'Compose works', command: 'npm run test:compose', commitSha: 'ancestor' }
+    ], 'current', 3);
+
+    expect(selected.map((item) => item.command)).toEqual([
+      'npm run build',
+      'npm run test:compose',
+      'npm run test:browser'
+    ]);
+    expect(selected[0]?.commitSha).toBe('current');
+  });
+
+  it('rebinds trusted evidence when squash merge metadata changed but the Git tree is identical', async () => {
+    const workspace = await mkdtemp(join(tmpdir(), 'forgemind-audit-tree-'));
+    temporaryDirectories.push(workspace);
+    await writeFile(join(workspace, 'result.txt'), 'validated content\n');
+    const git = simpleGit({ baseDir: workspace });
+    await git.init();
+    await git.addConfig('user.name', 'ForgeMind Test');
+    await git.addConfig('user.email', 'forgemind@example.test');
+    await git.add('.');
+    await git.commit('validated branch commit');
+    const validatedCommit = (await git.revparse(['HEAD'])).trim();
+    await git.raw(['commit', '--allow-empty', '-m', 'squash merge metadata']);
+    const mergedCommit = (await git.revparse(['HEAD'])).trim();
+
+    const rebound = await rebindTreeEquivalentEvidence(workspace, [
+      { criterion: 'Release validation', commitSha: validatedCommit }
+    ], mergedCommit);
+
+    expect(rebound[0]?.commitSha).toBe(mergedCommit);
+  });
+
+  it('shows exactly which files changed after trusted ancestor validation', async () => {
+    const workspace = await mkdtemp(join(tmpdir(), 'forgemind-audit-lineage-'));
+    temporaryDirectories.push(workspace);
+    await mkdir(join(workspace, 'tests', 'e2e'), { recursive: true });
+    await writeFile(join(workspace, 'tests', 'e2e', 'release.spec.mjs'), 'export const validated = true;\n');
+    const git = simpleGit({ baseDir: workspace });
+    await git.init();
+    await git.addConfig('user.name', 'ForgeMind Test');
+    await git.addConfig('user.email', 'forgemind@example.test');
+    await git.add('.');
+    await git.commit('validated e2e');
+    const validatedCommit = (await git.revparse(['HEAD'])).trim();
+    await writeFile(join(workspace, 'README.md'), '# Operations\n');
+    await git.add('.');
+    await git.commit('document operations');
+    const currentCommit = (await git.revparse(['HEAD'])).trim();
+
+    const context = await buildEvidenceLineageContext(workspace, [{ commitSha: validatedCommit }], currentCommit);
+
+    expect(context).toContain('files changed afterward: README.md');
+    expect(context).not.toContain('tests/e2e/release.spec.mjs');
   });
 });

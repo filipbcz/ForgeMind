@@ -15,6 +15,13 @@ describe('task state machine', () => {
     expect(canTransitionTask('creating_pr', 'validation_failed')).toBe(true);
   });
 
+  it('allows disabled GitHub phases to be skipped', () => {
+    expect(canTransitionTask('planning', 'creating_branch')).toBe(true);
+    expect(canTransitionTask('planning', 'running_ai')).toBe(true);
+    expect(canTransitionTask('creating_github_issue', 'running_ai')).toBe(true);
+    expect(canTransitionTask('reviewing', 'ready_for_user_review')).toBe(true);
+  });
+
   it('does not allow reopening terminal statuses directly', () => {
     expect(TERMINAL_TASK_STATUSES.has('completed')).toBe(true);
     expect(canTransitionTask('completed', 'running_ai')).toBe(false);

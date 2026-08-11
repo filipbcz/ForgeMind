@@ -1,4 +1,5 @@
 import {
+  activeProjectContractRequirements,
   type AcceptanceEvidence,
   type AcceptanceEvidenceSource,
   type AcceptanceEvidenceStatus,
@@ -12,14 +13,24 @@ import {
   type ProjectImplementationStep,
   type ProjectImplementationStepStatus,
   type ProjectAuditJob,
+  type ProjectArchitecture,
+  type ProjectArchitectureSnapshot,
+  type ProjectArchitectureUpdate,
   type ProjectContract,
+  type ProjectContractDelta,
+  type ProjectContractRequirement,
+  type ProjectContractSnapshot,
+  type ProjectMemory,
+  type ProjectValidationProfile,
   type ProjectRoadmapCycle,
   type ProjectRoadmapCycleStatus,
+  type ProjectSpecificationSnapshot,
   type Project,
   type ProjectCapability,
   type ProviderKind,
   type RiskLevel,
-  type TaskStatus
+  type TaskStatus,
+  type TaskCheckpoint
 } from '@forgemind/core';
 import { createHash } from 'node:crypto';
 import { parseAgentConfigYaml } from '@forgemind/config';
@@ -33,12 +44,16 @@ import {
   toAuditEvent,
   toPrismaJson,
   toProject,
+  toProjectArchitectureVersion,
+  toProjectContractVersion,
   toProjectAuditJob,
   toProjectImplementationStep,
   toProjectRoadmapCycle,
+  toProjectSpecificationVersion,
   toTask,
   toTaskRun
 } from './mappers.js';
+import { composeApprovedExtensionSpecification } from './specification.js';
 
 export const LOCAL_USER_ID = 'user_local_owner';
 
@@ -57,6 +72,7 @@ export interface CreateProjectInput {
   defaultBranch: string;
   configYaml?: string;
   brief?: string;
+  validationProfile?: ProjectValidationProfile;
   autoCreatePullRequest?: boolean;
   autoMergePullRequest?: boolean;
   autoCompleteTask?: boolean;
@@ -73,6 +89,7 @@ export interface UpdateProjectInput {
   defaultBranch?: string;
   configYaml?: string;
   brief?: string | null;
+  validationProfile?: ProjectValidationProfile | null;
   autoCreatePullRequest?: boolean;
   autoMergePullRequest?: boolean;
   autoCompleteTask?: boolean;
@@ -129,24 +146,38 @@ export interface CreateProjectRoadmapCycleInput {
   projectId: string;
   objective: string;
   projectContract: ProjectContract;
+  contractDelta?: ProjectContractDelta;
+  contractChangeSummary?: string;
+  architectureUpdate?: ProjectArchitectureUpdate;
+  approvedExtension?: {
+    sourceCycleId: string;
+    changeSummary?: string;
+  };
   steps: Array<{
     title: string;
     description: string;
     acceptanceCriteria: string[];
     requirementIds: string[];
     deliverables: string[];
+    changeRationale: string;
+    dependsOnStepTitles: string[];
+    validationFocus: ProjectImplementationStep['validationFocus'];
   }>;
 }
 
 export interface AppendProjectImplementationStepsInput {
   projectId: string;
   cycleId: string;
+  newRequirements?: ProjectContractRequirement[];
   steps: Array<{
     title: string;
     description: string;
     acceptanceCriteria: string[];
     requirementIds: string[];
     deliverables: string[];
+    changeRationale: string;
+    dependsOnStepTitles: string[];
+    validationFocus: ProjectImplementationStep['validationFocus'];
   }>;
 }
 
@@ -221,6 +252,7 @@ export interface CreateTaskInput {
   mode: TaskMode;
   maxIterations: number;
   maxBudgetUsd: number;
+  architectureVersionId?: string;
 }
 
 export interface ClaimedTask {
@@ -709,30 +741,46 @@ export class ForgeMindRepository {
     if (autoCompleteTask && !autoMergePullRequest) {
       throw new Error('Automatic merge is required for automatic task completion.');
     }
-    const project = await this.prisma.project.create({
-      data: {
-        name: input.name,
-        slug: input.slug,
-        githubOwner: input.githubOwner,
-        githubRepo: input.githubRepo,
-        defaultBranch: input.defaultBranch,
-        configYaml: input.configYaml,
-        brief: input.brief,
-        autoCreatePullRequest,
-        autoMergePullRequest,
-        autoCompleteTask,
-        allowSafeOperationsWithoutApproval: input.allowSafeOperationsWithoutApproval,
-        defaultTaskMode: input.defaultTaskMode,
-        aiProviderConnectionId: input.aiProviderConnectionId
-      }
-    });
+    const project = await this.prisma.$transaction(async (tx) => {
+      const created = await tx.project.create({
+        data: {
+          name: input.name,
+          slug: input.slug,
+          githubOwner: input.githubOwner,
+          githubRepo: input.githubRepo,
+          defaultBranch: input.defaultBranch,
+          configYaml: input.configYaml,
+          brief: input.brief,
+          validationProfile: input.validationProfile ? toPrismaJson(input.validationProfile as unknown as JsonValue) : undefined,
+          autoCreatePullRequest,
+          autoMergePullRequest,
+          autoCompleteTask,
+          allowSafeOperationsWithoutApproval: input.allowSafeOperationsWithoutApproval,
+          defaultTaskMode: input.defaultTaskMode,
+          aiProviderConnectionId: input.aiProviderConnectionId
+        }
+      });
 
-    await this.writeAudit({
-      actorType: 'user',
-      actorId: LOCAL_USER_ID,
-      eventType: 'project_created',
-      projectId: project.id,
-      payload: { slug: project.slug }
+      await tx.projectSpecificationVersion.create({
+        data: {
+          projectId: created.id,
+          version: 1,
+          fullSpecification: input.brief?.trim() || input.name.trim(),
+          changeSummary: 'Initial project brief.',
+          source: 'initial_brief',
+          approvedAt: created.createdAt
+        }
+      });
+
+      await this.writeAuditTx(tx, {
+        actorType: 'user',
+        actorId: LOCAL_USER_ID,
+        eventType: 'project_created',
+        projectId: created.id,
+        payload: { slug: created.slug, specificationVersion: 1 }
+      });
+
+      return created;
     });
 
     return toProject(project);
@@ -741,6 +789,65 @@ export class ForgeMindRepository {
   async getProject(projectId: string): Promise<Project | undefined> {
     const project = await this.prisma.project.findUnique({ where: { id: projectId } });
     return project ? toProject(project) : undefined;
+  }
+
+  async getProjectSpecifications(projectId: string): Promise<ProjectSpecificationSnapshot | undefined> {
+    const project = await this.prisma.project.findUnique({
+      where: { id: projectId },
+      select: { id: true }
+    });
+    if (!project) return undefined;
+
+    const specifications = await this.prisma.projectSpecificationVersion.findMany({
+      where: { projectId },
+      orderBy: [{ version: 'asc' }, { createdAt: 'asc' }]
+    });
+    if (specifications.length === 0) {
+      throw new Error(`Project "${projectId}" has no specification version.`);
+    }
+
+    const versions = specifications.map(toProjectSpecificationVersion);
+    return {
+      projectId,
+      current: versions.at(-1)!,
+      versions
+    };
+  }
+
+  async getProjectContracts(projectId: string): Promise<ProjectContractSnapshot | undefined> {
+    const project = await this.prisma.project.findUnique({
+      where: { id: projectId },
+      select: { id: true, currentContractVersionId: true }
+    });
+    if (!project) return undefined;
+
+    const records = await this.prisma.projectContractVersion.findMany({
+      where: { projectId },
+      orderBy: [{ version: 'asc' }, { createdAt: 'asc' }]
+    });
+    const versions = records.map(toProjectContractVersion);
+    const current = project.currentContractVersionId
+      ? versions.find((version) => version.id === project.currentContractVersionId)
+      : versions.at(-1);
+    return { projectId, current, versions };
+  }
+
+  async getProjectArchitectures(projectId: string): Promise<ProjectArchitectureSnapshot | undefined> {
+    const project = await this.prisma.project.findUnique({
+      where: { id: projectId },
+      select: { id: true, currentArchitectureVersionId: true }
+    });
+    if (!project) return undefined;
+
+    const records = await this.prisma.projectArchitectureVersion.findMany({
+      where: { projectId },
+      orderBy: [{ version: 'asc' }, { createdAt: 'asc' }]
+    });
+    const versions = records.map(toProjectArchitectureVersion);
+    const current = project.currentArchitectureVersionId
+      ? versions.find((version) => version.id === project.currentArchitectureVersionId)
+      : versions.at(-1);
+    return { projectId, current, versions };
   }
 
   async updateProject(projectId: string, input: UpdateProjectInput): Promise<Project | undefined> {
@@ -758,49 +865,89 @@ export class ForgeMindRepository {
     if (autoCompleteTask && !autoMergePullRequest) {
       throw new Error('Automatic merge is required for automatic task completion.');
     }
+    const invalidateProjectContext = shouldInvalidateProjectContract(existing.brief, input.brief);
+    const invalidatePlanningSession = invalidateProjectContext
+      || (input.aiProviderConnectionId !== undefined && input.aiProviderConnectionId !== existing.aiProviderConnectionId);
 
-    const updated = await this.prisma.project.update({
-      where: { id: projectId },
-      data: {
-        name: input.name,
-        slug: input.slug,
-        githubOwner: input.githubOwner,
-        githubRepo: input.githubRepo,
-        defaultBranch: input.defaultBranch,
-        configYaml: input.configYaml,
-        brief: input.brief,
-        projectContract: shouldInvalidateProjectContract(existing.brief, input.brief) ? Prisma.DbNull : undefined,
-        autoCreatePullRequest,
-        autoMergePullRequest,
-        autoCompleteTask,
-        allowSafeOperationsWithoutApproval,
-        defaultTaskMode,
-        aiProviderConnectionId: input.aiProviderConnectionId,
-        isActive: input.isActive
-      }
-    });
+    const updated = await this.prisma.$transaction(async (tx) => {
+      const result = await tx.project.update({
+        where: { id: projectId },
+        data: {
+          name: input.name,
+          slug: input.slug,
+          githubOwner: input.githubOwner,
+          githubRepo: input.githubRepo,
+          defaultBranch: input.defaultBranch,
+          configYaml: input.configYaml,
+          brief: input.brief,
+          validationProfile: input.validationProfile === null
+            ? Prisma.DbNull
+            : input.validationProfile ? toPrismaJson(input.validationProfile as unknown as JsonValue) : undefined,
+          projectContract: invalidateProjectContext ? Prisma.DbNull : undefined,
+          currentContractVersionId: invalidateProjectContext ? null : undefined,
+          projectMemory: invalidateProjectContext ? Prisma.DbNull : undefined,
+          projectArchitecture: invalidateProjectContext ? Prisma.DbNull : undefined,
+          planningSessionId: invalidatePlanningSession ? null : undefined,
+          planningSessionProvider: invalidatePlanningSession ? null : undefined,
+          planningSessionModel: invalidatePlanningSession ? null : undefined,
+          planningSessionConnectionId: invalidatePlanningSession ? null : undefined,
+          planningSessionUpdatedAt: invalidatePlanningSession ? null : undefined,
+          autoCreatePullRequest,
+          autoMergePullRequest,
+          autoCompleteTask,
+          allowSafeOperationsWithoutApproval,
+          defaultTaskMode,
+          aiProviderConnectionId: input.aiProviderConnectionId,
+          isActive: input.isActive
+        }
+      });
 
-    await this.writeAudit({
-      actorType: 'user',
-      actorId: LOCAL_USER_ID,
-      eventType: 'project_updated',
-      projectId: updated.id,
-      payload: {
-        name: updated.name,
-        slug: updated.slug,
-        githubOwner: updated.githubOwner,
-        githubRepo: updated.githubRepo,
-        defaultBranch: updated.defaultBranch,
-        autoCreatePullRequest: updated.autoCreatePullRequest,
-        autoMergePullRequest: updated.autoMergePullRequest,
-        autoCompleteTask: updated.autoCompleteTask,
-        allowSafeOperationsWithoutApproval: updated.allowSafeOperationsWithoutApproval,
-        defaultTaskMode: updated.defaultTaskMode,
-        aiProviderConnectionId: updated.aiProviderConnectionId,
-        isActive: updated.isActive,
-        hasConfigYaml: Boolean(updated.configYaml),
-        hasBrief: Boolean(updated.brief)
+      if (invalidateProjectContext) {
+        const currentSpecification = await tx.projectSpecificationVersion.findFirst({
+          where: { projectId },
+          orderBy: [{ version: 'desc' }, { createdAt: 'desc' }]
+        });
+        await tx.projectSpecificationVersion.create({
+          data: {
+            projectId,
+            version: (currentSpecification?.version ?? 0) + 1,
+            fullSpecification: input.brief?.trim() || result.name.trim(),
+            changeSummary: input.brief?.trim()
+              ? 'Project brief updated by user.'
+              : 'Project brief cleared by user.',
+            source: 'manual_revision',
+            parentVersionId: currentSpecification?.id,
+            approvedAt: new Date()
+          }
+        });
       }
+
+      await this.writeAuditTx(tx, {
+        actorType: 'user',
+        actorId: LOCAL_USER_ID,
+        eventType: 'project_updated',
+        projectId: result.id,
+        payload: {
+          name: result.name,
+          slug: result.slug,
+          githubOwner: result.githubOwner,
+          githubRepo: result.githubRepo,
+          defaultBranch: result.defaultBranch,
+          autoCreatePullRequest: result.autoCreatePullRequest,
+          autoMergePullRequest: result.autoMergePullRequest,
+          autoCompleteTask: result.autoCompleteTask,
+          allowSafeOperationsWithoutApproval: result.allowSafeOperationsWithoutApproval,
+          defaultTaskMode: result.defaultTaskMode,
+          aiProviderConnectionId: result.aiProviderConnectionId,
+          isActive: result.isActive,
+          hasConfigYaml: Boolean(result.configYaml),
+          hasBrief: Boolean(result.brief),
+          validationProfileEnabled: toProject(result).validationProfile?.enabled ?? false,
+          specificationRevised: invalidateProjectContext
+        }
+      });
+
+      return result;
     });
 
     return toProject(updated);
@@ -999,71 +1146,213 @@ export class ForgeMindRepository {
 
   async createProjectRoadmapCycle(input: CreateProjectRoadmapCycleInput): Promise<ProjectRoadmapSnapshot> {
     await this.ensureLocalUser();
-    const project = await this.prisma.project.findUnique({ where: { id: input.projectId } });
-    if (!project) {
-      throw new Error(`Project "${input.projectId}" does not exist`);
-    }
-
-    await this.prisma.$transaction(async (tx) => {
-      await tx.project.update({
-        where: { id: input.projectId },
-        data: { projectContract: toPrismaJson(input.projectContract as unknown as JsonValue) }
-      });
-
-      await tx.projectRoadmapCycle.updateMany({
-        where: {
-          projectId: input.projectId,
-          status: { in: ['active', 'verifying', 'partial', 'blocked', 'awaiting_extension_approval'] }
-        },
-        data: {
-          status: 'completed',
-          completedAt: new Date()
+    try {
+      await this.prisma.$transaction(async (tx) => {
+        const project = await tx.project.findUnique({ where: { id: input.projectId } });
+        if (!project) {
+          throw new Error(`Project "${input.projectId}" does not exist`);
         }
-      });
 
-      const cycleAggregate = await tx.projectRoadmapCycle.aggregate({
-        where: { projectId: input.projectId },
-        _max: { cycleNumber: true }
-      });
+        if (input.approvedExtension) {
+          const existingSpecification = await tx.projectSpecificationVersion.findUnique({
+            where: { sourceCycleId: input.approvedExtension.sourceCycleId }
+          });
+          if (existingSpecification) {
+            if (existingSpecification.projectId !== input.projectId) {
+              throw new Error('Approved extension belongs to another project.');
+            }
+            return;
+          }
 
-      const cycle = await tx.projectRoadmapCycle.create({
-        data: {
-          projectId: input.projectId,
-          cycleNumber: (cycleAggregate._max.cycleNumber ?? 0) + 1,
-          objective: input.objective,
-          status: 'active'
+          const sourceCycle = await tx.projectRoadmapCycle.findUnique({
+            where: { id: input.approvedExtension.sourceCycleId }
+          });
+          if (!sourceCycle || sourceCycle.projectId !== input.projectId) {
+            throw new Error('Approved extension source cycle does not exist in this project.');
+          }
+          if (sourceCycle.status !== 'awaiting_extension_approval') {
+            throw new Error(`Roadmap cycle "${sourceCycle.id}" is not awaiting extension approval.`);
+          }
         }
-      });
 
-      if (input.steps.length > 0) {
-        await tx.projectImplementationStep.createMany({
-          data: input.steps.map((step, index) => ({
-            projectId: input.projectId,
-            cycleId: cycle.id,
-            sequenceNumber: index + 1,
-            title: step.title,
-            description: step.description,
-            acceptanceCriteria: toPrismaJson(step.acceptanceCriteria),
-            requirementIds: toPrismaJson(step.requirementIds),
-            deliverables: toPrismaJson(step.deliverables),
-            status: 'pending'
-          }))
+        let specificationVersion = await tx.projectSpecificationVersion.findFirst({
+          where: { projectId: input.projectId },
+          orderBy: [{ version: 'desc' }, { createdAt: 'desc' }]
         });
-      }
-
-      await this.writeAuditTx(tx, {
-        actorType: 'user',
-        actorId: LOCAL_USER_ID,
-        eventType: 'project_roadmap_cycle_created',
-        projectId: input.projectId,
-        payload: {
-          objective: input.objective,
-          stepCount: input.steps.length,
-          contractVersion: input.projectContract.version,
-          requirementCount: input.projectContract.requirements.length
+        if (!specificationVersion) {
+          specificationVersion = await tx.projectSpecificationVersion.create({
+            data: {
+              projectId: input.projectId,
+              version: 1,
+              fullSpecification: project.brief?.trim() || project.name.trim(),
+              changeSummary: 'Initial project brief.',
+              source: 'initial_brief',
+              approvedAt: project.createdAt
+            }
+          });
         }
+
+        if (input.approvedExtension) {
+          specificationVersion = await tx.projectSpecificationVersion.create({
+            data: {
+              projectId: input.projectId,
+              version: specificationVersion.version + 1,
+              fullSpecification: composeApprovedExtensionSpecification(
+                specificationVersion.fullSpecification,
+                input.objective
+              ),
+              changeSummary: input.approvedExtension.changeSummary?.trim()
+                || `Approved extension following cycle ${input.approvedExtension.sourceCycleId}.`,
+              source: 'approved_extension',
+              parentVersionId: specificationVersion.id,
+              sourceCycleId: input.approvedExtension.sourceCycleId,
+              approvedAt: new Date()
+            }
+          });
+        }
+
+        const currentContractVersion = await tx.projectContractVersion.findFirst({
+          where: { projectId: input.projectId },
+          orderBy: [{ version: 'desc' }, { createdAt: 'desc' }]
+        });
+        const expectedContractVersion = (currentContractVersion?.version ?? 0) + 1;
+        if (input.projectContract.version !== expectedContractVersion) {
+          throw new Error(
+            `Project contract version ${input.projectContract.version} is invalid; expected ${expectedContractVersion}.`
+          );
+        }
+        const contractVersion = await tx.projectContractVersion.create({
+          data: {
+            projectId: input.projectId,
+            specificationVersionId: specificationVersion.id,
+            version: input.projectContract.version,
+            contractJson: toPrismaJson(input.projectContract as unknown as JsonValue),
+            contractDelta: input.contractDelta
+              ? toPrismaJson(input.contractDelta as unknown as JsonValue)
+              : undefined,
+            changeSummary: input.contractChangeSummary?.trim()
+              || (input.approvedExtension ? 'Approved project contract extension.' : 'Generated project contract.'),
+            source: input.approvedExtension
+              ? 'approved_extension'
+              : currentContractVersion
+                ? 'manual_regeneration'
+                : 'initial_plan',
+            parentVersionId: currentContractVersion?.id
+          }
+        });
+
+        const currentArchitectureVersion = await tx.projectArchitectureVersion.findFirst({
+          where: { projectId: input.projectId },
+          orderBy: [{ version: 'desc' }, { createdAt: 'desc' }]
+        });
+        const architecture = input.architectureUpdate
+          ? mergeProjectArchitecture(toProject(project).projectArchitecture, input.architectureUpdate)
+          : toProject(project).projectArchitecture;
+        const architectureVersion = architecture && input.architectureUpdate
+          ? await tx.projectArchitectureVersion.create({
+              data: {
+                projectId: input.projectId,
+                version: (currentArchitectureVersion?.version ?? 0) + 1,
+                architectureJson: toPrismaJson(architecture as unknown as JsonValue),
+                architectureUpdate: toPrismaJson(input.architectureUpdate as unknown as JsonValue),
+                changeSummary: input.architectureUpdate.summary?.trim()
+                  || (input.approvedExtension ? 'Architecture updated for approved extension.' : 'Initial project architecture.'),
+                source: input.approvedExtension ? 'approved_extension' : 'initial_plan',
+                parentVersionId: currentArchitectureVersion?.id,
+                contractVersionId: contractVersion.id
+              }
+            })
+          : currentArchitectureVersion;
+
+        await tx.project.update({
+          where: { id: input.projectId },
+          data: {
+            projectContract: toPrismaJson(input.projectContract as unknown as JsonValue),
+            currentContractVersionId: contractVersion.id,
+            projectArchitecture: architecture
+              ? toPrismaJson(architecture as unknown as JsonValue)
+              : undefined,
+            currentArchitectureVersionId: architectureVersion?.id
+          }
+        });
+
+        await tx.projectRoadmapCycle.updateMany({
+          where: {
+            projectId: input.projectId,
+            status: { in: ['active', 'verifying', 'partial', 'blocked', 'awaiting_extension_approval'] }
+          },
+          data: {
+            status: 'completed',
+            completedAt: new Date()
+          }
+        });
+
+        const cycleAggregate = await tx.projectRoadmapCycle.aggregate({
+          where: { projectId: input.projectId },
+          _max: { cycleNumber: true }
+        });
+
+        const cycle = await tx.projectRoadmapCycle.create({
+          data: {
+            projectId: input.projectId,
+            cycleNumber: (cycleAggregate._max.cycleNumber ?? 0) + 1,
+            objective: input.objective,
+            specificationVersionId: specificationVersion.id,
+            contractVersionId: contractVersion.id,
+            architectureVersionId: architectureVersion?.id,
+            status: 'active'
+          }
+        });
+
+        if (input.steps.length > 0) {
+          await tx.projectImplementationStep.createMany({
+            data: input.steps.map((step, index) => ({
+              projectId: input.projectId,
+              cycleId: cycle.id,
+              sequenceNumber: index + 1,
+              title: step.title,
+              description: step.description,
+              acceptanceCriteria: toPrismaJson(step.acceptanceCriteria),
+              requirementIds: toPrismaJson(step.requirementIds),
+              deliverables: toPrismaJson(step.deliverables),
+              changeRationale: step.changeRationale,
+              dependsOnStepTitles: toPrismaJson(step.dependsOnStepTitles),
+              validationFocus: toPrismaJson(step.validationFocus),
+              status: 'pending'
+            }))
+          });
+        }
+
+        await this.writeAuditTx(tx, {
+          actorType: 'user',
+          actorId: LOCAL_USER_ID,
+          eventType: 'project_roadmap_cycle_created',
+          projectId: input.projectId,
+          payload: {
+            objective: input.objective,
+            stepCount: input.steps.length,
+            contractVersion: input.projectContract.version,
+            contractVersionId: contractVersion.id,
+            requirementCount: input.projectContract.requirements.length,
+            specificationVersion: specificationVersion.version,
+            architectureVersion: architectureVersion?.version ?? null,
+            ...(input.approvedExtension
+              ? { approvedExtensionSourceCycleId: input.approvedExtension.sourceCycleId }
+              : {})
+          }
+        });
       });
-    });
+    } catch (error) {
+      if (input.approvedExtension && error instanceof Prisma.PrismaClientKnownRequestError && error.code === 'P2002') {
+        const existingSpecification = await this.prisma.projectSpecificationVersion.findUnique({
+          where: { sourceCycleId: input.approvedExtension.sourceCycleId }
+        });
+        if (existingSpecification?.projectId === input.projectId) {
+          return (await this.getProjectRoadmap(input.projectId))!;
+        }
+      }
+      throw error;
+    }
 
     return (await this.getProjectRoadmap(input.projectId))!;
   }
@@ -1170,7 +1459,22 @@ export class ForgeMindRepository {
 
       const contract = toProject(project).projectContract;
       if (!contract) throw new Error('Project contract is required for gap work items.');
+      const newRequirements = input.newRequirements ?? [];
       const requirementIds = new Set(contract.requirements.map((requirement) => requirement.id));
+      for (const [index, requirement] of newRequirements.entries()) {
+        const briefReferences = requirement.briefReferences?.map((item) => item.trim()).filter(Boolean) ?? [];
+        if (
+          !/^REQ-[A-Z0-9-]+$/.test(requirement.id)
+          || requirementIds.has(requirement.id)
+          || !requirement.title.trim()
+          || !requirement.description.trim()
+          || requirement.acceptanceCriteria.length === 0
+          || briefReferences.length === 0
+        ) {
+          throw new Error(`Gap contract amendment at position ${index + 1} is invalid or duplicates an existing requirement.`);
+        }
+        requirementIds.add(requirement.id);
+      }
       const existingKeys = new Set(existingSteps.map((step) => implementationStepIdentity({
         title: step.title,
         requirementIds: jsonStringArray(step.requirementIds),
@@ -1186,6 +1490,74 @@ export class ForgeMindRepository {
         return true;
       });
       if (uniqueSteps.length === 0) return [];
+
+      if (newRequirements.length > 0) {
+        const currentContractVersion = await tx.projectContractVersion.findFirst({
+          where: { projectId: input.projectId },
+          orderBy: [{ version: 'desc' }, { createdAt: 'desc' }]
+        });
+        if (!currentContractVersion) {
+          throw new Error('A persisted project contract version is required before adding audit gap requirements.');
+        }
+        const nextVersion = currentContractVersion.version + 1;
+        const normalizedNewRequirements: ProjectContractRequirement[] = newRequirements.map((requirement) => ({
+          id: requirement.id.trim(),
+          title: requirement.title.trim(),
+          description: requirement.description.trim(),
+          acceptanceCriteria: requirement.acceptanceCriteria.map((criterion) => criterion.trim()).filter(Boolean),
+          briefReferences: requirement.briefReferences?.map((reference) => reference.trim()).filter(Boolean),
+          status: 'active',
+          introducedInVersion: nextVersion,
+          lastChangedInVersion: nextVersion
+        }));
+        const amendedContract: ProjectContract = {
+          ...contract,
+          version: nextVersion,
+          requirements: [...contract.requirements, ...normalizedNewRequirements]
+        };
+        const contractDelta: ProjectContractDelta = {
+          baseVersion: contract.version,
+          summary: 'Added requirements discovered by the repository capability audit.',
+          addRequirements: normalizedNewRequirements.map((requirement) => ({
+            id: requirement.id,
+            title: requirement.title,
+            description: requirement.description,
+            acceptanceCriteria: requirement.acceptanceCriteria,
+            briefReferences: requirement.briefReferences
+          })),
+          updateRequirements: [],
+          supersedeRequirements: [],
+          removeRequirements: [],
+          invariantChanges: { add: [], remove: [] },
+          prohibitedSubstituteChanges: { add: [], remove: [] },
+          releaseCriteriaChanges: { add: [], remove: [] },
+          migrationImpacts: [],
+          compatibilityImpacts: []
+        };
+        const contractVersion = await tx.projectContractVersion.create({
+          data: {
+            projectId: input.projectId,
+            specificationVersionId: cycle.specificationVersionId,
+            version: nextVersion,
+            contractJson: toPrismaJson(amendedContract as unknown as JsonValue),
+            contractDelta: toPrismaJson(contractDelta as unknown as JsonValue),
+            changeSummary: contractDelta.summary!,
+            source: 'manual_regeneration',
+            parentVersionId: currentContractVersion.id
+          }
+        });
+        await tx.project.update({
+          where: { id: input.projectId },
+          data: {
+            projectContract: toPrismaJson(amendedContract as unknown as JsonValue),
+            currentContractVersionId: contractVersion.id
+          }
+        });
+        await tx.projectRoadmapCycle.update({
+          where: { id: input.cycleId },
+          data: { contractVersionId: contractVersion.id }
+        });
+      }
 
       const firstPendingSequence = existingSteps.find((step) => step.status === 'pending')?.sequenceNumber;
       const firstSequenceNumber = firstPendingSequence ?? ((existingSteps.at(-1)?.sequenceNumber ?? 0) + 1);
@@ -1223,6 +1595,9 @@ export class ForgeMindRepository {
             acceptanceCriteria: toPrismaJson(step.acceptanceCriteria),
             requirementIds: toPrismaJson(step.requirementIds),
             deliverables: toPrismaJson(step.deliverables),
+            changeRationale: step.changeRationale,
+            dependsOnStepTitles: toPrismaJson(step.dependsOnStepTitles),
+            validationFocus: toPrismaJson(step.validationFocus),
             status: 'pending'
           }
         });
@@ -1237,7 +1612,11 @@ export class ForgeMindRepository {
         actorType: 'agent',
         eventType: 'project_audit_gap_steps_created',
         projectId: input.projectId,
-        payload: { cycleId: input.cycleId, stepIds: created.map((step) => step.id) }
+        payload: {
+          cycleId: input.cycleId,
+          stepIds: created.map((step) => step.id),
+          newRequirementIds: newRequirements.map((requirement) => requirement.id)
+        }
       });
       return created;
     });
@@ -1320,7 +1699,7 @@ export class ForgeMindRepository {
     if (!project.projectContract || project.projectContract.version !== input.contractVersion) {
       throw new Error('Acceptance evidence does not match the active project contract version.');
     }
-    const knownRequirements = new Set(project.projectContract.requirements.map((requirement) => requirement.id));
+    const knownRequirements = new Set(activeProjectContractRequirements(project.projectContract).map((requirement) => requirement.id));
     const stepRequirements = stepRecord ? new Set(toProjectImplementationStep(stepRecord).requirementIds) : undefined;
     const requirementIds = Array.from(new Set(input.requirementIds));
     if (requirementIds.length === 0 || requirementIds.some((id) => !knownRequirements.has(id) || (stepRequirements && !stepRequirements.has(id)))) {
@@ -1535,6 +1914,215 @@ export class ForgeMindRepository {
     return task ? toTask(task) : undefined;
   }
 
+  async updateTaskProviderSession(input: {
+    taskId: string;
+    sessionId: string;
+    provider: ProviderKind;
+    model: string;
+    connectionId?: string;
+  }): Promise<void> {
+    const current = await this.prisma.task.findUnique({
+      where: { id: input.taskId },
+      select: {
+        projectId: true,
+        providerSessionId: true,
+        providerSessionProvider: true,
+        providerSessionModel: true,
+        providerSessionConnectionId: true
+      }
+    });
+    if (!current) throw new Error(`Task "${input.taskId}" not found`);
+
+    const isNewSession = current.providerSessionId !== input.sessionId
+      || current.providerSessionProvider !== input.provider
+      || current.providerSessionModel !== input.model
+      || (current.providerSessionConnectionId ?? undefined) !== input.connectionId;
+    await this.prisma.task.update({
+      where: { id: input.taskId },
+      data: {
+        providerSessionId: input.sessionId,
+        providerSessionProvider: input.provider,
+        providerSessionModel: input.model,
+        providerSessionConnectionId: input.connectionId,
+        providerSessionUpdatedAt: new Date()
+      }
+    });
+
+    if (isNewSession) {
+      await this.writeAudit({
+        actorType: 'agent',
+        eventType: 'task_provider_session_updated',
+        projectId: current.projectId,
+        taskId: input.taskId,
+        payload: {
+          provider: input.provider,
+          model: input.model,
+          connectionId: input.connectionId ?? null,
+          resumed: Boolean(current.providerSessionId)
+        }
+      });
+    }
+  }
+
+  async updateProjectPlanningSession(input: {
+    projectId: string;
+    sessionId: string;
+    provider: ProviderKind;
+    model: string;
+    connectionId?: string;
+  }): Promise<void> {
+    const current = await this.prisma.project.findUnique({
+      where: { id: input.projectId },
+      select: {
+        planningSessionId: true,
+        planningSessionProvider: true,
+        planningSessionModel: true,
+        planningSessionConnectionId: true
+      }
+    });
+    if (!current) throw new Error(`Project "${input.projectId}" not found`);
+
+    const isNewSession = current.planningSessionId !== input.sessionId
+      || current.planningSessionProvider !== input.provider
+      || current.planningSessionModel !== input.model
+      || (current.planningSessionConnectionId ?? undefined) !== input.connectionId;
+    await this.prisma.project.update({
+      where: { id: input.projectId },
+      data: {
+        planningSessionId: input.sessionId,
+        planningSessionProvider: input.provider,
+        planningSessionModel: input.model,
+        planningSessionConnectionId: input.connectionId,
+        planningSessionUpdatedAt: new Date()
+      }
+    });
+
+    if (isNewSession) {
+      await this.writeAudit({
+        actorType: 'agent',
+        eventType: 'project_planning_session_updated',
+        projectId: input.projectId,
+        payload: {
+          provider: input.provider,
+          model: input.model,
+          connectionId: input.connectionId ?? null,
+          resumed: Boolean(current.planningSessionId)
+        }
+      });
+    }
+  }
+
+  async recordCompletedTaskProjectMemory(input: {
+    taskId: string;
+    summary?: string;
+    changedFiles?: string[];
+    commitSha?: string;
+    architectureUpdate?: ProjectArchitectureUpdate;
+  }): Promise<void> {
+    const task = await this.prisma.task.findUnique({
+      where: { id: input.taskId },
+      include: {
+        project: true,
+        taskRuns: {
+          orderBy: { startedAt: 'desc' },
+          take: 1,
+          include: {
+            iterations: {
+              where: { phase: 'implementation' },
+              orderBy: { createdAt: 'desc' },
+              take: 1
+            }
+          }
+        }
+      }
+    });
+    if (!task || task.status !== 'completed') return;
+
+    const latestRun = task.taskRuns[0];
+    const latestImplementation = latestRun?.iterations[0];
+    const implementationPayload = asJsonRecord(latestImplementation?.validationResultJson);
+    const persistedArchitectureUpdate = toProjectArchitectureUpdate(implementationPayload?.architectureUpdate);
+    const persistedChangedFiles = Array.isArray(implementationPayload?.changedFiles)
+      ? implementationPayload.changedFiles.filter((path): path is string => typeof path === 'string')
+      : [];
+    const currentMemory = toProject(task.project).projectMemory;
+    const completedAt = (task.finishedAt ?? new Date()).toISOString();
+    const entry = {
+      taskId: task.id,
+      title: task.title,
+      summary: input.summary?.trim() || latestRun?.summary?.trim() || latestImplementation?.resultSummary || task.title,
+      changedFiles: Array.from(new Set(input.changedFiles?.length ? input.changedFiles : persistedChangedFiles)).slice(0, 40),
+      commitSha: input.commitSha,
+      completedAt
+    };
+    const memory: ProjectMemory = {
+      version: 1,
+      contractVersion: toProject(task.project).projectContract?.version,
+      baseCommitSha: input.commitSha ?? currentMemory?.baseCommitSha,
+      recentWork: [entry, ...(currentMemory?.recentWork ?? []).filter((item) => item.taskId !== task.id)].slice(0, 8),
+      updatedAt: new Date().toISOString()
+    };
+    const architectureUpdate = input.architectureUpdate ?? persistedArchitectureUpdate;
+    const architecture = architectureUpdate
+      ? mergeProjectArchitecture(toProject(task.project).projectArchitecture, architectureUpdate, task.id)
+      : undefined;
+
+    await this.prisma.$transaction(async (tx) => {
+      let architectureVersionId = task.architectureVersionId ?? task.project.currentArchitectureVersionId ?? undefined;
+      let architectureVersion: number | undefined;
+      if (architecture && architectureUpdate) {
+        const existing = await tx.projectArchitectureVersion.findUnique({ where: { sourceTaskId: task.id } });
+        const current = existing ? undefined : await tx.projectArchitectureVersion.findFirst({
+          where: { projectId: task.projectId },
+          orderBy: [{ version: 'desc' }, { createdAt: 'desc' }]
+        });
+        const created = existing ?? await tx.projectArchitectureVersion.create({
+          data: {
+            projectId: task.projectId,
+            version: (current?.version ?? 0) + 1,
+            architectureJson: toPrismaJson(architecture as unknown as JsonValue),
+            architectureUpdate: toPrismaJson(architectureUpdate as unknown as JsonValue),
+            changeSummary: architectureUpdate.summary?.trim() || `Architecture updated by task ${task.title}.`,
+            source: 'task_update',
+            parentVersionId: current?.id,
+            contractVersionId: task.project.currentContractVersionId,
+            sourceTaskId: task.id
+          }
+        });
+        architectureVersionId = created.id;
+        architectureVersion = created.version;
+      }
+
+      await tx.project.update({
+        where: { id: task.projectId },
+        data: {
+          projectMemory: toPrismaJson(memory as unknown as JsonValue),
+          projectArchitecture: architecture ? toPrismaJson(architecture as unknown as JsonValue) : undefined,
+          currentArchitectureVersionId: architectureVersionId
+        }
+      });
+      if (architectureVersionId) {
+        await tx.task.update({
+          where: { id: task.id },
+          data: { architectureVersionId }
+        });
+      }
+      await this.writeAuditTx(tx, {
+        actorType: 'system',
+        eventType: 'project_memory_updated',
+        projectId: task.projectId,
+        taskId: task.id,
+        payload: {
+          recentWorkCount: memory.recentWork.length,
+          contractVersion: memory.contractVersion ?? null,
+          baseCommitSha: memory.baseCommitSha ?? null,
+          architectureUpdated: Boolean(architecture),
+          architectureVersion: architectureVersion ?? null
+        }
+      });
+    });
+  }
+
   async getTaskQueuePosition(taskId: string): Promise<TaskQueuePosition> {
     const pendingJobs = await this.prisma.taskQueueJob.findMany({
       where: { status: 'pending' },
@@ -1595,6 +2183,16 @@ export class ForgeMindRepository {
       const existing = await tx.projectAuditJob.findUnique({ where: { cycleId: input.cycleId } });
       if (existing && (existing.status === 'pending' || existing.status === 'claimed')) {
         return { enqueued: false, job: toProjectAuditJob(existing) };
+      }
+      if (existing?.status === 'succeeded') {
+        const latestCompletedStep = await tx.projectImplementationStep.findFirst({
+          where: { cycleId: input.cycleId, status: 'completed' },
+          orderBy: { completedAt: 'desc' },
+          select: { completedAt: true }
+        });
+        if (!shouldRequeueProjectAuditAfterCompletedWork(existing.finishedAt, latestCompletedStep?.completedAt)) {
+          return { enqueued: false, job: toProjectAuditJob(existing) };
+        }
       }
 
       const now = new Date();
@@ -1703,7 +2301,13 @@ export class ForgeMindRepository {
     await this.prisma.$transaction(async (tx) => {
       await tx.projectAuditJob.update({
         where: { id: auditJobId },
-        data: { status, claimedAt: null, nextAttemptAt: null, errorMessage, finishedAt: new Date() }
+        data: {
+          status,
+          claimedAt: null,
+          nextAttemptAt: null,
+          errorMessage: status === 'succeeded' ? null : errorMessage,
+          finishedAt: new Date()
+        }
       });
       if (status === 'blocked' || status === 'failed') {
         await tx.projectRoadmapCycle.update({
@@ -2349,6 +2953,16 @@ export class ForgeMindRepository {
     if (!project) {
       throw new Error(`Project "${input.projectId}" does not exist`);
     }
+    const architectureVersionId = input.architectureVersionId ?? project.currentArchitectureVersionId ?? undefined;
+    if (architectureVersionId) {
+      const architectureVersion = await this.prisma.projectArchitectureVersion.findUnique({
+        where: { id: architectureVersionId },
+        select: { projectId: true }
+      });
+      if (!architectureVersion || architectureVersion.projectId !== project.id) {
+        throw new Error('Task architecture version does not belong to the selected project.');
+      }
+    }
 
     const task = await this.prisma.task.create({
       data: {
@@ -2358,6 +2972,7 @@ export class ForgeMindRepository {
         prompt: input.prompt,
         mode: input.mode,
         status: 'draft',
+        architectureVersionId,
         maxIterations: input.maxIterations,
         maxBudgetUsd: input.maxBudgetUsd
       }
@@ -2607,7 +3222,7 @@ export class ForgeMindRepository {
       const updated = await tx.task.update({
         where: { id: queued.id },
         data: { status: 'planning' },
-        include: { project: true }
+        include: { project: true, architectureVersion: true }
       });
 
       await tx.taskRun.updateMany({
@@ -2649,13 +3264,17 @@ export class ForgeMindRepository {
           eventType: 'task_claimed',
           projectId: updated.projectId,
           taskId: updated.id,
-          payload: { provider }
+          payload: { provider, architectureVersionId: updated.architectureVersionId ?? null }
         }
       });
 
+      const project = toProject(updated.project);
+      const taskArchitecture = updated.architectureVersion
+        ? toProjectArchitectureVersion(updated.architectureVersion).architecture
+        : undefined;
       return {
         task: toTask(updated),
-        project: toProject(updated.project),
+        project: taskArchitecture ? { ...project, projectArchitecture: taskArchitecture } : project,
         taskRun: toTaskRun(taskRun),
         queueJobId: claimedQueueJob.id,
         queueReason: claimedQueueJob.reason
@@ -2761,6 +3380,79 @@ export class ForgeMindRepository {
         validationResultJson: toPrismaJson(input.validationResult)
       }
     });
+  }
+
+  async listTaskCheckpoints(taskId: string): Promise<TaskCheckpoint[]> {
+    const checkpoints = await this.prisma.taskCheckpoint.findMany({
+      where: { taskId },
+      orderBy: { updatedAt: 'asc' }
+    });
+    return checkpoints.map((checkpoint) => ({
+      id: checkpoint.id,
+      taskId: checkpoint.taskId,
+      taskRunId: checkpoint.taskRunId ?? undefined,
+      key: checkpoint.key,
+      phase: checkpoint.phase as TaskCheckpoint['phase'],
+      status: checkpoint.status,
+      inputHash: checkpoint.inputHash,
+      output: checkpoint.outputJson === null ? undefined : checkpoint.outputJson as JsonValue,
+      errorMessage: checkpoint.errorMessage ?? undefined,
+      startedAt: checkpoint.startedAt.toISOString(),
+      completedAt: checkpoint.completedAt?.toISOString(),
+      updatedAt: checkpoint.updatedAt.toISOString()
+    }));
+  }
+
+  async recordTaskCheckpoint(input: {
+    taskId: string;
+    taskRunId?: string;
+    key: string;
+    phase: TaskCheckpoint['phase'];
+    status: TaskCheckpoint['status'];
+    inputHash: string;
+    output?: JsonValue;
+    errorMessage?: string;
+  }): Promise<TaskCheckpoint> {
+    const now = new Date();
+    const checkpoint = await this.prisma.taskCheckpoint.upsert({
+      where: { taskId_key: { taskId: input.taskId, key: input.key } },
+      create: {
+        taskId: input.taskId,
+        taskRunId: input.taskRunId,
+        key: input.key,
+        phase: input.phase,
+        status: input.status,
+        inputHash: input.inputHash,
+        outputJson: input.output === undefined ? undefined : toPrismaJson(input.output),
+        errorMessage: input.errorMessage,
+        startedAt: now,
+        completedAt: input.status === 'completed' ? now : null
+      },
+      update: {
+        taskRunId: input.taskRunId,
+        phase: input.phase,
+        status: input.status,
+        inputHash: input.inputHash,
+        outputJson: input.output === undefined ? undefined : toPrismaJson(input.output),
+        errorMessage: input.errorMessage ?? null,
+        startedAt: input.status === 'started' ? now : undefined,
+        completedAt: input.status === 'completed' ? now : null
+      }
+    });
+    return {
+      id: checkpoint.id,
+      taskId: checkpoint.taskId,
+      taskRunId: checkpoint.taskRunId ?? undefined,
+      key: checkpoint.key,
+      phase: checkpoint.phase as TaskCheckpoint['phase'],
+      status: checkpoint.status,
+      inputHash: checkpoint.inputHash,
+      output: checkpoint.outputJson === null ? undefined : checkpoint.outputJson as JsonValue,
+      errorMessage: checkpoint.errorMessage ?? undefined,
+      startedAt: checkpoint.startedAt.toISOString(),
+      completedAt: checkpoint.completedAt?.toISOString(),
+      updatedAt: checkpoint.updatedAt.toISOString()
+    };
   }
 
   async finishTaskRun(input: {
@@ -3173,6 +3865,44 @@ function toAIProviderConnectionSnapshot(connection: AiProviderConnection): AIPro
   };
 }
 
+function asJsonRecord(value: Prisma.JsonValue | null | undefined): Record<string, Prisma.JsonValue> | undefined {
+  return value && typeof value === 'object' && !Array.isArray(value)
+    ? value as Record<string, Prisma.JsonValue>
+    : undefined;
+}
+
+function toProjectArchitectureUpdate(value: Prisma.JsonValue | undefined): ProjectArchitectureUpdate | undefined {
+  const record = asJsonRecord(value);
+  if (!record) return undefined;
+  const modules = Array.isArray(record.modules) ? record.modules.flatMap((value) => {
+    const module = asJsonRecord(value);
+    if (!module || typeof module.name !== 'string' || typeof module.responsibility !== 'string') return [];
+    return [{
+      name: module.name,
+      responsibility: module.responsibility,
+      paths: jsonStringArray(module.paths ?? []),
+      publicInterfaces: jsonStringArray(module.publicInterfaces ?? []),
+      dependencies: jsonStringArray(module.dependencies ?? [])
+    }];
+  }) : [];
+  const decisions = Array.isArray(record.decisions) ? record.decisions.flatMap((value) => {
+    const decision = asJsonRecord(value);
+    if (!decision || typeof decision.summary !== 'string' || typeof decision.rationale !== 'string') return [];
+    return [{ summary: decision.summary, rationale: decision.rationale }];
+  }) : [];
+
+  return {
+    summary: typeof record.summary === 'string' ? record.summary : undefined,
+    modules,
+    decisions,
+    conventions: jsonStringArray(record.conventions ?? []),
+    dependencyRules: jsonStringArray(record.dependencyRules ?? []),
+    knownDebt: jsonStringArray(record.knownDebt ?? []),
+    resolvedDebt: jsonStringArray(record.resolvedDebt ?? []),
+    validationCommands: jsonStringArray(record.validationCommands ?? [])
+  };
+}
+
 function buildAIProviderConnectionName(provider: AIProviderConnectionKind, authMode: AIProviderAuthMode, model: string): string {
   const providerName = provider === 'codex' ? 'Codex' : 'OpenAI';
   const authName = authMode === 'codex_oauth' ? 'OAuth' : 'API key';
@@ -3190,12 +3920,14 @@ export function deriveProjectCapabilities(
   const latestCycle = [...cycles].sort((left, right) => right.cycleNumber - left.cycleNumber)[0];
   if (!latestCycle) return [];
 
-  return contract.requirements.map((requirement) => {
+  return activeProjectContractRequirements(contract).map((requirement) => {
     const workItems = steps.filter((step) => step.cycleId === latestCycle.id && step.requirementIds.includes(requirement.id));
+    const evidenceValidFromVersion = requirement.lastChangedInVersion ?? requirement.introducedInVersion ?? contract.version;
     const currentEvidence = evidence.filter((item) =>
       item.cycleId === latestCycle.id
       && item.requirementId === requirement.id
-      && item.contractVersion === contract.version
+      && item.contractVersion >= evidenceValidFromVersion
+      && item.contractVersion <= contract.version
     );
     const latestAuditByCriterion = new Map<string, AcceptanceEvidence>();
     for (const item of currentEvidence.filter((candidate) => candidate.source === 'repository_audit')) {
@@ -3238,6 +3970,105 @@ export function shouldInvalidateProjectContract(existingBrief: string | null, ne
   if (nextBrief === undefined) return false;
   const normalize = (value: string | null) => (value ?? '').replace(/\r\n/g, '\n').trim();
   return normalize(existingBrief) !== normalize(nextBrief);
+}
+
+export function shouldRequeueProjectAuditAfterCompletedWork(
+  auditFinishedAt: Date | null | undefined,
+  latestStepCompletedAt: Date | null | undefined
+): boolean {
+  return Boolean(
+    auditFinishedAt
+    && latestStepCompletedAt
+    && latestStepCompletedAt.getTime() > auditFinishedAt.getTime()
+  );
+}
+
+export function mergeProjectArchitecture(
+  current: ProjectArchitecture | undefined,
+  update: ProjectArchitectureUpdate,
+  taskId?: string,
+  updatedAt = new Date().toISOString()
+): ProjectArchitecture {
+  const modules = new Map(
+    (current?.modules ?? []).map((module) => [module.name.trim().toLowerCase(), module])
+  );
+  for (const module of update.modules ?? []) {
+    const name = cleanArchitectureText(module.name, 120);
+    const responsibility = cleanArchitectureText(module.responsibility, 600);
+    if (!name || !responsibility) continue;
+    modules.set(name.toLowerCase(), {
+      name,
+      responsibility,
+      paths: uniqueArchitectureItems(module.paths, 20, 240),
+      publicInterfaces: uniqueArchitectureItems(module.publicInterfaces, 20, 240),
+      dependencies: uniqueArchitectureItems(module.dependencies, 20, 120)
+    });
+  }
+
+  const databaseSchemas = new Map(
+    (current?.databaseSchemas ?? []).map((schema) => [schema.name.trim().toLowerCase(), schema])
+  );
+  for (const schema of update.databaseSchemas ?? []) {
+    const name = cleanArchitectureText(schema.name, 120);
+    const technology = cleanArchitectureText(schema.technology, 120);
+    const ownedByModule = cleanArchitectureText(schema.ownedByModule, 120);
+    if (!name || !technology || !ownedByModule) continue;
+    databaseSchemas.set(name.toLowerCase(), {
+      name,
+      technology,
+      paths: uniqueArchitectureItems(schema.paths, 20, 240),
+      ownedByModule,
+      migrationPaths: uniqueArchitectureItems(schema.migrationPaths, 20, 240)
+    });
+  }
+
+  const decisions = [...(current?.decisions ?? [])];
+  for (const decision of update.decisions ?? []) {
+    const summary = cleanArchitectureText(decision.summary, 400);
+    const rationale = cleanArchitectureText(decision.rationale, 800);
+    if (!summary || !rationale) continue;
+    const id = `arch-${createHash('sha256').update(`${summary}\n${rationale}`.toLowerCase()).digest('hex').slice(0, 12)}`;
+    if (decisions.some((item) => item.id === id)) continue;
+    decisions.push({ id, summary, rationale, taskId, createdAt: updatedAt });
+  }
+
+  const resolvedDebt = new Set((update.resolvedDebt ?? []).map(normalizeArchitectureIdentity));
+  const knownDebt = uniqueArchitectureItems([...(current?.knownDebt ?? []), ...(update.knownDebt ?? [])], 30, 500)
+    .filter((item) => !resolvedDebt.has(normalizeArchitectureIdentity(item)));
+
+  return {
+    version: 1,
+    summary: cleanArchitectureText(update.summary, 2_000) || current?.summary || 'Architecture is derived from completed project work.',
+    modules: [...modules.values()].slice(-30),
+    databaseSchemas: [...databaseSchemas.values()].slice(-20),
+    decisions: decisions.slice(-30),
+    conventions: uniqueArchitectureItems([...(current?.conventions ?? []), ...(update.conventions ?? [])], 30, 400),
+    dependencyRules: uniqueArchitectureItems([...(current?.dependencyRules ?? []), ...(update.dependencyRules ?? [])], 30, 400),
+    knownDebt,
+    validationCommands: uniqueArchitectureItems([...(current?.validationCommands ?? []), ...(update.validationCommands ?? [])], 20, 500),
+    updatedAt
+  };
+}
+
+function cleanArchitectureText(value: unknown, maxLength: number): string {
+  return typeof value === 'string' ? value.replace(/\s+/g, ' ').trim().slice(0, maxLength) : '';
+}
+
+function normalizeArchitectureIdentity(value: string): string {
+  return value.replace(/\s+/g, ' ').trim().toLowerCase();
+}
+
+function uniqueArchitectureItems(values: unknown[], limit: number, maxLength: number): string[] {
+  const result: string[] = [];
+  const seen = new Set<string>();
+  for (const value of values) {
+    const item = cleanArchitectureText(value, maxLength);
+    const identity = normalizeArchitectureIdentity(item);
+    if (!item || seen.has(identity)) continue;
+    seen.add(identity);
+    result.push(item);
+  }
+  return result.slice(-limit);
 }
 
 function implementationStepIdentity(input: { title: string; requirementIds: string[]; deliverables: string[] }): string {

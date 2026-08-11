@@ -176,6 +176,8 @@ interface GitHubIssueResponse {
 interface GitHubPullResponse {
   number: number;
   html_url: string;
+  merged?: boolean;
+  merge_commit_sha?: string | null;
 }
 
 interface GitHubMergePullResponse {
@@ -315,6 +317,18 @@ export class GitHubAppAdapter implements GitHubAdapter {
 
   async createDraftPullRequest(input: CreateDraftPullRequestInput): Promise<CreateDraftPullRequestResult> {
     const repository = requireProjectRepository(input.project);
+    const branchName = input.task.branchName;
+    if (!branchName) throw new Error('A task branch is required before creating a pull request.');
+    const existing = await this.request<GitHubPullResponse[]>(
+      'GET',
+      `/repos/${repository.owner}/${repository.repo}/pulls?state=open&head=${encodeURIComponent(`${repository.owner}:${branchName}`)}&base=${encodeURIComponent(input.project.defaultBranch)}`
+    );
+    if (existing[0]) {
+      return {
+        pullRequestNumber: existing[0].number,
+        pullRequestUrl: existing[0].html_url
+      };
+    }
     const pull = await this.request<GitHubPullResponse>('POST', `/repos/${repository.owner}/${repository.repo}/pulls`, {
       title: input.title,
       body: input.body,
@@ -331,6 +345,14 @@ export class GitHubAppAdapter implements GitHubAdapter {
 
   async mergePullRequest(project: Project, pullRequestNumber: number): Promise<MergePullRequestResult> {
     const repository = requireProjectRepository(project);
+    const existing = await this.request<GitHubPullResponse>('GET', `/repos/${repository.owner}/${repository.repo}/pulls/${pullRequestNumber}`);
+    if (existing.merged) {
+      return {
+        merged: true,
+        sha: existing.merge_commit_sha || undefined,
+        message: 'Pull request was already merged.'
+      };
+    }
     const result = await this.request<GitHubMergePullResponse>(
       'PUT',
       `/repos/${repository.owner}/${repository.repo}/pulls/${pullRequestNumber}/merge`,

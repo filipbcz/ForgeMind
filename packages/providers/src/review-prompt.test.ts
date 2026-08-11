@@ -49,4 +49,19 @@ describe('review prompt', () => {
     expect(prompt).toContain('score: null was treated as zero.');
     expect(prompt).toContain('+if (score == null) return correctCount;');
   });
+
+  it('reviews architecture boundary changes against the persisted context', () => {
+    const prompt = buildReviewPrompt({
+      taskId: 'task-3', taskTitle: 'Add reporting', repositoryPath: '/workspace', changedFiles: ['src/reporting.ts'],
+      acceptanceCriteria: ['Reporting works.'],
+      validation: { command: 'npm test', exitCode: 0, stdout: 'passed', stderr: '', passed: true },
+      diff: '+import { db } from "./internal-db";',
+      architectureContext: 'Reporting must depend on Persistence interfaces only.',
+      architectureUpdate: { decisions: [{ summary: 'Reporting boundary', rationale: 'Keep storage replaceable.' }] }
+    });
+
+    expect(prompt).toContain('Relevant project architecture:');
+    expect(prompt).toContain('Reporting must depend on Persistence interfaces only.');
+    expect(prompt).toContain('Proposed architecture delta:');
+  });
 });

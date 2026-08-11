@@ -27,6 +27,21 @@ export function buildReviewPrompt(input: ReviewInput): string {
     '',
     'Acceptance criteria:',
     renderList(input.acceptanceCriteria, 'No explicit acceptance criteria were provided.'),
+    ...(input.architectureContext
+      ? [
+          '',
+          'Relevant project architecture:',
+          input.architectureContext,
+          'Verify that the diff respects these boundaries. A deliberate boundary change must be accurately represented by the architecture update.'
+        ]
+      : []),
+    ...(input.architectureUpdate
+      ? [
+          '',
+          'Proposed architecture delta:',
+          JSON.stringify(input.architectureUpdate).slice(0, 3_000)
+        ]
+      : []),
     ...(input.previousReviewBlockers?.length
       ? [
           '',

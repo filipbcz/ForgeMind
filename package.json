@@ -22,11 +22,13 @@
     "typecheck": "tsc -b",
     "db:generate": "prisma generate --schema packages/db/prisma/schema.prisma",
     "db:migrate": "prisma migrate dev --schema packages/db/prisma/schema.prisma",
-    "db:seed": "tsx packages/db/prisma/seed.ts"
+    "db:seed": "tsx packages/db/prisma/seed.ts",
+    "qualify:reference": "node qualification/reference-project/run.mjs"
   },
   "devDependencies": {
     "@types/node": "^22.15.29",
     "prisma": "^6.9.0",
+    "playwright-core": "^1.54.2",
     "tsup": "^8.5.0",
     "tsx": "^4.19.4",
     "typescript": "^5.8.3",

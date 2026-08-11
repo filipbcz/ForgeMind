@@ -5,12 +5,25 @@ import { tmpdir } from 'node:os';
 import {
   assertAllowedValidationCommand,
   collectPassedValidationCheckResults,
+  createValidationEnvironment,
+  formatValidationFailure,
   normalizeValidationCommandForEnvironment,
   runValidationCommand,
   runValidationChecks
 } from './validation.js';
 
 describe('validation runner', () => {
+  it('preserves compiler diagnostics from stdout when stderr only contains an npm summary', () => {
+    const context = formatValidationFailure({
+      exitCode: 2,
+      stdout: 'build output\nsrc/report.ts(4,2): error TS2345: Invalid aggregate input.',
+      stderr: 'npm error Lifecycle script `build` failed'
+    });
+
+    expect(context).toContain('error TS2345');
+    expect(context).toContain('npm error Lifecycle script');
+  });
+
   it('installs development dependencies for npm ci validation', () => {
     expect(normalizeValidationCommandForEnvironment('npm ci')).toBe('npm ci --include=dev');
     expect(normalizeValidationCommandForEnvironment('npm ci && npm test')).toBe('npm ci --include=dev && npm test');
@@ -27,6 +40,25 @@ describe('validation runner', () => {
 
     expect(result.passed).toBe(true);
     expect(result.stdout).toContain('v');
+  });
+
+  it('isolates validation from control-plane secrets and permits explicit workspace overrides', async () => {
+    const environment = createValidationEnvironment({
+      PATH: 'test-path',
+      DATABASE_URL: 'postgresql://control-plane',
+      GITHUB_TOKEN: 'github-secret',
+      FORGEMIND_ENCRYPTION_KEY: 'encryption-secret',
+      FORGEMIND_WORKSPACE_ENV_DATABASE_URL: 'postgresql://workspace',
+      FORGEMIND_WORKSPACE_ENV_PUBLIC_MODE: 'qualification'
+    });
+
+    expect(environment).toEqual({
+      PATH: 'test-path',
+      DATABASE_URL: 'postgresql://workspace',
+      PUBLIC_MODE: 'qualification'
+    });
+    expect(environment).not.toHaveProperty('GITHUB_TOKEN');
+    expect(environment).not.toHaveProperty('FORGEMIND_ENCRYPTION_KEY');
   });
 
   it('treats stderr warnings as diagnostic output when the command exits successfully', async () => {
@@ -128,6 +160,20 @@ describe('validation runner', () => {
       command: normalizeValidationCommandForEnvironment(passedCommand),
       state: 'started'
     }));
+  });
+
+  it('reuses a checkpoint only for the same workspace input hash', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'forgemind-validation-fingerprint-'));
+    const command = `node -e "const fs=require('node:fs');const p='count.txt';const n=fs.existsSync(p)?Number(fs.readFileSync(p,'utf8')):0;fs.writeFileSync(p,String(n+1))"`;
+    const first = await runValidationChecks([{ kind: 'command', command }], cwd, undefined, new Map(), 'workspace-a');
+    const passed = collectPassedValidationCheckResults(first);
+
+    const resumed = await runValidationChecks([{ kind: 'command', command }], cwd, undefined, passed, 'workspace-a');
+    const changed = await runValidationChecks([{ kind: 'command', command }], cwd, undefined, passed, 'workspace-b');
+
+    expect(resumed.reusedCheckCount).toBe(1);
+    expect(changed.executedCheckCount).toBe(1);
+    expect(await readFile(join(cwd, 'count.txt'), 'utf8')).toBe('2');
   });
 
   it('rejects shell output redirection outside quoted arguments', () => {

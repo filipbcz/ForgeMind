@@ -2,9 +2,10 @@ import { describe, expect, it, vi } from 'vitest';
 import { join } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { tmpdir } from 'node:os';
-import { mkdir, readFile, writeFile } from 'node:fs/promises';
+import { access, mkdir, readFile, writeFile } from 'node:fs/promises';
 import { simpleGit } from 'simple-git';
 import {
+  buildTaskExecutionPrompt,
   compactTaskExecutionPrompt,
   createRoadmapTaskPlan,
   getMissingSystemValidationTool,
@@ -13,6 +14,7 @@ import {
   isReviewSummaryOnlyPath,
   isValidationCommandDefinitionFailure,
   normalizeValidationChecks,
+  resolveValidationChecks,
   runWorkerTask
 } from './workflow.js';
 import type { ForgeTask, Project, TaskActivity } from '@forgemind/core';
@@ -299,7 +301,7 @@ describe('worker workflow', () => {
 
     expect(result.status).toBe('ready_for_user_review');
     expect(result.branchName).toBe('main');
-    await expect(readFile(join(workspacePath, 'AGENTS.md'), 'utf8')).resolves.toContain(`- title: ${task.title}`);
+    await expect(access(join(workspacePath, 'AGENTS.md'))).rejects.toThrow();
   }, 15000);
 
   it('supports disabled create_issue in project config', async () => {
@@ -327,10 +329,11 @@ describe('worker workflow', () => {
 
   it('completes a task only after GitHub confirms the configured automatic merge', async () => {
     const workspaceRoot = join(tmpdir(), `forgemind-worker-auto-merge-${randomUUID()}`);
+    const mergeCommitSha = 'a'.repeat(40);
     const createPullRequest = vi.fn(createGitHubStub().createDraftPullRequest);
     const mergePullRequest = vi.fn(async () => ({
       merged: true,
-      sha: 'merge-sha',
+      sha: mergeCommitSha,
       message: 'Pull Request successfully merged'
     }));
 
@@ -349,6 +352,7 @@ describe('worker workflow', () => {
     });
 
     expect(result.status).toBe('completed');
+    expect(result.commitSha).toBe(mergeCommitSha);
     expect(createPullRequest).toHaveBeenCalledWith(expect.objectContaining({ draft: false }));
     expect(mergePullRequest).toHaveBeenCalledWith(expect.objectContaining({ defaultBranch: 'main' }), 4321);
   }, 10000);
@@ -776,6 +780,46 @@ describe('worker workflow', () => {
     expect(result.validation.passed).toBe(true);
     expect(result.approvals).not.toContain('github_workflow_change');
     expect(implement).not.toHaveBeenCalled();
+  }, 15000);
+
+  it('keeps an approved protected operation valid across correction attempts in the same task', async () => {
+    const workspaceRoot = join(tmpdir(), `forgemind-worker-approved-operation-retry-${randomUUID()}`);
+    const attempts: ImplementInput[] = [];
+    const provider: AIProvider = {
+      ...createProviderStub(),
+      async implement(input: ImplementInput): Promise<ImplementResult> {
+        attempts.push(input);
+        return {
+          summary: `Correction attempt ${input.attemptNumber}`,
+          changedFiles: ['status.txt'],
+          diffStat: { filesChanged: 1, insertions: 1, deletions: 0 },
+          requestedApprovals: ['delete_files'],
+          validationChecks: [],
+          fileUpdates: [{
+            path: 'status.txt',
+            content: input.attemptNumber === 1 ? 'fail\n' : 'pass\n'
+          }]
+        };
+      }
+    };
+
+    const result = await runWorkerTask({
+      project: demoProject,
+      task: { ...demoTask, id: `task_${randomUUID()}`, maxIterations: 2 },
+      provider,
+      verifyCommand: `node -e "const { readFileSync } = require('node:fs'); process.exit(readFileSync('status.txt', 'utf8').trim() === 'pass' ? 0 : 1)"`,
+      workspaceRoot,
+      resume: {
+        kind: 'approved_operation',
+        resumeFrom: 'implementation',
+        implementationSummary: 'Continue after approval.',
+        approvedApprovals: ['delete_files']
+      }
+    });
+
+    expect(result.status).toBe('ready_for_user_review');
+    expect(attempts).toHaveLength(2);
+    expect(result.approvals).not.toContain('delete_files');
   }, 15000);
 
   it('resumes a failed implementation attempt with its original review blockers', async () => {
@@ -1452,9 +1496,7 @@ describe('worker workflow', () => {
     expect(result.validation.passed).toBe(true);
     expect(result.validation.executedCheckCount).toBe(1);
     expect(result.validation.reusedCheckCount).toBe(2);
-    const generatedAgentInstructions = await readFile(join(result.workspacePath, 'AGENTS.md'), 'utf8');
-    expect(generatedAgentInstructions).toContain('Current implementation step:');
-    expect(generatedAgentInstructions).not.toContain('very long project brief');
+    await expect(access(join(result.workspacePath, 'AGENTS.md'))).rejects.toThrow();
     expect(planCalls).toHaveLength(3);
     expect(implementCalls).toHaveLength(1);
     expect(validationStatuses).toEqual(['validating']);
@@ -1490,8 +1532,8 @@ describe('worker workflow', () => {
     expect(taskActivities).toContainEqual(expect.objectContaining({
       phase: 'validation',
       state: 'completed',
-      title: expect.stringContaining('byla převzata'),
-      detail: expect.stringContaining('znovu se nespouští')
+      title: expect.stringContaining('pouzit checkpoint'),
+      detail: expect.stringContaining('znovu se nespousti')
     }));
     expect(planningIterations).toEqual(
       expect.arrayContaining([
@@ -1524,6 +1566,68 @@ describe('worker workflow', () => {
       ])
     );
   }, 20000);
+
+  it('reuses successful validation checks across implementation retries when repository inputs did not change', async () => {
+    const workspaceRoot = join(tmpdir(), `forgemind-worker-validation-retry-checkpoint-${randomUUID()}`);
+    const projectWithoutVerify = {
+      ...demoProject,
+      configYaml: noGitProjectConfig.replace('commands:\n  verify: "node --version"\n', 'commands: {}\n')
+    };
+    const stableCommand = `node -e "process.stdout.write('stable')"`;
+    const failingCommand = `node -e "process.stderr.write('assertion failed'); process.exit(1)"`;
+    const correctedCommand = `node -e "process.stdout.write('corrected')"`;
+    const taskActivities: TaskActivity[] = [];
+    let implementationAttempt = 0;
+    const provider: AIProvider = {
+      ...createProviderStub(),
+      async plan(): Promise<PlanResult> {
+        return {
+          summary: 'Validate the implementation.',
+          steps: ['Implement', 'Validate'],
+          acceptanceCriteria: ['Validation passes'],
+          validationChecks: []
+        };
+      },
+      async implement(): Promise<ImplementResult> {
+        implementationAttempt += 1;
+        return {
+          summary: implementationAttempt === 1 ? 'Implemented the change.' : 'Corrected only the failed validation check.',
+          changedFiles: ['status.txt'],
+          diffStat: { filesChanged: 1, insertions: 1, deletions: 0 },
+          requestedApprovals: [],
+          validationChecks: [
+            { kind: 'command', command: stableCommand },
+            { kind: 'command', command: implementationAttempt === 1 ? failingCommand : correctedCommand }
+          ],
+          fileUpdates: [{ path: 'status.txt', content: 'implemented\n' }]
+        };
+      }
+    };
+
+    const result = await runWorkerTask({
+      project: projectWithoutVerify,
+      task: { ...demoTask, id: `task_${randomUUID()}`, maxIterations: 2 },
+      provider,
+      workspaceRoot,
+      hooks: {
+        onActivity: async (activity) => {
+          taskActivities.push(activity);
+        }
+      }
+    });
+
+    expect(result.status).toBe('ready_for_user_review');
+    expect(implementationAttempt).toBe(2);
+    expect(result.validation.executedCheckCount).toBe(1);
+    expect(result.validation.reusedCheckCount).toBe(1);
+    expect(taskActivities.filter((activity) => activity.state === 'started' && activity.detail === stableCommand)).toHaveLength(1);
+    expect(taskActivities).toContainEqual(expect.objectContaining({
+      phase: 'validation',
+      state: 'completed',
+      title: expect.stringContaining('pouzit checkpoint'),
+      detail: expect.stringContaining(stableCommand)
+    }));
+  }, 15000);
 
   it('does not spend another provider call replacing a missing system toolchain', async () => {
     const workspaceRoot = join(tmpdir(), `forgemind-worker-missing-toolchain-${randomUUID()}`);
@@ -1620,6 +1724,124 @@ describe('worker workflow', () => {
       'Acceptance Criteria:',
       '- Import tests pass.'
     ].join('\n'));
+  });
+
+  it('adds only a bounded relevant slice of project memory to a task prompt', () => {
+    const prompt = buildTaskExecutionPrompt('Implement leaderboard score sorting.', {
+      version: 1,
+      baseCommitSha: 'abc123',
+      updatedAt: '2026-08-08T10:00:00.000Z',
+      recentWork: [
+        {
+          taskId: 'task-1',
+          title: 'Add leaderboard API',
+          summary: 'Added score persistence and sorting.',
+          changedFiles: ['src/leaderboard.ts'],
+          completedAt: '2026-08-08T09:00:00.000Z'
+        },
+        {
+          taskId: 'task-2',
+          title: 'Unrelated profile colors',
+          summary: 'Changed profile colors.',
+          changedFiles: ['src/profile.css'],
+          completedAt: '2026-08-08T08:00:00.000Z'
+        }
+      ]
+    });
+
+    expect(prompt).toContain('Project memory');
+    expect(prompt).toContain('Add leaderboard API');
+    expect(prompt).toContain('Last recorded successful commit: abc123');
+    expect(prompt.length).toBeLessThanOrEqual('Implement leaderboard score sorting.'.length + 4_000);
+  });
+
+  it('adds only relevant architecture modules and binding project boundaries', () => {
+    const prompt = buildTaskExecutionPrompt('Implement leaderboard score sorting.', undefined, {
+      version: 1,
+      summary: 'Feature modules depend on shared persistence interfaces.',
+      modules: [
+        { name: 'Leaderboard', responsibility: 'Own scores and ranking.', paths: ['src/leaderboard/**'], publicInterfaces: ['LeaderboardRepository'], dependencies: ['Persistence'] },
+        { name: 'Profiles', responsibility: 'Own profile colors.', paths: ['src/profiles/**'], publicInterfaces: ['ProfileService'], dependencies: [] }
+      ],
+      decisions: [{ id: 'arch-1', summary: 'Repository boundary', rationale: 'Keep storage replaceable.', createdAt: '' }],
+      conventions: ['Use dependency injection at module boundaries.'],
+      dependencyRules: ['Feature modules must not import another feature module internals.'],
+      knownDebt: [],
+      validationCommands: ['npm run architecture:check'],
+      updatedAt: ''
+    });
+
+    expect(prompt).toContain('Project architecture');
+    expect(prompt).toContain('LeaderboardRepository');
+    expect(prompt).not.toContain('ProfileService');
+    expect(prompt).toContain('npm run architecture:check');
+  });
+
+  it('deduplicates persisted architecture checks into the validation plan', async () => {
+    const checks = await resolveValidationChecks({
+      plan: {
+        summary: 'Plan', steps: [], acceptanceCriteria: [],
+        validationChecks: [{ kind: 'command', command: 'npm test' }]
+      },
+      architectureCommands: ['npm run architecture:check', 'npm test']
+    });
+
+    expect(checks.map((check) => check.command)).toEqual(['npm test', 'npm run architecture:check']);
+  });
+
+  it('drops architecture checks already covered by a broader planned command', async () => {
+    const checks = await resolveValidationChecks({
+      plan: {
+        summary: 'Plan', steps: [], acceptanceCriteria: [],
+        validationChecks: [{ kind: 'command', command: 'npm run lint && npm test && npm run build' }]
+      },
+      architectureCommands: ['npm run lint', 'npm run test:architecture', 'npm test', 'npm run build']
+    });
+
+    expect(checks.map((check) => check.command)).toEqual([
+      'npm run lint && npm test && npm run build',
+      'npm run test:architecture'
+    ]);
+  });
+
+  it('builds one ordered validation suite for install, Docker, migrations, readiness and AI checks', async () => {
+    const workspacePath = join(tmpdir(), `forgemind-profile-${randomUUID()}`);
+    await mkdir(workspacePath, { recursive: true });
+    await writeFile(join(workspacePath, 'compose.yml'), 'services: {}\n', 'utf8');
+
+    const checks = await resolveValidationChecks({
+      plan: {
+        summary: 'Plan', steps: [], acceptanceCriteria: [],
+        validationChecks: [
+          { kind: 'command', command: 'npm run build', category: 'build' },
+          { kind: 'command', command: 'npm run test:api', category: 'api' },
+          { kind: 'command', command: 'npm run test:e2e', category: 'browser' }
+        ]
+      },
+      installCommand: 'npm ci',
+      workspacePath,
+      validationProfile: {
+        version: 1,
+        enabled: true,
+        dockerComposeFiles: ['compose.yml'],
+        dockerComposeServices: ['postgres', 'api'],
+        requiredEnvironmentVariables: [],
+        migrationCommands: ['npm run db:migrate'],
+        readinessCommands: ['npm run test:health'],
+        commandTimeoutMinutes: 15
+      }
+    });
+
+    expect(checks.map((check) => check.command)).toEqual([
+      'npm ci',
+      'docker compose -f "compose.yml" up -d --wait postgres api',
+      'npm run db:migrate',
+      'npm run test:health',
+      'npm run build',
+      'npm run test:api',
+      'npm run test:e2e'
+    ]);
+    expect(checks.slice(1, 4).every((check) => check.timeoutMinutes === 15)).toBe(true);
   });
 
   it('derives a roadmap task plan without a separate provider planning call', () => {
@@ -2378,7 +2600,8 @@ describe('worker workflow', () => {
     expect(createdPrs).toHaveLength(1);
     expect(createdPrs[0]?.body).toContain('## Průběh běhu');
     expect(createdPrs[0]?.body).toContain('Total implementation attempts: 2');
-    expect(createdPrs[0]?.body).toContain('Validation retry before attempt 2: Exit code 1');
+    expect(createdPrs[0]?.body).toContain('Validation retry before attempt 2:');
+    expect(createdPrs[0]?.body).toContain('Exit code 1');
     expect(createdPrs[0]?.body).toContain('Input tokens: 12, output tokens: 6, estimated cost: 0.0042 USD');
     expect(createdPrs[0]?.body).toContain('## Poslední validace');
     expect(createdPrs[0]?.body).toContain('## Vyřešené review blokery');

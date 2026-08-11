@@ -43,7 +43,10 @@ import {
   fetchGitHubRepositories,
   fetchGitHubRepositoryOwners,
   fetchNotificationSettings,
+  fetchProjectArchitectures,
+  fetchProjectContracts,
   fetchProjectRoadmap,
+  fetchProjectSpecifications,
   fetchCodexOAuthStatus,
   fetchProviderModels,
   fetchProviderStatus,
@@ -82,7 +85,10 @@ import type {
   GitHubAdapterConnectRequest,
   GitHubAdapterStatusApi,
   GitHubBranchApi,
+  ProjectArchitectureSnapshotApi,
+  ProjectContractSnapshotApi,
   ProjectRoadmapApi,
+  ProjectSpecificationSnapshotApi,
   GitHubRepositoryApi,
   GitHubRepositoryOwnerApi,
   NotificationSettingsApi,
@@ -102,6 +108,7 @@ import type {
 } from './types.js';
 import { subscribeRealtime } from './realtime.js';
 import type { RealtimeConnectionMeta, RealtimeConnectionState } from './realtime.js';
+import { summarizeProjectProgress } from './project-progress.js';
 
 type View = 'tasks' | 'new-task' | 'approvals' | 'projects' | 'settings';
 type RealtimeUiState = 'connected' | 'reconnecting' | 'fallback';
@@ -258,6 +265,24 @@ export function App() {
     enabled: Boolean(selectedProject?.id),
     retry: 1
   });
+  const projectSpecificationsQuery = useQuery({
+    queryKey: ['projects', selectedProject?.id, 'specifications'],
+    queryFn: () => fetchProjectSpecifications(selectedProject?.id ?? ''),
+    enabled: Boolean(selectedProject?.id),
+    retry: 1
+  });
+  const projectContractsQuery = useQuery({
+    queryKey: ['projects', selectedProject?.id, 'contracts'],
+    queryFn: () => fetchProjectContracts(selectedProject?.id ?? ''),
+    enabled: Boolean(selectedProject?.id),
+    retry: 1
+  });
+  const projectArchitecturesQuery = useQuery({
+    queryKey: ['projects', selectedProject?.id, 'architectures'],
+    queryFn: () => fetchProjectArchitectures(selectedProject?.id ?? ''),
+    enabled: Boolean(selectedProject?.id),
+    retry: 1
+  });
 
   useEffect(() => {
     if (!selectedTaskId && tasks[0]) {
@@ -268,6 +293,12 @@ export function App() {
   const selectedTask = useMemo(() => tasks.find((task) => task.id === selectedTaskId) ?? tasks[0], [selectedTaskId, tasks]);
   const selectedTaskIsActive = activeStatuses.has(selectedTask?.status ?? 'draft');
   const selectedTaskPollInterval = selectedTaskIsActive ? (taskRealtimeState === 'connected' ? false : 15000) : false;
+  const taskProjectRoadmapQuery = useQuery({
+    queryKey: ['projects', selectedTask?.projectId, 'roadmap'],
+    queryFn: () => fetchProjectRoadmap(selectedTask?.projectId ?? ''),
+    enabled: Boolean(selectedTask?.projectId),
+    retry: 1
+  });
 
   const logsQuery = useQuery({
     queryKey: ['tasks', selectedTask?.id, 'logs'],
@@ -370,7 +401,8 @@ export function App() {
     queryClient.invalidateQueries({ queryKey: ['tasks', selectedTask.id, 'diff'] });
     queryClient.invalidateQueries({ queryKey: ['tasks', selectedTask.id, 'usage'] });
     queryClient.invalidateQueries({ queryKey: ['tasks', selectedTask.id, 'queue'] });
-  }, [queryClient, selectedTask?.id, selectedTask?.status, selectedTask?.updatedAt]);
+    queryClient.invalidateQueries({ queryKey: ['projects', selectedTask.projectId, 'roadmap'] });
+  }, [queryClient, selectedTask?.id, selectedTask?.projectId, selectedTask?.status, selectedTask?.updatedAt]);
 
   useEffect(() => {
     if (!selectedTask?.id) {
@@ -394,6 +426,7 @@ export function App() {
           queryClient.invalidateQueries({ queryKey: ['tasks', selectedTask.id, 'diff'] });
           queryClient.invalidateQueries({ queryKey: ['tasks', selectedTask.id, 'usage'] });
           queryClient.invalidateQueries({ queryKey: ['tasks', selectedTask.id, 'queue'] });
+          queryClient.invalidateQueries({ queryKey: ['projects', selectedTask.projectId, 'roadmap'] });
           queryClient.invalidateQueries({ queryKey: ['worker-status'] });
           queryClient.invalidateQueries({ queryKey: ['worker-events'] });
         }
@@ -407,6 +440,7 @@ export function App() {
         queryClient.invalidateQueries({ queryKey: ['tasks', selectedTask.id, 'diff'] });
         queryClient.invalidateQueries({ queryKey: ['tasks', selectedTask.id, 'usage'] });
         queryClient.invalidateQueries({ queryKey: ['tasks', selectedTask.id, 'queue'] });
+        queryClient.invalidateQueries({ queryKey: ['projects', selectedTask.projectId, 'roadmap'] });
         queryClient.invalidateQueries({ queryKey: ['worker-status'] });
       },
       onError: () => {
@@ -425,7 +459,7 @@ export function App() {
       setTaskRealtimeMeta({ state: 'idle' });
       unsubscribe();
     };
-  }, [queryClient, selectedTask?.id]);
+  }, [queryClient, selectedTask?.id, selectedTask?.projectId]);
 
   const pendingApprovals = approvals.filter((approval) => approval.status === 'pending');
   const activeTasks = tasks.filter((task) => !terminalStatuses.has(task.status));
@@ -448,6 +482,9 @@ export function App() {
     queryClient.invalidateQueries({ queryKey: ['projects'] });
     if (projectId) {
       queryClient.invalidateQueries({ queryKey: ['projects', projectId, 'roadmap'] });
+      queryClient.invalidateQueries({ queryKey: ['projects', projectId, 'specifications'] });
+      queryClient.invalidateQueries({ queryKey: ['projects', projectId, 'contracts'] });
+      queryClient.invalidateQueries({ queryKey: ['projects', projectId, 'architectures'] });
     }
   }
 
@@ -835,6 +872,8 @@ export function App() {
               <TaskDetail
                 projects={projects}
                 task={selectedTask}
+                roadmap={taskProjectRoadmapQuery.data}
+                roadmapLoading={taskProjectRoadmapQuery.isLoading}
                 logs={logsQuery.data ?? []}
                 diff={diffQuery.data}
                 usage={usageQuery.data}
@@ -893,6 +932,15 @@ export function App() {
             providerStatus={providerStatus}
             roadmap={projectRoadmapQuery.data}
             roadmapLoading={projectRoadmapQuery.isLoading}
+            specifications={projectSpecificationsQuery.data}
+            specificationsLoading={projectSpecificationsQuery.isLoading}
+            specificationsError={projectSpecificationsQuery.error ? formatUiError(projectSpecificationsQuery.error) : undefined}
+            contracts={projectContractsQuery.data}
+            contractsLoading={projectContractsQuery.isLoading}
+            contractsError={projectContractsQuery.error ? formatUiError(projectContractsQuery.error) : undefined}
+            architectures={projectArchitecturesQuery.data}
+            architecturesLoading={projectArchitecturesQuery.isLoading}
+            architecturesError={projectArchitecturesQuery.error ? formatUiError(projectArchitecturesQuery.error) : undefined}
             roadmapError={
               generateProjectRoadmapMutation.error
                 ? formatUiError(generateProjectRoadmapMutation.error)
@@ -1038,6 +1086,17 @@ function RealtimeStatusBadge({
 
 function formatUiError(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
+}
+
+function formatSpecificationSource(source: ProjectSpecificationSnapshotApi['current']['source']): string {
+  switch (source) {
+    case 'initial_brief':
+      return 'původní zadání';
+    case 'approved_extension':
+      return 'schválené rozšíření';
+    case 'manual_revision':
+      return 'ruční revize';
+  }
 }
 
 function NavButton(props: { active: boolean; compact?: boolean; icon: typeof LayoutList; label: string; onClick: () => void }) {
@@ -1423,6 +1482,8 @@ function TaskActivityPanel(props: {
 function TaskDetail(props: {
   projects: ProjectSummary[];
   task: TaskSummary;
+  roadmap?: ProjectRoadmapApi;
+  roadmapLoading: boolean;
   logs: AuditEventApi[];
   diff?: TaskDiffApi;
   usage?: TaskUsageApi;
@@ -1444,6 +1505,14 @@ function TaskDetail(props: {
   const latestError = resolveLatestTaskError(props.task.status, props.logs, latestRun);
   const queueLabel = formatQueueLabel(props.task, props.queue);
   const workflowItems = buildTaskWorkflow(props.task, props.logs);
+  const projectProgress = summarizeProjectProgress(props.roadmap, props.task.id);
+  const ProjectProgressIcon = projectProgress.tone === 'completed'
+    ? CheckCircle2
+    : projectProgress.tone === 'attention'
+      ? AlertTriangle
+      : projectProgress.tone === 'active'
+        ? Activity
+        : Clock3;
 
   return (
     <article className="detail">
@@ -1480,6 +1549,24 @@ function TaskDetail(props: {
           </div>
         </section>
       ) : null}
+
+      <section className={`project-progress-panel ${projectProgress.tone}`} aria-label="Stav projektu">
+        <span className="project-progress-icon"><ProjectProgressIcon size={20} /></span>
+        <div className="project-progress-content">
+          <span>Stav projektu</span>
+          <strong>{props.roadmapLoading ? 'Načítám stav projektu...' : projectProgress.headline}</strong>
+          <p>{props.roadmapLoading ? 'Získávám aktuální roadmapu a navazující operace.' : projectProgress.detail}</p>
+          {!props.roadmapLoading && projectProgress.totalSteps > 0 ? (
+            <div className="project-progress-meter">
+              <progress value={projectProgress.completedSteps} max={projectProgress.totalSteps} />
+              <small>
+                {projectProgress.completedSteps}/{projectProgress.totalSteps} kroků dokončeno
+                {projectProgress.taskPosition ? ` | tento task je krok ${projectProgress.taskPosition}` : ''}
+              </small>
+            </div>
+          ) : null}
+        </div>
+      </section>
 
       <section className="plain-section">
         <div className="section-heading">
@@ -2309,6 +2396,15 @@ function ProjectsPanel(props: {
   roadmap?: ProjectRoadmapApi;
   roadmapLoading: boolean;
   roadmapError?: string;
+  specifications?: ProjectSpecificationSnapshotApi;
+  specificationsLoading: boolean;
+  specificationsError?: string;
+  contracts?: ProjectContractSnapshotApi;
+  contractsLoading: boolean;
+  contractsError?: string;
+  architectures?: ProjectArchitectureSnapshotApi;
+  architecturesLoading: boolean;
+  architecturesError?: string;
   saving: boolean;
   updatingProject: boolean;
   updateProjectError?: string;
@@ -2347,9 +2443,19 @@ function ProjectsPanel(props: {
   );
   const [defaultTaskMode, setDefaultTaskMode] = useState<CreateTaskRequest['mode']>(selectedProject?.defaultTaskMode ?? 'safe');
   const [aiProviderConnectionId, setAiProviderConnectionId] = useState(selectedProject?.aiProviderConnectionId ?? '');
+  const [validationProfileEnabled, setValidationProfileEnabled] = useState(selectedProject?.validationProfile?.enabled ?? false);
+  const [dockerComposeFiles, setDockerComposeFiles] = useState((selectedProject?.validationProfile?.dockerComposeFiles ?? []).join('\n'));
+  const [dockerComposeServices, setDockerComposeServices] = useState((selectedProject?.validationProfile?.dockerComposeServices ?? []).join('\n'));
+  const [requiredEnvironmentVariables, setRequiredEnvironmentVariables] = useState((selectedProject?.validationProfile?.requiredEnvironmentVariables ?? []).join('\n'));
+  const [migrationCommands, setMigrationCommands] = useState((selectedProject?.validationProfile?.migrationCommands ?? []).join('\n'));
+  const [readinessCommands, setReadinessCommands] = useState((selectedProject?.validationProfile?.readinessCommands ?? []).join('\n'));
+  const [validationTimeoutMinutes, setValidationTimeoutMinutes] = useState(selectedProject?.validationProfile?.commandTimeoutMinutes ?? 10);
   const [deleteConfirmation, setDeleteConfirmation] = useState('');
   const [deleteGitHubRepository, setDeleteGitHubRepository] = useState(false);
-  const latestCycle = props.roadmap?.cycles.at(-1);
+  const roadmapCycles = [...(props.roadmap?.cycles ?? [])]
+    .sort((left, right) => right.cycleNumber - left.cycleNumber);
+  const latestCycle = roadmapCycles[0];
+  const currentContract = props.contracts?.current?.contract ?? selectedProject?.projectContract;
   const cycleSteps = latestCycle ? props.roadmap?.steps.filter((step) => step.cycleId === latestCycle.id) ?? [] : [];
   const roadmapUsesOlderBrief = Boolean(
     latestCycle?.cycleNumber === 1
@@ -2368,6 +2474,13 @@ function ProjectsPanel(props: {
     setAllowSafeOperationsWithoutApproval(selectedProject?.allowSafeOperationsWithoutApproval ?? false);
     setDefaultTaskMode(selectedProject?.defaultTaskMode ?? 'safe');
     setAiProviderConnectionId(selectedProject?.aiProviderConnectionId ?? '');
+    setValidationProfileEnabled(selectedProject?.validationProfile?.enabled ?? false);
+    setDockerComposeFiles((selectedProject?.validationProfile?.dockerComposeFiles ?? []).join('\n'));
+    setDockerComposeServices((selectedProject?.validationProfile?.dockerComposeServices ?? []).join('\n'));
+    setRequiredEnvironmentVariables((selectedProject?.validationProfile?.requiredEnvironmentVariables ?? []).join('\n'));
+    setMigrationCommands((selectedProject?.validationProfile?.migrationCommands ?? []).join('\n'));
+    setReadinessCommands((selectedProject?.validationProfile?.readinessCommands ?? []).join('\n'));
+    setValidationTimeoutMinutes(selectedProject?.validationProfile?.commandTimeoutMinutes ?? 10);
   }, [
     selectedProject?.id,
     selectedProject?.autoCreatePullRequest,
@@ -2375,7 +2488,8 @@ function ProjectsPanel(props: {
     selectedProject?.autoCompleteTask,
     selectedProject?.allowSafeOperationsWithoutApproval,
     selectedProject?.defaultTaskMode,
-    selectedProject?.aiProviderConnectionId
+    selectedProject?.aiProviderConnectionId,
+    selectedProject?.validationProfile
   ]);
 
   useEffect(() => {
@@ -2501,6 +2615,40 @@ function ProjectsPanel(props: {
                 </button>
               </div>
             </form>
+            {props.specificationsLoading ? <p className="muted">Načítám aktuální specifikaci...</p> : null}
+            {props.specificationsError ? <div className="error-banner">{props.specificationsError}</div> : null}
+            {props.specifications ? (
+              <div className="project-specification-history">
+                <div className="section-heading">
+                  <div>
+                    <h4>Aktuální specifikace</h4>
+                    <p>
+                      Verze {props.specifications.current.version} · {formatSpecificationSource(props.specifications.current.source)}
+                    </p>
+                  </div>
+                  <span className="badge completed">v{props.specifications.current.version}</span>
+                </div>
+                <pre className="project-specification-content">{props.specifications.current.fullSpecification}</pre>
+                {props.specifications.versions.length > 1 ? (
+                  <div className="project-specification-versions">
+                    <h4>Historie zadání</h4>
+                    {[...props.specifications.versions].reverse().map((version) => (
+                      <details key={version.id} className="project-specification-version">
+                        <summary>
+                          <span>
+                            <strong>Verze {version.version}</strong>
+                            <small>{version.changeSummary}</small>
+                          </span>
+                          <span>{formatSpecificationSource(version.source)}</span>
+                          <ArrowDown size={16} />
+                        </summary>
+                        <pre className="project-specification-content">{version.fullSpecification}</pre>
+                      </details>
+                    ))}
+                  </div>
+                ) : null}
+              </div>
+            ) : null}
           </section>
           <section className="plain-section">
             <h3>GitHub repository</h3>
@@ -2528,7 +2676,17 @@ function ProjectsPanel(props: {
                   autoCompleteTask,
                   allowSafeOperationsWithoutApproval,
                   defaultTaskMode,
-                  aiProviderConnectionId: aiProviderConnectionId || null
+                  aiProviderConnectionId: aiProviderConnectionId || null,
+                  validationProfile: {
+                    version: 1,
+                    enabled: validationProfileEnabled,
+                    dockerComposeFiles: parseProjectValidationLines(dockerComposeFiles),
+                    dockerComposeServices: parseProjectValidationLines(dockerComposeServices),
+                    requiredEnvironmentVariables: parseProjectValidationLines(requiredEnvironmentVariables),
+                    migrationCommands: parseProjectValidationLines(migrationCommands),
+                    readinessCommands: parseProjectValidationLines(readinessCommands),
+                    commandTimeoutMinutes: validationTimeoutMinutes
+                  }
                 });
               }}
             >
@@ -2571,6 +2729,49 @@ function ProjectsPanel(props: {
                   <small>Bez automatickeho merge zustane pull request jako draft.</small>
                 </span>
               </label>
+              <label className="toggle-row wide">
+                <input
+                  type="checkbox"
+                  checked={validationProfileEnabled}
+                  onChange={(event) => setValidationProfileEnabled(event.target.checked)}
+                />
+                <span>
+                  <strong>Pripravit validacni prostredi projektu</strong>
+                  <small>Worker spusti nakonfigurovane Docker sluzby, migrace a readiness kontroly pred AI validaci.</small>
+                </span>
+              </label>
+              {validationProfileEnabled ? (
+                <>
+                  <label className="wide">
+                    Docker Compose soubory
+                    <textarea rows={2} value={dockerComposeFiles} onChange={(event) => setDockerComposeFiles(event.target.value)} placeholder="docker-compose.yml" />
+                    <small>Relativni cesty v repozitari, jedna na radek.</small>
+                  </label>
+                  <label className="wide">
+                    Docker sluzby
+                    <textarea rows={2} value={dockerComposeServices} onChange={(event) => setDockerComposeServices(event.target.value)} placeholder={'postgres\napi'} />
+                    <small>Prazdne pole spusti vsechny sluzby z compose souboru.</small>
+                  </label>
+                  <label className="wide">
+                    Povinne promenne prostredi
+                    <textarea rows={2} value={requiredEnvironmentVariables} onChange={(event) => setRequiredEnvironmentVariables(event.target.value)} placeholder="TEST_DATABASE_URL" />
+                    <small>Ukladaji se pouze nazvy; hodnoty zustavaji v runtime secrets.</small>
+                  </label>
+                  <label className="wide">
+                    Migracni prikazy
+                    <textarea rows={3} value={migrationCommands} onChange={(event) => setMigrationCommands(event.target.value)} placeholder="npm run db:migrate" />
+                    <small>Spusti se po priprave Docker sluzeb a pred validacnimi prikazy AI.</small>
+                  </label>
+                  <label className="wide">
+                    Readiness kontroly
+                    <textarea rows={3} value={readinessCommands} onChange={(event) => setReadinessCommands(event.target.value)} placeholder="npm run test:health" />
+                  </label>
+                  <label>
+                    Timeout prikazu v minutach
+                    <input type="number" min={1} max={60} value={validationTimeoutMinutes} onChange={(event) => setValidationTimeoutMinutes(Number(event.target.value))} />
+                  </label>
+                </>
+              ) : null}
               <label className="toggle-row wide">
                 <input
                   type="checkbox"
@@ -2633,13 +2834,103 @@ function ProjectsPanel(props: {
             {!props.roadmapLoading && !latestCycle ? <p>Zatim bez roadmap cyklu.</p> : null}
             {latestCycle ? (
               <>
-                {selectedProject.projectContract ? (
+                {props.contractsLoading ? <p className="muted">Nacitam historii projektoveho kontraktu...</p> : null}
+                {props.contractsError ? <div className="error-banner">{props.contractsError}</div> : null}
+                {currentContract ? (
                   <div className="project-contract-summary">
-                    <strong>Projektovy kontrakt v{selectedProject.projectContract.version}</strong>
-                    <p>{selectedProject.projectContract.summary}</p>
+                    <strong>Projektovy kontrakt v{currentContract.version}</strong>
+                    <p>{currentContract.summary}</p>
                     <small>
-                      {selectedProject.projectContract.requirements.length} pozadavku | {selectedProject.projectContract.releaseCriteria.length} release kriterii
+                      {currentContract.requirements.filter((requirement) => (requirement.status ?? 'active') === 'active').length} aktivnich pozadavku
+                      {' | '}{currentContract.requirements.filter((requirement) => requirement.status === 'superseded').length} nahrazenych
+                      {' | '}{currentContract.requirements.filter((requirement) => requirement.status === 'removed').length} odstranenych
+                      {' | '}{currentContract.releaseCriteria.length} release kriterii
                     </small>
+                  </div>
+                ) : null}
+                {(props.contracts?.versions.length ?? 0) > 0 ? (
+                  <div className="contract-history">
+                    <h4>Historie kontraktu</h4>
+                    {[...(props.contracts?.versions ?? [])].reverse().map((version) => (
+                      <details key={version.id}>
+                        <summary>
+                          <span>
+                            <strong>Verze {version.version}</strong>
+                            <small>{version.changeSummary}</small>
+                          </span>
+                          <span className="badge">{version.source}</span>
+                        </summary>
+                        <div className="contract-history-body">
+                          <p>{version.contract.summary}</p>
+                          {version.contractDelta ? (
+                            <div className="contract-delta-summary">
+                              <strong>Zmena proti v{version.contractDelta.baseVersion}</strong>
+                              <small>
+                                +{version.contractDelta.addRequirements.length} novych, {version.contractDelta.updateRequirements.length} upravenych,
+                                {' '}{version.contractDelta.supersedeRequirements.length} nahrazenych, {version.contractDelta.removeRequirements.length} odstranenych
+                              </small>
+                              {version.contractDelta.migrationImpacts.length > 0 ? <p>Migrace: {version.contractDelta.migrationImpacts.join(' | ')}</p> : null}
+                              {version.contractDelta.compatibilityImpacts.length > 0 ? <p>Kompatibilita: {version.contractDelta.compatibilityImpacts.join(' | ')}</p> : null}
+                            </div>
+                          ) : null}
+                          <div className="contract-requirements">
+                            {version.contract.requirements.map((requirement) => (
+                              <div key={requirement.id} data-status={requirement.status ?? 'active'}>
+                                <strong>{requirement.id}: {requirement.title}</strong>
+                                <small>
+                                  {requirement.status ?? 'active'} | od v{requirement.introducedInVersion ?? version.version}
+                                  {requirement.supersededByRequirementId ? ` | nahrazeno ${requirement.supersededByRequirementId}` : ''}
+                                </small>
+                                <p>{requirement.description}</p>
+                                {requirement.lifecycleReason ? <small>Duvod zmeny: {requirement.lifecycleReason}</small> : null}
+                              </div>
+                            ))}
+                          </div>
+                        </div>
+                      </details>
+                    ))}
+                  </div>
+                ) : null}
+                {props.architecturesLoading ? <p className="muted">Nacitam historii architektury...</p> : null}
+                {props.architecturesError ? <div className="error-banner">{props.architecturesError}</div> : null}
+                {(props.architectures?.versions.length ?? 0) > 0 ? (
+                  <div className="contract-history">
+                    <h4>Historie architektury</h4>
+                    {[...(props.architectures?.versions ?? [])].reverse().map((version) => (
+                      <details key={version.id} open={version.id === props.architectures?.current?.id ? true : undefined}>
+                        <summary>
+                          <span>
+                            <strong>Architektura v{version.version}</strong>
+                            <small>{version.changeSummary}</small>
+                          </span>
+                          <span className="badge">{version.source}</span>
+                        </summary>
+                        <div className="contract-history-body">
+                          <p>{version.architecture.summary}</p>
+                          <small>
+                            {version.architecture.modules.length} modulu
+                            {' | '}{version.architecture.databaseSchemas?.length ?? 0} databazovych schemat
+                            {' | '}{version.architecture.decisions.length} rozhodnuti
+                          </small>
+                          {version.architecture.modules.length > 0 ? (
+                            <ul>
+                              {version.architecture.modules.map((module) => (
+                                <li key={module.name}>
+                                  <strong>{module.name}</strong>: {module.responsibility}
+                                  {module.dependencies.length ? ` | zavislosti: ${module.dependencies.join(', ')}` : ''}
+                                </li>
+                              ))}
+                            </ul>
+                          ) : null}
+                          {version.architecture.dependencyRules.length > 0 ? (
+                            <p>Pravidla zavislosti: {version.architecture.dependencyRules.join(' | ')}</p>
+                          ) : null}
+                          {version.architecture.knownDebt.length > 0 ? (
+                            <p>Znamy technicky dluh: {version.architecture.knownDebt.join(' | ')}</p>
+                          ) : null}
+                        </div>
+                      </details>
+                    ))}
                   </div>
                 ) : null}
                 {(props.roadmap?.capabilities ?? []).length > 0 ? (
@@ -2679,80 +2970,108 @@ function ProjectsPanel(props: {
                     ))}
                   </div>
                 ) : null}
-                <div className="project-row">
-                  <div>
-                    <strong>Cyklus {latestCycle.cycleNumber}</strong>
-                    <p>{latestCycle.objective}</p>
-                  </div>
-                  <MetricBlock label="Status" value={latestCycle.status} />
-                </div>
-                {props.roadmap?.auditJobs.find((job) => job.cycleId === latestCycle.id) ? (() => {
-                  const auditJob = props.roadmap!.auditJobs.find((job) => job.cycleId === latestCycle.id)!;
-                  return (
-                    <div className={auditJob.status === 'failed' || auditJob.status === 'blocked' ? 'error-banner' : 'success-banner'}>
-                      Audit projektu: {auditJob.status} | pokus {auditJob.attemptCount}
-                      {auditJob.errorMessage ? <pre>{auditJob.errorMessage}</pre> : null}
-                      {auditJob.status === 'failed' || auditJob.status === 'blocked' ? (
-                        <div className="actions">
-                          <button
-                            className="secondary-action"
-                            type="button"
-                            disabled={props.retryingAudit}
-                            onClick={() => props.onRetryAudit(selectedProject.id)}
-                          >
-                            <RotateCcw size={16} />
-                            Opakovat pouze audit
-                          </button>
-                        </div>
-                      ) : null}
-                    </div>
-                  );
-                })() : null}
-                <div className="timeline">
-                  {cycleSteps.map((step) => {
-                    const task = step.taskId ? props.tasks.find((item) => item.id === step.taskId) : undefined;
+                <div className="roadmap-cycle-list">
+                  {roadmapCycles.map((cycle) => {
+                    const isLatest = cycle.id === latestCycle.id;
+                    const steps = (props.roadmap?.steps ?? [])
+                      .filter((step) => step.cycleId === cycle.id)
+                      .sort((left, right) => left.sequenceNumber - right.sequenceNumber);
+                    const completedStepCount = steps.filter((step) => step.status === 'completed').length;
+                    const auditJob = props.roadmap?.auditJobs.find((job) => job.cycleId === cycle.id);
+                    const cycleContractVersion = props.contracts?.versions.find((version) => version.id === cycle.contractVersionId);
+                    const cycleContractLabel = cycleContractVersion?.changeSummary.startsWith('Imported legacy')
+                      && cycle.cycleNumber !== cycleContractVersion.version
+                      ? ' | puvodni kontrakt nebyl zaznamenan'
+                      : cycleContractVersion
+                        ? ` | kontrakt v${cycleContractVersion.version}`
+                        : '';
                     return (
-                      <div className="timeline-row" key={step.id}>
-                        <span>{step.sequenceNumber}.</span>
-                        <strong>{step.title}</strong>
-                        <small>
-                          {step.status}{step.requirementIds.length ? ` | ${step.requirementIds.join(', ')}` : ''}{task ? ` | ${task.title}` : ''}
-                        </small>
-                      </div>
+                      <details className="roadmap-cycle" open={isLatest ? true : undefined} key={cycle.id}>
+                        <summary>
+                          <span className="roadmap-cycle-title">
+                            <small>{isLatest ? 'Aktuální cyklus' : 'Historie'}</small>
+                            <strong>Cyklus {cycle.cycleNumber}</strong>
+                            <span>{completedStepCount}/{steps.length} kroků dokončeno{cycleContractLabel}</span>
+                          </span>
+                          <span className={`badge ${cycle.status}`}>{cycle.status}</span>
+                          <ArrowDown size={18} />
+                        </summary>
+                        <div className="roadmap-cycle-body">
+                          <p>{cycle.objective}</p>
+                          {auditJob ? (
+                            <div className={auditJob.status === 'failed' || auditJob.status === 'blocked' ? 'error-banner' : 'success-banner'}>
+                              Audit projektu: {auditJob.status} | pokus {auditJob.attemptCount}
+                              {auditJob.errorMessage ? <pre>{auditJob.errorMessage}</pre> : null}
+                              {isLatest && (auditJob.status === 'failed' || auditJob.status === 'blocked') ? (
+                                <div className="actions">
+                                  <button
+                                    className="secondary-action"
+                                    type="button"
+                                    disabled={props.retryingAudit}
+                                    onClick={() => props.onRetryAudit(selectedProject.id)}
+                                  >
+                                    <RotateCcw size={16} />
+                                    Opakovat pouze audit
+                                  </button>
+                                </div>
+                              ) : null}
+                            </div>
+                          ) : null}
+                          <div className="timeline">
+                            {steps.map((step) => {
+                              const task = step.taskId ? props.tasks.find((item) => item.id === step.taskId) : undefined;
+                              return (
+                                <div className="timeline-row" key={step.id}>
+                                  <span>{step.sequenceNumber}.</span>
+                                  <strong>{step.title}</strong>
+                                  <small>
+                                    {step.status}{step.requirementIds.length ? ` | ${step.requirementIds.join(', ')}` : ''}{task ? ` | ${task.title}` : ''}
+                                  </small>
+                                  {step.changeRationale ? <small>Duvod: {step.changeRationale}</small> : null}
+                                  {step.dependsOnStepTitles.length > 0 ? <small>Navazuje na: {step.dependsOnStepTitles.join(', ')}</small> : null}
+                                  {step.validationFocus.length > 0 ? <small>Overeni: {step.validationFocus.join(', ')}</small> : null}
+                                </div>
+                              );
+                            })}
+                          </div>
+                          {cycle.extensionProposal ? (
+                            <div className="prompt-response-panel roadmap-extension">
+                              <div className="prompt-response-header">
+                                <strong>{isLatest ? 'Další navržené rozšíření' : 'Navržené rozšíření cyklu'}</strong>
+                                <span>{cycle.status}</span>
+                              </div>
+                              <div className="prompt-response-body">
+                                <div className="prompt-response-block">
+                                  <pre>{cycle.extensionProposal}</pre>
+                                </div>
+                              </div>
+                              {isLatest && cycle.status === 'awaiting_extension_approval' ? (
+                                <div className="actions">
+                                  <button
+                                    className="primary-action"
+                                    type="button"
+                                    disabled={props.decidingExtension}
+                                    onClick={() => props.onDecideExtension(selectedProject.id, { approved: true, cycleId: cycle.id })}
+                                  >
+                                    Schválit
+                                  </button>
+                                  <button
+                                    className="secondary-action"
+                                    type="button"
+                                    disabled={props.decidingExtension}
+                                    onClick={() => props.onDecideExtension(selectedProject.id, { approved: false, cycleId: cycle.id })}
+                                  >
+                                    Zamítnout
+                                  </button>
+                                </div>
+                              ) : null}
+                            </div>
+                          ) : null}
+                        </div>
+                      </details>
                     );
                   })}
                 </div>
-                {latestCycle.extensionProposal ? (
-                  <div className="prompt-response-panel">
-                    <div className="prompt-response-header">
-                      <strong>Dalsi navrzene rozsireni</strong>
-                      <span>{latestCycle.status}</span>
-                    </div>
-                    <div className="prompt-response-body">
-                      <div className="prompt-response-block">
-                        <pre>{latestCycle.extensionProposal}</pre>
-                      </div>
-                    </div>
-                    <div className="actions">
-                      <button
-                        className="primary-action"
-                        type="button"
-                        disabled={props.decidingExtension}
-                        onClick={() => props.onDecideExtension(selectedProject.id, { approved: true })}
-                      >
-                        Schvalit
-                      </button>
-                      <button
-                        className="secondary-action"
-                        type="button"
-                        disabled={props.decidingExtension}
-                        onClick={() => props.onDecideExtension(selectedProject.id, { approved: false })}
-                      >
-                        Zamitnout
-                      </button>
-                    </div>
-                  </div>
-                ) : null}
               </>
             ) : null}
           </section>
@@ -2814,6 +3133,10 @@ function ProjectsPanel(props: {
       )}
     </section>
   );
+}
+
+function parseProjectValidationLines(value: string): string[] {
+  return value.split(/\r?\n/).map((item) => item.trim()).filter(Boolean);
 }
 
 function SettingsPanel({

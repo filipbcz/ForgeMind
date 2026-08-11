@@ -32,6 +32,9 @@ export interface ProjectApi {
   configYaml?: string;
   brief?: string;
   projectContract?: ProjectContractApi;
+  currentContractVersionId?: string;
+  currentArchitectureVersionId?: string;
+  validationProfile?: ProjectValidationProfileApi;
   autoCreatePullRequest: boolean;
   autoMergePullRequest: boolean;
   autoCompleteTask: boolean;
@@ -43,19 +46,121 @@ export interface ProjectApi {
   updatedAt: string;
 }
 
+export interface ProjectValidationProfileApi {
+  version: 1;
+  enabled: boolean;
+  dockerComposeFiles: string[];
+  dockerComposeServices: string[];
+  requiredEnvironmentVariables: string[];
+  migrationCommands: string[];
+  readinessCommands: string[];
+  commandTimeoutMinutes: number;
+}
+
 export interface ProjectContractApi {
   version: number;
   sourceBriefHash?: string;
+  sourceBriefSnapshot?: string;
   summary: string;
   invariants: string[];
   prohibitedSubstitutes: string[];
-  requirements: Array<{
-    id: string;
-    title: string;
-    description: string;
-    acceptanceCriteria: string[];
-  }>;
+  requirements: ProjectContractRequirementApi[];
   releaseCriteria: string[];
+}
+
+export interface ProjectContractRequirementApi {
+  id: string;
+  title: string;
+  description: string;
+  acceptanceCriteria: string[];
+  briefReferences?: string[];
+  status?: 'active' | 'superseded' | 'removed';
+  introducedInVersion?: number;
+  lastChangedInVersion?: number;
+  supersededByRequirementId?: string;
+  lifecycleReason?: string;
+}
+
+export interface ProjectContractDeltaApi {
+  baseVersion: number;
+  summary?: string;
+  addRequirements: ProjectContractRequirementApi[];
+  updateRequirements: Array<Partial<ProjectContractRequirementApi> & { id: string; rationale: string }>;
+  supersedeRequirements: Array<{ id: string; replacement: ProjectContractRequirementApi; rationale: string }>;
+  removeRequirements: Array<{ id: string; rationale: string }>;
+  invariantChanges: ProjectContractCollectionDeltaApi;
+  prohibitedSubstituteChanges: ProjectContractCollectionDeltaApi;
+  releaseCriteriaChanges: ProjectContractCollectionDeltaApi;
+  migrationImpacts: string[];
+  compatibilityImpacts: string[];
+}
+
+export interface ProjectContractCollectionDeltaApi {
+  add: string[];
+  remove: Array<{ value: string; rationale: string }>;
+}
+
+export interface ProjectContractVersionApi {
+  id: string;
+  projectId: string;
+  specificationVersionId?: string;
+  version: number;
+  contract: ProjectContractApi;
+  contractDelta?: ProjectContractDeltaApi;
+  changeSummary: string;
+  source: 'initial_plan' | 'approved_extension' | 'manual_regeneration';
+  parentVersionId?: string;
+  createdAt: string;
+}
+
+export interface ProjectContractSnapshotApi {
+  projectId: string;
+  current?: ProjectContractVersionApi;
+  versions: ProjectContractVersionApi[];
+}
+
+export interface ProjectArchitectureApi {
+  version: 1;
+  summary: string;
+  modules: Array<{
+    name: string;
+    responsibility: string;
+    paths: string[];
+    publicInterfaces: string[];
+    dependencies: string[];
+  }>;
+  databaseSchemas?: Array<{
+    name: string;
+    technology: string;
+    paths: string[];
+    ownedByModule: string;
+    migrationPaths: string[];
+  }>;
+  decisions: Array<{ id: string; summary: string; rationale: string; taskId?: string; createdAt: string }>;
+  conventions: string[];
+  dependencyRules: string[];
+  knownDebt: string[];
+  validationCommands: string[];
+  updatedAt: string;
+}
+
+export interface ProjectArchitectureVersionApi {
+  id: string;
+  projectId: string;
+  version: number;
+  architecture: ProjectArchitectureApi;
+  changeSummary: string;
+  source: 'initial_plan' | 'approved_extension' | 'task_update' | 'legacy_import';
+  parentVersionId?: string;
+  contractVersionId?: string;
+  sourceTaskId?: string;
+  createdAt: string;
+}
+
+export interface ProjectArchitectureSnapshotApi {
+  projectId: string;
+  current?: ProjectArchitectureVersionApi;
+  versions: ProjectArchitectureVersionApi[];
 }
 
 export type ProjectRoadmapCycleStatus = 'active' | 'verifying' | 'partial' | 'blocked' | 'awaiting_extension_approval' | 'completed';
@@ -82,11 +187,35 @@ export interface ProjectRoadmapCycleApi {
   projectId: string;
   cycleNumber: number;
   objective: string;
+  specificationVersionId?: string;
+  contractVersionId?: string;
+  architectureVersionId?: string;
   extensionProposal?: string;
   status: ProjectRoadmapCycleStatus;
   createdAt: string;
   updatedAt: string;
   completedAt?: string;
+}
+
+export type ProjectSpecificationSourceApi = 'initial_brief' | 'approved_extension' | 'manual_revision';
+
+export interface ProjectSpecificationVersionApi {
+  id: string;
+  projectId: string;
+  version: number;
+  fullSpecification: string;
+  changeSummary: string;
+  source: ProjectSpecificationSourceApi;
+  parentVersionId?: string;
+  sourceCycleId?: string;
+  approvedAt?: string;
+  createdAt: string;
+}
+
+export interface ProjectSpecificationSnapshotApi {
+  projectId: string;
+  current: ProjectSpecificationVersionApi;
+  versions: ProjectSpecificationVersionApi[];
 }
 
 export interface ProjectImplementationStepApi {
@@ -99,6 +228,9 @@ export interface ProjectImplementationStepApi {
   acceptanceCriteria: string[];
   requirementIds: string[];
   deliverables: string[];
+  changeRationale: string;
+  dependsOnStepTitles: string[];
+  validationFocus: Array<'implementation' | 'migration' | 'compatibility' | 'regression'>;
   status: ProjectImplementationStepStatus;
   taskId?: string;
   createdAt: string;
@@ -568,6 +700,7 @@ export interface CreateProjectRequest {
   defaultBranch: string;
   configYaml?: string;
   brief?: string;
+  validationProfile?: ProjectValidationProfileApi;
   autoCreatePullRequest?: boolean;
   autoMergePullRequest?: boolean;
   autoCompleteTask?: boolean;
@@ -589,6 +722,7 @@ export interface UpdateProjectRequest {
   defaultBranch?: string;
   configYaml?: string;
   brief?: string | null;
+  validationProfile?: ProjectValidationProfileApi | null;
   autoCreatePullRequest?: boolean;
   autoMergePullRequest?: boolean;
   autoCompleteTask?: boolean;
@@ -620,6 +754,7 @@ export interface GenerateProjectRoadmapRequest {
 
 export interface DecideProjectRoadmapExtensionRequest {
   approved: boolean;
+  cycleId?: string;
   objectiveOverride?: string;
 }
 

@@ -1,6 +1,7 @@
 export * from './provider.js';
 export * from './review-prompt.js';
 export * from './audit-prompt.js';
+export * from './extension-prompt.js';
 export * from './openai-provider.js';
 export * from './codex-provider.js';
 export * from './github-copilot-provider.js';

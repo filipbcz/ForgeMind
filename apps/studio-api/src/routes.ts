@@ -1,8 +1,8 @@
 import type { FastifyInstance } from 'fastify';
 import { createHash } from 'node:crypto';
 import { z } from 'zod';
-import { createProvider, GitHubCopilotProvider, listCodexModels, listOpenAIModels } from '@forgemind/providers';
-import type { PlanResult } from '@forgemind/providers';
+import { buildProjectExtensionProposalPrompt, CodexExecutionTimeoutError, createProvider, formatProjectExtensionProposal, GitHubCopilotProvider, listCodexModels, listOpenAIModels } from '@forgemind/providers';
+import type { AIProvider, PlanResult, ProviderSessionContext } from '@forgemind/providers';
 import {
   checkGitHubConnection,
   createGitHubBranch,
@@ -19,12 +19,24 @@ import type { AuthService } from './auth.js';
 import { completeCodexOAuthBrowserLogin, readCodexOAuthBrowserLoginStatus, readCodexOAuthStatus, resolveCodexHome, startCodexOAuthBrowserLogin } from './codex-oauth.js';
 import { createTaskDispatchService } from './dispatch.js';
 import { sendBadRequest, sendNotFound } from './http.js';
-import { advanceRoadmapAfterTaskCompletion, buildRoadmapStepTaskPrompt } from '@forgemind/db';
-import type { AIProviderConnectionKind, ForgeMindRepository } from '@forgemind/db';
+import { advanceRoadmapAfterTaskCompletion, buildRoadmapStepTaskPrompt, composeApprovedExtensionSpecification } from '@forgemind/db';
+import type { AIProviderConnectionKind, AIProviderConnectionSecret, ForgeMindRepository } from '@forgemind/db';
 import { parseGitHubWebhookPayload, projectGitHubWebhookEvent, verifyGitHubWebhookSignature } from './webhook.js';
 import type { NotificationService } from './notifications.js';
-import type { ProjectContract, TaskMode } from '@forgemind/core';
+import { activeProjectContractRequirements, applyProjectContractDelta } from '@forgemind/core';
+import type { Project, ProjectArchitectureUpdate, ProjectContract, ProjectContractDelta, TaskMode } from '@forgemind/core';
 import { resolveRuntimeEnvVar } from './runtime-env.js';
+
+const validationProfileSchema = z.object({
+  version: z.literal(1).default(1),
+  enabled: z.boolean().default(false),
+  dockerComposeFiles: z.array(z.string().trim().min(1)).max(8).default([]),
+  dockerComposeServices: z.array(z.string().trim().min(1)).max(32).default([]),
+  requiredEnvironmentVariables: z.array(z.string().trim().regex(/^[A-Z_][A-Z0-9_]*$/)).max(32).default([]),
+  migrationCommands: z.array(z.string().trim().min(1)).max(16).default([]),
+  readinessCommands: z.array(z.string().trim().min(1)).max(16).default([]),
+  commandTimeoutMinutes: z.number().int().min(1).max(60).default(10)
+});
 
 const projectSchema = z.object({
   name: z.string().min(2),
@@ -34,6 +46,7 @@ const projectSchema = z.object({
   defaultBranch: z.string().min(1).default('main'),
   configYaml: z.string().optional(),
   brief: z.string().min(20).optional(),
+  validationProfile: validationProfileSchema.optional(),
   autoCreatePullRequest: z.boolean().optional().default(true),
   autoMergePullRequest: z.boolean().optional().default(false),
   autoCompleteTask: z.boolean().optional().default(false),
@@ -49,6 +62,7 @@ const projectSchema = z.object({
 
 const updateProjectSchema = projectSchema.partial().extend({
   brief: z.string().trim().min(20).nullable().optional(),
+  validationProfile: validationProfileSchema.nullable().optional(),
   autoCreatePullRequest: z.boolean().optional(),
   autoMergePullRequest: z.boolean().optional(),
   autoCompleteTask: z.boolean().optional(),
@@ -104,13 +118,86 @@ const projectContractPlanSchema = z.object({
     id: z.string().trim().regex(/^REQ-[A-Z0-9-]+$/),
     title: z.string().trim().min(1),
     description: z.string().trim().min(1),
-    acceptanceCriteria: z.array(z.string().trim().min(1)).min(1)
+    acceptanceCriteria: z.array(z.string().trim().min(1)).min(1),
+    briefReferences: z.array(z.string().trim().min(1)).default([])
   })).min(1),
   releaseCriteria: z.array(z.string().trim().min(1)).min(1)
 });
 
+const projectContractRequirementDraftSchema = z.object({
+  id: z.string().trim().regex(/^REQ-[A-Z0-9-]+$/),
+  title: z.string().trim().min(1),
+  description: z.string().trim().min(1),
+  acceptanceCriteria: z.array(z.string().trim().min(1)).min(1),
+  briefReferences: z.array(z.string().trim().min(1)).default([])
+});
+
+const projectContractCollectionDeltaSchema = z.object({
+  add: z.array(z.string().trim().min(1)),
+  remove: z.array(z.object({
+    value: z.string().trim().min(1),
+    rationale: z.string().trim().min(1)
+  }))
+});
+
+const projectContractDeltaPlanSchema = z.object({
+  baseVersion: z.number().int().positive(),
+  summary: z.string().trim().min(1).nullable().optional(),
+  addRequirements: z.array(projectContractRequirementDraftSchema),
+  updateRequirements: z.array(z.object({
+    id: z.string().trim().regex(/^REQ-[A-Z0-9-]+$/),
+    title: z.string().trim().min(1).nullable().optional(),
+    description: z.string().trim().min(1).nullable().optional(),
+    acceptanceCriteria: z.array(z.string().trim().min(1)).min(1).nullable().optional(),
+    briefReferences: z.array(z.string().trim().min(1)).nullable().optional(),
+    rationale: z.string().trim().min(1)
+  })),
+  supersedeRequirements: z.array(z.object({
+    id: z.string().trim().regex(/^REQ-[A-Z0-9-]+$/),
+    replacement: projectContractRequirementDraftSchema,
+    rationale: z.string().trim().min(1)
+  })),
+  removeRequirements: z.array(z.object({
+    id: z.string().trim().regex(/^REQ-[A-Z0-9-]+$/),
+    rationale: z.string().trim().min(1)
+  })),
+  invariantChanges: projectContractCollectionDeltaSchema,
+  prohibitedSubstituteChanges: projectContractCollectionDeltaSchema,
+  releaseCriteriaChanges: projectContractCollectionDeltaSchema,
+  migrationImpacts: z.array(z.string().trim().min(1)),
+  compatibilityImpacts: z.array(z.string().trim().min(1))
+});
+
+const architectureUpdatePlanSchema = z.object({
+  summary: z.string().trim().min(1).nullable().optional(),
+  modules: z.array(z.object({
+    name: z.string().trim().min(1),
+    responsibility: z.string().trim().min(1),
+    paths: z.array(z.string().trim().min(1)),
+    publicInterfaces: z.array(z.string().trim().min(1)),
+    dependencies: z.array(z.string().trim().min(1))
+  })),
+  databaseSchemas: z.array(z.object({
+    name: z.string().trim().min(1),
+    technology: z.string().trim().min(1),
+    paths: z.array(z.string().trim().min(1)),
+    ownedByModule: z.string().trim().min(1),
+    migrationPaths: z.array(z.string().trim().min(1))
+  })).default([]),
+  decisions: z.array(z.object({
+    summary: z.string().trim().min(1),
+    rationale: z.string().trim().min(1)
+  })),
+  conventions: z.array(z.string().trim().min(1)),
+  dependencyRules: z.array(z.string().trim().min(1)),
+  knownDebt: z.array(z.string().trim().min(1)),
+  resolvedDebt: z.array(z.string().trim().min(1)),
+  validationCommands: z.array(z.string().trim().min(1))
+});
+
 const roadmapExtensionApprovalSchema = z.object({
   approved: z.boolean(),
+  cycleId: z.string().min(1).optional(),
   objectiveOverride: z.string().min(20).optional()
 });
 
@@ -888,6 +975,7 @@ export function registerRoutes(app: FastifyInstance, repository: ForgeMindReposi
           defaultBranch: githubRepository?.defaultBranch ?? input.defaultBranch,
           configYaml: input.configYaml,
           brief: input.brief,
+          validationProfile: input.validationProfile,
           autoCreatePullRequest: input.autoCreatePullRequest,
           autoMergePullRequest: input.autoMergePullRequest,
           autoCompleteTask: input.autoCompleteTask,
@@ -1030,6 +1118,24 @@ export function registerRoutes(app: FastifyInstance, repository: ForgeMindReposi
     return roadmap ? roadmap : sendNotFound(reply, `Project "${id}" not found`);
   });
 
+  app.get('/api/projects/:id/specifications', async (request, reply) => {
+    const { id } = idParamsSchema.parse(request.params);
+    const specifications = await repository.getProjectSpecifications(id);
+    return specifications ? specifications : sendNotFound(reply, `Project "${id}" not found`);
+  });
+
+  app.get('/api/projects/:id/contracts', async (request, reply) => {
+    const { id } = idParamsSchema.parse(request.params);
+    const contracts = await repository.getProjectContracts(id);
+    return contracts ? contracts : sendNotFound(reply, `Project "${id}" not found`);
+  });
+
+  app.get('/api/projects/:id/architectures', async (request, reply) => {
+    const { id } = idParamsSchema.parse(request.params);
+    const architectures = await repository.getProjectArchitectures(id);
+    return architectures ? architectures : sendNotFound(reply, `Project "${id}" not found`);
+  });
+
   app.post('/api/projects/:id/audit/retry', async (request, reply) => {
     try {
       const { id } = idParamsSchema.parse(request.params);
@@ -1100,13 +1206,35 @@ export function registerRoutes(app: FastifyInstance, repository: ForgeMindReposi
         return reply.code(400).send({ error: 'Project brief is required before generating implementation steps.' });
       }
 
-      const plan = await generateRoadmapPlan(repository, project, objective);
+      const specifications = await repository.getProjectSpecifications(project.id);
+      const currentSpecification = specifications?.current.fullSpecification ?? project.brief ?? objective;
+      const contractHistory = await repository.getProjectContracts(project.id);
+      const planning = await generateRoadmapPlan(repository, project, objective, currentSpecification);
+      let plan = planning.plan;
       const projectContract = toProjectContract(
         plan,
-        buildContractSource(project.brief, objective),
-        (project.projectContract?.version ?? 0) + 1
+        buildContractSource(currentSpecification, objective),
+        (contractHistory?.current?.version ?? 0) + 1
       );
-      const stepBlueprints = toImplementationStepBlueprints(plan, projectContract);
+      const architectureUpdate = toProjectArchitectureUpdate(plan, true);
+      const repairedRoadmap = await buildImplementationStepBlueprintsWithRepairs({
+        provider: planning.provider,
+        session: planning.session,
+        plan,
+        repairInput: {
+          taskId: project.id,
+          objective,
+          allowedRequirementIds: activeProjectContractRequirements(projectContract).map((requirement) => requirement.id),
+          completedStepTitles: planning.completedSteps,
+          migrationImpacts: [],
+          compatibilityImpacts: []
+        },
+        validate: (candidate) => toImplementationStepBlueprints(candidate, projectContract, undefined, {
+          completedStepTitles: planning.completedSteps
+        })
+      });
+      plan = repairedRoadmap.plan;
+      const stepBlueprints = repairedRoadmap.blueprints;
       if (stepBlueprints.length === 0) {
         throw new Error('AI provider did not return any implementation steps.');
       }
@@ -1115,12 +1243,14 @@ export function registerRoutes(app: FastifyInstance, repository: ForgeMindReposi
         projectId: project.id,
         objective,
         projectContract,
+        architectureUpdate,
         steps: stepBlueprints
       });
 
       const firstStep = findFirstPendingStepForLatestCycle(roadmap);
       if (firstStep) {
-        await createAndStartRoadmapTask(repository, dispatcher, { ...project, projectContract }, firstStep, objective);
+        const updatedProject = await repository.getProject(project.id);
+        await createAndStartRoadmapTask(repository, dispatcher, updatedProject ?? { ...project, projectContract }, firstStep, objective);
       }
 
       return reply.code(201).send((await repository.getProjectRoadmap(project.id))!);
@@ -1143,7 +1273,9 @@ export function registerRoutes(app: FastifyInstance, repository: ForgeMindReposi
         return sendNotFound(reply, `Project "${id}" not found`);
       }
 
-      const cycle = [...roadmap.cycles].sort((left, right) => right.cycleNumber - left.cycleNumber)[0];
+      const cycle = input.cycleId
+        ? roadmap.cycles.find((candidate) => candidate.id === input.cycleId)
+        : [...roadmap.cycles].sort((left, right) => right.cycleNumber - left.cycleNumber)[0];
       if (!cycle) {
         return reply.code(400).send({ error: 'No roadmap cycle exists for this project.' });
       }
@@ -1153,18 +1285,52 @@ export function registerRoutes(app: FastifyInstance, repository: ForgeMindReposi
         return (await repository.getProjectRoadmap(id))!;
       }
 
+      const specifications = await repository.getProjectSpecifications(project.id);
+      if (specifications?.versions.some((version) => version.sourceCycleId === cycle.id)) {
+        return roadmap;
+      }
+      if (cycle.status !== 'awaiting_extension_approval') {
+        return reply.code(409).send({ error: 'The selected roadmap cycle is not awaiting extension approval.' });
+      }
+
       const objective = input.objectiveOverride?.trim() || cycle.extensionProposal?.trim();
       if (!objective) {
         return reply.code(400).send({ error: 'There is no approved extension proposal to expand into implementation steps.' });
       }
 
-      const plan = await generateRoadmapPlan(repository, project, objective);
-      const projectContract = toProjectContract(
+      const currentSpecification = specifications?.current.fullSpecification ?? project.brief ?? project.name;
+      const nextSpecification = composeApprovedExtensionSpecification(currentSpecification, objective);
+      if (!project.projectContract) {
+        throw new Error('A current project contract is required before an extension can be approved. Regenerate the roadmap first.');
+      }
+      const planning = await generateRoadmapPlan(repository, project, objective, nextSpecification, project.projectContract);
+      let plan = planning.plan;
+      const contractDelta = toProjectContractDelta(plan);
+      const appliedContract = applyProjectContractDelta(project.projectContract, contractDelta);
+      const projectContract = withProjectContractSource(appliedContract.contract, nextSpecification);
+      const architectureUpdate = toProjectArchitectureUpdate(plan);
+      const roadmapValidationOptions = {
+        completedStepTitles: planning.completedSteps,
+        migrationImpacts: contractDelta.migrationImpacts,
+        compatibilityImpacts: contractDelta.compatibilityImpacts,
+        extension: true
+      };
+      const repairedRoadmap = await buildImplementationStepBlueprintsWithRepairs({
+        provider: planning.provider,
+        session: planning.session,
         plan,
-        buildContractSource(project.brief, objective),
-        (project.projectContract?.version ?? 0) + 1
-      );
-      const stepBlueprints = toImplementationStepBlueprints(plan, projectContract);
+        repairInput: {
+          taskId: project.id,
+          objective,
+          allowedRequirementIds: appliedContract.touchedRequirementIds,
+          completedStepTitles: planning.completedSteps,
+          migrationImpacts: contractDelta.migrationImpacts,
+          compatibilityImpacts: contractDelta.compatibilityImpacts
+        },
+        validate: (candidate) => toImplementationStepBlueprints(candidate, projectContract, appliedContract.touchedRequirementIds, roadmapValidationOptions)
+      });
+      plan = repairedRoadmap.plan;
+      const stepBlueprints = repairedRoadmap.blueprints;
       if (stepBlueprints.length === 0) {
         throw new Error('AI provider did not return any implementation steps.');
       }
@@ -1173,12 +1339,20 @@ export function registerRoutes(app: FastifyInstance, repository: ForgeMindReposi
         projectId: project.id,
         objective,
         projectContract,
+        contractDelta,
+        contractChangeSummary: contractDelta.summary ?? objective,
+        architectureUpdate,
+        approvedExtension: {
+          sourceCycleId: cycle.id,
+          changeSummary: `Approved extension for roadmap cycle ${cycle.cycleNumber + 1}.`
+        },
         steps: stepBlueprints
       });
 
       const firstStep = findFirstPendingStepForLatestCycle(nextRoadmap);
       if (firstStep) {
-        await createAndStartRoadmapTask(repository, dispatcher, { ...project, projectContract }, firstStep, objective);
+        const updatedProject = await repository.getProject(project.id);
+        await createAndStartRoadmapTask(repository, dispatcher, updatedProject ?? { ...project, projectContract }, firstStep, objective);
       }
 
       return (await repository.getProjectRoadmap(id))!;
@@ -1258,6 +1432,7 @@ export function registerRoutes(app: FastifyInstance, repository: ForgeMindReposi
     try {
       const { id } = idParamsSchema.parse(request.params);
       const task = await repository.transitionTask(id, 'completed', { source: 'user' });
+      await repository.recordCompletedTaskProjectMemory({ taskId: id });
       const roadmapAdvance = await advanceRoadmapAfterTaskCompletion(repository, id);
       if (roadmapAdvance.completedCycle && roadmapAdvance.project) {
         const extensionProposal = await generateExtensionProposal(
@@ -1585,9 +1760,11 @@ function buildTaskPrompt(input: z.infer<typeof createTaskSchema>): string {
 
 async function generateRoadmapPlan(
   repository: ForgeMindRepository,
-  project: { id: string; name: string; brief?: string; aiProviderConnectionId?: string },
-  objective: string
-) {
+  project: Project,
+  objective: string,
+  currentSpecification?: string,
+  currentContract?: ProjectContract
+): Promise<{ plan: PlanResult; provider: AIProvider; session: ProviderSessionContext; completedSteps: string[] }> {
   const connection = project.aiProviderConnectionId
     ? await readAIProviderConnectionSecretById(repository, project.aiProviderConnectionId)
     : await readAIProviderConnectionSecret(repository);
@@ -1601,35 +1778,194 @@ async function generateRoadmapPlan(
     model: connection.model,
     codexHome: connection.codexHome
   });
+  let session = createProjectPlanningSession(repository, project, connection);
   const existingRoadmap = await repository.getProjectRoadmap(project.id);
   const completedSteps = existingRoadmap?.steps.filter((step) => step.status === 'completed').map((step) => step.title) ?? [];
-  return provider.plan({
+  const planInput = {
     taskId: project.id,
     title: `Project roadmap for ${project.name}`,
-    prompt: [
-      `Generate an ordered implementation roadmap for the following project objective.`,
-      '',
-      `Project: ${project.name}`,
-      `Objective: ${objective}`,
-      project.brief?.trim() && project.brief.trim() !== objective.trim()
-        ? `Existing brief context: ${project.brief.trim()}`
+    prompt: buildRoadmapPlanningPrompt({
+      project: currentSpecification ? { ...project, brief: currentSpecification } : project,
+      objective,
+      completedSteps,
+      continuation: Boolean(session.id),
+      currentContract
+    }),
+    maxRuntimeMs: roadmapPlanningMaxRuntimeMs()
+  };
+  let plan: PlanResult;
+  try {
+    plan = await provider.plan({ ...planInput, session });
+  } catch (error) {
+    if (!(error instanceof CodexExecutionTimeoutError) || !session.id) throw error;
+    session = createProjectPlanningSession(repository, project, connection, true);
+    plan = await provider.plan({ ...planInput, session });
+  }
+  return { plan, provider, session, completedSteps };
+}
+
+function roadmapPlanningMaxRuntimeMs(): number {
+  const configured = Number(process.env.FORGEMIND_ROADMAP_PLAN_MAX_RUNTIME_MS);
+  return Number.isFinite(configured) && configured >= 60_000
+    ? Math.min(configured, 3_600_000)
+    : 15 * 60_000;
+}
+
+export async function repairRoadmapOnce(
+  provider: AIProvider,
+  session: ProviderSessionContext,
+  plan: PlanResult,
+  input: {
+    taskId: string;
+    objective: string;
+    validationError: string;
+    allowedRequirementIds: string[];
+    completedStepTitles: string[];
+    migrationImpacts: string[];
+    compatibilityImpacts: string[];
+  }
+): Promise<PlanResult> {
+  if (!provider.repairRoadmap) {
+    throw new Error(`Roadmap validation failed and provider "${provider.kind}" does not support targeted repair: ${input.validationError}`);
+  }
+  const repaired = await provider.repairRoadmap({
+    ...input,
+    implementationSteps: plan.implementationSteps ?? [],
+    session
+  });
+  return { ...plan, implementationSteps: repaired.implementationSteps };
+}
+
+export async function buildImplementationStepBlueprintsWithRepairs<T>(input: {
+  provider: AIProvider;
+  session: ProviderSessionContext;
+  plan: PlanResult;
+  repairInput: Omit<Parameters<typeof repairRoadmapOnce>[3], 'validationError'>;
+  validate: (plan: PlanResult) => T;
+  maxRepairs?: number;
+}): Promise<{ plan: PlanResult; blueprints: T }> {
+  let plan = input.plan;
+  const maxRepairs = Math.max(0, input.maxRepairs ?? 2);
+  for (let repairAttempt = 0; ; repairAttempt += 1) {
+    try {
+      return { plan, blueprints: input.validate(plan) };
+    } catch (error) {
+      if (repairAttempt >= maxRepairs) throw error;
+      plan = await repairRoadmapOnce(input.provider, input.session, plan, {
+        ...input.repairInput,
+        validationError: errorMessage(error)
+      });
+    }
+  }
+}
+
+function errorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
+
+export function createProjectPlanningSession(
+  repository: Pick<ForgeMindRepository, 'updateProjectPlanningSession'>,
+  project: Project,
+  connection: AIProviderConnectionSecret,
+  forceFresh = false
+): ProviderSessionContext {
+  const canResume = !forceFresh
+    && project.planningSessionProvider === connection.provider
+    && project.planningSessionModel === connection.model
+    && project.planningSessionConnectionId === connection.id;
+  return {
+    id: canResume ? project.planningSessionId : undefined,
+    provider: connection.provider,
+    model: connection.model,
+    onUpdate: async (update) => {
+      await repository.updateProjectPlanningSession({
+        projectId: project.id,
+        sessionId: update.id,
+        provider: update.provider,
+        model: update.model,
+        connectionId: connection.id
+      });
+    }
+  };
+}
+
+export function buildRoadmapPlanningPrompt(input: {
+  project: Pick<Project, 'name' | 'brief'>;
+  objective: string;
+  completedSteps: string[];
+  continuation: boolean;
+  currentContract?: ProjectContract;
+}): string {
+  if (input.currentContract) {
+    return [
+      input.continuation
+        ? 'Continue the existing project planning session. The persisted contract below is authoritative even if session memory differs.'
+        : 'Extend the persisted project contract below. It is the authoritative base contract.',
+      `Generate an ordered implementation roadmap for this objective: ${input.objective}`,
+      `Current contract (compact JSON):\n${JSON.stringify(compactProjectContract(input.currentContract))}`,
+      input.completedSteps.length > 0
+        ? `Do not recreate these completed steps:\n${input.completedSteps.map((step) => `- ${step}`).join('\n')}`
         : undefined,
-      completedSteps.length > 0 ? `Already completed implementation steps:\n${completedSteps.map((step) => `- ${step}`).join('\n')}` : undefined,
+      `Return projectContract as null and contractDelta with baseVersion ${input.currentContract.version}.`,
+      'The delta must list every requirement addition, update, supersession, or removal explicitly. Every update, supersession, and removal requires a concrete rationale.',
+      'Preserve all unchanged active requirements. Include migrationImpacts and compatibilityImpacts, using empty arrays when there are none.',
+      'Return only implementationSteps needed to realize the delta. Every added, updated, superseded, or removed requirement must be referenced by at least one returned step.',
+      'Every step must include a concrete changeRationale, dependsOnStepTitles referencing only earlier returned steps, and validationFocus. Include regression validation and add migration or compatibility validation when those impacts are declared.',
+      'Keep each implementation step focused: at most 3 requirementIds, 3 deliverables, 5 acceptanceCriteria, and 5 inScope items. Split broader work into additional ordered steps.',
+      'Return a compact architectureUpdate containing only architecture changes caused by this extension.'
+    ].filter(Boolean).join('\n\n');
+  }
+
+  return [
+      input.continuation
+        ? 'Generate a fresh complete project contract and roadmap. Persisted project state is authoritative; do not rely on an older session contract.'
+        : 'Generate an ordered implementation roadmap for the following project objective.',
+      '',
+      `Project: ${input.project.name}`,
+      `Objective: ${input.objective}`,
+      !input.continuation && input.project.brief?.trim() && input.project.brief.trim() !== input.objective.trim()
+        ? `Existing brief context: ${input.project.brief.trim()}`
+        : undefined,
+      input.completedSteps.length > 0 ? `Already completed implementation steps:\n${input.completedSteps.map((step) => `- ${step}`).join('\n')}` : undefined,
       '',
       'Return concrete implementation steps that can be executed one by one as individual engineering tasks in implementationSteps.',
       'Also return projectContract with version 1, summary, global invariants, prohibited substitutes, atomic requirements, and release criteria.',
+      'Return contractDelta as null because this is a complete contract generation.',
+      'For every projectContract requirement, include briefReferences with short phrases or section names that identify the source obligation in the supplied brief.',
+      'Return architectureUpdate with the intended modules, their paths and public interfaces, allowed dependencies, conventions, decisions, known debt, and lightweight executable architecture validation commands that remain valid after every implementation step.',
       'Every requirement id must use REQ-UPPERCASE format and describe one independently verifiable product capability, not an implementation layer.',
       'Each implementationSteps item must contain title, a distinct implementation-focused description, acceptanceCriteria, inScope, outOfScope, requirementIds, and concrete deliverables.',
+      'Each implementationSteps item must also contain changeRationale, dependsOnStepTitles, and validationFocus. Dependencies may reference only earlier step titles. validationFocus uses implementation, migration, compatibility, or regression.',
       'Each implementation step must fit one focused pull request and cover at most three contract requirements. Split broad epics into multiple steps.',
+      'Each implementation step may contain at most 3 deliverables, 5 acceptanceCriteria, and 5 inScope items.',
       'Every contract requirement must be referenced by at least one implementation step. Placeholder data, declarations, documentation, interfaces, or pass-valued evidence do not satisfy production capabilities unless explicitly required.',
       'Give every step only its own verifiable acceptance criteria. Do not copy project-wide acceptance criteria to every step.',
       'Steps must not overlap. Do not include work assigned to a later step, and do not recreate already completed capabilities.',
       'A documentation or scope-definition step must change documentation only and must not implement application code.',
       'Order dependencies explicitly so each task starts from the repository state produced by earlier tasks.'
-    ]
-      .filter(Boolean)
-      .join('\n')
-  });
+    ].filter(Boolean).join('\n');
+}
+
+function compactProjectContract(contract: ProjectContract): ProjectContract {
+  return {
+    version: contract.version,
+    summary: contract.summary,
+    invariants: contract.invariants,
+    prohibitedSubstitutes: contract.prohibitedSubstitutes,
+    requirements: contract.requirements,
+    releaseCriteria: contract.releaseCriteria
+  };
+}
+
+export function toProjectArchitectureUpdate(plan: PlanResult, requireModule = false): ProjectArchitectureUpdate {
+  const parsed = architectureUpdatePlanSchema.parse(plan.architectureUpdate);
+  if (requireModule && parsed.modules.length === 0) {
+    throw new Error('AI provider did not return an initial project architecture module.');
+  }
+  return {
+    ...parsed,
+    summary: parsed.summary ?? undefined
+  };
 }
 
 export function toProjectContract(plan: PlanResult, source = '', version?: number): ProjectContract {
@@ -1638,10 +1974,44 @@ export function toProjectContract(plan: PlanResult, source = '', version?: numbe
   if (new Set(ids).size !== ids.length) {
     throw new Error('AI provider returned duplicate project contract requirement ids.');
   }
+  const sourceBriefSnapshot = normalizeContractSource(source);
+  const contractVersion = version ?? contract.version;
   return {
     ...contract,
-    version: version ?? contract.version,
-    sourceBriefHash: createHash('sha256').update(normalizeContractSource(source)).digest('hex')
+    version: contractVersion,
+    requirements: contract.requirements.map((requirement) => ({
+      ...requirement,
+      status: 'active',
+      introducedInVersion: contractVersion,
+      lastChangedInVersion: contractVersion
+    })),
+    sourceBriefHash: createHash('sha256').update(sourceBriefSnapshot).digest('hex'),
+    sourceBriefSnapshot
+  };
+}
+
+export function toProjectContractDelta(plan: PlanResult): ProjectContractDelta {
+  const parsed = projectContractDeltaPlanSchema.parse(plan.contractDelta);
+  return {
+    ...parsed,
+    summary: parsed.summary ?? undefined,
+    updateRequirements: parsed.updateRequirements.map((requirement) => ({
+      id: requirement.id,
+      title: requirement.title ?? undefined,
+      description: requirement.description ?? undefined,
+      acceptanceCriteria: requirement.acceptanceCriteria ?? undefined,
+      briefReferences: requirement.briefReferences ?? undefined,
+      rationale: requirement.rationale
+    }))
+  };
+}
+
+function withProjectContractSource(contract: ProjectContract, source: string): ProjectContract {
+  const sourceBriefSnapshot = normalizeContractSource(source);
+  return {
+    ...contract,
+    sourceBriefHash: createHash('sha256').update(sourceBriefSnapshot).digest('hex'),
+    sourceBriefSnapshot
   };
 }
 
@@ -1655,12 +2025,31 @@ function normalizeContractSource(value: string): string {
 
 export function toImplementationStepBlueprints(
   plan: PlanResult,
-  projectContract: ProjectContract
-): Array<{ title: string; description: string; acceptanceCriteria: string[]; requirementIds: string[]; deliverables: string[] }> {
+  projectContract: ProjectContract,
+  requiredRequirementIds = activeProjectContractRequirements(projectContract).map((requirement) => requirement.id),
+  options: {
+    completedStepTitles?: string[];
+    migrationImpacts?: string[];
+    compatibilityImpacts?: string[];
+    extension?: boolean;
+  } = {}
+): Array<{
+  title: string;
+  description: string;
+  acceptanceCriteria: string[];
+  requirementIds: string[];
+  deliverables: string[];
+  changeRationale: string;
+  dependsOnStepTitles: string[];
+  validationFocus: Array<'implementation' | 'migration' | 'compatibility' | 'regression'>;
+}> {
   if (!Array.isArray(plan.implementationSteps) || plan.implementationSteps.length === 0) {
     throw new Error('AI provider did not return structured implementationSteps for the project roadmap.');
   }
 
+  const knownTitles = new Set<string>();
+  const completedTitles = new Set((options.completedStepTitles ?? []).map(normalizeRoadmapIdentity));
+  const allowedRequirementIds = new Set(requiredRequirementIds);
   const blueprints = plan.implementationSteps.map((step, index) => {
     const title = step.title.trim();
     const description = step.description.trim();
@@ -1669,18 +2058,48 @@ export function toImplementationStepBlueprints(
     const outOfScope = step.outOfScope.map((item) => item.trim()).filter(Boolean);
     const requirementIds = step.requirementIds.map((item) => item.trim()).filter(Boolean);
     const deliverables = step.deliverables.map((item) => item.trim()).filter(Boolean);
+    const changeRationale = step.changeRationale?.trim();
+    const dependsOnStepTitles = step.dependsOnStepTitles?.map((item) => item.trim()).filter(Boolean) ?? [];
+    const validationFocus = Array.from(new Set(step.validationFocus ?? []));
 
-    if (!title || !description || acceptanceCriteria.length === 0 || inScope.length === 0 || requirementIds.length === 0 || deliverables.length === 0) {
+    if (!title || !description || acceptanceCriteria.length === 0 || inScope.length === 0 || requirementIds.length === 0 || deliverables.length === 0 || !changeRationale) {
       throw new Error(`AI provider returned an incomplete implementation step at position ${index + 1}.`);
     }
     if (requirementIds.length > 3 || deliverables.length > 3 || acceptanceCriteria.length > 5 || inScope.length > 5) {
-      throw new Error(`AI provider returned an oversized implementation step at position ${index + 1}; split it into focused work items.`);
+      const counts = [
+        `requirementIds=${requirementIds.length}/3`,
+        `deliverables=${deliverables.length}/3`,
+        `acceptanceCriteria=${acceptanceCriteria.length}/5`,
+        `inScope=${inScope.length}/5`
+      ].join(', ');
+      throw new Error(`AI provider returned an oversized implementation step at position ${index + 1} (${counts}); split it into focused work items and preserve complete requirement coverage.`);
     }
     const knownRequirementIds = new Set(projectContract.requirements.map((requirement) => requirement.id));
     const unknownRequirementId = requirementIds.find((id) => !knownRequirementIds.has(id));
     if (unknownRequirementId) {
       throw new Error(`Implementation step ${index + 1} references unknown requirement "${unknownRequirementId}".`);
     }
+    const titleIdentity = normalizeRoadmapIdentity(title);
+    if (knownTitles.has(titleIdentity)) {
+      throw new Error(`Roadmap contains duplicate implementation step title "${title}".`);
+    }
+    if (completedTitles.has(titleIdentity)) {
+      throw new Error(`Roadmap recreates completed implementation step "${title}".`);
+    }
+    const invalidDependency = dependsOnStepTitles.find((dependency) => !knownTitles.has(normalizeRoadmapIdentity(dependency)));
+    if (invalidDependency) {
+      throw new Error(`Implementation step "${title}" depends on unknown or later step "${invalidDependency}".`);
+    }
+    if (options.extension) {
+      const scopeCrossingRequirement = requirementIds.find((id) => !allowedRequirementIds.has(id));
+      if (scopeCrossingRequirement) {
+        throw new Error(`Extension step "${title}" crosses the contract delta scope via requirement "${scopeCrossingRequirement}".`);
+      }
+    }
+    if (!validationFocus.includes('implementation')) {
+      throw new Error(`Implementation step "${title}" must include implementation validation focus.`);
+    }
+    knownTitles.add(titleIdentity);
 
     return {
       title,
@@ -1693,17 +2112,33 @@ export function toImplementationStepBlueprints(
       ].join('\n'),
       acceptanceCriteria,
       requirementIds,
-      deliverables
+      deliverables,
+      changeRationale,
+      dependsOnStepTitles,
+      validationFocus
     };
   });
 
   const coveredRequirementIds = new Set(plan.implementationSteps.flatMap((step) => step.requirementIds));
-  const missingRequirement = projectContract.requirements.find((requirement) => !coveredRequirementIds.has(requirement.id));
-  if (missingRequirement) {
-    throw new Error(`Roadmap does not cover project contract requirement "${missingRequirement.id}".`);
+  const missingRequirementId = requiredRequirementIds.find((requirementId) => !coveredRequirementIds.has(requirementId));
+  if (missingRequirementId) {
+    throw new Error(`Roadmap does not cover project contract requirement "${missingRequirementId}".`);
+  }
+  if (options.extension && !blueprints.some((step) => step.validationFocus.includes('regression'))) {
+    throw new Error('Extension roadmap must include regression validation focus.');
+  }
+  if ((options.migrationImpacts?.length ?? 0) > 0 && !blueprints.some((step) => step.validationFocus.includes('migration'))) {
+    throw new Error('Roadmap declares migration impacts but has no migration validation focus.');
+  }
+  if ((options.compatibilityImpacts?.length ?? 0) > 0 && !blueprints.some((step) => step.validationFocus.includes('compatibility'))) {
+    throw new Error('Roadmap declares compatibility impacts but has no compatibility validation focus.');
   }
 
   return blueprints;
+}
+
+function normalizeRoadmapIdentity(value: string): string {
+  return value.replace(/\s+/g, ' ').trim().toLowerCase();
 }
 
 export function findFirstPendingStepForLatestCycle<T extends {
@@ -1725,7 +2160,7 @@ export function findFirstPendingStepForLatestCycle<T extends {
 async function createAndStartRoadmapTask(
   repository: ForgeMindRepository,
   dispatcher: ReturnType<typeof createTaskDispatchService>,
-  project: { id: string; name: string; defaultTaskMode?: TaskMode; projectContract?: ProjectContract },
+  project: { id: string; name: string; defaultTaskMode?: TaskMode; projectContract?: ProjectContract; currentArchitectureVersionId?: string },
   step: {
     id: string;
     cycleId: string;
@@ -1742,6 +2177,7 @@ async function createAndStartRoadmapTask(
     .filter((candidate) => candidate.cycleId === step.cycleId)
     .sort((left, right) => left.sequenceNumber - right.sequenceNumber) ?? [];
   const currentIndex = cycleSteps.findIndex((candidate) => candidate.id === step.id);
+  const cycleArchitectureVersionId = roadmap?.cycles.find((cycle) => cycle.id === step.cycleId)?.architectureVersionId;
   const completedSteps = cycleSteps.slice(0, Math.max(0, currentIndex)).filter((candidate) => candidate.status === 'completed').map((candidate) => candidate.title);
   const futureSteps = currentIndex >= 0 ? cycleSteps.slice(currentIndex + 1).map((candidate) => candidate.title) : [];
   const task = await repository.createTask({
@@ -1755,13 +2191,17 @@ async function createAndStartRoadmapTask(
       acceptanceCriteria: step.acceptanceCriteria,
       requirementIds: step.requirementIds,
       deliverables: step.deliverables,
+      changeRationale: step.changeRationale,
+      dependsOnStepTitles: step.dependsOnStepTitles,
+      validationFocus: step.validationFocus,
       projectContract: project.projectContract,
       completedSteps,
       futureSteps
     }),
     mode: resolveTaskMode(undefined, project.defaultTaskMode),
     maxIterations: 10,
-    maxBudgetUsd: 5
+    maxBudgetUsd: 5,
+    architectureVersionId: project.currentArchitectureVersionId ?? cycleArchitectureVersionId
   });
 
   await repository.assignTaskToImplementationStep(step.id, task.id, 'running');
@@ -1781,20 +2221,41 @@ export { buildRoadmapStepTaskPrompt };
 
 async function generateExtensionProposal(
   repository: ForgeMindRepository,
-  project: { id: string; name: string; brief?: string },
+  project: Project,
   completedObjective: string
 ): Promise<string> {
-  const plan = await generateRoadmapPlan(
-    repository,
-    project,
-    [
-      `The previous roadmap objective has been completed: ${completedObjective}`,
-      'Propose the single next most valuable extension for this project.',
-      'Focus on a concrete follow-up objective, not on implementation steps.'
-    ].join('\n')
-  );
+  const connection = project.aiProviderConnectionId
+    ? await readAIProviderConnectionSecretById(repository, project.aiProviderConnectionId)
+    : await readAIProviderConnectionSecret(repository);
+  if (!connection) {
+    throw new Error('Connect an AI provider before generating a project extension proposal.');
+  }
 
-  return plan.summary.trim() || plan.steps[0]?.trim() || 'Navrhnout další rozšíření projektu.';
+  const provider = createProvider(connection.provider, {
+    apiKey: connection.apiKey,
+    authMode: connection.authMode,
+    model: connection.model,
+    codexHome: connection.codexHome
+  });
+  const session = createProjectPlanningSession(repository, project, connection);
+  const contract = project.projectContract;
+  const specifications = await repository.getProjectSpecifications(project.id);
+  const plan = await provider.plan({
+    taskId: `project-extension:${project.id}`,
+    title: `Next extension for ${project.name}`,
+    prompt: buildProjectExtensionProposalPrompt({
+      projectName: project.name,
+      completedObjective,
+      contractVersion: contract?.version,
+      contractSummary: contract?.summary,
+      completedCapabilities: contract?.requirements.map((requirement) => requirement.title),
+      projectBrief: specifications?.current.fullSpecification ?? project.brief,
+      continuation: Boolean(session.id)
+    }),
+    session
+  });
+
+  return formatProjectExtensionProposal(plan);
 }
 
 async function resolveProjectGitHubRepository(

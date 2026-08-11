@@ -87,7 +87,7 @@ describe('worker workflow with OpenAI provider', () => {
     expect(result.validation.passed).toBe(true);
     expect(result.summary).toContain('Review');
     expect(result.workspacePath).toContain(workspaceRoot);
-    await expect(access(join(workspaceRoot, demoTask.id, 'AGENTS.md'))).resolves.toBeUndefined();
+    await expect(access(join(workspaceRoot, demoTask.id, 'AGENTS.md'))).rejects.toThrow();
     await expect(access(join(workspaceRoot, demoTask.id, 'OPENAI_IMPLEMENTATION.md'))).resolves.toBeUndefined();
   }, 15000);
 });

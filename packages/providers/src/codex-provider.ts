@@ -6,6 +6,7 @@ import { join } from 'node:path';
 import { createInterface } from 'node:readline';
 import { promisify } from 'node:util';
 import type { ProviderKind } from '@forgemind/core';
+import { createWorkspaceEnvironment } from '@forgemind/shared';
 import type {
   AIProvider,
   CapabilityAuditInput,
@@ -18,7 +19,10 @@ import type {
   PlanResult,
   ReleaseAuditInput,
   ReleaseAuditResult,
+  RoadmapRepairInput,
+  RoadmapRepairResult,
   ProviderActivityHandler,
+  ProviderSessionContext,
   ProviderUsageMeasurement,
   ReviewInput,
   ReviewResult
@@ -26,7 +30,7 @@ import type {
 import { normalizeValidationChecks } from './provider.js';
 import { emitCapturedUsage, normalizeTokenBreakdown } from './provider-usage.js';
 import { buildReviewPrompt } from './review-prompt.js';
-import { buildCapabilityAuditPrompt, buildReleaseAuditPrompt, normalizeCapabilityAuditResult, normalizeReleaseAuditResult, parseCapabilityAuditContent } from './audit-prompt.js';
+import { buildCapabilityAuditPrompt, buildReleaseAuditPrompt, normalizeAuditContentWithSingleRepair, normalizeCapabilityAuditResult, normalizeReleaseAuditResult } from './audit-prompt.js';
 import type { ProviderRuntimeConfig } from './index.js';
 import type { ProviderModelOption } from './openai-provider.js';
 
@@ -65,7 +69,7 @@ export async function listCodexModels(input: {
 }): Promise<ProviderModelOption[]> {
   const child = spawn(input.binary ?? resolveCodexBinary(), ['app-server'], {
     cwd: input.codexHome,
-    env: { ...process.env, CODEX_HOME: input.codexHome },
+    env: { ...createWorkspaceEnvironment(), CODEX_HOME: input.codexHome },
     stdio: ['pipe', 'pipe', 'pipe'],
     windowsHide: true
   });
@@ -153,10 +157,11 @@ function validationChecksJsonSchema(): Record<string, unknown> {
     items: {
       type: 'object',
       additionalProperties: false,
-      required: ['kind', 'command', 'criterion', 'rationale'],
+      required: ['kind', 'command', 'category', 'criterion', 'rationale'],
       properties: {
         kind: { type: 'string', enum: ['command'] },
         command: { type: 'string' },
+        category: { type: 'string', enum: ['setup', 'build', 'database', 'api', 'browser', 'smoke'] },
         criterion: { type: ['string', 'null'] },
         rationale: { type: ['string', 'null'] }
       }
@@ -179,12 +184,13 @@ function projectContractJsonSchema(): Record<string, unknown> {
         items: {
           type: 'object',
           additionalProperties: false,
-          required: ['id', 'title', 'description', 'acceptanceCriteria'],
+          required: ['id', 'title', 'description', 'acceptanceCriteria', 'briefReferences'],
           properties: {
             id: { type: 'string' },
             title: { type: 'string' },
             description: { type: 'string' },
-            acceptanceCriteria: { type: 'array', items: { type: 'string' } }
+            acceptanceCriteria: { type: 'array', items: { type: 'string' } },
+            briefReferences: { type: 'array', items: { type: 'string' } }
           }
         }
       },
@@ -193,19 +199,215 @@ function projectContractJsonSchema(): Record<string, unknown> {
   };
 }
 
-function capabilityAuditJsonSchema(): Record<string, unknown> {
-  const gapWorkItem = {
+function projectContractRequirementDraftJsonSchema(): Record<string, unknown> {
+  return {
     type: 'object',
     additionalProperties: false,
-    required: ['title', 'description', 'acceptanceCriteria', 'inScope', 'outOfScope', 'requirementIds', 'deliverables'],
+    required: ['id', 'title', 'description', 'acceptanceCriteria', 'briefReferences'],
     properties: {
+      id: { type: 'string' },
       title: { type: 'string' },
       description: { type: 'string' },
       acceptanceCriteria: { type: 'array', items: { type: 'string' } },
-      inScope: { type: 'array', items: { type: 'string' } },
+      briefReferences: { type: 'array', items: { type: 'string' } }
+    }
+  };
+}
+
+function projectContractCollectionDeltaJsonSchema(): Record<string, unknown> {
+  return {
+    type: 'object',
+    additionalProperties: false,
+    required: ['add', 'remove'],
+    properties: {
+      add: { type: 'array', items: { type: 'string' } },
+      remove: {
+        type: 'array',
+        items: {
+          type: 'object',
+          additionalProperties: false,
+          required: ['value', 'rationale'],
+          properties: {
+            value: { type: 'string' },
+            rationale: { type: 'string' }
+          }
+        }
+      }
+    }
+  };
+}
+
+function projectContractDeltaJsonSchema(): Record<string, unknown> {
+  return {
+    type: 'object',
+    additionalProperties: false,
+    required: [
+      'baseVersion',
+      'summary',
+      'addRequirements',
+      'updateRequirements',
+      'supersedeRequirements',
+      'removeRequirements',
+      'invariantChanges',
+      'prohibitedSubstituteChanges',
+      'releaseCriteriaChanges',
+      'migrationImpacts',
+      'compatibilityImpacts'
+    ],
+    properties: {
+      baseVersion: { type: 'number' },
+      summary: { type: ['string', 'null'] },
+      addRequirements: { type: 'array', items: projectContractRequirementDraftJsonSchema() },
+      updateRequirements: {
+        type: 'array',
+        items: {
+          type: 'object',
+          additionalProperties: false,
+          required: ['id', 'title', 'description', 'acceptanceCriteria', 'briefReferences', 'rationale'],
+          properties: {
+            id: { type: 'string' },
+            title: { type: ['string', 'null'] },
+            description: { type: ['string', 'null'] },
+            acceptanceCriteria: { anyOf: [{ type: 'array', items: { type: 'string' } }, { type: 'null' }] },
+            briefReferences: { anyOf: [{ type: 'array', items: { type: 'string' } }, { type: 'null' }] },
+            rationale: { type: 'string' }
+          }
+        }
+      },
+      supersedeRequirements: {
+        type: 'array',
+        items: {
+          type: 'object',
+          additionalProperties: false,
+          required: ['id', 'replacement', 'rationale'],
+          properties: {
+            id: { type: 'string' },
+            replacement: projectContractRequirementDraftJsonSchema(),
+            rationale: { type: 'string' }
+          }
+        }
+      },
+      removeRequirements: {
+        type: 'array',
+        items: {
+          type: 'object',
+          additionalProperties: false,
+          required: ['id', 'rationale'],
+          properties: { id: { type: 'string' }, rationale: { type: 'string' } }
+        }
+      },
+      invariantChanges: projectContractCollectionDeltaJsonSchema(),
+      prohibitedSubstituteChanges: projectContractCollectionDeltaJsonSchema(),
+      releaseCriteriaChanges: projectContractCollectionDeltaJsonSchema(),
+      migrationImpacts: { type: 'array', items: { type: 'string' } },
+      compatibilityImpacts: { type: 'array', items: { type: 'string' } }
+    }
+  };
+}
+
+function architectureUpdateJsonSchema(): Record<string, unknown> {
+  return {
+    type: 'object',
+    additionalProperties: false,
+    required: ['summary', 'modules', 'databaseSchemas', 'decisions', 'conventions', 'dependencyRules', 'knownDebt', 'resolvedDebt', 'validationCommands'],
+    properties: {
+      summary: { type: ['string', 'null'] },
+      modules: {
+        type: 'array',
+        items: {
+          type: 'object',
+          additionalProperties: false,
+          required: ['name', 'responsibility', 'paths', 'publicInterfaces', 'dependencies'],
+          properties: {
+            name: { type: 'string' },
+            responsibility: { type: 'string' },
+            paths: { type: 'array', items: { type: 'string' } },
+            publicInterfaces: { type: 'array', items: { type: 'string' } },
+            dependencies: { type: 'array', items: { type: 'string' } }
+          }
+        }
+      },
+      databaseSchemas: {
+        type: 'array',
+        items: {
+          type: 'object',
+          additionalProperties: false,
+          required: ['name', 'technology', 'paths', 'ownedByModule', 'migrationPaths'],
+          properties: {
+            name: { type: 'string' },
+            technology: { type: 'string' },
+            paths: { type: 'array', items: { type: 'string' } },
+            ownedByModule: { type: 'string' },
+            migrationPaths: { type: 'array', items: { type: 'string' } }
+          }
+        }
+      },
+      decisions: {
+        type: 'array',
+        items: {
+          type: 'object',
+          additionalProperties: false,
+          required: ['summary', 'rationale'],
+          properties: { summary: { type: 'string' }, rationale: { type: 'string' } }
+        }
+      },
+      conventions: { type: 'array', items: { type: 'string' } },
+      dependencyRules: { type: 'array', items: { type: 'string' } },
+      knownDebt: { type: 'array', items: { type: 'string' } },
+      resolvedDebt: { type: 'array', items: { type: 'string' } },
+      validationCommands: { type: 'array', items: { type: 'string' } }
+    }
+  };
+}
+
+function implementationStepsJsonSchema(): Record<string, unknown> {
+  return {
+    type: 'array',
+    items: {
+      type: 'object',
+      additionalProperties: false,
+      required: [
+        'title', 'description', 'acceptanceCriteria', 'inScope', 'outOfScope',
+        'requirementIds', 'deliverables', 'changeRationale', 'dependsOnStepTitles', 'validationFocus'
+      ],
+      properties: {
+        title: { type: 'string' },
+        description: { type: 'string' },
+        acceptanceCriteria: { type: 'array', items: { type: 'string' } },
+        inScope: { type: 'array', items: { type: 'string' } },
+        outOfScope: { type: 'array', items: { type: 'string' } },
+        requirementIds: { type: 'array', items: { type: 'string' } },
+        deliverables: { type: 'array', items: { type: 'string' } },
+        changeRationale: { type: 'string' },
+        dependsOnStepTitles: { type: 'array', items: { type: 'string' } },
+        validationFocus: {
+          type: 'array',
+          items: { type: 'string', enum: ['implementation', 'migration', 'compatibility', 'regression'] }
+        }
+      }
+    }
+  };
+}
+
+function capabilityAuditJsonSchema(expectedCriteria: string[] = []): Record<string, unknown> {
+  const gapWorkItem = {
+    type: 'object',
+    additionalProperties: false,
+    required: ['title', 'description', 'acceptanceCriteria', 'inScope', 'outOfScope', 'requirementIds', 'deliverables', 'changeRationale', 'dependsOnStepTitles', 'validationFocus'],
+    properties: {
+      title: { type: 'string', minLength: 1 },
+      description: { type: 'string', minLength: 1 },
+      acceptanceCriteria: { type: 'array', minItems: 1, maxItems: 5, items: { type: 'string', minLength: 1 } },
+      inScope: { type: 'array', minItems: 1, maxItems: 5, items: { type: 'string', minLength: 1 } },
       outOfScope: { type: 'array', items: { type: 'string' } },
-      requirementIds: { type: 'array', items: { type: 'string' } },
-      deliverables: { type: 'array', items: { type: 'string' } }
+      requirementIds: { type: 'array', minItems: 1, items: { type: 'string', minLength: 1 } },
+      deliverables: { type: 'array', minItems: 1, maxItems: 3, items: { type: 'string', minLength: 1 } },
+      changeRationale: { type: 'string' },
+      dependsOnStepTitles: { type: 'array', items: { type: 'string' } },
+      validationFocus: {
+        type: 'array',
+        items: { type: 'string', enum: ['implementation', 'migration', 'compatibility', 'regression'] }
+      }
     }
   };
   return {
@@ -217,12 +419,15 @@ function capabilityAuditJsonSchema(): Record<string, unknown> {
       summary: { type: 'string' },
       criteria: {
         type: 'array',
+        ...(expectedCriteria.length > 0 ? { minItems: expectedCriteria.length, maxItems: expectedCriteria.length } : {}),
         items: {
           type: 'object',
           additionalProperties: false,
           required: ['criterion', 'status', 'evidence', 'gaps'],
           properties: {
-            criterion: { type: 'string' },
+            criterion: expectedCriteria.length > 0
+              ? { type: 'string', enum: expectedCriteria }
+              : { type: 'string' },
             status: { type: 'string', enum: ['passed', 'failed', 'blocked'] },
             evidence: { type: 'array', items: { type: 'string' } },
             gaps: { type: 'array', items: { type: 'string' } }
@@ -230,6 +435,51 @@ function capabilityAuditJsonSchema(): Record<string, unknown> {
         }
       },
       gapWorkItems: { type: 'array', items: gapWorkItem }
+    }
+  };
+}
+
+function releaseAuditJsonSchema(expectedCriteria: string[] = []): Record<string, unknown> {
+  const capabilitySchema = capabilityAuditJsonSchema(expectedCriteria) as {
+    properties: Record<string, unknown>;
+  };
+  return {
+    type: 'object',
+    additionalProperties: false,
+    required: ['verdict', 'summary', 'criteria', 'briefCoverage', 'contractAmendments', 'gapWorkItems'],
+    properties: {
+      ...capabilitySchema.properties,
+      briefCoverage: {
+        type: 'array',
+        items: {
+          type: 'object',
+          additionalProperties: false,
+          required: ['obligation', 'status', 'workflowOnly', 'requirementIds', 'evidence', 'gaps'],
+          properties: {
+            obligation: { type: 'string' },
+            status: { type: 'string', enum: ['passed', 'failed', 'blocked'] },
+            workflowOnly: { type: 'boolean' },
+            requirementIds: { type: 'array', items: { type: 'string' } },
+            evidence: { type: 'array', items: { type: 'string' } },
+            gaps: { type: 'array', items: { type: 'string' } }
+          }
+        }
+      },
+      contractAmendments: {
+        type: 'array',
+        items: {
+          type: 'object',
+          additionalProperties: false,
+          required: ['id', 'title', 'description', 'acceptanceCriteria', 'briefReferences'],
+          properties: {
+            id: { type: 'string' },
+            title: { type: 'string' },
+            description: { type: 'string' },
+            acceptanceCriteria: { type: 'array', items: { type: 'string' } },
+            briefReferences: { type: 'array', items: { type: 'string' } }
+          }
+        }
+      }
     }
   };
 }
@@ -314,7 +564,10 @@ export class CodexProvider implements AIProvider {
     }
     this.apiKey = key;
     this.apiBaseUrl = process.env.CODEX_API_BASE_URL ?? DEFAULT_CODEX_API_URL;
-    this.commandEnv = config?.codexHome ? { ...process.env, CODEX_HOME: config.codexHome } : process.env;
+    this.commandEnv = {
+      ...createWorkspaceEnvironment(),
+      ...(config?.codexHome ? { CODEX_HOME: config.codexHome } : {})
+    };
     this.model = config?.model?.trim() || (process.env.CODEX_MODEL ?? DEFAULT_CODEX_MODEL);
   }
 
@@ -328,9 +581,10 @@ export class CodexProvider implements AIProvider {
         role: 'system',
         content: input.previousValidationError
           ? 'Revise only the supplied failed validation check. Return JSON with a short summary, empty steps and implementationSteps arrays, the supplied acceptanceCriteria, and replacement validationChecks for that failed check only. Do not repeat successful or unrelated checks and do not propose implementation work. Reply with JSON only.'
-          : 'You are Codex. Return JSON with summary, steps, acceptanceCriteria, validationChecks, implementationSteps, and optional projectContract. ' +
-            'For ordinary task plans, implementationSteps must be an empty array and projectContract must be omitted. When the request asks for a project roadmap, include a projectContract and implementationSteps with title, description, acceptanceCriteria, inScope, outOfScope, requirementIds, and deliverables. ' +
-            'validationChecks must contain only executable command checks. Omit criteria that cannot be verified automatically. ' +
+          : 'You are Codex. Return JSON with summary, steps, acceptanceCriteria, validationChecks, implementationSteps, projectContract, contractDelta, and architectureUpdate. ' +
+            'For ordinary task plans, implementationSteps must be an empty array and projectContract, contractDelta, and architectureUpdate must be null. For an initial project roadmap, include a full projectContract, set contractDelta to null, and include implementationSteps and architectureUpdate. For an approved project extension, set projectContract to null and return contractDelta against the supplied base contract, plus only implementationSteps required by that delta and a compact architectureUpdate. Never silently omit an existing requirement: update, supersede, or remove it with an explicit rationale. Every new or replacement requirement must include briefReferences with short source phrases or section names from the brief. ' +
+            'Every implementation step must include changeRationale, dependsOnStepTitles referencing only earlier steps, and validationFocus. Include regression validation for extensions and migration or compatibility validation when the delta declares those impacts. Architecture updates must include databaseSchemas. ' +
+            'validationChecks must contain only executable command checks and classify each command as setup, build, database, api, browser, or smoke. Omit criteria that cannot be verified automatically. ' +
             'Commands must verify a criterion through their exit code and must not use shell redirection, fallback chains, or inspection-only git diff/status/log commands. ' +
             'Use { "kind": "command", "command": "...", "criterion": "...", "rationale": "..." }. Reply with JSON only.'
       },
@@ -350,7 +604,7 @@ export class CodexProvider implements AIProvider {
           .join('\n\n')
       }
     ];
-    const response = await this.requestResponses(messages);
+    const response = await this.requestResponses(messages, input.session);
     const content = response.content;
     await emitCapturedUsage(input.onActivity, response.usage);
 
@@ -366,11 +620,55 @@ export class CodexProvider implements AIProvider {
     };
   }
 
+  async repairRoadmap(input: RoadmapRepairInput): Promise<RoadmapRepairResult> {
+    const providerPrompt = [
+      'Repair only the supplied invalid implementation roadmap. Return JSON with implementationSteps only.',
+      'Do not regenerate the project contract, architecture, brief, or objective. Preserve valid steps and change only what the validation error requires.',
+      'Each step may contain at most 3 requirementIds, 3 deliverables, 5 acceptanceCriteria, and 5 inScope items. Split an oversized step into ordered focused steps while preserving complete requirement coverage.',
+      `Objective: ${input.objective}`,
+      `Validation error: ${input.validationError}`,
+      `Allowed requirement ids: ${input.allowedRequirementIds.join(', ')}`,
+      `Completed step titles that must not be recreated: ${input.completedStepTitles.join(' | ') || 'none'}`,
+      `Migration impacts: ${input.migrationImpacts.join(' | ') || 'none'}`,
+      `Compatibility impacts: ${input.compatibilityImpacts.join(' | ') || 'none'}`,
+      `Invalid roadmap JSON:\n${JSON.stringify(input.implementationSteps)}`
+    ].join('\n\n');
+    let content: string;
+    if (this.authMode === 'oauth') {
+      content = await this.runCodexExec({
+        repositoryPath: input.repositoryPath,
+        sandbox: 'read-only',
+        onActivity: input.onActivity,
+        session: input.session,
+        schema: {
+          type: 'object',
+          additionalProperties: false,
+          required: ['implementationSteps'],
+          properties: { implementationSteps: implementationStepsJsonSchema() }
+        },
+        prompt: providerPrompt
+      });
+    } else {
+      const response = await this.requestResponses([
+        { role: 'system', content: 'You repair only invalid roadmap items and return JSON only.' },
+        { role: 'user', content: providerPrompt }
+      ], input.session);
+      content = response.content;
+      await emitCapturedUsage(input.onActivity, response.usage);
+    }
+    return {
+      ...parseJsonContent<RoadmapRepairResult>(content, { implementationSteps: [] }),
+      providerPrompt,
+      providerResponse: content
+    };
+  }
+
   async implement(input: ImplementInput): Promise<ImplementResult> {
     if (this.authMode === 'oauth') {
       return this.implementWithCli(input);
     }
 
+    const continueSession = Boolean(resolveCompatibleSessionId(input.session, 'codex', this.model));
     const messages: Array<{ role: 'system' | 'user' | 'assistant'; content: string }> = [
       {
         role: 'system',
@@ -378,16 +676,16 @@ export class CodexProvider implements AIProvider {
           'You are Codex implementation agent. Make only the repository changes required by the supplied task and correction context. ' +
           'Do not run broad test suites, full builds, type checks, dependency installation, database validation, or repository-wide formatting; ForgeMind runs authoritative validation after implementation. ' +
           'Run a narrowly targeted check only when it is required to make the edit correctly. ' +
-          'After editing, propose the smallest authoritative validationChecks set that verifies the acceptance criteria against the resulting repository. ' +
-          'Return JSON with summary, changedFiles, diffStat, requestedApprovals, validationChecks, and optional fileUpdates [{ path, content }]. Reply with JSON only.'
+          'After editing, propose the smallest authoritative validationChecks set that verifies the acceptance criteria against the resulting repository. Classify every check as setup, build, database, api, browser, or smoke. ' +
+          'Return JSON with summary, changedFiles, diffStat, requestedApprovals, validationChecks, architectureUpdate, and optional fileUpdates [{ path, content }]. architectureUpdate must contain only architectural facts introduced or changed by this attempt, including databaseSchemas; use empty arrays when nothing changed. Reply with JSON only.'
       },
       {
         role: 'user',
         content: [
           'Implement the task.',
           `Attempt: ${input.attemptNumber ?? 1}`,
-          `Prompt: ${input.prompt}`,
-          `Plan: ${input.plan.steps.join(' | ')}`,
+          continueSession ? 'Continue the task from this provider session. The repository is authoritative.' : `Prompt: ${input.prompt}`,
+          continueSession ? '' : `Plan: ${input.plan.steps.join(' | ')}`,
           input.previousValidationError ? `Previous validation error: ${input.previousValidationError}` : '',
           input.previousReviewBlockers?.length ? `Previous review blockers: ${input.previousReviewBlockers.join(' | ')}` : '',
           input.previousSafeImprovements?.length ? `Apply these safe improvements automatically: ${input.previousSafeImprovements.join(' | ')}` : ''
@@ -396,7 +694,7 @@ export class CodexProvider implements AIProvider {
           .join('\n')
       }
     ];
-    const response = await this.requestResponses(messages);
+    const response = await this.requestResponses(messages, input.session);
     const content = response.content;
     await emitCapturedUsage(input.onActivity, response.usage);
 
@@ -456,7 +754,7 @@ export class CodexProvider implements AIProvider {
         content: reviewPrompt
       }
     ];
-    const response = await this.requestResponses(messages);
+    const response = await this.requestResponses(messages, input.session);
     const content = response.content;
     await emitCapturedUsage(input.onActivity, response.usage);
 
@@ -473,9 +771,10 @@ export class CodexProvider implements AIProvider {
   }
 
   async auditCapability(input: CapabilityAuditInput): Promise<CapabilityAuditResult> {
-    const providerPrompt = buildCapabilityAuditPrompt(
-      this.authMode === 'oauth' ? { ...input, repositoryContext: undefined } : input
-    );
+    if (!input.repositoryContext?.trim()) {
+      throw new Error('Codex capability audit requires a targeted repository packet.');
+    }
+    const providerPrompt = buildCapabilityAuditPrompt(input);
     if (this.authMode === 'oauth') {
       return this.auditCapabilityWithCli(input, providerPrompt);
     }
@@ -491,27 +790,63 @@ export class CodexProvider implements AIProvider {
     ];
     const response = await this.requestResponses(messages);
     await emitCapturedUsage(input.onActivity, response.usage);
-    const result = normalizeCapabilityAuditResult(input, parseCapabilityAuditContent(response.content));
+    const normalized = await normalizeAuditContentWithSingleRepair<CapabilityAuditResult>({
+      auditKind: 'capability',
+      content: response.content,
+      expectedCriteria: input.requirement.acceptanceCriteria,
+      allowedRequirementIds: [input.requirement.id],
+      normalize: (value) => normalizeCapabilityAuditResult(input, value),
+      repair: async (repairPrompt) => {
+        const repairResponse = await this.requestResponses([
+          { role: 'system', content: 'Repair only the supplied audit JSON. Do not inspect or reassess the repository. Return strict JSON.' },
+          { role: 'user', content: repairPrompt }
+        ]);
+        await emitCapturedUsage(input.onActivity, repairResponse.usage);
+        return repairResponse.content;
+      }
+    });
     return {
-      ...result,
-      providerPrompt: serializeMessages(messages),
-      providerResponse: response.content
+      ...normalized.result,
+      providerPrompt: normalized.repairPrompt
+        ? `${serializeMessages(messages)}\n\n[repair]\n${normalized.repairPrompt}`
+        : serializeMessages(messages),
+      providerResponse: normalized.response
     };
   }
 
   async auditRelease(input: ReleaseAuditInput): Promise<ReleaseAuditResult> {
-    const providerPrompt = buildReleaseAuditPrompt(
-      this.authMode === 'oauth' ? { ...input, repositoryContext: undefined } : input
-    );
+    if (!input.repositoryContext?.trim()) {
+      throw new Error('Codex release audit requires a targeted repository packet.');
+    }
+    const providerPrompt = buildReleaseAuditPrompt(input);
     if (this.authMode === 'oauth') {
+      const schema = releaseAuditJsonSchema([...input.contract.invariants, ...input.contract.releaseCriteria]);
       const content = await this.runCodexExec({
-        repositoryPath: input.repositoryPath,
+        packetOnly: true,
         sandbox: 'read-only',
         onActivity: input.onActivity,
-        schema: capabilityAuditJsonSchema(),
+        schema,
         prompt: providerPrompt
       });
-      return { ...normalizeReleaseAuditResult(input, parseCapabilityAuditContent(content)), providerPrompt, providerResponse: content };
+      const normalized = await normalizeAuditContentWithSingleRepair<ReleaseAuditResult>({
+        auditKind: 'release',
+        content,
+        expectedCriteria: [...input.contract.invariants, ...input.contract.releaseCriteria],
+        allowedRequirementIds: input.contract.requirements.map((requirement) => requirement.id),
+        normalize: (value) => normalizeReleaseAuditResult(input, value),
+        repair: (repairPrompt) => this.runCodexExec({
+          packetOnly: true,
+          sandbox: 'read-only',
+          onActivity: input.onActivity,
+          schema,
+          prompt: repairPrompt
+        })
+      });
+      return {
+        ...normalized.result,
+        providerPrompt: normalized.repairPrompt ? `${providerPrompt}\n\n[repair]\n${normalized.repairPrompt}` : providerPrompt,
+        providerResponse: normalized.response
+      };
     }
     if (!input.repositoryContext?.trim()) throw new Error('Codex API release audit requires a targeted repository packet.');
     const messages: Array<{ role: 'system' | 'user' | 'assistant'; content: string }> = [
@@ -520,10 +855,27 @@ export class CodexProvider implements AIProvider {
     ];
     const response = await this.requestResponses(messages);
     await emitCapturedUsage(input.onActivity, response.usage);
+    const normalized = await normalizeAuditContentWithSingleRepair<ReleaseAuditResult>({
+      auditKind: 'release',
+      content: response.content,
+      expectedCriteria: [...input.contract.invariants, ...input.contract.releaseCriteria],
+      allowedRequirementIds: input.contract.requirements.map((requirement) => requirement.id),
+      normalize: (value) => normalizeReleaseAuditResult(input, value),
+      repair: async (repairPrompt) => {
+        const repairResponse = await this.requestResponses([
+          { role: 'system', content: 'Repair only the supplied release-audit JSON. Do not inspect or reassess the repository. Return strict JSON.' },
+          { role: 'user', content: repairPrompt }
+        ]);
+        await emitCapturedUsage(input.onActivity, repairResponse.usage);
+        return repairResponse.content;
+      }
+    });
     return {
-      ...normalizeReleaseAuditResult(input, parseCapabilityAuditContent(response.content)),
-      providerPrompt: serializeMessages(messages),
-      providerResponse: response.content
+      ...normalized.result,
+      providerPrompt: normalized.repairPrompt
+        ? `${serializeMessages(messages)}\n\n[repair]\n${normalized.repairPrompt}`
+        : serializeMessages(messages),
+      providerResponse: normalized.response
     };
   }
 
@@ -561,6 +913,7 @@ export class CodexProvider implements AIProvider {
         : 'Create an implementation plan for this ForgeMind task.',
       'Return only JSON matching the provided schema.',
       'Translate acceptance criteria into concrete validation checks whenever possible.',
+      'For roadmap plans, every implementation step must include changeRationale, dependsOnStepTitles referencing only earlier steps, and validationFocus. Architecture updates must include databaseSchemas.',
       'Return only executable validation commands. Omit criteria that cannot be verified automatically. Commands must verify a criterion through their exit code and must not use shell redirection, fallback chains, or inspection-only git diff/status/log commands.',
       `Task id: ${input.taskId}`,
       `Title: ${input.title}`,
@@ -574,35 +927,28 @@ export class CodexProvider implements AIProvider {
         : ''
     ].join('\n\n');
     const content = await this.runCodexExec({
-      repositoryPath: input.repositoryPath,
       sandbox: 'read-only',
       onActivity: input.onActivity,
+      session: input.session,
+      maxRuntimeMs: input.maxRuntimeMs,
       schema: {
         type: 'object',
         additionalProperties: false,
-        required: ['summary', 'steps', 'acceptanceCriteria', 'implementationSteps', 'validationChecks'],
+        required: ['summary', 'steps', 'acceptanceCriteria', 'implementationSteps', 'projectContract', 'contractDelta', 'architectureUpdate', 'validationChecks'],
         properties: {
           summary: { type: 'string' },
           steps: { type: 'array', items: { type: 'string' } },
           acceptanceCriteria: { type: 'array', items: { type: 'string' } },
-          implementationSteps: {
-            type: 'array',
-            items: {
-              type: 'object',
-              additionalProperties: false,
-              required: ['title', 'description', 'acceptanceCriteria', 'inScope', 'outOfScope', 'requirementIds', 'deliverables'],
-              properties: {
-                title: { type: 'string' },
-                description: { type: 'string' },
-                acceptanceCriteria: { type: 'array', items: { type: 'string' } },
-                inScope: { type: 'array', items: { type: 'string' } },
-                outOfScope: { type: 'array', items: { type: 'string' } },
-                requirementIds: { type: 'array', items: { type: 'string' } },
-                deliverables: { type: 'array', items: { type: 'string' } }
-              }
-            }
+          implementationSteps: implementationStepsJsonSchema(),
+          projectContract: {
+            anyOf: [projectContractJsonSchema(), { type: 'null' }]
           },
-          projectContract: projectContractJsonSchema(),
+          contractDelta: {
+            anyOf: [projectContractDeltaJsonSchema(), { type: 'null' }]
+          },
+          architectureUpdate: {
+            anyOf: [architectureUpdateJsonSchema(), { type: 'null' }]
+          },
           validationChecks: validationChecksJsonSchema()
         }
       },
@@ -624,7 +970,10 @@ export class CodexProvider implements AIProvider {
       requestedApprovals: [],
       validationChecks: []
     };
-    const providerPrompt = buildCodexImplementationPrompt(input);
+    const providerPrompt = buildCodexImplementationPrompt(
+      input,
+      Boolean(resolveCompatibleSessionId(input.session, 'codex', this.model))
+    );
     const beforeSnapshot = await collectChangedFileSnapshot(input.repositoryPath);
     let content: string;
     let recoveredFromTimeout = false;
@@ -633,10 +982,11 @@ export class CodexProvider implements AIProvider {
         repositoryPath: input.repositoryPath,
         sandbox: 'workspace-write',
         onActivity: input.onActivity,
+        session: input.session,
         schema: {
           type: 'object',
           additionalProperties: false,
-          required: ['summary', 'changedFiles', 'diffStat', 'requestedApprovals', 'validationChecks'],
+          required: ['summary', 'changedFiles', 'diffStat', 'requestedApprovals', 'validationChecks', 'architectureUpdate'],
           properties: {
             summary: { type: 'string' },
             changedFiles: { type: 'array', items: { type: 'string' } },
@@ -651,7 +1001,8 @@ export class CodexProvider implements AIProvider {
               }
             },
             requestedApprovals: { type: 'array', items: { type: 'string', enum: APPROVAL_TYPES } },
-            validationChecks: validationChecksJsonSchema()
+            validationChecks: validationChecksJsonSchema(),
+            architectureUpdate: architectureUpdateJsonSchema()
           }
         },
         prompt: providerPrompt
@@ -707,6 +1058,7 @@ export class CodexProvider implements AIProvider {
       repositoryPath: input.repositoryPath,
       sandbox: 'read-only',
       onActivity: input.onActivity,
+      session: input.session,
       schema: {
         type: 'object',
         additionalProperties: false,
@@ -729,29 +1081,51 @@ export class CodexProvider implements AIProvider {
   }
 
   private async auditCapabilityWithCli(input: CapabilityAuditInput, providerPrompt: string): Promise<CapabilityAuditResult> {
+    const schema = capabilityAuditJsonSchema(input.requirement.acceptanceCriteria);
     const content = await this.runCodexExec({
-      repositoryPath: input.repositoryPath,
+      packetOnly: true,
       sandbox: 'read-only',
       onActivity: input.onActivity,
-      schema: capabilityAuditJsonSchema(),
+      schema,
       prompt: providerPrompt
     });
-    const result = normalizeCapabilityAuditResult(input, parseCapabilityAuditContent(content));
-    return { ...result, providerPrompt, providerResponse: content };
+    const normalized = await normalizeAuditContentWithSingleRepair<CapabilityAuditResult>({
+      auditKind: 'capability',
+      content,
+      expectedCriteria: input.requirement.acceptanceCriteria,
+      allowedRequirementIds: [input.requirement.id],
+      normalize: (value) => normalizeCapabilityAuditResult(input, value),
+      repair: (repairPrompt) => this.runCodexExec({
+        packetOnly: true,
+        sandbox: 'read-only',
+        onActivity: input.onActivity,
+        schema,
+        prompt: repairPrompt
+      })
+    });
+    return {
+      ...normalized.result,
+      providerPrompt: normalized.repairPrompt ? `${providerPrompt}\n\n[repair]\n${normalized.repairPrompt}` : providerPrompt,
+      providerResponse: normalized.response
+    };
   }
 
   private async runCodexExec(input: {
     prompt: string;
     schema: Record<string, unknown>;
     repositoryPath?: string;
+    packetOnly?: boolean;
     sandbox: 'read-only' | 'workspace-write';
     onActivity?: ProviderActivityHandler;
+    session?: ProviderSessionContext;
+    maxRuntimeMs?: number;
   }): Promise<string> {
     await this.verifyOAuthSession();
 
     const tempDir = await mkdtemp(join(tmpdir(), 'forgemind-codex-'));
     const schemaPath = join(tempDir, 'schema.json');
     const outputPath = join(tempDir, 'last-message.json');
+    const executionDirectory = input.packetOnly ? tempDir : input.repositoryPath;
     await writeFile(schemaPath, JSON.stringify(input.schema), 'utf8');
 
     const args = buildCodexExecArgs({
@@ -760,7 +1134,8 @@ export class CodexProvider implements AIProvider {
       model: this.model,
       schemaPath,
       outputPath,
-      repositoryPath: input.repositoryPath
+      repositoryPath: executionDirectory,
+      sessionId: resolveCompatibleSessionId(input.session, 'codex', this.model)
     });
 
     try {
@@ -770,9 +1145,17 @@ export class CodexProvider implements AIProvider {
         elapsedMs: 0
       });
       const execution = await runCodexProcess(args, input.prompt, {
-        cwd: input.repositoryPath,
+        cwd: executionDirectory,
         env: this.commandEnv,
-        onActivity: input.onActivity
+        maxRuntimeMs: input.maxRuntimeMs,
+        onActivity: input.onActivity,
+        onSessionId: async (id) => {
+          if (!input.session) return;
+          input.session.id = id;
+          input.session.provider = 'codex';
+          input.session.model = this.model;
+          await input.session?.onUpdate?.({ id, provider: 'codex', model: this.model });
+        }
       });
       if (execution.totalTokens !== undefined) {
         await emitCapturedUsage(input.onActivity, {
@@ -814,7 +1197,8 @@ export class CodexProvider implements AIProvider {
   }
 
   private async requestResponses(
-    messages: Array<{ role: 'system' | 'user' | 'assistant'; content: string }>
+    messages: Array<{ role: 'system' | 'user' | 'assistant'; content: string }>,
+    session?: ProviderSessionContext
   ): Promise<{ content: string; usage?: ProviderUsageMeasurement }> {
     if (!this.apiKey) {
       throw new Error('CODEX_API_KEY is required for Codex API key provider mode.');
@@ -828,6 +1212,7 @@ export class CodexProvider implements AIProvider {
       },
       body: JSON.stringify({
         model: this.model,
+        previous_response_id: resolveCompatibleSessionId(session, 'codex', this.model),
         input: messages.map((message) => ({
           role: message.role,
           content: [{ type: 'input_text', text: message.content }]
@@ -843,6 +1228,7 @@ export class CodexProvider implements AIProvider {
     }
 
     const data = (await response.json()) as {
+      id?: string;
       output_text?: string;
       output?: Array<{ content?: Array<{ text?: string }> }>;
       usage?: {
@@ -852,6 +1238,13 @@ export class CodexProvider implements AIProvider {
         input_tokens_details?: { cached_tokens?: number };
       };
     };
+
+    if (data.id && session) {
+      session.id = data.id;
+      session.provider = 'codex';
+      session.model = this.model;
+      await session?.onUpdate?.({ id: data.id, provider: 'codex', model: this.model });
+    }
 
     let content = '';
     if (typeof data.output_text === 'string' && data.output_text.trim().length > 0) {
@@ -882,6 +1275,17 @@ function serializeMessages(messages: Array<{ role: 'system' | 'user' | 'assistan
   return messages.map((message) => `[${message.role}]\n${message.content}`).join('\n\n');
 }
 
+function resolveCompatibleSessionId(
+  session: ProviderSessionContext | undefined,
+  provider: ProviderKind,
+  model: string
+): string | undefined {
+  if (!session?.id) return undefined;
+  if (session.provider && session.provider !== provider) return undefined;
+  if (session.model && session.model !== model) return undefined;
+  return session.id;
+}
+
 export function buildCodexExecArgs(input: {
   sandbox: 'read-only' | 'workspace-write';
   bypassSandbox?: boolean;
@@ -889,21 +1293,29 @@ export function buildCodexExecArgs(input: {
   schemaPath: string;
   outputPath: string;
   repositoryPath?: string;
+  sessionId?: string;
 }): string[] {
-  const args = ['exec', '--color', 'never'];
+  const args = input.sessionId ? ['exec', 'resume'] : ['exec', '--color', 'never'];
 
   if (input.sandbox === 'workspace-write' || input.bypassSandbox) {
     args.push('--dangerously-bypass-approvals-and-sandbox');
+  } else if (input.sessionId) {
+    args.push('-c', `sandbox_mode="${input.sandbox}"`);
   } else {
     args.push('--sandbox', input.sandbox);
   }
 
-  args.push('--model', input.model, '--output-schema', input.schemaPath, '--output-last-message', input.outputPath, '--skip-git-repo-check');
+  args.push('--model', input.model);
+  args.push('--output-schema', input.schemaPath);
+  args.push('--output-last-message', input.outputPath, '--skip-git-repo-check', '--json');
 
-  if (input.repositoryPath) {
+  if (input.repositoryPath && !input.sessionId) {
     args.push('--cd', input.repositoryPath);
   }
 
+  if (input.sessionId) {
+    args.push(input.sessionId);
+  }
   args.push('-');
   return args;
 }
@@ -915,10 +1327,12 @@ export interface CodexProcessOptions {
   inactivityTimeoutMs?: number;
   maxRuntimeMs?: number;
   onActivity?: ProviderActivityHandler;
+  onSessionId?: (sessionId: string) => void | Promise<void>;
 }
 
 export interface CodexProcessResult {
   totalTokens?: number;
+  sessionId?: string;
 }
 
 export class CodexExecutionTimeoutError extends Error {
@@ -967,6 +1381,10 @@ export async function runCodexProcess(
     let maxRuntimeTimer: NodeJS.Timeout;
     let terminationTimer: NodeJS.Timeout | undefined;
     let workspaceWatcher: FSWatcher | undefined;
+    let sessionId: string | undefined;
+    let jsonLineBuffer = '';
+    let jsonTotalTokens: number | undefined;
+    const expectsJsonEvents = args.includes('--json');
     let activityQueue = Promise.resolve();
     let activityFlushTimer: NodeJS.Timeout | undefined;
     const bufferedActivity: Record<'stdout' | 'stderr', string> = { stdout: '', stderr: '' };
@@ -1039,6 +1457,30 @@ export async function runCodexProcess(
       resetInactivityTimer();
       emitActivity(kind, message);
     };
+    const consumeJsonEvents = (chunk: string, flush = false): string[] => {
+      jsonLineBuffer += chunk;
+      const lines = jsonLineBuffer.split(/\r?\n/);
+      jsonLineBuffer = flush ? '' : (lines.pop() ?? '');
+      const messages: string[] = [];
+      for (const line of lines) {
+        try {
+          const event = JSON.parse(line) as CodexJsonEvent;
+          if (event.type === 'thread.started' && event.thread_id && event.thread_id !== sessionId) {
+            sessionId = event.thread_id;
+            activityQueue = activityQueue.then(() => options.onSessionId?.(event.thread_id!)).then(() => undefined);
+          }
+          const usage = event.usage;
+          if (usage && typeof usage.input_tokens === 'number' && typeof usage.output_tokens === 'number') {
+            jsonTotalTokens = usage.input_tokens + usage.output_tokens;
+          }
+          const message = formatCodexJsonEvent(event);
+          if (message) messages.push(message);
+        } catch {
+          if (line.trim()) messages.push(line);
+        }
+      }
+      return messages;
+    };
 
     inactivityTimer = setTimeout(() => stopForTimeout('inactivity'), inactivityTimeoutMs);
     maxRuntimeTimer = setTimeout(() => stopForTimeout('max_runtime'), maxRuntimeMs);
@@ -1063,7 +1505,11 @@ export async function runCodexProcess(
     child.stdout?.on('data', (chunk: Buffer) => {
       const text = chunk.toString('utf8');
       stdout = appendCappedOutput(stdout, text);
-      recordActivity('stdout', text);
+      if (expectsJsonEvents) {
+        for (const message of consumeJsonEvents(text)) recordActivity('stdout', message);
+      } else {
+        recordActivity('stdout', text);
+      }
     });
     child.stderr?.on('data', (chunk: Buffer) => {
       const text = chunk.toString('utf8');
@@ -1072,13 +1518,16 @@ export async function runCodexProcess(
     });
     child.on('error', (error) => finish(error));
     child.on('close', (code) => {
+      if (expectsJsonEvents) {
+        for (const message of consumeJsonEvents('', true)) recordActivity('stdout', message);
+      }
       if (timeoutReason) {
         finish(new CodexExecutionTimeoutError(timeoutReason, Date.now() - startedAt, stdout, stderr));
         return;
       }
       if (code === 0) {
         emitActivity('lifecycle', 'Codex process completed.');
-        finish(undefined, { totalTokens: parseCodexCliTotalTokens(stderr) });
+        finish(undefined, { totalTokens: jsonTotalTokens ?? parseCodexCliTotalTokens(stderr), sessionId });
         return;
       }
 
@@ -1086,6 +1535,40 @@ export async function runCodexProcess(
     });
     child.stdin?.end(stdin);
   });
+}
+
+interface CodexJsonEvent {
+  type?: string;
+  thread_id?: string;
+  message?: string;
+  error?: { message?: string } | string;
+  usage?: { input_tokens?: number; output_tokens?: number };
+  item?: {
+    type?: string;
+    text?: string;
+    command?: string;
+    aggregated_output?: string;
+    status?: string;
+    exit_code?: number;
+  };
+}
+
+export function formatCodexJsonEvent(event: CodexJsonEvent): string | undefined {
+  if (event.type === 'thread.started') return event.thread_id ? `Codex session: ${event.thread_id}` : undefined;
+  if (event.type === 'turn.started') return 'Codex turn started.';
+  if (event.type === 'turn.completed') return 'Codex turn completed.';
+  if (event.type === 'turn.failed' || event.type === 'error') {
+    return typeof event.error === 'string' ? event.error : event.error?.message ?? event.message ?? 'Codex turn failed.';
+  }
+  if (!event.type?.startsWith('item.') || !event.item) return undefined;
+  if (event.item.type === 'agent_message' || event.item.type === 'reasoning') return event.item.text?.trim() || undefined;
+  if (event.item.type === 'command_execution') {
+    if (event.type === 'item.started') return event.item.command ? `Running: ${event.item.command}` : undefined;
+    const output = event.item.aggregated_output?.trim();
+    const status = event.item.exit_code === undefined ? event.item.status : `exit ${event.item.exit_code}`;
+    return [event.item.command ? `Finished (${status}): ${event.item.command}` : `Command finished (${status}).`, output].filter(Boolean).join('\n');
+  }
+  return event.item.text?.trim() || undefined;
 }
 
 export function isNoisyWorkspaceActivityPath(path: string): boolean {
@@ -1124,6 +1607,7 @@ function getCodexBinaryCandidates(env: NodeJS.ProcessEnv): string[] {
 
   if (env.LOCALAPPDATA) {
     candidates.push(
+      ...getDesktopCodexBinaryCandidates(join(env.LOCALAPPDATA, 'OpenAI', 'Codex', 'bin')),
       join(env.LOCALAPPDATA, 'OpenAI', 'Codex', 'bin', 'codex.exe'),
       join(env.LOCALAPPDATA, 'Programs', 'Codex', 'codex.exe')
     );
@@ -1131,6 +1615,22 @@ function getCodexBinaryCandidates(env: NodeJS.ProcessEnv): string[] {
 
   candidates.push(...getVsCodeCodexBinaryCandidates(env));
   return candidates;
+}
+
+function getDesktopCodexBinaryCandidates(binRoot: string): string[] {
+  if (!existsSync(binRoot)) {
+    return [];
+  }
+
+  try {
+    return readdirSync(binRoot, { withFileTypes: true })
+      .filter((entry) => entry.isDirectory())
+      .map((entry) => join(binRoot, entry.name, 'codex.exe'))
+      .filter((candidate) => existsSync(candidate))
+      .sort((left, right) => statSync(right).mtimeMs - statSync(left).mtimeMs);
+  } catch {
+    return [];
+  }
 }
 
 function getVsCodeCodexBinaryCandidates(env: NodeJS.ProcessEnv): string[] {
@@ -1233,13 +1733,14 @@ function stripAnsi(value: string): string {
   return value.replace(/\u001b\[[0-9;]*m/g, '').replace(/\r/g, '');
 }
 
-export function buildCodexImplementationPrompt(input: ImplementInput): string {
+export function buildCodexImplementationPrompt(input: ImplementInput, continueSession = false): string {
   return [
     'Implement this task directly in the repository workspace.',
     'Do not create commits, branches, issues, or pull requests. ForgeMind handles those steps.',
     'Do not run broad test suites, full builds, type checks, dependency installation, database validation, or repository-wide formatting. ForgeMind runs authoritative validation after implementation.',
     'Run a narrowly targeted check only when it is required to make the edit correctly.',
     'After editing, return the smallest authoritative validationChecks set for the resulting repository and acceptance criteria. Do not use environment-only smoke checks such as node --version unless the task explicitly requires them.',
+    'Return architectureUpdate as a compact delta containing only modules, databaseSchemas, interfaces, dependencies, decisions, conventions, debt, or architecture validation commands introduced or changed by this attempt. Use empty arrays when architecture did not change.',
     'Validation checks must be executable commands that prove a criterion through their exit code. Omit criteria that cannot be verified automatically.',
     input.attemptNumber && input.attemptNumber > 1
       ? 'This is a correction pass. Preserve completed work and change only what is required by the supplied validation error or review blocker.'
@@ -1247,8 +1748,8 @@ export function buildCodexImplementationPrompt(input: ImplementInput): string {
     'When finished, return only JSON matching the provided schema.',
     `Task id: ${input.taskId}`,
     `Attempt: ${input.attemptNumber ?? 1}`,
-    `Task scope:\n${input.prompt}`,
-    `Plan:\n${input.plan.steps.map((step, index) => `${index + 1}. ${step}`).join('\n')}`,
+    continueSession ? 'Continue from the existing task session. Inspect the current repository state and preserve completed work.' : `Task scope:\n${input.prompt}`,
+    continueSession ? '' : `Plan:\n${input.plan.steps.map((step, index) => `${index + 1}. ${step}`).join('\n')}`,
     input.previousValidationError ? `Previous validation error:\n${input.previousValidationError}` : '',
     input.previousReviewBlockers?.length ? `Previous review blockers:\n${input.previousReviewBlockers.join('\n')}` : '',
     input.previousSafeImprovements?.length ? `Safe improvements to apply:\n${input.previousSafeImprovements.join('\n')}` : ''

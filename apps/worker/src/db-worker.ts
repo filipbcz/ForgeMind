@@ -1,14 +1,15 @@
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { join, resolve } from 'node:path';
 import { parseAgentConfigYaml, toCoreLimits, type AgentConfig } from '@forgemind/config';
-import { DEFAULT_LIMITS, evaluateLimits, requiresApproval, type Limits, type LimitUsage } from '@forgemind/core';
+import { activeProjectContractRequirements, DEFAULT_LIMITS, evaluateLimits, requiresApproval, type Limits, type LimitUsage } from '@forgemind/core';
 import { advanceRoadmapAfterTaskCompletion, createRepository, getPrismaClient, startNextRoadmapStep, type AIProviderConnectionSecret, type ForgeMindRepository } from '@forgemind/db';
 import { GitHubAppAdapter, createGitHubAdapterFromEnv } from '@forgemind/github';
-import { createProvider, type AIProvider } from '@forgemind/providers';
-import type { AcceptanceEvidence, ApprovalType, Project, ProjectContract, ProviderKind, TaskStatus } from '@forgemind/core';
+import { buildProjectExtensionProposalPrompt, createProvider, formatProjectExtensionProposal, type AIProvider, type ProviderSessionContext } from '@forgemind/providers';
+import type { AcceptanceEvidence, ApprovalType, Project, ProjectArchitectureUpdate, ProjectContract, ProviderKind, TaskStatus } from '@forgemind/core';
 import { toErrorMessage, type JsonValue } from '@forgemind/shared';
-import { runWorkerTask, type WorkerTaskResult, type WorkerTaskResume } from './workflow.js';
+import { formatProjectArchitectureContext, runWorkerTask, type WorkerTaskResult, type WorkerTaskResume } from './workflow.js';
 import { buildTargetedRepositoryContext, prepareCapabilityAuditWorkspace, runCapabilityAudit, runReleaseAudit } from './capability-audit.js';
+import { formatValidationFailure } from './validation.js';
 
 type ApprovedLimitSignal = 'diff_lines_limit_reached' | 'changed_files_limit_reached';
 
@@ -38,6 +39,15 @@ interface PlannedValidationCheckSnapshot {
   instructions?: string;
   criterion?: string;
   rationale?: string;
+  category?: string;
+}
+
+interface TaskCheckpointSnapshot {
+  key: string;
+  phase: string;
+  status: 'started' | 'completed' | 'failed';
+  inputHash: string;
+  output?: unknown;
 }
 
 export async function runDatabaseWorkerOnce(options: { deferInterruptSignals?: boolean } = {}) {
@@ -113,11 +123,18 @@ export async function runDatabaseWorkerOnce(options: { deferInterruptSignals?: b
   const startedAtMs = Date.now();
   const verifyCommand = resolveVerifyCommand(claimed.project.configYaml);
   const workspaceRoot = resolveWorkerWorkspaceRoot();
-  const githubConnection = await repository.getGitHubConnectionSecret();
-  const github = githubConnection
-    ? new GitHubAppAdapter({ token: githubConnection.token, apiBaseUrl: githubConnection.apiBaseUrl })
-    : await createGitHubAdapterFromEnv();
   const projectConfig = parseProjectConfig(claimed.project.configYaml);
+  const requiresGitHub = !projectConfig
+    || projectConfig.workflow.create_issue
+    || projectConfig.workflow.create_branch
+    || projectConfig.workflow.create_draft_pr
+    || projectConfig.workflow.auto_push;
+  const githubConnection = requiresGitHub ? await repository.getGitHubConnectionSecret() : undefined;
+  const github = requiresGitHub
+    ? (githubConnection
+        ? new GitHubAppAdapter({ token: githubConnection.token, apiBaseUrl: githubConnection.apiBaseUrl })
+        : await createGitHubAdapterFromEnv())
+    : undefined;
   const limits = resolveLimits(claimed.project.configYaml, claimed.task.maxIterations);
   const selection = await resolveProviderSelection({
     repository,
@@ -147,6 +164,27 @@ export async function runDatabaseWorkerOnce(options: { deferInterruptSignals?: b
     primary: primaryRuntimeProvider,
     fallback: fallbackRuntimeProvider
   });
+  const primaryConnectionId = selection.primary.connection?.id;
+  const hasCompatibleProviderSession = claimed.task.providerSessionProvider === selection.primary.kind
+    && claimed.task.providerSessionModel === selectedProviderModel
+    && claimed.task.providerSessionConnectionId === primaryConnectionId;
+  const providerSession: ProviderSessionContext = {
+    id: hasCompatibleProviderSession ? claimed.task.providerSessionId : undefined,
+    provider: hasCompatibleProviderSession ? claimed.task.providerSessionProvider : selection.primary.kind,
+    model: hasCompatibleProviderSession ? claimed.task.providerSessionModel : selectedProviderModel,
+    onUpdate: async (session) => {
+      const connectionId = session.provider === selection.primary.kind
+        ? selection.primary.connection?.id
+        : selection.fallback?.connection?.id;
+      await repository.updateTaskProviderSession({
+        taskId: claimed.task.id,
+        sessionId: session.id,
+        provider: session.provider,
+        model: session.model,
+        connectionId
+      });
+    }
+  };
   const resumeContext = await resolveTaskResumeContext(
     repository,
     claimed.task.id,
@@ -203,6 +241,7 @@ export async function runDatabaseWorkerOnce(options: { deferInterruptSignals?: b
       workspaceRoot,
       usageSummary: `Pre-run estimate: ${costEstimate.inputTokens} input tokens, ${costEstimate.outputTokens} output tokens, ${costEstimate.estimatedCostUsd.toFixed(4)} USD`,
       resume: resumeContext?.workflowResume,
+      providerSession,
       github,
       hooks: {
         onActivity: async (activity) => {
@@ -256,6 +295,7 @@ export async function runDatabaseWorkerOnce(options: { deferInterruptSignals?: b
           });
         },
         onGitHubOperationFailed: async (failure) => {
+          const errorMessage = sanitizeAuditErrorMessage(failure.errorMessage);
           await repository.writeAudit({
             actorType: 'system',
             eventType: 'task_github_operation_failed',
@@ -264,11 +304,18 @@ export async function runDatabaseWorkerOnce(options: { deferInterruptSignals?: b
               taskRunId: claimed.taskRun.id,
               queueJobId: claimed.queueJobId ?? null,
               operation: failure.operation,
-              errorMessage: failure.errorMessage,
+              errorMessage,
               provider: getLastProviderKind(),
               model: getLastProviderKind(),
               context: failure.context ?? null
             }
+          });
+        },
+        onCheckpoint: async (checkpoint) => {
+          await repository.recordTaskCheckpoint({
+            taskId: claimed.task.id,
+            taskRunId: claimed.taskRun.id,
+            ...checkpoint
           });
         },
         onProviderActivity: async (activity) => {
@@ -455,6 +502,12 @@ export async function runDatabaseWorkerOnce(options: { deferInterruptSignals?: b
       });
       if (result.status === 'completed') {
         await repository.transitionTask(claimed.task.id, 'completed');
+        await repository.recordCompletedTaskProjectMemory({
+          taskId: claimed.task.id,
+          summary: result.summary,
+          commitSha: result.commitSha,
+          architectureUpdate: result.architectureUpdate
+        });
         await advanceRoadmapAfterTaskCompletion(repository, claimed.task.id);
       }
       await repository.finishTaskRun({
@@ -489,7 +542,7 @@ export async function runDatabaseWorkerOnce(options: { deferInterruptSignals?: b
       };
     }
 
-    const message = toErrorMessage(error);
+    const message = sanitizeAuditErrorMessage(toErrorMessage(error));
     const status = error instanceof WorkerLimitError ? error.status : error instanceof ProviderExecutionError ? 'provider_failed' : 'failed';
     await repository.failTask(claimed.task.id, message, status);
     await repository.finishTaskRun({
@@ -500,14 +553,11 @@ export async function runDatabaseWorkerOnce(options: { deferInterruptSignals?: b
       ...getRunUsageFields()
     });
     await finalizeQueueJob('failed', message);
-    if (error instanceof WorkerLimitError || error instanceof ProviderExecutionError) {
-      return {
-        claimed: true,
-        taskId: claimed.task.id,
-        status
-      };
-    }
-    throw error;
+    return {
+      claimed: true,
+      taskId: claimed.task.id,
+      status
+    };
   }
 }
 
@@ -584,16 +634,22 @@ async function runNextProjectAudit(input: {
     const targetRequirementIds = new Set(
       claimed.job.requirementIds.length > 0
         ? claimed.job.requirementIds
-        : contract.requirements.map((requirement) => requirement.id)
+        : activeProjectContractRequirements(contract).map((requirement) => requirement.id)
     );
+    let deferredRequirementCount = 0;
     for (const requirement of contract.requirements.filter((item) => targetRequirementIds.has(item.id))) {
       const roadmap = await input.repository.getProjectRoadmap(claimed.project.id);
       const capability = roadmap?.capabilities.find((item) => item.requirement.id === requirement.id);
       if (capability?.status === 'satisfied') continue;
 
-      const workItems = (roadmap?.steps ?? []).filter((step) =>
-        step.cycleId === claimed.cycle.id && step.requirementIds.includes(requirement.id)
+      const requirementWorkItems = (roadmap?.steps ?? []).filter((step) =>
+        step.requirementIds.includes(requirement.id)
       );
+      if (requirementWorkItems.some((step) => step.status === 'pending' || step.status === 'running')) {
+        deferredRequirementCount += 1;
+        continue;
+      }
+      const workItems = requirementWorkItems.filter((step) => step.status === 'completed');
       const audit = await runCapabilityAudit({
         repository: input.repository,
         provider,
@@ -603,12 +659,15 @@ async function runNextProjectAudit(input: {
         workItems,
         workspacePath: workspace.workspacePath,
         commitSha: workspace.commitSha,
-        repositoryContext: await buildTargetedRepositoryContext(workspace.workspacePath, [
-          requirement.id,
-          requirement.title,
-          requirement.description,
-          ...requirement.acceptanceCriteria
-        ]),
+        repositoryContext: [
+          formatProjectArchitectureContext(claimed.project.projectArchitecture, `${requirement.title} ${requirement.description}`),
+          await buildTargetedRepositoryContext(workspace.workspacePath, [
+            requirement.id,
+            requirement.title,
+            requirement.description,
+            ...requirement.acceptanceCriteria
+          ])
+        ].filter(Boolean).join('\n\n'),
         onActivity
       });
 
@@ -659,7 +718,7 @@ async function runNextProjectAudit(input: {
         claimed: true,
         kind: 'project_audit',
         projectId: claimed.project.id,
-        status: 'capabilities_satisfied',
+        status: deferredRequirementCount > 0 ? 'roadmap_continued' : 'capabilities_satisfied',
         nextTaskId: nextTask?.id,
         provider: getLastProviderKind()
       };
@@ -676,7 +735,10 @@ async function runNextProjectAudit(input: {
         cycleId: claimed.cycle.id,
         workspacePath: workspace.workspacePath,
         commitSha: workspace.commitSha,
-        repositoryContext: workspace.repositoryContext,
+        repositoryContext: [
+          formatProjectArchitectureContext(claimed.project.projectArchitecture, contract.summary),
+          workspace.repositoryContext
+        ].filter(Boolean).join('\n\n'),
         onActivity
       });
       if (releaseAudit.verdict === 'blocked') {
@@ -687,6 +749,7 @@ async function runNextProjectAudit(input: {
         const created = await input.repository.appendProjectImplementationSteps({
           projectId: claimed.project.id,
           cycleId: claimed.cycle.id,
+          newRequirements: releaseAudit.contractAmendments,
           steps: releaseAudit.gapWorkItems.map((step) => ({
             title: step.title,
             description: formatGapStepDescription(step),
@@ -714,20 +777,45 @@ async function runNextProjectAudit(input: {
       }
     }
 
+    const planningProviderModel = resolveProviderModel(selection.primary.kind, selection.primary.connection);
+    const planningConnectionId = selection.primary.connection?.id;
+    const hasCompatiblePlanningSession = claimed.project.planningSessionProvider === selection.primary.kind
+      && claimed.project.planningSessionModel === planningProviderModel
+      && claimed.project.planningSessionConnectionId === planningConnectionId;
+    const planningSession: ProviderSessionContext = {
+      id: hasCompatiblePlanningSession ? claimed.project.planningSessionId : undefined,
+      provider: selection.primary.kind,
+      model: planningProviderModel,
+      onUpdate: async (session) => {
+        const connectionId = session.provider === selection.primary.kind
+          ? selection.primary.connection?.id
+          : selection.fallback?.connection?.id;
+        await input.repository.updateProjectPlanningSession({
+          projectId: claimed.project.id,
+          sessionId: session.id,
+          provider: session.provider,
+          model: session.model,
+          connectionId
+        });
+      }
+    };
     const extensionPlan = await provider.plan({
       taskId: `project-extension:${claimed.cycle.id}`,
       title: `Next extension for ${claimed.project.name}`,
-      prompt: [
-        `Project contract version ${contract.version} has passed its independent release audit.`,
-        `Completed objective: ${claimed.cycle.objective}`,
-        `Contract summary: ${contract.summary}`,
-        'Propose only the single next most valuable optional extension. Do not repeat completed scope and do not implement anything.'
-      ].join('\n'),
+      prompt: buildProjectExtensionProposalPrompt({
+        projectName: claimed.project.name,
+        completedObjective: claimed.cycle.objective,
+        contractVersion: contract.version,
+        contractSummary: contract.summary,
+        completedCapabilities: activeProjectContractRequirements(contract).map((requirement) => requirement.title),
+        projectBrief: claimed.project.brief,
+        continuation: hasCompatiblePlanningSession
+      }),
       repositoryPath: workspace.workspacePath,
-      onActivity
+      onActivity,
+      session: planningSession
     });
-    const extensionProposal = extensionPlan.summary.trim() || extensionPlan.steps[0]?.trim();
-    if (!extensionProposal) throw new Error('AI provider did not return a project extension proposal.');
+    const extensionProposal = formatProjectExtensionProposal(extensionPlan);
     await input.repository.updateProjectRoadmapCycleStatus(claimed.cycle.id, 'completed');
     await input.repository.setProjectRoadmapCycleExtensionProposal(claimed.cycle.id, {
       proposal: extensionProposal,
@@ -777,7 +865,7 @@ function hasSatisfiedReleaseAudit(evidence: AcceptanceEvidence[], contract: Proj
       && item.criterion.startsWith('Release: ')
     )
     .map((item) => item.criterion.slice('Release: '.length).replace(/\s+/g, ' ').trim().toLowerCase()));
-  return [...contract.invariants, ...contract.releaseCriteria]
+  return [...contract.invariants, ...contract.releaseCriteria, 'Original brief coverage']
     .every((criterion) => passedCriteria.has(criterion.replace(/\s+/g, ' ').trim().toLowerCase()));
 }
 
@@ -1054,9 +1142,9 @@ function resolveVerifyCommand(configYaml?: string): string | undefined {
   }
 }
 
-function resolveWorkerWorkspaceRoot(): string {
+export function resolveWorkerWorkspaceRoot(): string {
   if (process.env.FORGEMIND_WORKSPACE_ROOT?.trim()) {
-    return process.env.FORGEMIND_WORKSPACE_ROOT;
+    return resolve(process.env.FORGEMIND_WORKSPACE_ROOT);
   }
 
   return join(tmpdir(), 'forgemind-workspaces');
@@ -1295,15 +1383,17 @@ async function resolveTaskResumeContext(
     getTaskDiff: (taskId: string) => Promise<{
       iterations: TaskDiffIterationSnapshot[];
     }>;
+    listTaskCheckpoints?: (taskId: string) => Promise<TaskCheckpointSnapshot[]>;
   },
   taskId: string,
   queueReason?: string,
   currentTaskRunId?: string
 ): Promise<TaskResumeContext | undefined> {
-  const [approvals, diff, audit] = await Promise.all([
+  const [approvals, diff, audit, checkpoints] = await Promise.all([
     repository.listApprovals(),
     repository.getTaskDiff(taskId),
-    repository.listTaskAudit(taskId)
+    repository.listTaskAudit(taskId),
+    repository.listTaskCheckpoints?.(taskId) ?? Promise.resolve([])
   ]);
   const taskApprovals = approvals.filter((approval) => approval.taskId === taskId);
   const approvedTypes = new Set(taskApprovals.filter((approval) => approval.status === 'approved').map((approval) => approval.type));
@@ -1311,14 +1401,16 @@ async function resolveTaskResumeContext(
   const lastImplementationIteration = findLastIteration(diff.iterations, 'implementation');
   const lastValidationIteration = findLastIteration(diff.iterations, 'validation');
   const lastReviewIteration = findLastIteration(diff.iterations, 'review');
+  const architectureUpdate = extractArchitectureUpdate(lastImplementationIteration);
   const approvedReviewResume = buildApprovedReviewResume(lastPlanningIteration, lastImplementationIteration, lastReviewIteration, approvedTypes);
+  if (approvedReviewResume) approvedReviewResume.architectureUpdate = architectureUpdate;
   const latestApprovedLargeDiffAt = getLatestApprovedLargeDiffAt(taskApprovals);
   const latestApprovedReviewAt = approvedReviewResume
     ? getLatestApprovedReviewAt(taskApprovals, approvedReviewResume.riskyChanges ?? [])
     : undefined;
 
   if (queueReason === 'task_retried' || queueReason === 'worker_interrupted' || queueReason === 'phase_retry') {
-    const phaseRetryResume = buildPhaseRetryResume(diff.iterations, audit, approvedTypes, currentTaskRunId);
+    const phaseRetryResume = buildPhaseRetryResume(diff.iterations, audit, approvedTypes, currentTaskRunId, checkpoints);
     if (phaseRetryResume) {
       return {
         workflowResume: phaseRetryResume,
@@ -1336,6 +1428,7 @@ async function resolveTaskResumeContext(
           lastImplementationIteration?.resultSummary
           ?? 'Continue the implementation preserved in the workspace after the worker was interrupted.',
         validationChecks: extractLatestValidationChecks(diff.iterations),
+        architectureUpdate,
         approvedApprovals: Array.from(approvedTypes)
       },
       ignoredLimitSignals: []
@@ -1349,6 +1442,7 @@ async function resolveTaskResumeContext(
         planSummary: lastPlanningIteration?.resultSummary,
         implementationSummary: lastImplementationIteration.resultSummary || 'Resume the preserved implementation for validation.',
         validationChecks: extractLatestValidationChecks(diff.iterations),
+        architectureUpdate,
         approvedApprovals: Array.from(approvedTypes)
       },
       ignoredLimitSignals: []
@@ -1366,6 +1460,7 @@ async function resolveTaskResumeContext(
         planSummary: lastPlanningIteration?.resultSummary,
         implementationSummary: lastImplementationIteration.resultSummary || 'Resuming previously approved implementation.',
         validationChecks: extractLatestValidationChecks(diff.iterations),
+        architectureUpdate,
         approvedApprovals: Array.from(approvedTypes)
       },
       ignoredLimitSignals: ['diff_lines_limit_reached', 'changed_files_limit_reached']
@@ -1391,6 +1486,7 @@ async function resolveTaskResumeContext(
           lastImplementationIteration?.resultSummary
           ?? 'Resume workspace changes after the requested operation was approved.',
         validationChecks: extractLatestValidationChecks(diff.iterations),
+        architectureUpdate,
         approvedApprovals: Array.from(approvedTypes)
       },
       ignoredLimitSignals: []
@@ -1404,7 +1500,8 @@ function buildPhaseRetryResume(
   iterations: TaskDiffIterationSnapshot[],
   audit: TaskAuditSnapshot[],
   approvedTypes: ReadonlySet<ApprovalType>,
-  currentTaskRunId?: string
+  currentTaskRunId?: string,
+  checkpoints: TaskCheckpointSnapshot[] = []
 ): WorkerTaskResume | undefined {
   const failureAt = findLatestFailureTimestamp(audit);
   if (failureAt === undefined) {
@@ -1471,6 +1568,9 @@ function buildPhaseRetryResume(
     .map((event) => asRecord(event.payload))
     .filter((payload) => payload?.state === 'completed' && typeof payload.operation === 'string')
     .map((payload) => payload!.operation as string);
+  completedOperations.push(...checkpoints
+    .filter((checkpoint) => checkpoint.status === 'completed' && checkpoint.key.startsWith('external:'))
+    .map((checkpoint) => checkpoint.key.slice('external:'.length)));
   const completedValidationCommands = relevantAudit
     .filter((event) => timestampOf(event.createdAt) >= timestampOf(latestImplementation?.createdAt))
     .filter((event) => event.eventType === 'task_activity')
@@ -1484,7 +1584,7 @@ function buildPhaseRetryResume(
     ))
     .map((payload) => payload!.detail as string);
   const persistedValidationCommands = extractStringArray(latestValidation?.validationResult, 'passedValidationCommands');
-  const passedValidationChecks = Array.from(new Set([
+  const passedValidationChecks: NonNullable<WorkerTaskResume['passedValidationChecks']> = Array.from(new Set([
     ...completedValidationCommands,
     ...persistedValidationCommands
   ])).map((command) => ({
@@ -1493,11 +1593,48 @@ function buildPhaseRetryResume(
       stdout: 'Previously passed before the worker retry.',
       stderr: '',
       passed: true
-    }));
+  }));
+  for (const checkpoint of checkpoints.filter((item) => item.status === 'completed' && item.key.startsWith('validation:'))) {
+    const output = asRecord(checkpoint.output);
+    const command = typeof output?.command === 'string' ? output.command : undefined;
+    if (!command || passedValidationChecks.some((item) => item.command === command && item.inputHash === checkpoint.inputHash)) continue;
+    passedValidationChecks.push({
+      command,
+      exitCode: 0,
+      stdout: 'Previously passed before the worker retry.',
+      stderr: '',
+      passed: true,
+      inputHash: checkpoint.inputHash
+    });
+  }
   const resumeValidationPlanRevision = (
     inFlightPhase === 'planning'
     && Boolean(validation && !validation.passed && validation.failingCommand)
   );
+  const githubChecksCheckpoint = [...checkpoints].reverse().find((checkpoint) => (
+    checkpoint.status === 'completed' && checkpoint.key === 'external:wait_for_checks'
+  ));
+  const githubChecksOutput = asRecord(githubChecksCheckpoint?.output);
+  const githubChecks = githubChecksOutput
+    && (githubChecksOutput.status === 'success' || githubChecksOutput.status === 'not_configured')
+    && typeof githubChecksOutput.summary === 'string'
+    ? {
+        status: githubChecksOutput.status,
+        summary: githubChecksOutput.summary,
+        failures: Array.isArray(githubChecksOutput.failures)
+          ? githubChecksOutput.failures.flatMap((failure) => {
+              const item = asRecord(failure);
+              return item && typeof item.name === 'string' && typeof item.output === 'string'
+                ? [{
+                    name: item.name,
+                    output: item.output,
+                    detailsUrl: typeof item.detailsUrl === 'string' ? item.detailsUrl : undefined
+                  }]
+                : [];
+            })
+          : []
+      }
+    : undefined;
 
   return {
     kind: 'phase_retry',
@@ -1508,8 +1645,9 @@ function buildPhaseRetryResume(
       ?? 'Continue from the implementation preserved in the workspace.',
     changedFiles,
     diffStat,
+    architectureUpdate: extractArchitectureUpdate(latestImplementation),
     previousValidationError: resumeFrom === 'implementation' && validation && !validation.passed
-      ? validation.stderr || validation.stdout || `Exit code ${validation.exitCode}`
+      ? formatValidationFailure(validation)
       : undefined,
     previousReviewBlockers: resumeFrom === 'implementation' ? reviewBlockers : undefined,
     previousSafeImprovements: resumeFrom === 'implementation' ? reviewSafeImprovements : undefined,
@@ -1520,7 +1658,8 @@ function buildPhaseRetryResume(
     riskyChanges: reviewRisks,
     validationChecks: extractLatestValidationChecks(completedIterations),
     approvedApprovals: Array.from(approvedTypes),
-    completedOperations: Array.from(new Set(completedOperations))
+    completedOperations: Array.from(new Set(completedOperations)),
+    githubChecks
   };
 }
 
@@ -1570,6 +1709,12 @@ function resolveValidationPassed(payload: Record<string, unknown> | undefined): 
 
 function extractReviewBlockers(iteration: TaskDiffIterationSnapshot | undefined): string[] {
   return extractStringArray(iteration?.validationResult, 'blockers');
+}
+
+function extractArchitectureUpdate(iteration: TaskDiffIterationSnapshot | undefined): ProjectArchitectureUpdate | undefined {
+  const payload = asRecord(iteration?.validationResult);
+  const update = asRecord(payload?.architectureUpdate);
+  return update ? update as unknown as ProjectArchitectureUpdate : undefined;
 }
 
 function extractStringArray(value: unknown, key: string): string[] {
@@ -1730,6 +1875,9 @@ function normalizeValidationCheckSnapshot(item: unknown) {
     return {
       kind: 'command' as const,
       command: check.command.trim(),
+      category: check.category === 'setup' || check.category === 'build' || check.category === 'database' || check.category === 'api' || check.category === 'browser' || check.category === 'smoke'
+        ? check.category
+        : undefined,
       criterion: typeof check.criterion === 'string' && check.criterion.trim() ? check.criterion.trim() : undefined,
       rationale: typeof check.rationale === 'string' && check.rationale.trim() ? check.rationale.trim() : undefined
     };

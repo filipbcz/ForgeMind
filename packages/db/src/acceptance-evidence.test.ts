@@ -1,6 +1,11 @@
 import { describe, expect, it } from 'vitest';
 import type { AcceptanceEvidence, Project, ProjectImplementationStep, ProjectRoadmapCycle } from '@forgemind/core';
-import { acceptanceCriterionKey, deriveProjectCapabilities, shouldInvalidateProjectContract } from './repository.js';
+import {
+  acceptanceCriterionKey,
+  deriveProjectCapabilities,
+  shouldInvalidateProjectContract,
+  shouldRequeueProjectAuditAfterCompletedWork
+} from './repository.js';
 
 const project: Project = {
   id: 'project_1',
@@ -46,6 +51,9 @@ const step: ProjectImplementationStep = {
   acceptanceCriteria: ['Work item tests pass.'],
   requirementIds: ['REQ-API'],
   deliverables: ['API implementation'],
+  changeRationale: 'Implement the traced contract requirement.',
+  dependsOnStepTitles: [],
+  validationFocus: ['implementation'],
   status: 'completed',
   taskId: 'task_1',
   createdAt: project.createdAt,
@@ -80,6 +88,20 @@ describe('project capability evidence', () => {
     expect(shouldInvalidateProjectContract('Original brief', undefined)).toBe(false);
   });
 
+  it('requeues a succeeded audit only after a newer work item completion', () => {
+    const auditFinishedAt = new Date('2026-08-10T10:00:00.000Z');
+
+    expect(shouldRequeueProjectAuditAfterCompletedWork(
+      auditFinishedAt,
+      new Date('2026-08-10T10:00:01.000Z')
+    )).toBe(true);
+    expect(shouldRequeueProjectAuditAfterCompletedWork(
+      auditFinishedAt,
+      new Date('2026-08-10T09:59:59.000Z')
+    )).toBe(false);
+    expect(shouldRequeueProjectAuditAfterCompletedWork(auditFinishedAt, null)).toBe(false);
+  });
+
   it('keeps a completed work item in verifying until an independent audit passes', () => {
     const validationEvidence = evidence('validation_command', 'passed', 'Work item tests pass.');
     const [beforeAudit] = deriveProjectCapabilities(project, [cycle], [step], [validationEvidence]);
@@ -97,5 +119,34 @@ describe('project capability evidence', () => {
     const [capability] = deriveProjectCapabilities(project, [cycle], [step], [auditEvidence]);
 
     expect(capability?.status).toBe('partial');
+  });
+
+  it('preserves evidence across contract versions only while the requirement is unchanged', () => {
+    const auditEvidence = evidence('repository_audit', 'passed', 'The production API integration test passes.');
+    const unchangedProject: Project = {
+      ...project,
+      projectContract: {
+        ...project.projectContract!,
+        version: 2,
+        requirements: [{
+          ...project.projectContract!.requirements[0]!,
+          introducedInVersion: 1,
+          lastChangedInVersion: 1
+        }]
+      }
+    };
+    const changedProject: Project = {
+      ...unchangedProject,
+      projectContract: {
+        ...unchangedProject.projectContract!,
+        requirements: [{
+          ...unchangedProject.projectContract!.requirements[0]!,
+          lastChangedInVersion: 2
+        }]
+      }
+    };
+
+    expect(deriveProjectCapabilities(unchangedProject, [cycle], [step], [auditEvidence])[0]?.status).toBe('satisfied');
+    expect(deriveProjectCapabilities(changedProject, [cycle], [step], [auditEvidence])[0]?.status).toBe('verifying');
   });
 });

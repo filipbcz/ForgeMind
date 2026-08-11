@@ -1,4 +1,7 @@
 import { describe, expect, it, vi } from 'vitest';
+import { mkdirSync, mkdtempSync, rmSync, utimesSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { listOpenAIModels, OpenAIProvider } from './openai-provider.js';
 import { CodexProvider, buildCodexExecArgs, normalizeCodexModels, resolveCodexBinary } from './codex-provider.js';
 
@@ -194,12 +197,64 @@ describe('Codex provider', () => {
     expect(args).not.toContain('--sandbox');
   });
 
+  it('resumes a persisted Codex task session with the current phase output schema', () => {
+    const args = buildCodexExecArgs({
+      sandbox: 'workspace-write',
+      model: 'gpt-5.5',
+      schemaPath: 'schema.json',
+      outputPath: 'last-message.json',
+      repositoryPath: 'C:/tmp/repo',
+      sessionId: '0199a213-81c0-7800-8aa1-bbab2a035a53'
+    });
+
+    expect(args.slice(0, 2)).toEqual(['exec', 'resume']);
+    expect(args).toContain('0199a213-81c0-7800-8aa1-bbab2a035a53');
+    expect(args).toContain('--json');
+    expect(args).toContain('--output-schema');
+    expect(args).toContain('schema.json');
+    expect(args).not.toContain('--cd');
+  });
+
+  it('configures a read-only sandbox through resume-compatible Codex CLI arguments', () => {
+    const args = buildCodexExecArgs({
+      sandbox: 'read-only',
+      model: 'gpt-5.5',
+      schemaPath: 'schema.json',
+      outputPath: 'last-message.json',
+      sessionId: '0199a213-81c0-7800-8aa1-bbab2a035a53'
+    });
+
+    expect(args.slice(0, 2)).toEqual(['exec', 'resume']);
+    expect(args).not.toContain('--sandbox');
+    expect(args).toContain('-c');
+    expect(args).toContain('sandbox_mode="read-only"');
+  });
+
   it('prefers explicit Codex CLI path when configured', () => {
     expect(resolveCodexBinary({ FORGEMIND_CODEX_CLI_PATH: 'C:/tools/codex.exe' })).toBe('C:/tools/codex.exe');
   });
 
   it('falls back to the command name when no known Codex CLI path exists', () => {
     expect(resolveCodexBinary({ APPDATA: 'C:/missing/appdata', LOCALAPPDATA: 'C:/missing/local', USERPROFILE: 'C:/missing/user' })).toBe('codex');
+  });
+
+  it('uses the newest versioned Codex desktop binary', () => {
+    const localAppData = mkdtempSync(join(tmpdir(), 'forgemind-codex-desktop-'));
+    const binRoot = join(localAppData, 'OpenAI', 'Codex', 'bin');
+    const older = join(binRoot, 'older', 'codex.exe');
+    const newer = join(binRoot, 'newer', 'codex.exe');
+    mkdirSync(join(binRoot, 'older'), { recursive: true });
+    mkdirSync(join(binRoot, 'newer'), { recursive: true });
+    writeFileSync(older, '');
+    writeFileSync(newer, '');
+    utimesSync(older, new Date(1_000), new Date(1_000));
+    utimesSync(newer, new Date(2_000), new Date(2_000));
+
+    try {
+      expect(resolveCodexBinary({ LOCALAPPDATA: localAppData })).toBe(newer);
+    } finally {
+      rmSync(localAppData, { recursive: true, force: true });
+    }
   });
 
   it('should call Codex responses API for planning', async () => {

@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from 'vitest';
-import { ForgeMindRepository } from './repository.js';
+import { ForgeMindRepository, mergeProjectArchitecture } from './repository.js';
 
 function createMockPrisma() {
   let queuePaused = false;
@@ -190,6 +190,23 @@ function createMockPrisma() {
       updateMany: vi.fn(async () => ({ count: 1 }))
     },
     taskIteration: { create: vi.fn(), findMany: vi.fn() },
+    taskCheckpoint: {
+      findMany: vi.fn(async () => []),
+      upsert: vi.fn(async (args: any) => ({
+        id: 'checkpoint_1',
+        taskId: args.create.taskId,
+        taskRunId: args.create.taskRunId ?? null,
+        key: args.create.key,
+        phase: args.create.phase,
+        status: args.create.status,
+        inputHash: args.create.inputHash,
+        outputJson: args.create.outputJson ?? null,
+        errorMessage: args.create.errorMessage ?? null,
+        startedAt: args.create.startedAt,
+        completedAt: args.create.completedAt,
+        updatedAt: new Date()
+      }))
+    },
     approval: { create: vi.fn(), findMany: vi.fn(), findUnique: vi.fn(), update: vi.fn() },
     providerUsage: { create: vi.fn(), findMany: vi.fn() },
     auditLog: { create: vi.fn(async () => ({ id: 'audit_1', createdAt: new Date() })), findMany: vi.fn() },
@@ -222,6 +239,71 @@ function createMockPrisma() {
 }
 
 describe('ForgeMindRepository task runs', () => {
+  it('merges architecture deltas without duplicates and resolves recorded debt', () => {
+    const architecture = mergeProjectArchitecture({
+      version: 1,
+      summary: 'Initial architecture.',
+      modules: [{ name: 'API', responsibility: 'HTTP API.', paths: ['src/api/**'], publicInterfaces: ['Api'], dependencies: [] }],
+      decisions: [],
+      conventions: ['Use typed routes.'],
+      dependencyRules: ['API depends on domain interfaces only.'],
+      knownDebt: ['Remove legacy route.'],
+      validationCommands: ['npm test'],
+      updatedAt: '2026-08-01T00:00:00.000Z'
+    }, {
+      summary: 'Layered API architecture.',
+      modules: [{ name: 'API', responsibility: 'Typed HTTP boundary.', paths: ['src/api/**'], publicInterfaces: ['Api'], dependencies: ['Domain'] }],
+      decisions: [{ summary: 'Introduce domain boundary', rationale: 'Prevent persistence details from leaking into routes.' }],
+      conventions: ['Use typed routes.'],
+      dependencyRules: ['API depends on domain interfaces only.'],
+      resolvedDebt: ['Remove legacy route.'],
+      validationCommands: ['npm test', 'npm run architecture:check']
+    }, 'task_1', '2026-08-09T00:00:00.000Z');
+
+    expect(architecture.modules).toHaveLength(1);
+    expect(architecture.modules[0]).toMatchObject({ responsibility: 'Typed HTTP boundary.', dependencies: ['Domain'] });
+    expect(architecture.knownDebt).toEqual([]);
+    expect(architecture.conventions).toEqual(['Use typed routes.']);
+    expect(architecture.decisions[0]).toMatchObject({ taskId: 'task_1', createdAt: '2026-08-09T00:00:00.000Z' });
+    expect(architecture.validationCommands).toEqual(['npm test', 'npm run architecture:check']);
+  });
+
+  it('persists a reusable project planning session with an audit event', async () => {
+    const { prisma } = createMockPrisma();
+    prisma.project.findUnique.mockResolvedValueOnce({
+      planningSessionId: null,
+      planningSessionProvider: null,
+      planningSessionModel: null,
+      planningSessionConnectionId: null
+    });
+    const repository = new ForgeMindRepository(prisma);
+
+    await repository.updateProjectPlanningSession({
+      projectId: 'project_1',
+      sessionId: 'thread_1',
+      provider: 'codex',
+      model: 'gpt-5.5',
+      connectionId: 'connection_1'
+    });
+
+    expect(prisma.project.update).toHaveBeenCalledWith({
+      where: { id: 'project_1' },
+      data: {
+        planningSessionId: 'thread_1',
+        planningSessionProvider: 'codex',
+        planningSessionModel: 'gpt-5.5',
+        planningSessionConnectionId: 'connection_1',
+        planningSessionUpdatedAt: expect.any(Date)
+      }
+    });
+    expect(prisma.auditLog.create).toHaveBeenCalledWith({
+      data: expect.objectContaining({
+        eventType: 'project_planning_session_updated',
+        projectId: 'project_1'
+      })
+    });
+  });
+
   it('queues a task run when a task starts', async () => {
     const { prisma, taskRunCreate } = createMockPrisma();
     const repository = new ForgeMindRepository(prisma);
@@ -587,6 +669,32 @@ describe('ForgeMindRepository task runs', () => {
       filesChanged: 6,
       insertions: 140,
       deletions: 12
+    }));
+  });
+
+  it('upserts a durable task checkpoint with a stable task and operation key', async () => {
+    const { prisma } = createMockPrisma();
+    const repository = new ForgeMindRepository(prisma);
+
+    const checkpoint = await repository.recordTaskCheckpoint({
+      taskId: 'task_1',
+      taskRunId: 'run_1',
+      key: 'external:merge_pr',
+      phase: 'github',
+      status: 'completed',
+      inputHash: 'input-sha',
+      output: { pullRequestNumber: 42 }
+    });
+
+    expect(prisma.taskCheckpoint.upsert).toHaveBeenCalledWith(expect.objectContaining({
+      where: { taskId_key: { taskId: 'task_1', key: 'external:merge_pr' } },
+      update: expect.objectContaining({ status: 'completed', inputHash: 'input-sha' })
+    }));
+    expect(checkpoint).toEqual(expect.objectContaining({
+      taskId: 'task_1',
+      key: 'external:merge_pr',
+      status: 'completed',
+      inputHash: 'input-sha'
     }));
   });
 });

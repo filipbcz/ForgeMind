@@ -23,6 +23,10 @@ Primarni source of truth je PostgreSQL (packages/db/prisma/schema.prisma). Klico
 - task_iterations: detailni iterace (planning/implementation/validation/review) vcetne diff a validation payloadu.
 - approvals: rizikove rozhodnuti, ktera pozastavi workflow.
 - audit_log: auditovatelny event stream pro stavove prechody, queue a GitHub operace.
+- projects.project_architecture: omezena strukturovana pamet modulu, verejnych rozhrani, zavislosti, rozhodnuti, konvenci, technickeho dluhu a architektonickych validaci.
+- project_architecture_versions: nemenne architektonicke snapshoty vcetne databazovych schemat, zdrojove contract verze a tasku. Projekt, roadmap cyklus i task odkazuji na konkretni verzi.
+
+Provider session snizuje opakovane posilani kontextu, ale neni source of truth. Aktualni repozitar, project contract a konkretni ProjectArchitectureVersion tasku maji vzdy prednost pred historii AI session.
 
 ## 3) API orchestrace (studio-api)
 
@@ -45,6 +49,7 @@ Worker flow (apps/worker/src/db-worker.ts):
 3. claimNextSubmittedTask claimne nejstarsi pending job, ktery je ready podle next_attempt_at.
 4. provider estimate se ulozi pro reporting; pouze provider fail zastavi beh pred execute.
 5. implementacni provider vrati zmeny i minimalni autoritativni spustitelne validationChecks ve stejne odpovedi; worker je pote spusti pred review. Manualni kontroly se negeneruji ani nevyhodnocuji; pokud zadne kriterium nelze automatizovat, validation faze se oznaci jako preskocena a workflow pokracuje.
+   Ve stejne odpovedi provider vraci malou architectureUpdate deltu. Nevznika tim dalsi AI volani.
 6. runWorkerTask provede planning/implementation/validation/review/GitHub kroky.
 7. hooks zapisuji status prechody, iteration data, GitHub IDs a audit eventy.
 8. finalizeQueueJob pouzije retry/backoff semantiku:
@@ -53,6 +58,44 @@ Worker flow (apps/worker/src/db-worker.ts):
 - succeeded/cancelled -> final stav
 
 Retry a obnova workeru jsou phase-aware. Z iteration checkpointu a audit udalosti se urci posledni nedokoncena faze. Planning, implementation, validation, review a delivery se obnovuji samostatne; uspesne predchozi faze ani dokoncene commit/push operace se neopakuji. U validacni sady se zachovaji i jednotlive uspesne prikazy a pad pri AI oprave validacniho planu navaze primo novym pokusem o opravu. Implementacni retry dostane posledni validation error nebo review blockers a pokracuje nad zachovanym workspace.
+
+Komplexni validacni prostredi:
+
+1. Projekt muze mit strukturovany `ProjectValidationProfile`. Profil obsahuje pouze relativni Docker Compose soubory, nazvy sluzeb, nazvy povinnych runtime promennych, migracni a readiness prikazy a timeout; hodnoty secrets se do projektu neukladaji.
+2. AI vraci minimalni autoritativni prikazy a kazdy oznaci jako setup, build, database, api, browser nebo smoke.
+3. Worker sestavi jednu deterministickou sadu: instalace zavislosti, `docker compose up -d --wait`, migrace, readiness a nakonec AI build/API/browser/smoke kontroly. Vsechny prikazy prochazeji stejnou sandbox a approval policy.
+4. Kazdy validacni prikaz ma checkpoint s otiskem skutecneho workspace. Restart nad nezmenenym workspace uspesny prikaz neprovede znovu; nova implementacni zmena vytvori novy otisk a vynuti nove overeni.
+
+Trvale checkpointy a idempotence:
+
+1. `task_checkpoints` uklada stav `started/completed/failed`, fazi, stabilni klic operace, otisk vstupu a omezeny vystup pro validaci a externi efekty.
+2. Commit, push, vytvoreni PR, GitHub checks a merge se pri phase retry obnovuji pouze od prvni nedokoncene operace.
+3. GitHub adapter pred vytvorenim PR vyhleda otevreny PR pro stejnou head/base branch a merge jiz slouceneho PR vraci jako uspesny. Opakovani po vypadku proto nevytvari duplicitni PR ani merge.
+4. Migrace validacniho prostredi pouzivaji stejne checkpointy jako ostatni prikazy. Project audit ma unikatni job na roadmap cyklus a uspesny audit se znovu nezaqueueuje.
+
+Project architecture lifecycle:
+
+1. Roadmap plan inicializuje architektonicke moduly, databazova schemata a hranice a ulozi prvni nemenny snapshot.
+2. Roadmap cyklus i task odkazuji na konkretni snapshot; worker pri claimu pouzije verzi tasku a dostane jen relevantni moduly a globalni pravidla v omezenem kontextu.
+3. Implementace vrati architectureUpdate deltu; review ji porovna s diffem a existujicimi hranicemi.
+4. Po dokonceni tasku repository deltu slouci bez duplicit, idempotentne vytvori novou verzi a zachova auditni vazbu rozhodnuti na task.
+5. Architektonicke validacni prikazy se pridaji do kazde validacni sady, projdou stejnou bezpecnostni policy a pri retry se znovu nespousteji, pokud uz prosly.
+6. Capability a release audity dostanou architektonicky kontext explicitne a zustavaji nezavisle na implementacni session.
+
+Brief-to-release gate:
+
+1. Projekt ma verzovanou historii uplnych specifikacnich snapshotu. Vytvoreni projektu zalozi verzi 1, rucni zmena briefu vytvori dalsi revizi a schvalene rozsireni v jedne transakci vytvori novou verzi specifikace i navazujici roadmap cyklus. Kazdy cyklus odkazuje na verzi, podle ktere vznikl.
+2. Opakovane schvaleni stejneho rozsireni je idempotentni podle zdrojoveho roadmap cyklu a nesmi znovu volat provider ani vytvorit duplicitni specifikaci, cyklus nebo task.
+3. Kazda zmena project contractu vytvori nemenny `ProjectContractVersion` navazany na konkretni specifikaci a roadmap cyklus. Projekt drzi pouze ukazatel na aktualni verzi; historicke verze zustavaji citelne pres API a UI.
+4. Prvni roadmapa vraci uplny contract. Schvalene rozsireni vraci pouze strukturovany `contractDelta`; ForgeMind deterministicky kontroluje zakladni verzi, existenci identifikatoru, duvody odstraneni a konflikt operaci a pak vytvori kumulativni contract bez dalsiho AI volani.
+5. Requirement ma lifecycle `active`, `superseded` nebo `removed`, verzi vzniku a pripadnou vazbu na nahradu. Nezmenene aktivni pozadavky se prenaseji automaticky a nemohou potichu zmizet.
+6. Kazdy novy contract requirement nese kratke briefReferences; roadmap kroky, tasky a acceptance evidence zustavaji navazane pres stejne `REQ-*` identifikatory.
+7. Po uspesnych capability auditech spusti worker v cerstvem nezavislem kontextu release audit nad aktualni specifikaci, contractem, aktualnim commitem a cilene omezenym repository packetem.
+8. Audit ze specifikace znovu odvozuje podstatne produktove povinnosti. Project cycle nelze dokoncit bez konkretniho repository evidence pro kazdou z nich a pro kazde release kriterium.
+9. Pokud contract nekterou podstatnou povinnost opomenul, audit vrati atomicky novy `REQ-*` a minimalni opravny krok. Repository amendment vytvori novou contract verzi, zrusi pouze dotcene capability/release evidence a zachova dukazy hotovych pozadavku.
+10. Navrh volitelneho rozsireni se vytvori az po uspesnem `Original brief coverage` evidence na aktualnim commitu.
+11. Roadmap krok nese `changeRationale`, explicitni zavislosti na drivejsich krocich a `validationFocus`. Pred ulozenim se deterministicky kontroluje pokryti dotcenych pozadavku, duplicita, poradi zavislosti, prekroceni rozsahu delty a migracni, kompatibilitni a regresni odpovednost.
+12. Neplatna roadmapa dostane nejvyse jeden cileny AI repair pouze nad chybnymi kroky a validacni chybou. Pokud oprava znovu neprojde, nevytvori se cyklus ani prvni task.
 
 ## 5) Policy enforcement (aktualni)
 

@@ -126,43 +126,58 @@ model User {
   createdAt    DateTime @default(now()) @map("created_at")
   updatedAt    DateTime @updatedAt @map("updated_at")
 
-  tasks                   Task[]
-  approvals               Approval[]
-  notificationSettings    NotificationSettings?
+  tasks                     Task[]
+  approvals                 Approval[]
+  notificationSettings      NotificationSettings?
   notificationSubscriptions NotificationSubscription[]
-  githubConnection        GitHubConnection?
-  aiProviderConnections   AiProviderConnection[]
+  githubConnection          GitHubConnection?
+  aiProviderConnections     AiProviderConnection[]
 
   @@map("users")
 }
 
 model Project {
-  id            String   @id @default(uuid())
-  name          String
-  slug          String   @unique
-  githubOwner   String?  @map("github_owner")
-  githubRepo    String?  @map("github_repo")
-  defaultBranch String   @default("main") @map("default_branch")
-  configYaml    String?  @map("config_yaml")
-  brief                 String?
-  projectContract       Json?    @map("project_contract")
-  autoCreatePullRequest Boolean  @default(true) @map("auto_create_pull_request")
-  autoMergePullRequest  Boolean  @default(false) @map("auto_merge_pull_request")
-  autoCompleteTask      Boolean  @default(false) @map("auto_complete_task")
-  allowSafeOperationsWithoutApproval Boolean @default(false) @map("allow_safe_operations_without_approval")
-  defaultTaskMode       TaskMode @default(safe) @map("default_task_mode")
-  aiProviderConnectionId String?  @map("ai_provider_connection_id")
-  isActive              Boolean  @default(true) @map("is_active")
-  createdAt     DateTime @default(now()) @map("created_at")
-  updatedAt     DateTime @updatedAt @map("updated_at")
+  id                                 String        @id @default(uuid())
+  name                               String
+  slug                               String        @unique
+  githubOwner                        String?       @map("github_owner")
+  githubRepo                         String?       @map("github_repo")
+  defaultBranch                      String        @default("main") @map("default_branch")
+  configYaml                         String?       @map("config_yaml")
+  brief                              String?
+  projectContract                    Json?         @map("project_contract")
+  currentContractVersionId           String?       @unique @map("current_contract_version_id")
+  projectMemory                      Json?         @map("project_memory")
+  projectArchitecture                Json?         @map("project_architecture")
+  currentArchitectureVersionId       String?       @unique @map("current_architecture_version_id")
+  validationProfile                  Json?         @map("validation_profile")
+  planningSessionId                  String?       @map("planning_session_id")
+  planningSessionProvider            ProviderKind? @map("planning_session_provider")
+  planningSessionModel               String?       @map("planning_session_model")
+  planningSessionConnectionId        String?       @map("planning_session_connection_id")
+  planningSessionUpdatedAt           DateTime?     @map("planning_session_updated_at")
+  autoCreatePullRequest              Boolean       @default(true) @map("auto_create_pull_request")
+  autoMergePullRequest               Boolean       @default(false) @map("auto_merge_pull_request")
+  autoCompleteTask                   Boolean       @default(false) @map("auto_complete_task")
+  allowSafeOperationsWithoutApproval Boolean       @default(false) @map("allow_safe_operations_without_approval")
+  defaultTaskMode                    TaskMode      @default(safe) @map("default_task_mode")
+  aiProviderConnectionId             String?       @map("ai_provider_connection_id")
+  isActive                           Boolean       @default(true) @map("is_active")
+  createdAt                          DateTime      @default(now()) @map("created_at")
+  updatedAt                          DateTime      @updatedAt @map("updated_at")
 
-  tasks         Task[]
-  auditLog      AuditLog[]
-  roadmapCycles ProjectRoadmapCycle[]
-  roadmapSteps  ProjectImplementationStep[]
-  acceptanceEvidence AcceptanceEvidence[]
-  auditJobs      ProjectAuditJob[]
-  aiProviderConnection AiProviderConnection? @relation(fields: [aiProviderConnectionId], references: [id], onDelete: SetNull)
+  tasks                      Task[]
+  auditLog                   AuditLog[]
+  roadmapCycles              ProjectRoadmapCycle[]
+  specificationVersions      ProjectSpecificationVersion[]
+  contractVersions           ProjectContractVersion[]      @relation("ProjectContractVersions")
+  currentContractVersion     ProjectContractVersion?       @relation("CurrentProjectContractVersion", fields: [currentContractVersionId], references: [id], onDelete: SetNull)
+  architectureVersions       ProjectArchitectureVersion[]  @relation("ProjectArchitectureVersions")
+  currentArchitectureVersion ProjectArchitectureVersion?   @relation("CurrentProjectArchitectureVersion", fields: [currentArchitectureVersionId], references: [id], onDelete: SetNull)
+  roadmapSteps               ProjectImplementationStep[]
+  acceptanceEvidence         AcceptanceEvidence[]
+  auditJobs                  ProjectAuditJob[]
+  aiProviderConnection       AiProviderConnection?         @relation(fields: [aiProviderConnectionId], references: [id], onDelete: SetNull)
 
   @@map("projects")
 }
@@ -174,6 +189,13 @@ enum ProjectRoadmapCycleStatus {
   blocked
   awaiting_extension_approval
   completed
+}
+
+enum ProjectArchitectureVersionSource {
+  initial_plan
+  approved_extension
+  task_update
+  legacy_import
 }
 
 enum ProjectAuditJobStatus {
@@ -191,6 +213,18 @@ enum ProjectImplementationStepStatus {
   cancelled
 }
 
+enum ProjectSpecificationSource {
+  initial_brief
+  approved_extension
+  manual_revision
+}
+
+enum ProjectContractVersionSource {
+  initial_plan
+  approved_extension
+  manual_regeneration
+}
+
 enum AcceptanceEvidenceSource {
   validation_command
   github_check
@@ -205,15 +239,15 @@ enum AcceptanceEvidenceStatus {
 }
 
 model GitHubConnection {
-  id              String   @id @default(uuid())
-  userId          String   @unique @map("user_id")
-  tokenCiphertext String   @map("token_ciphertext")
-  tokenFingerprint String  @map("token_fingerprint")
-  apiBaseUrl      String   @default("https://api.github.com") @map("api_base_url")
-  connectedAt     DateTime @default(now()) @map("connected_at")
-  lastCheckedAt   DateTime? @map("last_checked_at")
-  createdAt       DateTime @default(now()) @map("created_at")
-  updatedAt       DateTime @updatedAt @map("updated_at")
+  id               String    @id @default(uuid())
+  userId           String    @unique @map("user_id")
+  tokenCiphertext  String    @map("token_ciphertext")
+  tokenFingerprint String    @map("token_fingerprint")
+  apiBaseUrl       String    @default("https://api.github.com") @map("api_base_url")
+  connectedAt      DateTime  @default(now()) @map("connected_at")
+  lastCheckedAt    DateTime? @map("last_checked_at")
+  createdAt        DateTime  @default(now()) @map("created_at")
+  updatedAt        DateTime  @updatedAt @map("updated_at")
 
   user User @relation(fields: [userId], references: [id])
 
@@ -221,23 +255,23 @@ model GitHubConnection {
 }
 
 model AiProviderConnection {
-  id                String       @id @default(uuid())
-  userId            String       @map("user_id")
+  id                String             @id @default(uuid())
+  userId            String             @map("user_id")
   name              String
-  isDefault         Boolean      @default(false) @map("is_default")
+  isDefault         Boolean            @default(false) @map("is_default")
   provider          ProviderKind
   authMode          AiProviderAuthMode @default(api_key) @map("auth_mode")
   model             String
-  apiKeyCiphertext  String?      @map("api_key_ciphertext")
-  apiKeyFingerprint String?      @map("api_key_fingerprint")
-  codexHome         String?      @map("codex_home")
-  accountSummary    String?      @map("account_summary")
-  connectedAt       DateTime     @default(now()) @map("connected_at")
-  lastCheckedAt     DateTime?    @map("last_checked_at")
-  createdAt         DateTime     @default(now()) @map("created_at")
-  updatedAt         DateTime     @updatedAt @map("updated_at")
+  apiKeyCiphertext  String?            @map("api_key_ciphertext")
+  apiKeyFingerprint String?            @map("api_key_fingerprint")
+  codexHome         String?            @map("codex_home")
+  accountSummary    String?            @map("account_summary")
+  connectedAt       DateTime           @default(now()) @map("connected_at")
+  lastCheckedAt     DateTime?          @map("last_checked_at")
+  createdAt         DateTime           @default(now()) @map("created_at")
+  updatedAt         DateTime           @updatedAt @map("updated_at")
 
-  user User @relation(fields: [userId], references: [id])
+  user     User      @relation(fields: [userId], references: [id])
   projects Project[]
 
   @@unique([userId, name])
@@ -246,14 +280,14 @@ model AiProviderConnection {
 }
 
 model NotificationSettings {
-  id             String   @id @default(uuid())
-  userId         String   @unique @map("user_id")
-  pushEnabled    Boolean  @default(false) @map("push_enabled")
-  approvalRequests Boolean @default(true) @map("approval_requests")
-  taskUpdates    Boolean  @default(true) @map("task_updates")
-  budgetAlerts   Boolean  @default(true) @map("budget_alerts")
-  createdAt      DateTime @default(now()) @map("created_at")
-  updatedAt      DateTime @updatedAt @map("updated_at")
+  id               String   @id @default(uuid())
+  userId           String   @unique @map("user_id")
+  pushEnabled      Boolean  @default(false) @map("push_enabled")
+  approvalRequests Boolean  @default(true) @map("approval_requests")
+  taskUpdates      Boolean  @default(true) @map("task_updates")
+  budgetAlerts     Boolean  @default(true) @map("budget_alerts")
+  createdAt        DateTime @default(now()) @map("created_at")
+  updatedAt        DateTime @updatedAt @map("updated_at")
 
   user User @relation(fields: [userId], references: [id])
 
@@ -277,79 +311,174 @@ model NotificationSubscription {
 }
 
 model Task {
-  id                   String     @id @default(uuid())
-  projectId            String     @map("project_id")
-  createdByUserId      String     @map("created_by_user_id")
-  title                String
-  prompt               String
-  mode                 TaskMode   @default(safe)
-  status               TaskStatus @default(draft)
-  githubIssueNumber    Int?       @map("github_issue_number")
-  githubIssueUrl       String?    @map("github_issue_url")
-  branchName           String?    @map("branch_name")
-  pullRequestNumber    Int?       @map("pull_request_number")
-  pullRequestUrl       String?    @map("pull_request_url")
-  maxIterations        Int        @default(10) @map("max_iterations")
-  maxBudgetUsd         Decimal    @default(2.00) @map("max_budget_usd") @db.Decimal(10, 2)
-  createdAt            DateTime   @default(now()) @map("created_at")
-  updatedAt            DateTime   @updatedAt @map("updated_at")
-  startedAt            DateTime?  @map("started_at")
-  finishedAt           DateTime?  @map("finished_at")
+  id                          String        @id @default(uuid())
+  projectId                   String        @map("project_id")
+  createdByUserId             String        @map("created_by_user_id")
+  title                       String
+  prompt                      String
+  mode                        TaskMode      @default(safe)
+  status                      TaskStatus    @default(draft)
+  githubIssueNumber           Int?          @map("github_issue_number")
+  githubIssueUrl              String?       @map("github_issue_url")
+  branchName                  String?       @map("branch_name")
+  architectureVersionId       String?       @map("architecture_version_id")
+  pullRequestNumber           Int?          @map("pull_request_number")
+  pullRequestUrl              String?       @map("pull_request_url")
+  providerSessionId           String?       @map("provider_session_id")
+  providerSessionProvider     ProviderKind? @map("provider_session_provider")
+  providerSessionModel        String?       @map("provider_session_model")
+  providerSessionConnectionId String?       @map("provider_session_connection_id")
+  providerSessionUpdatedAt    DateTime?     @map("provider_session_updated_at")
+  maxIterations               Int           @default(10) @map("max_iterations")
+  maxBudgetUsd                Decimal       @default(2.00) @map("max_budget_usd") @db.Decimal(10, 2)
+  createdAt                   DateTime      @default(now()) @map("created_at")
+  updatedAt                   DateTime      @updatedAt @map("updated_at")
+  startedAt                   DateTime?     @map("started_at")
+  finishedAt                  DateTime?     @map("finished_at")
 
-  project        Project         @relation(fields: [projectId], references: [id])
-  createdByUser  User            @relation(fields: [createdByUserId], references: [id])
-  taskRuns       TaskRun[]
-  queueJobs      TaskQueueJob[]
-  approvals      Approval[]
-  providerUsage  ProviderUsage[]
-  auditLog       AuditLog[]
-  roadmapSteps   ProjectImplementationStep[]
-  acceptanceEvidence AcceptanceEvidence[]
+  project                    Project                      @relation(fields: [projectId], references: [id])
+  createdByUser              User                         @relation(fields: [createdByUserId], references: [id])
+  taskRuns                   TaskRun[]
+  queueJobs                  TaskQueueJob[]
+  approvals                  Approval[]
+  providerUsage              ProviderUsage[]
+  auditLog                   AuditLog[]
+  roadmapSteps               ProjectImplementationStep[]
+  architectureVersion        ProjectArchitectureVersion?  @relation("TaskEffectiveArchitecture", fields: [architectureVersionId], references: [id], onDelete: SetNull)
+  sourceArchitectureVersions ProjectArchitectureVersion[] @relation("ArchitectureSourceTask")
+  acceptanceEvidence         AcceptanceEvidence[]
+  checkpoints               TaskCheckpoint[]
 
   @@index([projectId, status])
   @@map("tasks")
 }
 
 model ProjectRoadmapCycle {
-  id                String                    @id @default(uuid())
-  projectId         String                    @map("project_id")
-  cycleNumber       Int                       @map("cycle_number")
-  objective         String
-  extensionProposal String?                   @map("extension_proposal")
-  status            ProjectRoadmapCycleStatus @default(active)
-  createdAt         DateTime                  @default(now()) @map("created_at")
-  updatedAt         DateTime                  @updatedAt @map("updated_at")
-  completedAt       DateTime?                 @map("completed_at")
+  id                     String                    @id @default(uuid())
+  projectId              String                    @map("project_id")
+  specificationVersionId String?                   @map("specification_version_id")
+  contractVersionId      String?                   @map("contract_version_id")
+  architectureVersionId  String?                   @map("architecture_version_id")
+  cycleNumber            Int                       @map("cycle_number")
+  objective              String
+  extensionProposal      String?                   @map("extension_proposal")
+  status                 ProjectRoadmapCycleStatus @default(active)
+  createdAt              DateTime                  @default(now()) @map("created_at")
+  updatedAt              DateTime                  @updatedAt @map("updated_at")
+  completedAt            DateTime?                 @map("completed_at")
 
-  project Project @relation(fields: [projectId], references: [id])
-  steps   ProjectImplementationStep[]
-  acceptanceEvidence AcceptanceEvidence[]
-  auditJobs ProjectAuditJob[]
+  project                       Project                      @relation(fields: [projectId], references: [id])
+  specificationVersion          ProjectSpecificationVersion? @relation("RoadmapCycleSpecification", fields: [specificationVersionId], references: [id], onDelete: SetNull)
+  contractVersion               ProjectContractVersion?      @relation("RoadmapCycleContract", fields: [contractVersionId], references: [id], onDelete: SetNull)
+  architectureVersion           ProjectArchitectureVersion?  @relation("RoadmapCycleArchitecture", fields: [architectureVersionId], references: [id], onDelete: SetNull)
+  generatedSpecificationVersion ProjectSpecificationVersion? @relation("SpecificationSourceCycle")
+  steps                         ProjectImplementationStep[]
+  acceptanceEvidence            AcceptanceEvidence[]
+  auditJobs                     ProjectAuditJob[]
 
   @@unique([projectId, cycleNumber])
   @@index([projectId, status])
   @@map("project_roadmap_cycles")
 }
 
-model ProjectImplementationStep {
-  id                 String                          @id @default(uuid())
-  projectId          String                          @map("project_id")
-  cycleId            String                          @map("cycle_id")
-  sequenceNumber     Int                             @map("sequence_number")
-  title              String
-  description        String
-  acceptanceCriteria Json                            @map("acceptance_criteria")
-  requirementIds     Json                            @default("[]") @map("requirement_ids")
-  deliverables       Json                            @default("[]")
-  status             ProjectImplementationStepStatus @default(pending)
-  taskId             String?                         @unique @map("task_id")
-  createdAt          DateTime                        @default(now()) @map("created_at")
-  updatedAt          DateTime                        @updatedAt @map("updated_at")
-  completedAt        DateTime?                       @map("completed_at")
+model ProjectSpecificationVersion {
+  id                String                     @id @default(uuid())
+  projectId         String                     @map("project_id")
+  version           Int
+  fullSpecification String                     @map("full_specification")
+  changeSummary     String                     @map("change_summary")
+  source            ProjectSpecificationSource
+  parentVersionId   String?                    @map("parent_version_id")
+  sourceCycleId     String?                    @unique @map("source_cycle_id")
+  approvedAt        DateTime?                  @map("approved_at")
+  createdAt         DateTime                   @default(now()) @map("created_at")
 
-  project Project             @relation(fields: [projectId], references: [id])
-  cycle   ProjectRoadmapCycle @relation(fields: [cycleId], references: [id])
-  task    Task?               @relation(fields: [taskId], references: [id])
+  project          Project                       @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  parentVersion    ProjectSpecificationVersion?  @relation("SpecificationVersionParent", fields: [parentVersionId], references: [id], onDelete: SetNull)
+  childVersions    ProjectSpecificationVersion[] @relation("SpecificationVersionParent")
+  sourceCycle      ProjectRoadmapCycle?          @relation("SpecificationSourceCycle", fields: [sourceCycleId], references: [id], onDelete: SetNull)
+  roadmapCycles    ProjectRoadmapCycle[]         @relation("RoadmapCycleSpecification")
+  contractVersions ProjectContractVersion[]
+
+  @@unique([projectId, version])
+  @@index([projectId, createdAt])
+  @@map("project_specification_versions")
+}
+
+model ProjectContractVersion {
+  id                     String                       @id @default(uuid())
+  projectId              String                       @map("project_id")
+  specificationVersionId String?                      @map("specification_version_id")
+  version                Int
+  contractJson           Json                         @map("contract_json")
+  contractDelta          Json?                        @map("contract_delta")
+  changeSummary          String                       @map("change_summary")
+  source                 ProjectContractVersionSource
+  parentVersionId        String?                      @map("parent_version_id")
+  createdAt              DateTime                     @default(now()) @map("created_at")
+
+  project              Project                      @relation("ProjectContractVersions", fields: [projectId], references: [id], onDelete: Cascade)
+  currentForProject    Project?                     @relation("CurrentProjectContractVersion")
+  specificationVersion ProjectSpecificationVersion? @relation(fields: [specificationVersionId], references: [id], onDelete: SetNull)
+  parentVersion        ProjectContractVersion?      @relation("ProjectContractVersionParent", fields: [parentVersionId], references: [id], onDelete: SetNull)
+  childVersions        ProjectContractVersion[]     @relation("ProjectContractVersionParent")
+  roadmapCycles        ProjectRoadmapCycle[]        @relation("RoadmapCycleContract")
+  architectureVersions ProjectArchitectureVersion[]
+
+  @@unique([projectId, version])
+  @@index([projectId, createdAt])
+  @@map("project_contract_versions")
+}
+
+model ProjectArchitectureVersion {
+  id                 String                           @id @default(uuid())
+  projectId          String                           @map("project_id")
+  version            Int
+  architectureJson   Json                             @map("architecture_json")
+  architectureUpdate Json?                            @map("architecture_update")
+  changeSummary      String                           @map("change_summary")
+  source             ProjectArchitectureVersionSource
+  parentVersionId    String?                          @map("parent_version_id")
+  contractVersionId  String?                          @map("contract_version_id")
+  sourceTaskId       String?                          @unique @map("source_task_id")
+  createdAt          DateTime                         @default(now()) @map("created_at")
+
+  project           Project                      @relation("ProjectArchitectureVersions", fields: [projectId], references: [id], onDelete: Cascade)
+  currentForProject Project?                     @relation("CurrentProjectArchitectureVersion")
+  parentVersion     ProjectArchitectureVersion?  @relation("ProjectArchitectureVersionParent", fields: [parentVersionId], references: [id], onDelete: SetNull)
+  childVersions     ProjectArchitectureVersion[] @relation("ProjectArchitectureVersionParent")
+  contractVersion   ProjectContractVersion?      @relation(fields: [contractVersionId], references: [id], onDelete: SetNull)
+  sourceTask        Task?                        @relation("ArchitectureSourceTask", fields: [sourceTaskId], references: [id], onDelete: SetNull)
+  effectiveTasks    Task[]                       @relation("TaskEffectiveArchitecture")
+  roadmapCycles     ProjectRoadmapCycle[]        @relation("RoadmapCycleArchitecture")
+
+  @@unique([projectId, version])
+  @@index([projectId, createdAt])
+  @@map("project_architecture_versions")
+}
+
+model ProjectImplementationStep {
+  id                  String                          @id @default(uuid())
+  projectId           String                          @map("project_id")
+  cycleId             String                          @map("cycle_id")
+  sequenceNumber      Int                             @map("sequence_number")
+  title               String
+  description         String
+  acceptanceCriteria  Json                            @map("acceptance_criteria")
+  requirementIds      Json                            @default("[]") @map("requirement_ids")
+  deliverables        Json                            @default("[]")
+  changeRationale     String                          @default("") @map("change_rationale")
+  dependsOnStepTitles Json                            @default("[]") @map("depends_on_step_titles")
+  validationFocus     Json                            @default("[]") @map("validation_focus")
+  status              ProjectImplementationStepStatus @default(pending)
+  taskId              String?                         @unique @map("task_id")
+  createdAt           DateTime                        @default(now()) @map("created_at")
+  updatedAt           DateTime                        @updatedAt @map("updated_at")
+  completedAt         DateTime?                       @map("completed_at")
+
+  project            Project              @relation(fields: [projectId], references: [id])
+  cycle              ProjectRoadmapCycle  @relation(fields: [cycleId], references: [id])
+  task               Task?                @relation(fields: [taskId], references: [id])
   acceptanceEvidence AcceptanceEvidence[]
 
   @@unique([cycleId, sequenceNumber])
@@ -392,19 +521,19 @@ model AcceptanceEvidence {
 }
 
 model ProjectAuditJob {
-  id            String                @id @default(uuid())
-  projectId     String                @map("project_id")
-  cycleId       String                @unique @map("cycle_id")
-  triggerTaskId String?               @map("trigger_task_id")
-  requirementIds Json                 @default("[]") @map("requirement_ids")
-  status        ProjectAuditJobStatus @default(pending)
-  attemptCount  Int                   @default(0) @map("attempt_count")
-  nextAttemptAt DateTime?             @map("next_attempt_at")
-  errorMessage  String?               @map("error_message")
-  createdAt     DateTime              @default(now()) @map("created_at")
-  updatedAt     DateTime              @updatedAt @map("updated_at")
-  claimedAt     DateTime?             @map("claimed_at")
-  finishedAt    DateTime?             @map("finished_at")
+  id             String                @id @default(uuid())
+  projectId      String                @map("project_id")
+  cycleId        String                @unique @map("cycle_id")
+  triggerTaskId  String?               @map("trigger_task_id")
+  requirementIds Json                  @default("[]") @map("requirement_ids")
+  status         ProjectAuditJobStatus @default(pending)
+  attemptCount   Int                   @default(0) @map("attempt_count")
+  nextAttemptAt  DateTime?             @map("next_attempt_at")
+  errorMessage   String?               @map("error_message")
+  createdAt      DateTime              @default(now()) @map("created_at")
+  updatedAt      DateTime              @updatedAt @map("updated_at")
+  claimedAt      DateTime?             @map("claimed_at")
+  finishedAt     DateTime?             @map("finished_at")
 
   project Project             @relation(fields: [projectId], references: [id], onDelete: Cascade)
   cycle   ProjectRoadmapCycle @relation(fields: [cycleId], references: [id], onDelete: Cascade)
@@ -414,16 +543,16 @@ model ProjectAuditJob {
 }
 
 model TaskQueueJob {
-  id           String         @id @default(uuid())
-  taskId       String         @map("task_id")
-  status       QueueJobStatus @default(pending)
-  reason       String
-  attemptCount Int            @default(0) @map("attempt_count")
-  nextAttemptAt DateTime?     @map("next_attempt_at")
-  errorMessage String?        @map("error_message")
-  createdAt    DateTime       @default(now()) @map("created_at")
-  claimedAt    DateTime?      @map("claimed_at")
-  finishedAt   DateTime?      @map("finished_at")
+  id            String         @id @default(uuid())
+  taskId        String         @map("task_id")
+  status        QueueJobStatus @default(pending)
+  reason        String
+  attemptCount  Int            @default(0) @map("attempt_count")
+  nextAttemptAt DateTime?      @map("next_attempt_at")
+  errorMessage  String?        @map("error_message")
+  createdAt     DateTime       @default(now()) @map("created_at")
+  claimedAt     DateTime?      @map("claimed_at")
+  finishedAt    DateTime?      @map("finished_at")
 
   task Task @relation(fields: [taskId], references: [id])
 
@@ -434,10 +563,10 @@ model TaskQueueJob {
 }
 
 model WorkerControl {
-  id          String   @id
-  queuePaused Boolean  @default(false) @map("queue_paused")
+  id          String    @id
+  queuePaused Boolean   @default(false) @map("queue_paused")
   pausedAt    DateTime? @map("paused_at")
-  updatedAt   DateTime @updatedAt @map("updated_at")
+  updatedAt   DateTime  @updatedAt @map("updated_at")
 
   @@map("worker_control")
 }
@@ -460,13 +589,42 @@ model TaskRun {
   summary          String?
   errorMessage     String?      @map("error_message")
 
-  task           Task            @relation(fields: [taskId], references: [id])
-  iterations     TaskIteration[]
-  providerUsage  ProviderUsage[]
+  task               Task                 @relation(fields: [taskId], references: [id])
+  iterations         TaskIteration[]
+  providerUsage      ProviderUsage[]
   acceptanceEvidence AcceptanceEvidence[]
+  checkpoints        TaskCheckpoint[]
 
   @@index([taskId, status])
   @@map("task_runs")
+}
+
+enum TaskCheckpointStatus {
+  started
+  completed
+  failed
+}
+
+model TaskCheckpoint {
+  id           String               @id @default(uuid())
+  taskId       String               @map("task_id")
+  taskRunId    String?              @map("task_run_id")
+  key          String
+  phase        String
+  status       TaskCheckpointStatus @default(started)
+  inputHash    String               @map("input_hash")
+  outputJson   Json?                @map("output_json")
+  errorMessage String?              @map("error_message")
+  startedAt    DateTime             @default(now()) @map("started_at")
+  completedAt  DateTime?            @map("completed_at")
+  updatedAt    DateTime             @updatedAt @map("updated_at")
+
+  task    Task     @relation(fields: [taskId], references: [id], onDelete: Cascade)
+  taskRun TaskRun? @relation(fields: [taskRunId], references: [id], onDelete: SetNull)
+
+  @@unique([taskId, key])
+  @@index([taskId, status])
+  @@map("task_checkpoints")
 }
 
 model TaskIteration {

@@ -99,6 +99,16 @@ export interface Project {
   configYaml?: string;
   brief?: string;
   projectContract?: ProjectContract;
+  currentContractVersionId?: string;
+  projectMemory?: ProjectMemory;
+  projectArchitecture?: ProjectArchitecture;
+  currentArchitectureVersionId?: string;
+  validationProfile?: ProjectValidationProfile;
+  planningSessionId?: string;
+  planningSessionProvider?: ProviderKind;
+  planningSessionModel?: string;
+  planningSessionConnectionId?: string;
+  planningSessionUpdatedAt?: IsoDateString;
   autoCreatePullRequest?: boolean;
   autoMergePullRequest?: boolean;
   autoCompleteTask?: boolean;
@@ -110,21 +120,220 @@ export interface Project {
   updatedAt: IsoDateString;
 }
 
-export interface ProjectContractRequirement {
+export type ValidationCheckCategory = 'setup' | 'build' | 'database' | 'api' | 'browser' | 'smoke';
+
+export interface ProjectValidationProfile {
+  version: 1;
+  enabled: boolean;
+  dockerComposeFiles: string[];
+  dockerComposeServices: string[];
+  requiredEnvironmentVariables: string[];
+  migrationCommands: string[];
+  readinessCommands: string[];
+  commandTimeoutMinutes: number;
+}
+
+export type TaskCheckpointStatus = 'started' | 'completed' | 'failed';
+
+export interface TaskCheckpoint {
+  id: string;
+  taskId: string;
+  taskRunId?: string;
+  key: string;
+  phase: TaskActivityPhase;
+  status: TaskCheckpointStatus;
+  inputHash: string;
+  output?: JsonValue;
+  errorMessage?: string;
+  startedAt: IsoDateString;
+  completedAt?: IsoDateString;
+  updatedAt: IsoDateString;
+}
+
+export interface ProjectMemoryEntry {
+  taskId: string;
+  title: string;
+  summary: string;
+  changedFiles: string[];
+  commitSha?: string;
+  completedAt: IsoDateString;
+}
+
+export interface ProjectMemory {
+  version: 1;
+  contractVersion?: number;
+  baseCommitSha?: string;
+  recentWork: ProjectMemoryEntry[];
+  updatedAt: IsoDateString;
+}
+
+export interface ProjectArchitectureModule {
+  name: string;
+  responsibility: string;
+  paths: string[];
+  publicInterfaces: string[];
+  dependencies: string[];
+}
+
+export interface ProjectArchitectureDatabaseSchema {
+  name: string;
+  technology: string;
+  paths: string[];
+  ownedByModule: string;
+  migrationPaths: string[];
+}
+
+export interface ProjectArchitectureDecision {
+  id: string;
+  summary: string;
+  rationale: string;
+  taskId?: string;
+  createdAt: IsoDateString;
+}
+
+export interface ProjectArchitecture {
+  version: 1;
+  summary: string;
+  modules: ProjectArchitectureModule[];
+  databaseSchemas?: ProjectArchitectureDatabaseSchema[];
+  decisions: ProjectArchitectureDecision[];
+  conventions: string[];
+  dependencyRules: string[];
+  knownDebt: string[];
+  validationCommands: string[];
+  updatedAt: IsoDateString;
+}
+
+export interface ProjectArchitectureUpdate {
+  summary?: string;
+  modules?: ProjectArchitectureModule[];
+  databaseSchemas?: ProjectArchitectureDatabaseSchema[];
+  decisions?: Array<{ summary: string; rationale: string }>;
+  conventions?: string[];
+  dependencyRules?: string[];
+  knownDebt?: string[];
+  resolvedDebt?: string[];
+  validationCommands?: string[];
+}
+
+export type ProjectArchitectureVersionSource =
+  | 'initial_plan'
+  | 'approved_extension'
+  | 'task_update'
+  | 'legacy_import';
+
+export interface ProjectArchitectureVersion {
+  id: string;
+  projectId: string;
+  version: number;
+  architecture: ProjectArchitecture;
+  architectureUpdate?: ProjectArchitectureUpdate;
+  changeSummary: string;
+  source: ProjectArchitectureVersionSource;
+  parentVersionId?: string;
+  contractVersionId?: string;
+  sourceTaskId?: string;
+  createdAt: IsoDateString;
+}
+
+export interface ProjectArchitectureSnapshot {
+  projectId: string;
+  current?: ProjectArchitectureVersion;
+  versions: ProjectArchitectureVersion[];
+}
+
+export type ProjectContractRequirementStatus = 'active' | 'superseded' | 'removed';
+
+export interface ProjectContractRequirementDraft {
   id: string;
   title: string;
   description: string;
   acceptanceCriteria: string[];
+  briefReferences?: string[];
+}
+
+export interface ProjectContractRequirement extends ProjectContractRequirementDraft {
+  status?: ProjectContractRequirementStatus;
+  introducedInVersion?: number;
+  lastChangedInVersion?: number;
+  supersededByRequirementId?: string;
+  lifecycleReason?: string;
 }
 
 export interface ProjectContract {
   version: number;
   sourceBriefHash?: string;
+  sourceBriefSnapshot?: string;
   summary: string;
   invariants: string[];
   prohibitedSubstitutes: string[];
   requirements: ProjectContractRequirement[];
   releaseCriteria: string[];
+}
+
+export interface ProjectContractRequirementUpdate {
+  id: string;
+  title?: string;
+  description?: string;
+  acceptanceCriteria?: string[];
+  briefReferences?: string[];
+  rationale: string;
+}
+
+export interface ProjectContractRequirementSupersession {
+  id: string;
+  replacement: ProjectContractRequirementDraft;
+  rationale: string;
+}
+
+export interface ProjectContractRequirementRemoval {
+  id: string;
+  rationale: string;
+}
+
+export interface ProjectContractStringRemoval {
+  value: string;
+  rationale: string;
+}
+
+export interface ProjectContractCollectionDelta {
+  add: string[];
+  remove: ProjectContractStringRemoval[];
+}
+
+export interface ProjectContractDelta {
+  baseVersion: number;
+  summary?: string;
+  addRequirements: ProjectContractRequirementDraft[];
+  updateRequirements: ProjectContractRequirementUpdate[];
+  supersedeRequirements: ProjectContractRequirementSupersession[];
+  removeRequirements: ProjectContractRequirementRemoval[];
+  invariantChanges: ProjectContractCollectionDelta;
+  prohibitedSubstituteChanges: ProjectContractCollectionDelta;
+  releaseCriteriaChanges: ProjectContractCollectionDelta;
+  migrationImpacts: string[];
+  compatibilityImpacts: string[];
+}
+
+export type ProjectContractVersionSource = 'initial_plan' | 'approved_extension' | 'manual_regeneration';
+
+export interface ProjectContractVersion {
+  id: string;
+  projectId: string;
+  specificationVersionId?: string;
+  version: number;
+  contract: ProjectContract;
+  contractDelta?: ProjectContractDelta;
+  changeSummary: string;
+  source: ProjectContractVersionSource;
+  parentVersionId?: string;
+  createdAt: IsoDateString;
+}
+
+export interface ProjectContractSnapshot {
+  projectId: string;
+  current?: ProjectContractVersion;
+  versions: ProjectContractVersion[];
 }
 
 export type AcceptanceEvidenceSource = 'validation_command' | 'github_check' | 'repository_audit' | 'artifact';
@@ -195,6 +404,9 @@ export type ProjectImplementationStepStatus = 'pending' | 'running' | 'completed
 export interface ProjectRoadmapCycle {
   id: string;
   projectId: string;
+  specificationVersionId?: string;
+  contractVersionId?: string;
+  architectureVersionId?: string;
   cycleNumber: number;
   objective: string;
   extensionProposal?: string;
@@ -202,6 +414,27 @@ export interface ProjectRoadmapCycle {
   createdAt: IsoDateString;
   updatedAt: IsoDateString;
   completedAt?: IsoDateString;
+}
+
+export type ProjectSpecificationSource = 'initial_brief' | 'approved_extension' | 'manual_revision';
+
+export interface ProjectSpecificationVersion {
+  id: string;
+  projectId: string;
+  version: number;
+  fullSpecification: string;
+  changeSummary: string;
+  source: ProjectSpecificationSource;
+  parentVersionId?: string;
+  sourceCycleId?: string;
+  approvedAt?: IsoDateString;
+  createdAt: IsoDateString;
+}
+
+export interface ProjectSpecificationSnapshot {
+  projectId: string;
+  current: ProjectSpecificationVersion;
+  versions: ProjectSpecificationVersion[];
 }
 
 export interface ProjectImplementationStep {
@@ -214,6 +447,9 @@ export interface ProjectImplementationStep {
   acceptanceCriteria: string[];
   requirementIds: string[];
   deliverables: string[];
+  changeRationale: string;
+  dependsOnStepTitles: string[];
+  validationFocus: Array<'implementation' | 'migration' | 'compatibility' | 'regression'>;
   status: ProjectImplementationStepStatus;
   taskId?: string;
   createdAt: IsoDateString;
@@ -232,8 +468,14 @@ export interface ForgeTask {
   githubIssueNumber?: number;
   githubIssueUrl?: string;
   branchName?: string;
+  architectureVersionId?: string;
   pullRequestNumber?: number;
   pullRequestUrl?: string;
+  providerSessionId?: string;
+  providerSessionProvider?: ProviderKind;
+  providerSessionModel?: string;
+  providerSessionConnectionId?: string;
+  providerSessionUpdatedAt?: IsoDateString;
   maxIterations: number;
   maxBudgetUsd: number;
   createdAt: IsoDateString;

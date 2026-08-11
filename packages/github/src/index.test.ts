@@ -512,10 +512,12 @@ describe('GitHub helpers', () => {
   it('creates a ready pull request and merges it with squash when requested', async () => {
     const adapter = new GitHubAppAdapter({ token: 'test-token' });
     const requestSpy = vi.spyOn(adapter as any, 'request');
+    requestSpy.mockResolvedValueOnce([]);
     requestSpy.mockResolvedValueOnce({
       number: 42,
       html_url: 'https://github.com/demo/demo-repo/pull/42'
     });
+    requestSpy.mockResolvedValueOnce({ number: 42, html_url: 'https://github.com/demo/demo-repo/pull/42', merged: false });
     requestSpy.mockResolvedValueOnce({
       sha: 'merge-sha',
       merged: true,
@@ -531,8 +533,8 @@ describe('GitHub helpers', () => {
     });
     const merge = await adapter.mergePullRequest(projectFixture, pullRequest.pullRequestNumber);
 
-    expect(requestSpy).toHaveBeenNthCalledWith(1, 'POST', '/repos/demo/demo-repo/pulls', expect.objectContaining({ draft: false }));
-    expect(requestSpy).toHaveBeenNthCalledWith(2, 'PUT', '/repos/demo/demo-repo/pulls/42/merge', { merge_method: 'squash' });
+    expect(requestSpy).toHaveBeenNthCalledWith(2, 'POST', '/repos/demo/demo-repo/pulls', expect.objectContaining({ draft: false }));
+    expect(requestSpy).toHaveBeenNthCalledWith(4, 'PUT', '/repos/demo/demo-repo/pulls/42/merge', { merge_method: 'squash' });
     expect(merge).toEqual({ merged: true, sha: 'merge-sha', message: 'Pull Request successfully merged' });
 
     requestSpy.mockRestore();
@@ -595,6 +597,7 @@ describe('GitHub helpers', () => {
     const adapter = new GitHubAppAdapter({ token: 'test-token' });
     const requestSpy = vi.spyOn(adapter as any, 'request');
 
+    requestSpy.mockResolvedValueOnce([]);
     requestSpy.mockResolvedValueOnce({
       number: 456,
       html_url: 'https://github.com/demo/demo-repo/pull/456'
@@ -622,6 +625,43 @@ describe('GitHub helpers', () => {
       pullRequestUrl: 'https://github.com/demo/demo-repo/pull/456'
     });
 
+    requestSpy.mockRestore();
+  });
+
+  it('reuses an existing pull request for the task branch', async () => {
+    const adapter = new GitHubAppAdapter({ token: 'test-token' });
+    const requestSpy = vi.spyOn(adapter as any, 'request');
+    requestSpy.mockResolvedValueOnce([{ number: 456, html_url: 'https://github.com/demo/demo-repo/pull/456' }]);
+
+    const result = await adapter.createDraftPullRequest({
+      project: projectFixture,
+      task: { ...taskFixture, branchName: 'ai/123-demo' },
+      title: '[AI] Implement feature X',
+      body: 'PR body'
+    });
+
+    expect(result.pullRequestNumber).toBe(456);
+    expect(requestSpy).toHaveBeenCalledOnce();
+    expect(requestSpy).not.toHaveBeenCalledWith('POST', expect.anything(), expect.anything());
+    requestSpy.mockRestore();
+  });
+
+  it('treats an already merged pull request as a successful idempotent merge', async () => {
+    const adapter = new GitHubAppAdapter({ token: 'test-token' });
+    const requestSpy = vi.spyOn(adapter as any, 'request');
+    requestSpy.mockResolvedValueOnce({
+      number: 42,
+      html_url: 'https://github.com/demo/demo-repo/pull/42',
+      merged: true,
+      merge_commit_sha: 'existing-merge-sha'
+    });
+
+    await expect(adapter.mergePullRequest(projectFixture, 42)).resolves.toEqual({
+      merged: true,
+      sha: 'existing-merge-sha',
+      message: 'Pull request was already merged.'
+    });
+    expect(requestSpy).toHaveBeenCalledOnce();
     requestSpy.mockRestore();
   });
 

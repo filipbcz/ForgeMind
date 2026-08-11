@@ -27,7 +27,10 @@ import type {
   ProviderModelsResponse,
   ProviderStatusApi,
   ProjectApi,
+  ProjectArchitectureSnapshotApi,
+  ProjectContractSnapshotApi,
   ProjectRoadmapApi,
+  ProjectSpecificationSnapshotApi,
   ProjectSummary,
   TaskApi,
   TaskDiffApi,
@@ -142,6 +145,18 @@ export async function assignProjectRepository(projectId: string, input: AssignPr
 
 export async function fetchProjectRoadmap(projectId: string): Promise<ProjectRoadmapApi> {
   return request<ProjectRoadmapApi>(`/api/projects/${projectId}/roadmap`);
+}
+
+export async function fetchProjectSpecifications(projectId: string): Promise<ProjectSpecificationSnapshotApi> {
+  return request<ProjectSpecificationSnapshotApi>(`/api/projects/${projectId}/specifications`);
+}
+
+export async function fetchProjectContracts(projectId: string): Promise<ProjectContractSnapshotApi> {
+  return request<ProjectContractSnapshotApi>(`/api/projects/${projectId}/contracts`);
+}
+
+export async function fetchProjectArchitectures(projectId: string): Promise<ProjectArchitectureSnapshotApi> {
+  return request<ProjectArchitectureSnapshotApi>(`/api/projects/${projectId}/architectures`);
 }
 
 export async function retryProjectAudit(projectId: string): Promise<ProjectRoadmapApi> {

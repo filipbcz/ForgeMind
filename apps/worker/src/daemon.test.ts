@@ -34,4 +34,27 @@ describe('worker daemon', () => {
     expect(runOnce).toHaveBeenCalledTimes(1);
     expect(result).toEqual({ processedCount: 1, idlePollCount: 0, drained: true });
   });
+
+  it('recovers from a transient poll failure without exiting the daemon', async () => {
+    const onError = vi.fn();
+    const runOnce = vi
+      .fn()
+      .mockRejectedValueOnce(new Error('Database postgresql://user:secret@db/control disconnected'))
+      .mockResolvedValueOnce({ claimed: false });
+
+    const result = await runWorkerDaemon({
+      runOnce,
+      stopWhenIdle: true,
+      pollDelayMs: 0,
+      errorDelayMs: 0,
+      onError
+    });
+
+    expect(runOnce).toHaveBeenCalledTimes(2);
+    expect(onError).toHaveBeenCalledWith(
+      expect.objectContaining({ message: 'Database postgresql://[credential-redacted]@db/control disconnected' }),
+      1
+    );
+    expect(result.idlePollCount).toBe(1);
+  });
 });

@@ -1,8 +1,10 @@
 import { execaCommand } from 'execa';
 import type { ValidationCheck } from '@forgemind/providers';
+import { createWorkspaceEnvironment } from '@forgemind/shared';
 
 const VALIDATION_OUTPUT_FLUSH_MS = 350;
 const MAX_ACTIVITY_CHUNK_CHARS = 8_000;
+const MAX_FAILURE_CONTEXT_CHARS = 12_000;
 
 const forbiddenCommandPatterns = [
   /\bsudo\b/i,
@@ -25,12 +27,30 @@ export interface ValidationResult {
   failingCommand?: string;
 }
 
+export function formatValidationFailure(
+  result: Pick<ValidationResult, 'stdout' | 'stderr' | 'exitCode'>
+): string {
+  const stdout = result.stdout.trim();
+  const stderr = result.stderr.trim();
+  if (!stdout && !stderr) return `Exit code ${result.exitCode}`;
+  if (!stdout) return stderr.slice(-MAX_FAILURE_CONTEXT_CHARS);
+  if (!stderr) return stdout.slice(-MAX_FAILURE_CONTEXT_CHARS);
+
+  const stderrBudget = Math.min(4_000, Math.floor(MAX_FAILURE_CONTEXT_CHARS / 3));
+  const stdoutBudget = MAX_FAILURE_CONTEXT_CHARS - stderrBudget;
+  return [
+    `[stdout]\n${stdout.slice(-stdoutBudget)}`,
+    `[stderr]\n${stderr.slice(-stderrBudget)}`
+  ].join('\n\n');
+}
+
 export interface ValidationCheckExecutionResult {
   command: string;
   exitCode: number;
   stdout: string;
   stderr: string;
   passed: boolean;
+  inputHash?: string;
   criterion?: string;
   rationale?: string;
 }
@@ -45,9 +65,15 @@ export interface ValidationActivity {
   message?: string;
   exitCode?: number;
   reused?: boolean;
+  inputHash?: string;
+  category?: ValidationCheck['category'];
 }
 
 export type ValidationActivityHandler = (activity: ValidationActivity) => Promise<void> | void;
+
+export function createValidationEnvironment(source: NodeJS.ProcessEnv = process.env): NodeJS.ProcessEnv {
+  return createWorkspaceEnvironment(source);
+}
 
 export function normalizeValidationCommandForEnvironment(command: string): string {
   const trimmed = command.trim();
@@ -150,7 +176,8 @@ function shouldUsePowerShell(command: string): boolean {
 export async function runValidationCommand(
   command: string,
   cwd: string,
-  onOutput?: (stream: 'stdout' | 'stderr', message: string) => Promise<void> | void
+  onOutput?: (stream: 'stdout' | 'stderr', message: string) => Promise<void> | void,
+  timeoutMinutes = 10
 ): Promise<ValidationResult> {
   const effectiveCommand = normalizeValidationCommandForEnvironment(command);
   assertAllowedValidationCommand(effectiveCommand);
@@ -158,8 +185,9 @@ export async function runValidationCommand(
   try {
     const subprocess = execaCommand(effectiveCommand, {
       cwd,
+      env: createValidationEnvironment(),
       shell: shouldUsePowerShell(effectiveCommand) ? 'powershell.exe' : true,
-      timeout: 10 * 60 * 1000,
+      timeout: Math.max(1, Math.min(60, timeoutMinutes)) * 60 * 1000,
       reject: false
     });
     const pendingOutput: Record<'stdout' | 'stderr', string> = { stdout: '', stderr: '' };
@@ -218,7 +246,8 @@ export async function runValidationChecks(
   checks: ValidationCheck[],
   cwd: string,
   onActivity?: ValidationActivityHandler,
-  passedCheckResults: ReadonlyMap<string, ValidationCheckExecutionResult> = new Map()
+  passedCheckResults: ReadonlyMap<string, ValidationCheckExecutionResult> = new Map(),
+  inputHash?: string
 ): Promise<ValidationResult> {
   if (checks.length === 0) {
     return {
@@ -241,13 +270,15 @@ export async function runValidationChecks(
 
   for (const [index, check] of checks.entries()) {
     const effectiveCommand = normalizeValidationCommandForEnvironment(check.command);
-    const passedResult = passedCheckResults.get(effectiveCommand);
+    const resultKey = validationCheckResultKey(effectiveCommand, inputHash);
+    const passedResult = passedCheckResults.get(resultKey) ?? passedCheckResults.get(effectiveCommand);
     if (passedResult?.passed) {
       reusedCheckCount += 1;
       checkResults.push({
         ...passedResult,
         criterion: check.criterion,
-        rationale: check.rationale
+        rationale: check.rationale,
+        inputHash
       });
       outputs.push(`[command] ${effectiveCommand}`);
       outputs.push('[result] Previously passed; not executed again.');
@@ -258,7 +289,9 @@ export async function runValidationChecks(
         checkCount: checks.length,
         elapsedMs: 0,
         exitCode: 0,
-        reused: true
+        reused: true,
+        inputHash,
+        category: check.category
       });
       continue;
     }
@@ -270,7 +303,9 @@ export async function runValidationChecks(
       command: effectiveCommand,
       checkIndex: index + 1,
       checkCount: checks.length,
-      elapsedMs: 0
+      elapsedMs: 0,
+      inputHash,
+      category: check.category
     });
     const result = await runValidationCommand(effectiveCommand, cwd, async (stream, message) => {
       await onActivity?.({
@@ -280,16 +315,20 @@ export async function runValidationChecks(
         checkCount: checks.length,
         elapsedMs: Date.now() - startedAt,
         stream,
-        message
+        message,
+        inputHash,
+        category: check.category
       });
-    });
+    }, check.timeoutMinutes);
     await onActivity?.({
       state: 'completed',
       command: effectiveCommand,
       checkIndex: index + 1,
       checkCount: checks.length,
       elapsedMs: Date.now() - startedAt,
-      exitCode: result.exitCode
+      exitCode: result.exitCode,
+      inputHash,
+      category: check.category
     });
     outputs.push(`[command] ${effectiveCommand}`);
     if (check.criterion) {
@@ -306,6 +345,7 @@ export async function runValidationChecks(
     }
     checkResults.push({
       ...result,
+      inputHash,
       criterion: check.criterion,
       rationale: check.rationale
     });
@@ -337,10 +377,14 @@ export function collectPassedValidationCheckResults(
 ): Map<string, ValidationCheckExecutionResult> {
   for (const checkResult of result.checkResults ?? []) {
     if (checkResult.passed) {
-      target.set(checkResult.command, checkResult);
+      target.set(validationCheckResultKey(checkResult.command, checkResult.inputHash), checkResult);
     }
   }
   return target;
+}
+
+export function validationCheckResultKey(command: string, inputHash?: string): string {
+  return inputHash ? `${inputHash}:${command}` : command;
 }
 
 function sanitizeValidationOutput(value: string): string {

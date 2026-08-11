@@ -38,6 +38,26 @@ describe('Codex process activity timeouts', () => {
     expect(prompt).not.toContain('Parent objective');
   });
 
+  it('does not resend task scope and plan when continuing a persisted session', () => {
+    const prompt = buildCodexImplementationPrompt({
+      taskId: 'task-1',
+      prompt: 'A very long task scope that the session already knows.',
+      repositoryPath: '/workspace',
+      attemptNumber: 2,
+      plan: {
+        summary: 'Existing plan.',
+        steps: ['A very long implementation plan that the session already knows.'],
+        acceptanceCriteria: ['Build passes.']
+      },
+      previousValidationError: 'Expected exit code 0, received 1.'
+    }, true);
+
+    expect(prompt).toContain('Continue from the existing task session');
+    expect(prompt).toContain('Expected exit code 0, received 1.');
+    expect(prompt).not.toContain('A very long task scope');
+    expect(prompt).not.toContain('A very long implementation plan');
+  });
+
   it('fails before execution when the configured OAuth session is not active', async () => {
     const previousAuthMode = process.env.CODEX_AUTH_MODE;
     const previousBinary = process.env.FORGEMIND_CODEX_CLI_PATH;
@@ -99,6 +119,23 @@ describe('Codex process activity timeouts', () => {
 
     expect(received.some((message) => message.includes('live'))).toBe(true);
     expect(received.at(-1)).toContain('completed');
+  });
+
+  it('captures a persisted Codex session from JSONL events', async () => {
+    const onSessionId = vi.fn();
+    const result = await runCodexProcess(
+      ['-e', "process.stdout.write(JSON.stringify({type:'thread.started',thread_id:'session-123'})+'\\n');process.stdout.write(JSON.stringify({type:'turn.completed',usage:{input_tokens:12,output_tokens:3}})+'\\n')", '--', '--json'],
+      '',
+      {
+        binary: process.execPath,
+        inactivityTimeoutMs: 1_500,
+        maxRuntimeMs: 3_000,
+        onSessionId
+      }
+    );
+
+    expect(onSessionId).toHaveBeenCalledWith('session-123');
+    expect(result).toMatchObject({ sessionId: 'session-123', totalTokens: 15 });
   });
 
   it('stops a process after sustained inactivity', async () => {

@@ -1,4 +1,4 @@
-import type { AcceptanceEvidenceSource, AcceptanceEvidenceStatus, ApprovalType, ProjectContract, ProjectContractRequirement, ProviderKind } from '@forgemind/core';
+import type { AcceptanceEvidenceSource, AcceptanceEvidenceStatus, ApprovalType, ProjectArchitectureUpdate, ProjectContract, ProjectContractDelta, ProjectContractRequirement, ProviderKind, ValidationCheckCategory } from '@forgemind/core';
 
 export interface ProviderActivity {
   kind: 'lifecycle' | 'stdout' | 'stderr' | 'workspace';
@@ -8,6 +8,19 @@ export interface ProviderActivity {
 }
 
 export type ProviderActivityHandler = (activity: ProviderActivity) => void | Promise<void>;
+
+export interface ProviderSessionUpdate {
+  id: string;
+  provider: ProviderKind;
+  model: string;
+}
+
+export interface ProviderSessionContext {
+  id?: string;
+  provider?: ProviderKind;
+  model?: string;
+  onUpdate?: (session: ProviderSessionUpdate) => void | Promise<void>;
+}
 
 export interface ProviderUsageMeasurement {
   provider: ProviderKind;
@@ -25,9 +38,11 @@ export interface PlanInput {
   title: string;
   prompt: string;
   repositoryPath?: string;
+  maxRuntimeMs?: number;
   previousValidationError?: string;
   previousValidationChecks?: ValidationCheck[];
   onActivity?: ProviderActivityHandler;
+  session?: ProviderSessionContext;
 }
 
 export interface PlanResult {
@@ -36,6 +51,8 @@ export interface PlanResult {
   acceptanceCriteria: string[];
   implementationSteps?: ImplementationStepPlan[];
   projectContract?: ProjectContract;
+  contractDelta?: ProjectContractDelta;
+  architectureUpdate?: ProjectArchitectureUpdate;
   validationChecks?: ValidationCheck[];
   providerPrompt?: string;
   providerResponse?: string;
@@ -49,11 +66,36 @@ export interface ImplementationStepPlan {
   outOfScope: string[];
   requirementIds: string[];
   deliverables: string[];
+  changeRationale: string;
+  dependsOnStepTitles: string[];
+  validationFocus: Array<'implementation' | 'migration' | 'compatibility' | 'regression'>;
+}
+
+export interface RoadmapRepairInput {
+  taskId: string;
+  objective: string;
+  validationError: string;
+  implementationSteps: ImplementationStepPlan[];
+  allowedRequirementIds: string[];
+  completedStepTitles: string[];
+  migrationImpacts: string[];
+  compatibilityImpacts: string[];
+  repositoryPath?: string;
+  onActivity?: ProviderActivityHandler;
+  session?: ProviderSessionContext;
+}
+
+export interface RoadmapRepairResult {
+  implementationSteps: ImplementationStepPlan[];
+  providerPrompt?: string;
+  providerResponse?: string;
 }
 
 export interface ValidationCheck {
   kind: 'command';
   command: string;
+  category?: ValidationCheckCategory;
+  timeoutMinutes?: number;
   criterion?: string;
   rationale?: string;
 }
@@ -66,12 +108,17 @@ export function normalizeValidationChecks(value: unknown): ValidationCheck[] {
     const check = item as Record<string, unknown>;
     const criterion = typeof check.criterion === 'string' ? check.criterion.trim() || undefined : undefined;
     const rationale = typeof check.rationale === 'string' ? check.rationale.trim() || undefined : undefined;
+    const category = isValidationCheckCategory(check.category) ? check.category : undefined;
 
     if (check.kind === 'command' && typeof check.command === 'string' && check.command.trim()) {
-      return [{ kind: 'command', command: check.command.trim(), criterion, rationale }];
+      return [{ kind: 'command', command: check.command.trim(), category, criterion, rationale }];
     }
     return [];
   });
+}
+
+function isValidationCheckCategory(value: unknown): value is ValidationCheckCategory {
+  return value === 'setup' || value === 'build' || value === 'database' || value === 'api' || value === 'browser' || value === 'smoke';
 }
 
 export interface ImplementInput {
@@ -84,6 +131,7 @@ export interface ImplementInput {
   previousReviewBlockers?: string[];
   previousSafeImprovements?: string[];
   onActivity?: ProviderActivityHandler;
+  session?: ProviderSessionContext;
 }
 
 export interface FileUpdate {
@@ -101,6 +149,7 @@ export interface ImplementResult {
   };
   requestedApprovals: ApprovalType[];
   validationChecks?: ValidationCheck[];
+  architectureUpdate?: ProjectArchitectureUpdate;
   fileUpdates?: FileUpdate[];
   providerPrompt?: string;
   providerResponse?: string;
@@ -122,7 +171,10 @@ export interface ReviewInput {
     passed: boolean;
   };
   diff: string;
+  architectureContext?: string;
+  architectureUpdate?: ProjectArchitectureUpdate;
   onActivity?: ProviderActivityHandler;
+  session?: ProviderSessionContext;
 }
 
 export interface ReviewResult {
@@ -177,14 +229,43 @@ export interface CapabilityAuditResult {
   providerResponse?: string;
 }
 
+export interface BriefCoverageResult {
+  obligation: string;
+  status: 'passed' | 'failed' | 'blocked';
+  workflowOnly: boolean;
+  requirementIds: string[];
+  evidence: string[];
+  gaps: string[];
+}
+
 export interface ReleaseAuditInput {
   projectId: string;
   contract: ProjectContract;
+  originalBrief: string;
   satisfiedCapabilities: Array<{
     requirementId: string;
     title: string;
     satisfiedCriteria: number;
     totalCriteria: number;
+  }>;
+  implementationSteps?: Array<{
+    sequenceNumber: number;
+    title: string;
+    description: string;
+    acceptanceCriteria: string[];
+    requirementIds: string[];
+    deliverables: string[];
+    status: string;
+    origin: 'initial_roadmap' | 'audit_repair';
+    taskId?: string;
+  }>;
+  executionEvidence?: Array<{
+    criterion: string;
+    source: AcceptanceEvidenceSource;
+    status: AcceptanceEvidenceStatus;
+    command?: string;
+    commitSha?: string;
+    summary?: string;
   }>;
   repositoryPath: string;
   repositoryContext?: string;
@@ -192,7 +273,10 @@ export interface ReleaseAuditInput {
   onActivity?: ProviderActivityHandler;
 }
 
-export type ReleaseAuditResult = CapabilityAuditResult;
+export interface ReleaseAuditResult extends CapabilityAuditResult {
+  briefCoverage: BriefCoverageResult[];
+  contractAmendments: ProjectContractRequirement[];
+}
 
 export interface CostEstimateInput {
   prompt: string;
@@ -208,6 +292,7 @@ export interface CostEstimateResult {
 export interface AIProvider {
   kind: ProviderKind;
   plan(input: PlanInput): Promise<PlanResult>;
+  repairRoadmap?(input: RoadmapRepairInput): Promise<RoadmapRepairResult>;
   implement(input: ImplementInput): Promise<ImplementResult>;
   review(input: ReviewInput): Promise<ReviewResult>;
   auditCapability?(input: CapabilityAuditInput): Promise<CapabilityAuditResult>;

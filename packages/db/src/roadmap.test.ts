@@ -89,7 +89,7 @@ describe('roadmap task completion', () => {
     expect(repository.updateProjectRoadmapCycleStatus).not.toHaveBeenCalled();
   });
 
-  it('audits a finished requirement before starting the next requirement', async () => {
+  it('starts the next planned step before auditing completed requirements', async () => {
     const steps = [
       { id: 'step_1', projectId: 'project_1', cycleId: 'cycle_1', sequenceNumber: 1, title: 'API', description: 'API', acceptanceCriteria: ['API works'], requirementIds: ['REQ-API'], deliverables: ['API'], status: 'running', taskId: 'task_1' },
       { id: 'step_2', projectId: 'project_1', cycleId: 'cycle_1', sequenceNumber: 2, title: 'UI', description: 'UI', acceptanceCriteria: ['UI works'], requirementIds: ['REQ-UI'], deliverables: ['UI'], status: 'pending' }
@@ -115,13 +115,21 @@ describe('roadmap task completion', () => {
         }
       })),
       enqueueProjectAudit,
-      createTask: vi.fn()
+      createTask: vi.fn(async (input) => ({ id: 'task_2', createdByUserId: 'user_1', status: 'draft', createdAt: '', updatedAt: '', ...input })),
+      assignTaskToImplementationStep: vi.fn(async (_stepId: string, taskId: string, status: string) => {
+        steps[1]!.taskId = taskId;
+        steps[1]!.status = status;
+        return steps[1];
+      }),
+      startTask: vi.fn(async () => ({ id: 'task_2', projectId: 'project_1', title: 'Project: UI', prompt: 'Prompt', mode: 'safe', status: 'submitted' })),
+      enqueueTask: vi.fn(async () => ({ enqueued: true })),
+      writeAudit: vi.fn(async () => ({ id: 'audit_1' }))
     };
 
     const result = await advanceRoadmapAfterTaskCompletion(repository as never, 'task_1');
 
-    expect(result.auditQueued).toBe(true);
-    expect(enqueueProjectAudit).toHaveBeenCalledWith(expect.objectContaining({ requirementIds: ['REQ-API'] }));
-    expect(repository.createTask).not.toHaveBeenCalled();
+    expect(result.nextTask?.id).toBe('task_2');
+    expect(enqueueProjectAudit).not.toHaveBeenCalled();
+    expect(repository.createTask).toHaveBeenCalledTimes(1);
   });
 });

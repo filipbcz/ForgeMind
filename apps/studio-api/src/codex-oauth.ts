@@ -1,6 +1,6 @@
 import { spawn, execFile, execFileSync } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
-import { existsSync, readFileSync, readdirSync } from 'node:fs';
+import { existsSync, readFileSync, readdirSync, statSync } from 'node:fs';
 import { mkdir, writeFile } from 'node:fs/promises';
 import { dirname, join, resolve } from 'node:path';
 import { promisify } from 'node:util';
@@ -280,6 +280,7 @@ function resolveCodexBinaryFromSystem(): string | undefined {
   const localAppData = process.env.LOCALAPPDATA?.trim();
   const userProfile = process.env.USERPROFILE?.trim();
   const candidates = [
+    ...(localAppData ? resolveCodexBinariesFromDesktopInstall(join(localAppData, 'OpenAI', 'Codex', 'bin')) : []),
     localAppData
       ? join(localAppData, 'OpenAI', 'Codex', 'bin', 'codex.exe')
       : undefined,
@@ -306,6 +307,22 @@ function resolveCodexBinaryFromSystem(): string | undefined {
   }
 
   return resolveCodexBinaryWithWhere();
+}
+
+function resolveCodexBinariesFromDesktopInstall(binRoot: string): string[] {
+  if (!existsSync(binRoot)) {
+    return [];
+  }
+
+  try {
+    return readdirSync(binRoot, { withFileTypes: true })
+      .filter((entry) => entry.isDirectory())
+      .map((entry) => join(binRoot, entry.name, 'codex.exe'))
+      .filter((candidate) => existsSync(candidate))
+      .sort((left, right) => statSync(right).mtimeMs - statSync(left).mtimeMs);
+  } catch {
+    return [];
+  }
 }
 
 function resolveCodexBinaryWithWhere(): string | undefined {

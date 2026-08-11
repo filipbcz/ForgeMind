@@ -11,13 +11,15 @@ import type {
   PlanResult,
   ReleaseAuditInput,
   ReleaseAuditResult,
+  RoadmapRepairInput,
+  RoadmapRepairResult,
   ReviewInput,
   ReviewResult
 } from './provider.js';
 import { normalizeValidationChecks } from './provider.js';
 import { emitCapturedUsage, normalizeTokenBreakdown } from './provider-usage.js';
 import { buildReviewPrompt } from './review-prompt.js';
-import { buildCapabilityAuditPrompt, buildReleaseAuditPrompt, normalizeCapabilityAuditResult, normalizeReleaseAuditResult, parseCapabilityAuditContent } from './audit-prompt.js';
+import { buildCapabilityAuditPrompt, buildReleaseAuditPrompt, normalizeAuditContentWithSingleRepair, normalizeCapabilityAuditResult, normalizeReleaseAuditResult } from './audit-prompt.js';
 import type { ProviderRuntimeConfig } from './index.js';
 
 const DEFAULT_OPENAI_API_URL = 'https://api.openai.com/v1/chat/completions';
@@ -137,11 +139,12 @@ export class OpenAIProvider implements AIProvider {
         role: 'system',
         content: input.previousValidationError
           ? 'Revise only the supplied failed validation check. Return JSON with a short summary, empty steps and implementationSteps arrays, the supplied acceptanceCriteria, and replacement validationChecks for that failed check only. Do not repeat successful or unrelated checks and do not propose implementation work. Respond only with JSON.'
-          : 'You are an AI project planner. Provide a JSON object with summary, steps, acceptanceCriteria, validationChecks, implementationSteps, and optional projectContract. ' +
-            'For ordinary task plans, implementationSteps must be an empty array and projectContract must be omitted. When the request asks for a project roadmap, include a projectContract and implementationSteps with title, description, acceptanceCriteria, inScope, outOfScope, requirementIds, and deliverables. ' +
-            'validationChecks must contain only executable command checks. Omit criteria that cannot be verified automatically. ' +
+          : 'You are an AI project planner. Provide a JSON object with summary, steps, acceptanceCriteria, validationChecks, implementationSteps, projectContract, contractDelta, and architectureUpdate. ' +
+            'For ordinary task plans, implementationSteps must be an empty array and projectContract, contractDelta, and architectureUpdate must be omitted. For an initial project roadmap, include a full projectContract and set contractDelta to null. For an approved project extension, set projectContract to null and return a contractDelta against the supplied base contract, plus only implementationSteps required by that delta. Never silently omit an existing requirement: update, supersede, or remove it with an explicit rationale. Every new or replacement requirement must include briefReferences with short source phrases or section names from the brief. Include a compact architectureUpdate describing intended modules, boundaries, conventions, decisions, debt, and architecture validation commands. ' +
+            'Every implementation step must include changeRationale, dependsOnStepTitles referencing only earlier steps, and validationFocus. Include regression validation for extensions and migration or compatibility validation when the delta declares those impacts. Architecture updates must include databaseSchemas. ' +
+            'validationChecks must contain only executable command checks and classify each command as setup, build, database, api, browser, or smoke. Omit criteria that cannot be verified automatically. ' +
             'Commands must verify a criterion through their exit code and must not use shell redirection, fallback chains, or inspection-only git diff/status/log commands. ' +
-            'Use { "kind": "command", "command": "...", "criterion": "...", "rationale": "..." }. Respond only with JSON.'
+            'Use { "kind": "command", "command": "...", "category": "build", "criterion": "...", "rationale": "..." }. Respond only with JSON.'
       },
       {
         role: 'user',
@@ -175,11 +178,39 @@ export class OpenAIProvider implements AIProvider {
     };
   }
 
+  async repairRoadmap(input: RoadmapRepairInput): Promise<RoadmapRepairResult> {
+    const messages: Array<{ role: 'system' | 'user' | 'assistant'; content: string }> = [
+      {
+        role: 'system',
+        content: 'Repair only the supplied invalid implementation roadmap. Return JSON containing implementationSteps only. Preserve valid steps and do not regenerate the brief, contract, architecture, or objective. Each step may contain at most 3 requirementIds, 3 deliverables, 5 acceptanceCriteria, and 5 inScope items; split oversized work while preserving complete requirement coverage.'
+      },
+      {
+        role: 'user',
+        content: [
+          `Objective: ${input.objective}`,
+          `Validation error: ${input.validationError}`,
+          `Allowed requirement ids: ${input.allowedRequirementIds.join(', ')}`,
+          `Completed step titles that must not be recreated: ${input.completedStepTitles.join(' | ') || 'none'}`,
+          `Migration impacts: ${input.migrationImpacts.join(' | ') || 'none'}`,
+          `Compatibility impacts: ${input.compatibilityImpacts.join(' | ') || 'none'}`,
+          `Invalid roadmap JSON:\n${JSON.stringify(input.implementationSteps)}`
+        ].join('\n\n')
+      }
+    ];
+    const response = await this.requestChat(messages);
+    await emitCapturedUsage(input.onActivity, response.usage);
+    return {
+      ...parseJsonContent<RoadmapRepairResult>(response.content, { implementationSteps: [] }),
+      providerPrompt: serializeMessages(messages),
+      providerResponse: response.content
+    };
+  }
+
   async implement(input: ImplementInput): Promise<ImplementResult> {
     const messages: Array<{ role: 'system' | 'user' | 'assistant'; content: string }> = [
       {
         role: 'system',
-        content: 'You are an AI implementation assistant. Make only the repository changes required by the supplied task and correction context. Do not perform broad validation that ForgeMind will run after implementation. After editing, propose the smallest authoritative validationChecks set that verifies the acceptance criteria against the resulting repository. Provide a JSON object with summary, changedFiles, diffStat, requestedApprovals, validationChecks, and optional fileUpdates [{ path, content }]. Respond only with JSON.'
+        content: 'You are an AI implementation assistant. Make only the repository changes required by the supplied task and correction context. Do not perform broad validation that ForgeMind will run after implementation. After editing, propose the smallest authoritative validationChecks set that verifies the acceptance criteria against the resulting repository and classify every check as setup, build, database, api, browser, or smoke. Provide a JSON object with summary, changedFiles, diffStat, requestedApprovals, validationChecks, architectureUpdate, and optional fileUpdates [{ path, content }]. architectureUpdate must be a compact delta containing only architectural facts introduced or changed by this attempt, including databaseSchemas; use empty arrays when nothing changed. Respond only with JSON.'
       },
       {
         role: 'user',
@@ -283,11 +314,27 @@ export class OpenAIProvider implements AIProvider {
     ];
     const response = await this.requestChat(messages);
     await emitCapturedUsage(input.onActivity, response.usage);
-    const result = normalizeCapabilityAuditResult(input, parseCapabilityAuditContent(response.content));
+    const normalized = await normalizeAuditContentWithSingleRepair<CapabilityAuditResult>({
+      auditKind: 'capability',
+      content: response.content,
+      expectedCriteria: input.requirement.acceptanceCriteria,
+      allowedRequirementIds: [input.requirement.id],
+      normalize: (value) => normalizeCapabilityAuditResult(input, value),
+      repair: async (repairPrompt) => {
+        const repairResponse = await this.requestChat([
+          { role: 'system', content: 'Repair only the supplied audit JSON. Do not inspect or reassess the repository. Return strict JSON.' },
+          { role: 'user', content: repairPrompt }
+        ]);
+        await emitCapturedUsage(input.onActivity, repairResponse.usage);
+        return repairResponse.content;
+      }
+    });
     return {
-      ...result,
-      providerPrompt: serializeMessages(messages),
-      providerResponse: response.content
+      ...normalized.result,
+      providerPrompt: normalized.repairPrompt
+        ? `${serializeMessages(messages)}\n\n[repair]\n${normalized.repairPrompt}`
+        : serializeMessages(messages),
+      providerResponse: normalized.response
     };
   }
 
@@ -300,10 +347,27 @@ export class OpenAIProvider implements AIProvider {
     ];
     const response = await this.requestChat(messages);
     await emitCapturedUsage(input.onActivity, response.usage);
+    const normalized = await normalizeAuditContentWithSingleRepair<ReleaseAuditResult>({
+      auditKind: 'release',
+      content: response.content,
+      expectedCriteria: [...input.contract.invariants, ...input.contract.releaseCriteria],
+      allowedRequirementIds: input.contract.requirements.map((requirement) => requirement.id),
+      normalize: (value) => normalizeReleaseAuditResult(input, value),
+      repair: async (repairPrompt) => {
+        const repairResponse = await this.requestChat([
+          { role: 'system', content: 'Repair only the supplied release-audit JSON. Do not inspect or reassess the repository. Return strict JSON.' },
+          { role: 'user', content: repairPrompt }
+        ]);
+        await emitCapturedUsage(input.onActivity, repairResponse.usage);
+        return repairResponse.content;
+      }
+    });
     return {
-      ...normalizeReleaseAuditResult(input, parseCapabilityAuditContent(response.content)),
-      providerPrompt: serializeMessages(messages),
-      providerResponse: response.content
+      ...normalized.result,
+      providerPrompt: normalized.repairPrompt
+        ? `${serializeMessages(messages)}\n\n[repair]\n${normalized.repairPrompt}`
+        : serializeMessages(messages),
+      providerResponse: normalized.response
     };
   }
 

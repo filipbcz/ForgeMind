@@ -29,6 +29,82 @@ async function loadRunWorkerTask() {
 }
 
 describe('Studio API routes', () => {
+  it('returns the current project specification and its version history', async () => {
+    const current = {
+      id: 'spec_2', projectId: 'project_1', version: 2,
+      fullSpecification: 'Initial brief\n\nApproved extension',
+      changeSummary: 'Approved extension.', source: 'approved_extension',
+      parentVersionId: 'spec_1', sourceCycleId: 'cycle_1', createdAt: '2026-08-10T10:00:00.000Z'
+    };
+    const specifications = { projectId: 'project_1', current, versions: [current] };
+    const repository = {
+      getProjectSpecifications: vi.fn(async () => specifications)
+    };
+    const app = Fastify();
+    registerRoutes(app, repository as never);
+
+    const response = await app.inject({ method: 'GET', url: '/api/projects/project_1/specifications' });
+
+    expect(response.statusCode).toBe(200);
+    expect(response.json()).toEqual(specifications);
+    await app.close();
+  });
+
+  it('returns immutable project contract history with the current pointer', async () => {
+    const current = {
+      id: 'contract_2', projectId: 'project_1', specificationVersionId: 'spec_2', version: 2,
+      contract: { version: 2, summary: 'Extended', invariants: [], prohibitedSubstitutes: [], requirements: [], releaseCriteria: [] },
+      changeSummary: 'Added reporting.', source: 'approved_extension', parentVersionId: 'contract_1', createdAt: '2026-08-10T10:00:00.000Z'
+    };
+    const contracts = { projectId: 'project_1', current, versions: [current] };
+    const repository = { getProjectContracts: vi.fn(async () => contracts) };
+    const app = Fastify();
+    registerRoutes(app, repository as never);
+
+    const response = await app.inject({ method: 'GET', url: '/api/projects/project_1/contracts' });
+
+    expect(response.statusCode).toBe(200);
+    expect(response.json()).toEqual(contracts);
+    await app.close();
+  });
+
+  it('treats a repeated extension approval as idempotent before invoking the provider', async () => {
+    const roadmap = {
+      projectId: 'project_1',
+      cycles: [
+        { id: 'cycle_1', projectId: 'project_1', cycleNumber: 1, objective: 'Initial', status: 'completed' },
+        { id: 'cycle_2', projectId: 'project_1', cycleNumber: 2, objective: 'Extension', status: 'active' }
+      ],
+      steps: [], evidence: [], capabilities: [], auditJobs: []
+    };
+    const repository = {
+      getProject: vi.fn(async () => ({
+        id: 'project_1', name: 'Project', slug: 'project', defaultBranch: 'main',
+        brief: 'Initial project brief long enough.', isActive: true, createdAt: '', updatedAt: ''
+      })),
+      getProjectRoadmap: vi.fn(async () => roadmap),
+      getProjectSpecifications: vi.fn(async () => ({
+        projectId: 'project_1',
+        current: { id: 'spec_2', projectId: 'project_1', version: 2, fullSpecification: 'Current', changeSummary: 'Extension', source: 'approved_extension', sourceCycleId: 'cycle_1', createdAt: '' },
+        versions: [{ id: 'spec_2', projectId: 'project_1', version: 2, fullSpecification: 'Current', changeSummary: 'Extension', source: 'approved_extension', sourceCycleId: 'cycle_1', createdAt: '' }]
+      })),
+      createProjectRoadmapCycle: vi.fn()
+    };
+    const app = Fastify();
+    registerRoutes(app, repository as never);
+
+    const response = await app.inject({
+      method: 'POST',
+      url: '/api/projects/project_1/extension/decision',
+      payload: { approved: true, cycleId: 'cycle_1' }
+    });
+
+    expect(response.statusCode).toBe(200);
+    expect(response.json()).toEqual(roadmap);
+    expect(repository.createProjectRoadmapCycle).not.toHaveBeenCalled();
+    await app.close();
+  });
+
   it('requeues only a failed project audit with its original requirement scope', async () => {
     const roadmap = {
       projectId: 'project_1',
@@ -275,6 +351,7 @@ describe('Studio API routes', () => {
         updatedAt: new Date().toISOString(),
         finishedAt: status === 'completed' ? new Date().toISOString() : undefined
       })),
+      recordCompletedTaskProjectMemory: vi.fn(async () => undefined),
       listTaskAudit: vi.fn(),
       getTaskDiff: vi.fn(),
       getTaskUsage: vi.fn(),
@@ -318,6 +395,24 @@ describe('Studio API routes', () => {
     });
     expect(clearProjectBriefResponse.statusCode).toBe(200);
     expect(repository.updateProject).toHaveBeenLastCalledWith('project_1', { brief: null });
+
+    const validationProfile = {
+      version: 1 as const,
+      enabled: true,
+      dockerComposeFiles: ['compose.yml'],
+      dockerComposeServices: ['postgres', 'api'],
+      requiredEnvironmentVariables: ['TEST_DATABASE_URL'],
+      migrationCommands: ['npm run db:migrate'],
+      readinessCommands: ['npm run test:health'],
+      commandTimeoutMinutes: 15
+    };
+    const validationProfileResponse = await app.inject({
+      method: 'PATCH',
+      url: '/api/projects/project_1',
+      payload: { validationProfile }
+    });
+    expect(validationProfileResponse.statusCode).toBe(200);
+    expect(repository.updateProject).toHaveBeenLastCalledWith('project_1', { validationProfile });
 
     const shortProjectBriefResponse = await app.inject({
       method: 'PATCH',

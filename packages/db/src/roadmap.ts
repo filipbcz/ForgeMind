@@ -1,3 +1,4 @@
+import { activeProjectContractRequirements } from '@forgemind/core';
 import type { ForgeTask, Project, ProjectImplementationStep, ProjectRoadmapCycle } from '@forgemind/core';
 import type { ForgeMindRepository } from './repository.js';
 
@@ -37,45 +38,27 @@ export async function advanceRoadmapAfterTaskCompletion(
   }
 
   const nextStep = cycleSteps.find((candidate) => candidate.status === 'pending');
-  const auditableRequirementIds = project.projectContract?.requirements
-    .filter((requirement) => {
-      const requirementSteps = cycleSteps.filter((step) => (step.requirementIds ?? []).includes(requirement.id));
-      const capability = roadmap.capabilities?.find((item) => item.requirement.id === requirement.id);
-      return requirementSteps.length > 0
-        && requirementSteps.every((step) => step.status === 'completed')
-        && capability?.status !== 'satisfied';
-    })
-    .map((requirement) => requirement.id) ?? [];
-  if (auditableRequirementIds.length > 0) {
-    const audit = await repository.enqueueProjectAudit({
-      projectId: project.id,
-      cycleId: cycle.id,
-      triggerTaskId: taskId,
-      requirementIds: auditableRequirementIds
-    });
-    return { advanced: true, completedStep, auditQueued: audit.enqueued, project };
-  }
-  if (!nextStep) {
-    if (!project.projectContract) {
-      const completedCycle = cycle.status === 'completed'
-        ? cycle
-        : await repository.updateProjectRoadmapCycleStatus(cycle.id, 'completed');
-      return { advanced: true, completedStep, completedCycle, project };
-    }
-    if (cycle.status === 'completed' || cycle.status === 'awaiting_extension_approval') {
-      return { advanced: linkedStep.status !== 'completed', completedStep, completedCycle: cycle, project };
-    }
-    const audit = await repository.enqueueProjectAudit({
-      projectId: project.id,
-      cycleId: cycle.id,
-      triggerTaskId: taskId,
-      requirementIds: project.projectContract.requirements.map((requirement) => requirement.id)
-    });
-    return { advanced: true, completedStep, auditQueued: audit.enqueued, project };
+  if (nextStep) {
+    const nextTask = await startNextRoadmapStep(repository, project.id, cycle.id);
+    return { advanced: Boolean(nextTask), completedStep, nextTask, project };
   }
 
-  const nextTask = await startNextRoadmapStep(repository, project.id, cycle.id);
-  return { advanced: Boolean(nextTask), completedStep, nextTask, project };
+  if (!project.projectContract) {
+    const completedCycle = cycle.status === 'completed'
+      ? cycle
+      : await repository.updateProjectRoadmapCycleStatus(cycle.id, 'completed');
+    return { advanced: true, completedStep, completedCycle, project };
+  }
+  if (cycle.status === 'completed' || cycle.status === 'awaiting_extension_approval') {
+    return { advanced: linkedStep.status !== 'completed', completedStep, completedCycle: cycle, project };
+  }
+  const audit = await repository.enqueueProjectAudit({
+    projectId: project.id,
+    cycleId: cycle.id,
+    triggerTaskId: taskId,
+    requirementIds: activeProjectContractRequirements(project.projectContract).map((requirement) => requirement.id)
+  });
+  return { advanced: true, completedStep, auditQueued: audit.enqueued, project };
 }
 
 export async function startNextRoadmapStep(
@@ -113,6 +96,9 @@ export async function startNextRoadmapStep(
       acceptanceCriteria: nextStep.acceptanceCriteria,
       requirementIds: nextStep.requirementIds,
       deliverables: nextStep.deliverables,
+      changeRationale: nextStep.changeRationale,
+      dependsOnStepTitles: nextStep.dependsOnStepTitles,
+      validationFocus: nextStep.validationFocus,
       projectContract: project.projectContract,
       completedSteps,
       futureSteps
@@ -149,6 +135,9 @@ export function buildRoadmapStepTaskPrompt(input: {
   acceptanceCriteria: string[];
   requirementIds?: string[];
   deliverables?: string[];
+  changeRationale?: string;
+  dependsOnStepTitles?: string[];
+  validationFocus?: ProjectImplementationStep['validationFocus'];
   projectContract?: Project['projectContract'];
   completedSteps: string[];
   futureSteps: string[];
@@ -195,6 +184,15 @@ export function buildRoadmapStepTaskPrompt(input: {
 
   if (input.deliverables?.length) {
     lines.push('', 'Required deliverables:', ...input.deliverables.map((deliverable) => `- ${deliverable}`));
+  }
+  if (input.changeRationale) {
+    lines.push('', 'Reason this step exists in the current change:', input.changeRationale);
+  }
+  if (input.dependsOnStepTitles?.length) {
+    lines.push('', 'Required predecessor steps:', ...input.dependsOnStepTitles.map((title) => `- ${title}`));
+  }
+  if (input.validationFocus?.length) {
+    lines.push('', 'Required validation focus:', ...input.validationFocus.map((focus) => `- ${focus}`));
   }
 
   if (input.completedSteps.length > 0) {

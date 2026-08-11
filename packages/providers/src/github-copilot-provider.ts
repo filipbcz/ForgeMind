@@ -60,8 +60,8 @@ export class GitHubCopilotProvider implements AIProvider {
   async plan(input: PlanInput): Promise<PlanResult> {
     const messages = [
       'You are GitHub Copilot acting as a codebase planner inside ForgeMind.',
-      'Return only valid JSON with summary, steps, acceptanceCriteria, implementationSteps, and validationChecks.',
-      'For ordinary task plans, implementationSteps must be an empty array.',
+      'Return only valid JSON with summary, steps, acceptanceCriteria, implementationSteps, projectContract, architectureUpdate, and validationChecks.',
+      'For ordinary task plans, implementationSteps must be an empty array and projectContract and architectureUpdate may be omitted.',
       'validationChecks must contain only executable command checks.',
       'Do not add any markdown, code fences, or extra commentary.',
       `Task title: ${input.title}`,
@@ -88,7 +88,7 @@ export class GitHubCopilotProvider implements AIProvider {
   async implement(input: ImplementInput): Promise<ImplementResult> {
     const messages = [
       'You are GitHub Copilot acting as a code editing assistant inside ForgeMind.',
-      'Return only valid JSON with summary, changedFiles, diffStat, requestedApprovals, validationChecks, and optional fileUpdates.',
+      'Return only valid JSON with summary, changedFiles, diffStat, requestedApprovals, validationChecks, architectureUpdate, and optional fileUpdates.',
       'changedFiles should list files actually changed or created.',
       'fileUpdates should include exact file contents for each changed file when you can provide them.',
       'Do not add any markdown, code fences, or extra commentary.',

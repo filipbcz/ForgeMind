@@ -5,13 +5,21 @@ import type {
   ForgeTask,
   ProjectAuditJob as CoreProjectAuditJob,
   ProjectImplementationStep as CoreProjectImplementationStep,
+  ProjectArchitecture,
+  ProjectArchitectureVersion as CoreProjectArchitectureVersion,
   ProjectContract,
+  ProjectContractDelta,
+  ProjectContractRequirementStatus,
+  ProjectContractVersion as CoreProjectContractVersion,
+  ProjectMemory,
+  ProjectValidationProfile,
   ProjectRoadmapCycle as CoreProjectRoadmapCycle,
+  ProjectSpecificationVersion as CoreProjectSpecificationVersion,
   Project as CoreProject,
   TaskRun as CoreTaskRun
 } from '@forgemind/core';
 import type { JsonValue } from '@forgemind/shared';
-import type { AcceptanceEvidence, Approval, AuditLog, Prisma, Project, ProjectAuditJob, ProjectImplementationStep, ProjectRoadmapCycle, Task, TaskRun } from '@prisma/client';
+import type { AcceptanceEvidence, Approval, AuditLog, Prisma, Project, ProjectArchitectureVersion, ProjectAuditJob, ProjectContractVersion, ProjectImplementationStep, ProjectRoadmapCycle, ProjectSpecificationVersion, Task, TaskRun } from '@prisma/client';
 
 export function toProject(project: Project): CoreProject {
   return {
@@ -24,6 +32,16 @@ export function toProject(project: Project): CoreProject {
     configYaml: project.configYaml ?? undefined,
     brief: project.brief ?? undefined,
     projectContract: toProjectContract(project.projectContract),
+    currentContractVersionId: project.currentContractVersionId ?? undefined,
+    projectMemory: toProjectMemory(project.projectMemory),
+    projectArchitecture: toProjectArchitecture(project.projectArchitecture),
+    currentArchitectureVersionId: project.currentArchitectureVersionId ?? undefined,
+    validationProfile: toProjectValidationProfile(project.validationProfile),
+    planningSessionId: project.planningSessionId ?? undefined,
+    planningSessionProvider: project.planningSessionProvider ?? undefined,
+    planningSessionModel: project.planningSessionModel ?? undefined,
+    planningSessionConnectionId: project.planningSessionConnectionId ?? undefined,
+    planningSessionUpdatedAt: project.planningSessionUpdatedAt?.toISOString(),
     autoCreatePullRequest: project.autoCreatePullRequest,
     autoMergePullRequest: project.autoMergePullRequest,
     autoCompleteTask: project.autoCompleteTask,
@@ -36,17 +54,185 @@ export function toProject(project: Project): CoreProject {
   };
 }
 
+function toProjectValidationProfile(value: Prisma.JsonValue | null): ProjectValidationProfile | undefined {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return undefined;
+  const profile = value as Record<string, Prisma.JsonValue>;
+  if (profile.version !== 1 || typeof profile.enabled !== 'boolean') return undefined;
+  const timeout = typeof profile.commandTimeoutMinutes === 'number' && Number.isFinite(profile.commandTimeoutMinutes)
+    ? Math.max(1, Math.min(60, Math.trunc(profile.commandTimeoutMinutes)))
+    : 10;
+  return {
+    version: 1,
+    enabled: profile.enabled,
+    dockerComposeFiles: jsonStringArray(profile.dockerComposeFiles),
+    dockerComposeServices: jsonStringArray(profile.dockerComposeServices),
+    requiredEnvironmentVariables: jsonStringArray(profile.requiredEnvironmentVariables),
+    migrationCommands: jsonStringArray(profile.migrationCommands),
+    readinessCommands: jsonStringArray(profile.readinessCommands),
+    commandTimeoutMinutes: timeout
+  };
+}
+
+function toProjectArchitecture(value: Prisma.JsonValue | null): ProjectArchitecture | undefined {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return undefined;
+  const architecture = value as Record<string, Prisma.JsonValue>;
+  if (
+    architecture.version !== 1
+    || typeof architecture.summary !== 'string'
+    || !Array.isArray(architecture.modules)
+    || !Array.isArray(architecture.decisions)
+    || typeof architecture.updatedAt !== 'string'
+  ) return undefined;
+
+  const modules = architecture.modules.flatMap((value) => {
+    if (!value || typeof value !== 'object' || Array.isArray(value)) return [];
+    const module = value as Record<string, Prisma.JsonValue>;
+    if (typeof module.name !== 'string' || typeof module.responsibility !== 'string') return [];
+    return [{
+      name: module.name,
+      responsibility: module.responsibility,
+      paths: jsonStringArray(module.paths),
+      publicInterfaces: jsonStringArray(module.publicInterfaces),
+      dependencies: jsonStringArray(module.dependencies)
+    }];
+  });
+  const decisions = architecture.decisions.flatMap((value) => {
+    if (!value || typeof value !== 'object' || Array.isArray(value)) return [];
+    const decision = value as Record<string, Prisma.JsonValue>;
+    if (
+      typeof decision.id !== 'string'
+      || typeof decision.summary !== 'string'
+      || typeof decision.rationale !== 'string'
+      || typeof decision.createdAt !== 'string'
+    ) return [];
+    return [{
+      id: decision.id,
+      summary: decision.summary,
+      rationale: decision.rationale,
+      taskId: typeof decision.taskId === 'string' ? decision.taskId : undefined,
+      createdAt: decision.createdAt
+    }];
+  });
+
+  return {
+    version: 1,
+    summary: architecture.summary,
+    modules,
+    databaseSchemas: Array.isArray(architecture.databaseSchemas)
+      ? architecture.databaseSchemas.flatMap((value) => {
+          if (!value || typeof value !== 'object' || Array.isArray(value)) return [];
+          const schema = value as Record<string, Prisma.JsonValue>;
+          if (
+            typeof schema.name !== 'string'
+            || typeof schema.technology !== 'string'
+            || typeof schema.ownedByModule !== 'string'
+          ) return [];
+          return [{
+            name: schema.name,
+            technology: schema.technology,
+            paths: jsonStringArray(schema.paths),
+            ownedByModule: schema.ownedByModule,
+            migrationPaths: jsonStringArray(schema.migrationPaths)
+          }];
+        })
+      : [],
+    decisions,
+    conventions: jsonStringArray(architecture.conventions),
+    dependencyRules: jsonStringArray(architecture.dependencyRules),
+    knownDebt: jsonStringArray(architecture.knownDebt),
+    validationCommands: jsonStringArray(architecture.validationCommands),
+    updatedAt: architecture.updatedAt
+  };
+}
+
+function jsonStringArray(value: Prisma.JsonValue | undefined): string[] {
+  return Array.isArray(value) ? value.filter((item): item is string => typeof item === 'string') : [];
+}
+
+function toProjectMemory(value: Prisma.JsonValue | null): ProjectMemory | undefined {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return undefined;
+  const memory = value as Record<string, Prisma.JsonValue>;
+  if (memory.version !== 1 || !Array.isArray(memory.recentWork) || typeof memory.updatedAt !== 'string') return undefined;
+
+  const recentWork = memory.recentWork.flatMap((item) => {
+    if (!item || typeof item !== 'object' || Array.isArray(item)) return [];
+    const entry = item as Record<string, Prisma.JsonValue>;
+    if (
+      typeof entry.taskId !== 'string'
+      || typeof entry.title !== 'string'
+      || typeof entry.summary !== 'string'
+      || !Array.isArray(entry.changedFiles)
+      || typeof entry.completedAt !== 'string'
+    ) return [];
+    return [{
+      taskId: entry.taskId,
+      title: entry.title,
+      summary: entry.summary,
+      changedFiles: entry.changedFiles.filter((path): path is string => typeof path === 'string'),
+      commitSha: typeof entry.commitSha === 'string' ? entry.commitSha : undefined,
+      completedAt: entry.completedAt
+    }];
+  });
+
+  return {
+    version: 1,
+    contractVersion: typeof memory.contractVersion === 'number' ? memory.contractVersion : undefined,
+    baseCommitSha: typeof memory.baseCommitSha === 'string' ? memory.baseCommitSha : undefined,
+    recentWork,
+    updatedAt: memory.updatedAt
+  };
+}
+
 export function toProjectRoadmapCycle(cycle: ProjectRoadmapCycle): CoreProjectRoadmapCycle {
   return {
     id: cycle.id,
     projectId: cycle.projectId,
     cycleNumber: cycle.cycleNumber,
     objective: cycle.objective,
+    specificationVersionId: cycle.specificationVersionId ?? undefined,
+    contractVersionId: cycle.contractVersionId ?? undefined,
+    architectureVersionId: cycle.architectureVersionId ?? undefined,
     extensionProposal: cycle.extensionProposal ?? undefined,
     status: cycle.status,
     createdAt: cycle.createdAt.toISOString(),
     updatedAt: cycle.updatedAt.toISOString(),
     completedAt: cycle.completedAt?.toISOString()
+  };
+}
+
+export function toProjectSpecificationVersion(
+  specification: ProjectSpecificationVersion
+): CoreProjectSpecificationVersion {
+  return {
+    id: specification.id,
+    projectId: specification.projectId,
+    version: specification.version,
+    fullSpecification: specification.fullSpecification,
+    changeSummary: specification.changeSummary,
+    source: specification.source,
+    parentVersionId: specification.parentVersionId ?? undefined,
+    sourceCycleId: specification.sourceCycleId ?? undefined,
+    approvedAt: specification.approvedAt?.toISOString(),
+    createdAt: specification.createdAt.toISOString()
+  };
+}
+
+export function toProjectContractVersion(version: ProjectContractVersion): CoreProjectContractVersion {
+  const contract = toProjectContract(version.contractJson);
+  if (!contract) {
+    throw new Error(`Stored project contract version "${version.id}" is invalid.`);
+  }
+  return {
+    id: version.id,
+    projectId: version.projectId,
+    specificationVersionId: version.specificationVersionId ?? undefined,
+    version: version.version,
+    contract,
+    contractDelta: toProjectContractDelta(version.contractDelta),
+    changeSummary: version.changeSummary,
+    source: version.source,
+    parentVersionId: version.parentVersionId ?? undefined,
+    createdAt: version.createdAt.toISOString()
   };
 }
 
@@ -91,11 +277,39 @@ export function toProjectImplementationStep(step: ProjectImplementationStep): Co
     acceptanceCriteria,
     requirementIds,
     deliverables,
+    changeRationale: step.changeRationale,
+    dependsOnStepTitles: jsonStringArray(step.dependsOnStepTitles),
+    validationFocus: jsonStringArray(step.validationFocus).filter(
+      (item): item is CoreProjectImplementationStep['validationFocus'][number] =>
+        item === 'implementation' || item === 'migration' || item === 'compatibility' || item === 'regression'
+    ),
     status: step.status,
     taskId: step.taskId ?? undefined,
     createdAt: step.createdAt.toISOString(),
     updatedAt: step.updatedAt.toISOString(),
     completedAt: step.completedAt?.toISOString()
+  };
+}
+
+export function toProjectArchitectureVersion(version: ProjectArchitectureVersion): CoreProjectArchitectureVersion {
+  const architecture = toProjectArchitecture(version.architectureJson);
+  if (!architecture) {
+    throw new Error(`Stored project architecture version "${version.id}" is invalid.`);
+  }
+  return {
+    id: version.id,
+    projectId: version.projectId,
+    version: version.version,
+    architecture,
+    architectureUpdate: version.architectureUpdate
+      ? JSON.parse(JSON.stringify(version.architectureUpdate)) as CoreProjectArchitectureVersion['architectureUpdate']
+      : undefined,
+    changeSummary: version.changeSummary,
+    source: version.source,
+    parentVersionId: version.parentVersionId ?? undefined,
+    contractVersionId: version.contractVersionId ?? undefined,
+    sourceTaskId: version.sourceTaskId ?? undefined,
+    createdAt: version.createdAt.toISOString()
   };
 }
 
@@ -127,7 +341,7 @@ export function toAcceptanceEvidence(evidence: AcceptanceEvidence): CoreAcceptan
   };
 }
 
-function toProjectContract(value: Prisma.JsonValue | null): ProjectContract | undefined {
+export function toProjectContract(value: Prisma.JsonValue | null): ProjectContract | undefined {
   if (!value || typeof value !== 'object' || Array.isArray(value)) return undefined;
   const contract = value as Record<string, Prisma.JsonValue>;
   if (
@@ -152,7 +366,25 @@ function toProjectContract(value: Prisma.JsonValue | null): ProjectContract | un
       id: requirement.id,
       title: requirement.title,
       description: requirement.description,
-      acceptanceCriteria: requirement.acceptanceCriteria.filter((criterion): criterion is string => typeof criterion === 'string')
+      acceptanceCriteria: requirement.acceptanceCriteria.filter((criterion): criterion is string => typeof criterion === 'string'),
+      briefReferences: Array.isArray(requirement.briefReferences)
+        ? requirement.briefReferences.filter((reference): reference is string => typeof reference === 'string')
+        : undefined,
+      status: requirement.status === 'active' || requirement.status === 'superseded' || requirement.status === 'removed'
+        ? requirement.status as ProjectContractRequirementStatus
+        : undefined,
+      introducedInVersion: typeof requirement.introducedInVersion === 'number'
+        ? requirement.introducedInVersion
+        : undefined,
+      lastChangedInVersion: typeof requirement.lastChangedInVersion === 'number'
+        ? requirement.lastChangedInVersion
+        : undefined,
+      supersededByRequirementId: typeof requirement.supersededByRequirementId === 'string'
+        ? requirement.supersededByRequirementId
+        : undefined,
+      lifecycleReason: typeof requirement.lifecycleReason === 'string'
+        ? requirement.lifecycleReason
+        : undefined
     }];
   });
 
@@ -160,12 +392,32 @@ function toProjectContract(value: Prisma.JsonValue | null): ProjectContract | un
   return {
     version: contract.version,
     sourceBriefHash: typeof contract.sourceBriefHash === 'string' ? contract.sourceBriefHash : undefined,
+    sourceBriefSnapshot: typeof contract.sourceBriefSnapshot === 'string' ? contract.sourceBriefSnapshot : undefined,
     summary: contract.summary,
     invariants: contract.invariants.filter((item): item is string => typeof item === 'string'),
     prohibitedSubstitutes: contract.prohibitedSubstitutes.filter((item): item is string => typeof item === 'string'),
     requirements,
     releaseCriteria: contract.releaseCriteria.filter((item): item is string => typeof item === 'string')
   };
+}
+
+function toProjectContractDelta(value: Prisma.JsonValue | null): ProjectContractDelta | undefined {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return undefined;
+  const delta = value as Record<string, Prisma.JsonValue>;
+  if (
+    typeof delta.baseVersion !== 'number'
+    || !Array.isArray(delta.addRequirements)
+    || !Array.isArray(delta.updateRequirements)
+    || !Array.isArray(delta.supersedeRequirements)
+    || !Array.isArray(delta.removeRequirements)
+    || !delta.invariantChanges || typeof delta.invariantChanges !== 'object' || Array.isArray(delta.invariantChanges)
+    || !delta.prohibitedSubstituteChanges || typeof delta.prohibitedSubstituteChanges !== 'object' || Array.isArray(delta.prohibitedSubstituteChanges)
+    || !delta.releaseCriteriaChanges || typeof delta.releaseCriteriaChanges !== 'object' || Array.isArray(delta.releaseCriteriaChanges)
+    || !Array.isArray(delta.migrationImpacts)
+    || !Array.isArray(delta.compatibilityImpacts)
+  ) return undefined;
+
+  return JSON.parse(JSON.stringify(value)) as ProjectContractDelta;
 }
 
 export function toTask(task: Task): ForgeTask {
@@ -180,8 +432,14 @@ export function toTask(task: Task): ForgeTask {
     githubIssueNumber: task.githubIssueNumber ?? undefined,
     githubIssueUrl: task.githubIssueUrl ?? undefined,
     branchName: task.branchName ?? undefined,
+    architectureVersionId: task.architectureVersionId ?? undefined,
     pullRequestNumber: task.pullRequestNumber ?? undefined,
     pullRequestUrl: task.pullRequestUrl ?? undefined,
+    providerSessionId: task.providerSessionId ?? undefined,
+    providerSessionProvider: task.providerSessionProvider ?? undefined,
+    providerSessionModel: task.providerSessionModel ?? undefined,
+    providerSessionConnectionId: task.providerSessionConnectionId ?? undefined,
+    providerSessionUpdatedAt: task.providerSessionUpdatedAt?.toISOString(),
     maxIterations: task.maxIterations,
     maxBudgetUsd: Number(task.maxBudgetUsd),
     createdAt: task.createdAt.toISOString(),
