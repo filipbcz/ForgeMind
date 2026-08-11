@@ -728,6 +728,17 @@ async function runNextProjectAudit(input: {
     if (!allSatisfied) throw new Error('Capability audit finished without satisfying every project requirement.');
 
     if (!hasSatisfiedReleaseAudit(finalRoadmap?.evidence ?? [], contract, workspace.commitSha)) {
+      const releaseFocus = [
+        contract.summary,
+        ...contract.invariants,
+        ...contract.releaseCriteria,
+        ...activeProjectContractRequirements(contract).flatMap((requirement) => [
+          requirement.id,
+          requirement.title,
+          requirement.description,
+          ...requirement.acceptanceCriteria
+        ])
+      ];
       const releaseAudit = await runReleaseAudit({
         repository: input.repository,
         provider,
@@ -737,7 +748,7 @@ async function runNextProjectAudit(input: {
         commitSha: workspace.commitSha,
         repositoryContext: [
           formatProjectArchitectureContext(claimed.project.projectArchitecture, contract.summary),
-          workspace.repositoryContext
+          await buildTargetedRepositoryContext(workspace.workspacePath, releaseFocus)
         ].filter(Boolean).join('\n\n'),
         onActivity
       });

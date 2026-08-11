@@ -32,6 +32,8 @@ describe('Codex process activity timeouts', () => {
     expect(prompt).toContain('score: null is treated as zero.');
     expect(prompt).toContain('ForgeMind runs authoritative validation');
     expect(prompt).toContain('authoritative validationChecks');
+    expect(prompt).toContain('outcome to already_satisfied');
+    expect(prompt).toContain('including outcome');
     expect(prompt).toContain('Do not use environment-only smoke checks');
     expect(prompt).toContain('Omit criteria that cannot be verified automatically');
     expect(prompt).not.toContain('manual checks');

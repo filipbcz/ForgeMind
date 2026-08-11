@@ -1804,6 +1804,31 @@ describe('worker workflow', () => {
     ]);
   });
 
+  it('configures a CMake preset before persisted build and CTest consumers', async () => {
+    const workspacePath = join(tmpdir(), `forgemind-cmake-validation-${randomUUID()}`);
+    await mkdir(workspacePath, { recursive: true });
+    await writeFile(join(workspacePath, 'CMakePresets.json'), JSON.stringify({
+      version: 6,
+      configurePresets: [{ name: 'ninja-debug', generator: 'Ninja', binaryDir: '${sourceDir}/build/ninja-debug' }]
+    }), 'utf8');
+
+    const checks = await resolveValidationChecks({
+      plan: {
+        summary: 'Plan', steps: [], acceptanceCriteria: [],
+        validationChecks: [{ kind: 'command', command: 'cmake --build --preset ninja-debug', category: 'build' }]
+      },
+      architectureCommands: ['ctest --preset ninja-debug --output-on-failure'],
+      workspacePath
+    });
+
+    expect(checks.map((check) => check.command)).toEqual([
+      'cmake --preset ninja-debug',
+      'cmake --build --preset ninja-debug',
+      'ctest --preset ninja-debug --output-on-failure'
+    ]);
+    expect(checks[0]?.category).toBe('setup');
+  });
+
   it('builds one ordered validation suite for install, Docker, migrations, readiness and AI checks', async () => {
     const workspacePath = join(tmpdir(), `forgemind-profile-${randomUUID()}`);
     await mkdir(workspacePath, { recursive: true });
@@ -1891,6 +1916,13 @@ describe('worker workflow', () => {
       exitCode: 127,
       stdout: '',
       stderr: 'sh: 1: tsc: not found',
+      passed: false
+    })).toBe(true);
+    expect(isValidationCommandDefinitionFailure({
+      command: 'cmake --build --preset ninja-debug',
+      exitCode: 1,
+      stdout: '',
+      stderr: 'Error: /workspace/build/ninja-debug is not a directory',
       passed: false
     })).toBe(true);
   });
@@ -2062,6 +2094,45 @@ describe('worker workflow', () => {
     expect(result.status).toBe('validation_failed');
     expect(result.summary).toContain('Provider did not create or modify any task files.');
     await expect(readFile(join(workspaceRoot, task.id, 'MOCK_IMPLEMENTATION.md'), 'utf8')).rejects.toThrow();
+  });
+
+  it('completes an explicitly already-satisfied task after authoritative validation without a synthetic diff', async () => {
+    const workspaceRoot = join(tmpdir(), `forgemind-worker-already-satisfied-${randomUUID()}`);
+    const review = vi.fn(async (): Promise<ReviewResult> => ({
+      summary: 'Review should not be needed.',
+      blockers: [],
+      safeImprovements: [],
+      riskyChanges: []
+    }));
+    const implement = vi.fn(async (): Promise<ImplementResult> => ({
+      outcome: 'already_satisfied',
+      summary: 'Existing implementation and tests already satisfy the task.',
+      changedFiles: [],
+      diffStat: { filesChanged: 0, insertions: 0, deletions: 0 },
+      requestedApprovals: [],
+      validationChecks: [{ kind: 'command', command: 'node --version', category: 'smoke' }]
+    }));
+    const provider = createProviderStub({ implement, review });
+    const statuses: string[] = [];
+
+    const result = await runWorkerTask({
+      project: demoProject,
+      task: { ...demoTask, id: `task_${randomUUID()}`, maxIterations: 2 },
+      provider,
+      workspaceRoot,
+      hooks: {
+        onStatus: async (status) => {
+          statuses.push(status);
+        }
+      }
+    });
+
+    expect(result.status).toBe('completed');
+    expect(result.validation.passed).toBe(true);
+    expect(result.summary).toContain('already satisfy');
+    expect(implement).toHaveBeenCalledTimes(1);
+    expect(review).not.toHaveBeenCalled();
+    expect(statuses).toContain('reviewing');
   });
 
   it('reports actual diff stats for newly created untracked files', async () => {

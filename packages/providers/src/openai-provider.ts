@@ -210,7 +210,7 @@ export class OpenAIProvider implements AIProvider {
     const messages: Array<{ role: 'system' | 'user' | 'assistant'; content: string }> = [
       {
         role: 'system',
-        content: 'You are an AI implementation assistant. Make only the repository changes required by the supplied task and correction context. Do not perform broad validation that ForgeMind will run after implementation. After editing, propose the smallest authoritative validationChecks set that verifies the acceptance criteria against the resulting repository and classify every check as setup, build, database, api, browser, or smoke. Provide a JSON object with summary, changedFiles, diffStat, requestedApprovals, validationChecks, architectureUpdate, and optional fileUpdates [{ path, content }]. architectureUpdate must be a compact delta containing only architectural facts introduced or changed by this attempt, including databaseSchemas; use empty arrays when nothing changed. Respond only with JSON.'
+        content: 'You are an AI implementation assistant. Make only the repository changes required by the supplied task and correction context. Do not perform broad validation that ForgeMind will run after implementation. Set outcome to changes_made when repository changes are required. If the repository already satisfies every acceptance criterion, do not modify files: set outcome to already_satisfied, return empty changedFiles, a zero diffStat, and executable validationChecks that prove the criteria. After editing, propose the smallest authoritative validationChecks set that verifies the acceptance criteria against the resulting repository and classify every check as setup, build, database, api, browser, or smoke. Provide a JSON object with outcome, summary, changedFiles, diffStat, requestedApprovals, validationChecks, architectureUpdate, and optional fileUpdates [{ path, content }]. architectureUpdate must be a compact delta containing only architectural facts introduced or changed by this attempt, including databaseSchemas; use empty arrays when nothing changed. Respond only with JSON.'
       },
       {
         role: 'user',
@@ -233,6 +233,7 @@ export class OpenAIProvider implements AIProvider {
     await emitCapturedUsage(input.onActivity, response.usage);
 
     const fallback: ImplementResult = {
+      outcome: 'changes_made',
       summary: `OpenAI implementation summary for task ${input.taskId}.`,
       changedFiles: ['OPENAI_IMPLEMENTATION.md'],
       diffStat: summarizeDiffStats(input.prompt),
@@ -255,10 +256,15 @@ export class OpenAIProvider implements AIProvider {
     };
 
     const result = parseJsonContent<ImplementResult>(content, fallback);
-    if (!result.changedFiles || !Array.isArray(result.changedFiles) || result.changedFiles.length === 0) {
+    result.outcome = result.outcome === 'already_satisfied' ? 'already_satisfied' : 'changes_made';
+    if (result.outcome === 'already_satisfied') {
+      result.changedFiles = [];
+      result.diffStat = { filesChanged: 0, insertions: 0, deletions: 0 };
+      result.fileUpdates = [];
+    } else if (!result.changedFiles || !Array.isArray(result.changedFiles) || result.changedFiles.length === 0) {
       result.changedFiles = ['OPENAI_IMPLEMENTATION.md'];
     }
-    result.fileUpdates = normalizeFileUpdates(result, fallback);
+    result.fileUpdates = result.outcome === 'already_satisfied' ? [] : normalizeFileUpdates(result, fallback);
     if (!result.diffStat) {
       result.diffStat = summarizeDiffStats(result.summary);
     }

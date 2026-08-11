@@ -318,19 +318,27 @@ async function appendRepositorySections(
   characterBudget: number,
   focusTerms: string[]
 ): Promise<void> {
-  let usedCharacters = 0;
-  for (const path of paths) {
-    if (usedCharacters >= characterBudget) break;
+  const candidates: Array<{ path: string; content: string; index: number; focusScore: number }> = [];
+  for (const [index, path] of paths.entries()) {
     try {
       const content = await readFile(join(workspacePath, path), 'utf8');
       if (content.includes('\0')) continue;
-      const fileLimit = Math.min(6_000, characterBudget - usedCharacters);
-      const bounded = boundRepositoryFileContent(content, fileLimit, focusTerms);
-      sections.push(`--- ${path} ---\n${bounded}`);
-      usedCharacters += bounded.length;
+      const normalized = content.toLowerCase();
+      const focusScore = focusTerms.reduce((score, term) => score + (normalized.includes(term) ? 1 : 0), 0);
+      candidates.push({ path, content, index, focusScore });
     } catch {
       // Binary or transient files are not useful in the audit packet.
     }
+  }
+
+  candidates.sort((left, right) => right.focusScore - left.focusScore || left.index - right.index);
+  let usedCharacters = 0;
+  for (const candidate of candidates) {
+    if (usedCharacters >= characterBudget) break;
+    const fileLimit = Math.min(6_000, characterBudget - usedCharacters);
+    const bounded = boundRepositoryFileContent(candidate.content, fileLimit, focusTerms);
+    sections.push(`--- ${candidate.path} ---\n${bounded}`);
+    usedCharacters += bounded.length;
   }
 }
 

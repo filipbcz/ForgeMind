@@ -79,6 +79,30 @@ describe('buildTargetedRepositoryContext', () => {
     expect(packet).toContain('[focused excerpts]');
     expect(packet.length).toBeLessThan(80_000);
   });
+
+  it('prioritizes a focused test file before irrelevant files exhaust the packet budget', async () => {
+    const workspace = await mkdtemp(join(tmpdir(), 'forgemind-audit-context-'));
+    temporaryDirectories.push(workspace);
+    await mkdir(join(workspace, 'tests'), { recursive: true });
+    for (let index = 0; index < 8; index += 1) {
+      await writeFile(
+        join(workspace, 'tests', `a-irrelevant-${index}.test.cpp`),
+        `const char* fixture${index} = ${JSON.stringify('irrelevant-content-'.repeat(500))};\n`
+      );
+    }
+    const focusedLines = Array.from({ length: 180 }, (_, index) => `const auto filler${index} = ${JSON.stringify('x'.repeat(70))};`);
+    focusedLines.splice(90, 0, 'expect(showMissing.error == "exact missing show diagnostic"); // focused-show-marker');
+    await writeFile(join(workspace, 'tests', 'z-cli-runner.test.cpp'), `${focusedLines.join('\n')}\n`);
+    const git = simpleGit({ baseDir: workspace });
+    await git.init();
+    await git.add('.');
+
+    const packet = await buildTargetedRepositoryContext(workspace, ['exact missing show diagnostic']);
+
+    expect(packet).toContain('--- tests/z-cli-runner.test.cpp ---');
+    expect(packet).toContain('focused-show-marker');
+    expect(packet.length).toBeLessThan(80_000);
+  });
 });
 
 describe('selectReleaseExecutionEvidence', () => {

@@ -451,6 +451,7 @@ export async function runWorkerTask(input: WorkerTaskInput): Promise<WorkerTaskR
     }
 
     if (!isResumedImplementation) {
+      const alreadySatisfied = implementation.outcome === 'already_satisfied';
       await input.hooks?.onIteration?.({
         phase: 'implementation',
         prompt: executionPrompt,
@@ -459,9 +460,10 @@ export async function runWorkerTask(input: WorkerTaskInput): Promise<WorkerTaskR
         providerResponse: implementation.providerResponse,
         diffStat: implementation.diffStat,
         validationResult: {
-          passed: substantiveChangedFiles.length > 0,
+          passed: substantiveChangedFiles.length > 0 || alreadySatisfied,
           attempt,
           changedFiles: substantiveChangedFiles,
+          alreadySatisfied,
           architectureUpdate: implementation.architectureUpdate
             ? implementation.architectureUpdate as unknown as JsonValue
             : null,
@@ -512,19 +514,33 @@ export async function runWorkerTask(input: WorkerTaskInput): Promise<WorkerTaskR
       };
     }
 
-    if (substantiveChangedFiles.length === 0 && !isResumedImplementation) {
+    const alreadySatisfied = implementation.outcome === 'already_satisfied';
+    const hasAlreadySatisfiedValidation = Boolean(
+      config.verifyCommand?.trim()
+      || normalizeValidationChecks(implementation.validationChecks).length > 0
+    );
+    if (
+      substantiveChangedFiles.length === 0
+      && !isResumedImplementation
+      && (!alreadySatisfied || !hasAlreadySatisfiedValidation)
+    ) {
+      const missingProof = alreadySatisfied && !hasAlreadySatisfiedValidation;
       validation = {
         command: 'implementation-changes',
         exitCode: 1,
         stdout: '',
-        stderr: 'Provider did not create or modify any task files.',
+        stderr: missingProof
+          ? 'Provider marked the task as already satisfied without an executable validation check.'
+          : 'Provider did not create or modify any task files.',
         passed: false
       };
       await input.hooks?.onStatus?.('validating', { attempt });
       await input.hooks?.onIteration?.({
         phase: 'validation',
         prompt: validation.command,
-        resultSummary: 'Implementation produced no task file changes.',
+        resultSummary: missingProof
+          ? 'Already-satisfied result did not include executable proof.'
+          : 'Implementation produced no task file changes.',
         diffStat: implementation.diffStat,
         validationResult: {
           command: validation.command,
@@ -544,7 +560,7 @@ export async function runWorkerTask(input: WorkerTaskInput): Promise<WorkerTaskR
           branchName,
           workspacePath,
           validation,
-          summary: 'Provider did not create or modify any task files.',
+          summary: validation.stderr,
           approvals: [],
           completedAt: nowIso()
         };
@@ -791,6 +807,46 @@ export async function runWorkerTask(input: WorkerTaskInput): Promise<WorkerTaskR
     }
 
     if (validation.passed) {
+      if (alreadySatisfied && substantiveChangedFiles.length === 0) {
+        await input.hooks?.onStatus?.('reviewing', { attempt, alreadySatisfied: true });
+        const summary = implementation.summary.trim() || 'Existing implementation already satisfies the task.';
+        await emitTaskActivity(input.hooks, {
+          phase: 'review',
+          state: 'completed',
+          title: 'Existujici reseni splnuje zadani',
+          detail: summary,
+          operation: 'verify_existing_implementation',
+          attempt,
+          elapsedMs: 0
+        });
+        await input.hooks?.onIteration?.({
+          phase: 'review',
+          prompt: 'Verify existing implementation without repository changes.',
+          resultSummary: summary,
+          diffStat: implementation.diffStat,
+          validationResult: { blockers: [], riskyChanges: [], alreadySatisfied: true, attempt }
+        });
+        await emitTaskActivity(input.hooks, {
+          phase: 'completion',
+          state: 'completed',
+          title: 'Task je dokonceny bez zbytecnych zmen',
+          detail: summary,
+          operation: 'finish_task'
+        });
+        return {
+          taskId: input.task.id,
+          status: 'completed',
+          issueUrl: issue.issueUrl,
+          branchName,
+          workspacePath,
+          validation,
+          commitSha: await resolveHeadSha(git),
+          summary,
+          approvals: [],
+          completedAt: nowIso()
+        };
+      }
+
       const reviewResume = input.resume;
       if (reviewResume && (reviewResume.kind === 'approved_review' || resumeDelivery)) {
         await input.hooks?.onStatus?.('reviewing', { attempt, resumed: true, kind: reviewResume.kind });
@@ -1620,6 +1676,8 @@ export function isValidationCommandDefinitionFailure(validation: ValidationResul
     /(?:unknown|unrecognized|invalid) (?:option|argument|flag)/i,
     /no such file or directory/i,
     /cannot find (?:module|package).*requested by the validation command/i,
+    /(?:error:\s*)?[^\r\n]+ is not a directory/i,
+    /could not load cache/i,
     /unexpected eof while looking for matching/i
   ].some((pattern) => pattern.test(output));
 }
@@ -1695,7 +1753,78 @@ export async function resolveValidationChecks(input: {
   const profiledChecks = input.validationProfile?.enabled
     ? await applyProjectValidationProfile(checks, input.validationProfile, input.workspacePath)
     : checks;
-  return deduplicateValidationChecks(profiledChecks);
+  return orderValidationChecksByPrerequisite(
+    deduplicateValidationChecks(profiledChecks),
+    input.workspacePath
+  );
+}
+
+async function orderValidationChecksByPrerequisite(
+  checks: ValidationCheck[],
+  workspacePath?: string
+): Promise<ValidationCheck[]> {
+  const ordered = [...checks];
+  const configuredPresets = await readCmakeConfigurePresets(workspacePath);
+  const consumedPresets = uniqueStrings(ordered.flatMap((check) => extractConsumedCmakePresets(check.command)));
+
+  for (const preset of consumedPresets) {
+    let consumerIndex = ordered.findIndex((check) => extractConsumedCmakePresets(check.command).includes(preset));
+    if (consumerIndex < 0) continue;
+    const producerIndex = ordered.findIndex((check) => extractConfiguredCmakePresets(check.command).includes(preset));
+    if (producerIndex < 0 && configuredPresets.has(preset)) {
+      ordered.splice(consumerIndex, 0, {
+        kind: 'command',
+        command: `cmake --preset ${/^[a-zA-Z0-9_.-]+$/.test(preset) ? preset : quoteCommandArgument(preset)}`,
+        category: 'setup',
+        criterion: `Configure the CMake preset "${preset}" before build and CTest commands.`,
+        rationale: 'Required prerequisite inferred from the committed CMake configure preset.'
+      });
+      continue;
+    }
+    if (producerIndex > consumerIndex) {
+      const [producer] = ordered.splice(producerIndex, 1);
+      ordered.splice(consumerIndex, 0, producer!);
+    }
+  }
+
+  return deduplicateValidationChecks(ordered);
+}
+
+async function readCmakeConfigurePresets(workspacePath?: string): Promise<Set<string>> {
+  const names = new Set<string>();
+  if (!workspacePath) return names;
+  for (const fileName of ['CMakePresets.json', 'CMakeUserPresets.json']) {
+    try {
+      const parsed = JSON.parse(await readFile(join(workspacePath, fileName), 'utf8')) as {
+        configurePresets?: Array<{ name?: unknown }>;
+      };
+      for (const preset of parsed.configurePresets ?? []) {
+        if (typeof preset.name === 'string' && preset.name.trim()) names.add(preset.name.trim());
+      }
+    } catch {
+      // Missing or non-JSON preset files cannot provide a deterministic prerequisite.
+    }
+  }
+  return names;
+}
+
+function extractConfiguredCmakePresets(command: string): string[] {
+  return extractCmakePresetArguments(command, /(?:^|\s)cmake\s+--preset(?:=|\s+)(?:"([^"]+)"|'([^']+)'|([^\s&]+))/i);
+}
+
+function extractConsumedCmakePresets(command: string): string[] {
+  return uniqueStrings([
+    ...extractCmakePresetArguments(command, /(?:^|\s)cmake\s+--build\s+--preset(?:=|\s+)(?:"([^"]+)"|'([^']+)'|([^\s&]+))/i),
+    ...extractCmakePresetArguments(command, /(?:^|\s)ctest\s+--preset(?:=|\s+)(?:"([^"]+)"|'([^']+)'|([^\s&]+))/i)
+  ]);
+}
+
+function extractCmakePresetArguments(command: string, pattern: RegExp): string[] {
+  return splitValidationConjunctions(command).flatMap((segment) => {
+    const match = segment.match(pattern);
+    const value = match?.[1] ?? match?.[2] ?? match?.[3];
+    return value?.trim() ? [value.trim()] : [];
+  });
 }
 
 export function deduplicateValidationChecks(checks: ValidationCheck[]): ValidationCheck[] {

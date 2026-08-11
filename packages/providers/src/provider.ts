@@ -140,6 +140,7 @@ export interface FileUpdate {
 }
 
 export interface ImplementResult {
+  outcome?: 'changes_made' | 'already_satisfied';
   summary: string;
   changedFiles: string[];
   diffStat: {

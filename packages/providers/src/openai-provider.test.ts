@@ -136,6 +136,49 @@ describe('OpenAI provider', () => {
       expect.objectContaining({ kind: 'command', command: 'npm test -- demo' })
     ]);
   });
+
+  it('preserves an explicit already-satisfied result without generating placeholder changes', async () => {
+    process.env.OPENAI_API_KEY = 'test-key';
+    vi.mocked(fetch).mockResolvedValueOnce({
+      ok: true,
+      json: async () => ({
+        choices: [
+          {
+            message: {
+              content: JSON.stringify({
+                outcome: 'already_satisfied',
+                summary: 'The focused test already proves the requested behavior.',
+                changedFiles: [],
+                diffStat: { filesChanged: 0, insertions: 0, deletions: 0 },
+                requestedApprovals: [],
+                validationChecks: [
+                  {
+                    kind: 'command',
+                    command: 'npm test -- existing-behavior',
+                    criterion: 'The existing behavior remains covered.',
+                    rationale: 'The repository already contains the implementation and focused test.'
+                  }
+                ]
+              })
+            }
+          }
+        ]
+      })
+    } as Response);
+
+    const openai = new OpenAIProvider();
+    const result = await openai.implement({
+      taskId: 'already-done',
+      prompt: 'Implement behavior that is already present.',
+      plan: { summary: 'verify', steps: ['verify existing behavior'], acceptanceCriteria: ['focused test passes'] },
+      repositoryPath: 'C:/tmp/repo'
+    });
+
+    expect(result.outcome).toBe('already_satisfied');
+    expect(result.changedFiles).toEqual([]);
+    expect(result.fileUpdates).toEqual([]);
+    expect(result.diffStat).toEqual({ filesChanged: 0, insertions: 0, deletions: 0 });
+  });
 });
 
 describe('Codex provider', () => {
@@ -308,6 +351,50 @@ describe('Codex provider', () => {
     });
 
     expect(result.fileUpdates).toEqual([{ path: 'src/codex.ts', content: 'export const codex = true;\n' }]);
+  });
+
+  it('preserves an explicit already-satisfied Codex result without generating placeholder changes', async () => {
+    process.env.CODEX_API_KEY = 'test-key';
+    vi.mocked(fetch).mockResolvedValueOnce(
+      successfulResponse({
+        output: [
+          {
+            content: [
+              {
+                text: JSON.stringify({
+                  outcome: 'already_satisfied',
+                  summary: 'The requested behavior is already implemented.',
+                  changedFiles: [],
+                  diffStat: { filesChanged: 0, insertions: 0, deletions: 0 },
+                  requestedApprovals: [],
+                  validationChecks: [
+                    {
+                      kind: 'command',
+                      command: 'npm test -- existing-behavior',
+                      criterion: 'The existing behavior remains covered.',
+                      rationale: 'The focused test proves the acceptance criterion.'
+                    }
+                  ]
+                })
+              }
+            ]
+          }
+        ]
+      })
+    );
+
+    const codex = new CodexProvider();
+    const result = await codex.implement({
+      taskId: 'already-done',
+      prompt: 'Implement behavior that is already present.',
+      plan: { summary: 'verify', steps: ['verify existing behavior'], acceptanceCriteria: ['focused test passes'] },
+      repositoryPath: 'C:/tmp/repo'
+    });
+
+    expect(result.outcome).toBe('already_satisfied');
+    expect(result.changedFiles).toEqual([]);
+    expect(result.fileUpdates).toEqual([]);
+    expect(result.diffStat).toEqual({ filesChanged: 0, insertions: 0, deletions: 0 });
   });
 
   it('should surface Codex API errors with status and body', async () => {

@@ -676,8 +676,9 @@ export class CodexProvider implements AIProvider {
           'You are Codex implementation agent. Make only the repository changes required by the supplied task and correction context. ' +
           'Do not run broad test suites, full builds, type checks, dependency installation, database validation, or repository-wide formatting; ForgeMind runs authoritative validation after implementation. ' +
           'Run a narrowly targeted check only when it is required to make the edit correctly. ' +
+          'Set outcome to changes_made when repository changes are required. If the current repository already satisfies every acceptance criterion, do not modify files: set outcome to already_satisfied, return empty changedFiles, a zero diffStat, and executable validationChecks that prove the criteria. ' +
           'After editing, propose the smallest authoritative validationChecks set that verifies the acceptance criteria against the resulting repository. Classify every check as setup, build, database, api, browser, or smoke. ' +
-          'Return JSON with summary, changedFiles, diffStat, requestedApprovals, validationChecks, architectureUpdate, and optional fileUpdates [{ path, content }]. architectureUpdate must contain only architectural facts introduced or changed by this attempt, including databaseSchemas; use empty arrays when nothing changed. Reply with JSON only.'
+          'Return JSON with outcome, summary, changedFiles, diffStat, requestedApprovals, validationChecks, architectureUpdate, and optional fileUpdates [{ path, content }]. architectureUpdate must contain only architectural facts introduced or changed by this attempt, including databaseSchemas; use empty arrays when nothing changed. Reply with JSON only.'
       },
       {
         role: 'user',
@@ -699,6 +700,7 @@ export class CodexProvider implements AIProvider {
     await emitCapturedUsage(input.onActivity, response.usage);
 
     const fallback: ImplementResult = {
+      outcome: 'changes_made',
       summary: `Codex implementation summary for task ${input.taskId}.`,
       changedFiles: ['CODEX_IMPLEMENTATION.md'],
       diffStat: summarizeDiffStats(input.prompt),
@@ -721,7 +723,12 @@ export class CodexProvider implements AIProvider {
     };
 
     const result = parseJsonContent<ImplementResult>(content, fallback);
-    if (!Array.isArray(result.changedFiles) || result.changedFiles.length === 0) {
+    result.outcome = result.outcome === 'already_satisfied' ? 'already_satisfied' : 'changes_made';
+    if (result.outcome === 'already_satisfied') {
+      result.changedFiles = [];
+      result.diffStat = { filesChanged: 0, insertions: 0, deletions: 0 };
+      result.fileUpdates = [];
+    } else if (!Array.isArray(result.changedFiles) || result.changedFiles.length === 0) {
       result.changedFiles = ['CODEX_IMPLEMENTATION.md'];
     }
     if (!result.diffStat) {
@@ -732,7 +739,7 @@ export class CodexProvider implements AIProvider {
     }
     result.validationChecks = normalizeValidationChecks(result.validationChecks);
 
-    result.fileUpdates = normalizeFileUpdates(result, fallback);
+    result.fileUpdates = result.outcome === 'already_satisfied' ? [] : normalizeFileUpdates(result, fallback);
     result.providerPrompt = serializeMessages(messages);
     result.providerResponse = content;
     return result;
@@ -964,6 +971,7 @@ export class CodexProvider implements AIProvider {
 
   private async implementWithCli(input: ImplementInput): Promise<ImplementResult> {
     const fallback: ImplementResult = {
+      outcome: 'changes_made',
       summary: `Codex implementation summary for task ${input.taskId}.`,
       changedFiles: [],
       diffStat: { filesChanged: 0, insertions: 0, deletions: 0 },
@@ -986,8 +994,9 @@ export class CodexProvider implements AIProvider {
         schema: {
           type: 'object',
           additionalProperties: false,
-          required: ['summary', 'changedFiles', 'diffStat', 'requestedApprovals', 'validationChecks', 'architectureUpdate'],
+          required: ['outcome', 'summary', 'changedFiles', 'diffStat', 'requestedApprovals', 'validationChecks', 'architectureUpdate'],
           properties: {
+            outcome: { type: 'string', enum: ['changes_made', 'already_satisfied'] },
             summary: { type: 'string' },
             changedFiles: { type: 'array', items: { type: 'string' } },
             diffStat: {
@@ -1028,6 +1037,7 @@ export class CodexProvider implements AIProvider {
 
     const result = parseJsonContent<ImplementResult>(content, fallback);
     const changedFiles = await collectChangedFiles(input.repositoryPath);
+    result.outcome = result.outcome === 'already_satisfied' ? 'already_satisfied' : 'changes_made';
     if (!Array.isArray(result.changedFiles) || result.changedFiles.length === 0) {
       result.changedFiles = changedFiles;
     }
@@ -1039,6 +1049,7 @@ export class CodexProvider implements AIProvider {
     }
     result.validationChecks = normalizeValidationChecks(result.validationChecks);
     if (recoveredFromTimeout) {
+      result.outcome = 'changes_made';
       result.summary = `Codex stopped after inactivity; preserved ${changedFiles.length} changed file(s) for validation and review.`;
     }
     result.fileUpdates = undefined;
@@ -1739,13 +1750,14 @@ export function buildCodexImplementationPrompt(input: ImplementInput, continueSe
     'Do not create commits, branches, issues, or pull requests. ForgeMind handles those steps.',
     'Do not run broad test suites, full builds, type checks, dependency installation, database validation, or repository-wide formatting. ForgeMind runs authoritative validation after implementation.',
     'Run a narrowly targeted check only when it is required to make the edit correctly.',
+    'Set outcome to changes_made when repository changes are required. If the current repository already satisfies every acceptance criterion, do not modify files: set outcome to already_satisfied, return empty changedFiles, a zero diffStat, and executable validationChecks that prove the criteria.',
     'After editing, return the smallest authoritative validationChecks set for the resulting repository and acceptance criteria. Do not use environment-only smoke checks such as node --version unless the task explicitly requires them.',
     'Return architectureUpdate as a compact delta containing only modules, databaseSchemas, interfaces, dependencies, decisions, conventions, debt, or architecture validation commands introduced or changed by this attempt. Use empty arrays when architecture did not change.',
     'Validation checks must be executable commands that prove a criterion through their exit code. Omit criteria that cannot be verified automatically.',
     input.attemptNumber && input.attemptNumber > 1
       ? 'This is a correction pass. Preserve completed work and change only what is required by the supplied validation error or review blocker.'
       : '',
-    'When finished, return only JSON matching the provided schema.',
+    'When finished, return only JSON matching the provided schema, including outcome.',
     `Task id: ${input.taskId}`,
     `Attempt: ${input.attemptNumber ?? 1}`,
     continueSession ? 'Continue from the existing task session. Inspect the current repository state and preserve completed work.' : `Task scope:\n${input.prompt}`,
