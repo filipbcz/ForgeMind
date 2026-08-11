@@ -14,6 +14,7 @@ import {
   isReviewSummaryOnlyPath,
   isValidationCommandDefinitionFailure,
   normalizeValidationChecks,
+  replaceFailedValidationCheck,
   resolveValidationChecks,
   runWorkerTask
 } from './workflow.js';
@@ -993,6 +994,7 @@ describe('worker workflow', () => {
       };
     });
     const implement = vi.fn();
+    const statuses: string[] = [];
     const review = vi.fn(async (): Promise<ReviewResult> => ({
       summary: 'Review passed.',
       blockers: [],
@@ -1023,6 +1025,11 @@ describe('worker workflow', () => {
           failingCommand: 'missing-tool test'
         },
         resumeValidationPlanRevision: true
+      },
+      hooks: {
+        onStatus: async (status) => {
+          statuses.push(status);
+        }
       }
     });
 
@@ -1032,6 +1039,74 @@ describe('worker workflow', () => {
     expect(plan).toHaveBeenCalledOnce();
     expect(implement).not.toHaveBeenCalled();
     expect(review).toHaveBeenCalledOnce();
+    expect(statuses).toEqual(expect.arrayContaining(['running_ai', 'validating', 'reviewing']));
+    expect(statuses.indexOf('validating')).toBeLessThan(statuses.indexOf('reviewing'));
+  }, 15000);
+
+  it('removes a failed check when AI selects an equivalent check that already passed', () => {
+    const checks = [
+      { kind: 'command' as const, command: 'node tools/forge_validate.js architecture' },
+      { kind: 'command' as const, command: 'python tools/forge_validate.py architecture' }
+    ];
+
+    expect(replaceFailedValidationCheck(
+      checks,
+      'python tools/forge_validate.py architecture',
+      [{ kind: 'command', command: 'node tools/forge_validate.js architecture' }]
+    )).toEqual([
+      { kind: 'command', command: 'node tools/forge_validate.js architecture' }
+    ]);
+  });
+
+  it('does not re-add persisted architecture checks to an authoritative resume plan', async () => {
+    const workspaceRoot = join(tmpdir(), `forgemind-worker-resume-authoritative-validation-${randomUUID()}`);
+    const task = { ...demoTask, id: `task_${randomUUID()}` };
+    const workspacePath = join(workspaceRoot, task.id);
+    await mkdir(workspacePath, { recursive: true });
+    await writeFile(join(workspacePath, 'status.txt'), 'implemented\n', 'utf8');
+    const implement = vi.fn();
+    const plan = vi.fn();
+    const review = vi.fn(async (): Promise<ReviewResult> => ({
+      summary: 'Review passed.',
+      blockers: [],
+      safeImprovements: [],
+      riskyChanges: []
+    }));
+
+    const result = await runWorkerTask({
+      project: {
+        ...demoProject,
+        configYaml: noGitProjectConfig.replace('commands:\n  verify: "node --version"', 'commands: {}'),
+        projectArchitecture: {
+          version: 1,
+          summary: 'Validation architecture.',
+          modules: [],
+          decisions: [],
+          conventions: [],
+          dependencyRules: [],
+          knownDebt: [],
+          validationCommands: ['missing-tool architecture'],
+          updatedAt: new Date().toISOString()
+        }
+      },
+      task,
+      provider: createProviderStub({ plan, implement, review }),
+      workspaceRoot,
+      resume: {
+        kind: 'phase_retry',
+        resumeFrom: 'validation',
+        attempt: 1,
+        implementationSummary: 'Implementation already completed.',
+        changedFiles: ['status.txt'],
+        diffStat: { filesChanged: 1, insertions: 1, deletions: 0 },
+        validationChecks: [{ kind: 'command', command: 'node --version' }]
+      }
+    });
+
+    expect(result.status).toBe('ready_for_user_review');
+    expect(result.validation.command).toBe('node --version');
+    expect(plan).not.toHaveBeenCalled();
+    expect(implement).not.toHaveBeenCalled();
   }, 15000);
 
   it('resumes delivery without repeating AI, commit, or push checkpoints', async () => {

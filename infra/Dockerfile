@@ -43,6 +43,8 @@ RUN apt-get update \
     ninja-build \
     openssh-client \
     pkg-config \
+    python-is-python3 \
+    python3 \
     ripgrep \
   && npm install --global "@openai/codex@${CODEX_VERSION}" \
   && rm -rf /var/lib/apt/lists/*

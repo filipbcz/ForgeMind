@@ -271,7 +271,9 @@ export async function runWorkerTask(input: WorkerTaskInput): Promise<WorkerTaskR
     plan,
     installCommand,
     explicitVerifyCommand: config.verifyCommand,
-    architectureCommands: input.project.projectArchitecture?.validationCommands,
+    architectureCommands: input.resume?.validationChecks?.length
+      ? undefined
+      : input.project.projectArchitecture?.validationCommands,
     validationProfile: input.project.validationProfile,
     workspacePath
   });
@@ -578,15 +580,20 @@ export async function runWorkerTask(input: WorkerTaskInput): Promise<WorkerTaskR
     const isFirstResumedAttempt = attempt === firstAttempt;
     let resumeValidationPlanRevision = isFirstResumedAttempt && input.resume?.resumeValidationPlanRevision === true;
     let missingSystemValidationTool: string | undefined;
+    let validationStatusEmitted = false;
     while (true) {
+      if (!validationStatusEmitted) {
+        await input.hooks?.onStatus?.('validating', {
+          attempt,
+          resumed: Boolean(resumedValidation?.passed || resumeValidationPlanRevision),
+          kind: input.resume?.kind ?? null
+        });
+        validationStatusEmitted = true;
+      }
       if (resumedValidation?.passed) {
-        await input.hooks?.onStatus?.('validating', { attempt, resumed: true, kind: input.resume?.kind ?? 'phase_retry' });
         validation = resumedValidation;
         resumedValidation = undefined;
         break;
-      }
-      if (!resumeValidationPlanRevision && validationPlanRevisionCount === 0) {
-        await input.hooks?.onStatus?.('validating', { attempt });
       }
       if (!resumeValidationPlanRevision) {
         const validationInputHash = await collectValidationInputHash(git, workspacePath);
@@ -1644,13 +1651,16 @@ export function replaceFailedValidationCheck(
       .map(validationCheckIdentity)
   );
   const failedIdentity = validationCheckIdentity(failedCheck);
-  const replacements = normalizeValidationChecks(proposedChecks).filter((check) => {
-    const identity = validationCheckIdentity(check);
-    return identity !== failedIdentity && !existingOtherIdentities.has(identity);
-  });
-  if (replacements.length === 0) {
+  const distinctProposals = normalizeValidationChecks(proposedChecks).filter((check) => (
+    validationCheckIdentity(check) !== failedIdentity
+  ));
+  if (distinctProposals.length === 0) {
     return undefined;
   }
+  const replacements = distinctProposals.filter((check) => {
+    const identity = validationCheckIdentity(check);
+    return !existingOtherIdentities.has(identity);
+  });
 
   return [
     ...currentChecks.slice(0, failedIndex),
