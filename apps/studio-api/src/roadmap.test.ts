@@ -217,6 +217,43 @@ describe('project roadmap generation', () => {
     expect(() => toImplementationStepBlueprints(plan, projectContract)).toThrow('REQ-GENERATOR');
   });
 
+  it('adds the default implementation validation focus without an AI repair', () => {
+    const plan: PlanResult = {
+      summary: 'Roadmap with specialized validation metadata',
+      steps: [],
+      acceptanceCriteria: [],
+      projectContract,
+      implementationSteps: [{
+        title: 'Document scope',
+        description: 'Document the supported product scope.',
+        acceptanceCriteria: ['The scope document is reviewed.'],
+        inScope: ['Scope documentation'],
+        outOfScope: [],
+        requirementIds: ['REQ-SCOPE'],
+        deliverables: ['Scope document'],
+        changeRationale: 'Establish the scope boundary.',
+        dependsOnStepTitles: [],
+        validationFocus: ['regression']
+      }, {
+        title: 'Build exercise generator',
+        description: 'Implement deterministic exercise generation.',
+        acceptanceCriteria: ['Generator tests pass.'],
+        inScope: ['Generator implementation'],
+        outOfScope: [],
+        requirementIds: ['REQ-GENERATOR'],
+        deliverables: ['Generator module'],
+        changeRationale: 'Implement the generator requirement.',
+        dependsOnStepTitles: ['Document scope'],
+        validationFocus: []
+      }]
+    };
+
+    const blueprints = toImplementationStepBlueprints(plan, projectContract);
+
+    expect(blueprints[0].validationFocus).toEqual(['implementation', 'regression']);
+    expect(blueprints[1].validationFocus).toEqual(['implementation']);
+  });
+
   it('rejects broad work items instead of accepting an epic as one task', () => {
     const plan: PlanResult = {
       summary: 'Oversized roadmap',

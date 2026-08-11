@@ -2060,7 +2060,7 @@ export function toImplementationStepBlueprints(
     const deliverables = step.deliverables.map((item) => item.trim()).filter(Boolean);
     const changeRationale = step.changeRationale?.trim();
     const dependsOnStepTitles = step.dependsOnStepTitles?.map((item) => item.trim()).filter(Boolean) ?? [];
-    const validationFocus = Array.from(new Set(step.validationFocus ?? []));
+    const validationFocus = Array.from(new Set(['implementation' as const, ...(step.validationFocus ?? [])]));
 
     if (!title || !description || acceptanceCriteria.length === 0 || inScope.length === 0 || requirementIds.length === 0 || deliverables.length === 0 || !changeRationale) {
       throw new Error(`AI provider returned an incomplete implementation step at position ${index + 1}.`);
@@ -2095,9 +2095,6 @@ export function toImplementationStepBlueprints(
       if (scopeCrossingRequirement) {
         throw new Error(`Extension step "${title}" crosses the contract delta scope via requirement "${scopeCrossingRequirement}".`);
       }
-    }
-    if (!validationFocus.includes('implementation')) {
-      throw new Error(`Implementation step "${title}" must include implementation validation focus.`);
     }
     knownTitles.add(titleIdentity);
 
