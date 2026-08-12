@@ -1,7 +1,11 @@
 import { describe, expect, it, vi } from 'vitest';
-import { buildCodexImplementationPrompt, CodexProvider, isNoisyWorkspaceActivityPath, parseCodexCliTotalTokens, runCodexProcess } from './codex-provider.js';
+import { buildCodexImplementationPrompt, buildCodexReviewSchema, CodexProvider, isNoisyWorkspaceActivityPath, parseCodexCliTotalTokens, runCodexProcess } from './codex-provider.js';
 
 describe('Codex process activity timeouts', () => {
+  it('builds a strict review schema accepted by Codex structured output', () => {
+    expectStrictObjectSchemas(buildCodexReviewSchema());
+  });
+
   it('parses the actual total token count emitted by Codex CLI', () => {
     expect(parseCodexCliTotalTokens('codex output\ntokens used\n124,947\n')).toBe(124947);
     expect(parseCodexCliTotalTokens('codex output without usage')).toBeUndefined();
@@ -183,3 +187,21 @@ describe('Codex process activity timeouts', () => {
     await expect(execution).rejects.toThrow('cancelled by test');
   });
 });
+
+function expectStrictObjectSchemas(schema: unknown): void {
+  if (!schema || typeof schema !== 'object' || Array.isArray(schema)) return;
+
+  const value = schema as Record<string, unknown>;
+  if (value.type === 'object' && value.properties && typeof value.properties === 'object' && !Array.isArray(value.properties)) {
+    const propertyNames = Object.keys(value.properties as Record<string, unknown>).sort();
+    expect(Array.isArray(value.required) ? [...value.required].sort() : value.required).toEqual(propertyNames);
+  }
+
+  for (const child of Object.values(value)) {
+    if (Array.isArray(child)) {
+      child.forEach(expectStrictObjectSchemas);
+    } else {
+      expectStrictObjectSchemas(child);
+    }
+  }
+}

@@ -24,6 +24,7 @@ describe('review prompt', () => {
     expect(prompt).toContain('Do not repeat the supplied validation commands.');
     expect(prompt).toContain('Treat exit code 0 as evidence that a command completed, not by itself as proof');
     expect(prompt).toContain('meaningfully verify the acceptance criteria');
+    expect(prompt).toContain('Return one criterionResults entry for every explicit acceptance criterion');
     expect(prompt).toContain('Implement profile selection without changing authentication.');
     expect(prompt).toContain('A profile can be selected.');
     expect(prompt).toContain('Command: npm test && npm run build');
@@ -85,7 +86,7 @@ describe('review prompt', () => {
     });
 
     expect(prompt).toContain('Verify only the supplied ForgeMind existing-state evidence packet.');
-    expect(prompt).toContain('Return one criterionResults entry for every acceptance criterion');
+    expect(prompt).toContain('Return one criterionResults entry for every explicit acceptance criterion');
     expect(prompt).toContain('Do not inspect repository files outside the supplied evidence packet');
     expect(prompt).toContain('--- src/profile.ts ---');
     expect(prompt).toContain('Diff:\n(not applicable for existing-state verification)');

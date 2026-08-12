@@ -54,6 +54,33 @@ const APPROVAL_TYPES = [
   'write_outside_repo'
 ];
 
+export function buildCodexReviewSchema(): Record<string, unknown> {
+  return {
+    type: 'object',
+    additionalProperties: false,
+    required: ['summary', 'blockers', 'safeImprovements', 'riskyChanges', 'criterionResults'],
+    properties: {
+      summary: { type: 'string' },
+      blockers: { type: 'array', items: { type: 'string' } },
+      safeImprovements: { type: 'array', items: { type: 'string' } },
+      riskyChanges: { type: 'array', items: { type: 'string', enum: APPROVAL_TYPES } },
+      criterionResults: {
+        type: 'array',
+        items: {
+          type: 'object',
+          additionalProperties: false,
+          required: ['criterion', 'status', 'evidence'],
+          properties: {
+            criterion: { type: 'string' },
+            status: { type: 'string', enum: ['satisfied', 'not_satisfied', 'insufficient_evidence'] },
+            evidence: { type: 'array', items: { type: 'string' } }
+          }
+        }
+      }
+    }
+  };
+}
+
 interface CodexAppServerModel {
   id?: string;
   model?: string;
@@ -658,7 +685,7 @@ export class CodexProvider implements AIProvider {
     const messages: Array<{ role: 'system' | 'user' | 'assistant'; content: string }> = [
       {
         role: 'system',
-          content: 'You are Codex reviewer. Follow the review packet constraints and return JSON with summary, blockers, safeImprovements, riskyChanges, and criterionResults when requested.'
+        content: 'You are Codex reviewer. Follow the review packet constraints and return JSON with summary, blockers, safeImprovements, riskyChanges, and criterionResults.'
       },
       {
         role: 'user',
@@ -976,30 +1003,7 @@ export class CodexProvider implements AIProvider {
       onActivity: input.onActivity,
       session: input.session,
       signal: input.signal,
-      schema: {
-        type: 'object',
-        additionalProperties: false,
-        required: ['summary', 'blockers', 'safeImprovements', 'riskyChanges'],
-        properties: {
-          summary: { type: 'string' },
-          blockers: { type: 'array', items: { type: 'string' } },
-          safeImprovements: { type: 'array', items: { type: 'string' } },
-          riskyChanges: { type: 'array', items: { type: 'string', enum: APPROVAL_TYPES } },
-          criterionResults: {
-            type: 'array',
-            items: {
-              type: 'object',
-              additionalProperties: false,
-              required: ['criterion', 'status', 'evidence'],
-              properties: {
-                criterion: { type: 'string' },
-                status: { type: 'string', enum: ['satisfied', 'not_satisfied', 'insufficient_evidence'] },
-                evidence: { type: 'array', items: { type: 'string' } }
-              }
-            }
-          }
-        }
-      },
+      schema: buildCodexReviewSchema(),
       prompt: providerPrompt
     });
 
