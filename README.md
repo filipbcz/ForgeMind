@@ -293,6 +293,7 @@ ai:
   primary_provider: "codex"
   fallback_provider: "github_copilot"
   reviewer_provider: "codex"
+  # reviewer_connection_id: "provider-connection-id"
   model_profile: "balanced"
 
 limits:
@@ -487,9 +488,9 @@ validation_failed
 5. Spusť AI implementaci.
 6. Získej diff.
 7. Spusť validace.
-8. Pokud validace selže, pošli chybu zpět AI.
-9. Pokud se chyba opakuje, zastav.
-10. Pokud validace projde, spusť AI review.
+8. Pokud validace selže, pošli AI celý příkaz, exit code, stdout a stderr.
+9. AI rozhodne, zda nahradit pouze chybnou kontrolu, opravit implementaci, nebo označit skutečný blocker; úspěšné kontroly se neopakují.
+10. Pokud validace projde, spusť AI review, které posoudí změny i význam validačního důkazu proti zadání.
 11. Pokud review najde blocker, vrať do implementace.
 12. Pokud review navrhne bezpečné vylepšení, proveď ho.
 13. Pokud review navrhne rizikovou změnu, vyžádej schválení.

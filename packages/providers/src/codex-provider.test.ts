@@ -169,4 +169,17 @@ describe('Codex process activity timeouts', () => {
       reason: 'max_runtime'
     });
   });
+
+  it('terminates the running Codex process when the task is cancelled', async () => {
+    const controller = new AbortController();
+    const execution = runCodexProcess(['-e', 'setInterval(()=>{},1000)'], '', {
+      binary: process.execPath,
+      inactivityTimeoutMs: 5_000,
+      maxRuntimeMs: 5_000,
+      signal: controller.signal
+    });
+    setTimeout(() => controller.abort(new Error('cancelled by test')), 50);
+
+    await expect(execution).rejects.toThrow('cancelled by test');
+  });
 });

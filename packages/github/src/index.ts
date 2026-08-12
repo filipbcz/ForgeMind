@@ -33,6 +33,12 @@ export interface MergePullRequestResult {
   message: string;
 }
 
+export interface PullRequestState {
+  merged: boolean;
+  state: string;
+  mergeCommitSha?: string;
+}
+
 export interface GitHubCheckFailure {
   name: string;
   detailsUrl?: string;
@@ -50,16 +56,18 @@ export interface WaitForGitHubChecksOptions {
   discoveryTimeoutMs?: number;
   pollIntervalMs?: number;
   onProgress?: (message: string) => Promise<void> | void;
+  signal?: AbortSignal;
 }
 
 export interface GitHubAdapter {
-  createIssue(input: CreateIssueInput): Promise<CreateIssueResult>;
+  createIssue(input: CreateIssueInput, signal?: AbortSignal): Promise<CreateIssueResult>;
   getRemoteUrl?(project: Project): string | undefined;
-  createBranch(project: Project, branchName: string, fromBranch: string): Promise<void>;
-  commitAndPush(project: Project, branchName: string, message: string, workspacePath?: string): Promise<void>;
-  createDraftPullRequest(input: CreateDraftPullRequestInput): Promise<CreateDraftPullRequestResult>;
-  mergePullRequest?(project: Project, pullRequestNumber: number): Promise<MergePullRequestResult>;
-  commentOnIssue(project: Project, issueNumber: number, body: string): Promise<void>;
+  createBranch(project: Project, branchName: string, fromBranch: string, signal?: AbortSignal): Promise<void>;
+  commitAndPush(project: Project, branchName: string, message: string, workspacePath?: string, signal?: AbortSignal): Promise<void>;
+  createDraftPullRequest(input: CreateDraftPullRequestInput, signal?: AbortSignal): Promise<CreateDraftPullRequestResult>;
+  mergePullRequest?(project: Project, pullRequestNumber: number, signal?: AbortSignal): Promise<MergePullRequestResult>;
+  getPullRequestState?(project: Project, pullRequestNumber: number): Promise<PullRequestState>;
+  commentOnIssue(project: Project, issueNumber: number, body: string, signal?: AbortSignal): Promise<void>;
   readCheckStatus(project: Project, ref: string): Promise<'pending' | 'success' | 'failure'>;
   waitForChecks?(project: Project, ref: string, options?: WaitForGitHubChecksOptions): Promise<GitHubChecksResult>;
 }
@@ -178,6 +186,7 @@ interface GitHubPullResponse {
   html_url: string;
   merged?: boolean;
   merge_commit_sha?: string | null;
+  state?: string;
 }
 
 interface GitHubMergePullResponse {
@@ -257,13 +266,13 @@ export class GitHubAppAdapter implements GitHubAdapter {
     this.apiBaseUrl = options.apiBaseUrl ?? process.env.GITHUB_API_BASE_URL ?? 'https://api.github.com';
   }
 
-  async createIssue(input: CreateIssueInput): Promise<CreateIssueResult> {
+  async createIssue(input: CreateIssueInput, signal?: AbortSignal): Promise<CreateIssueResult> {
     const repository = requireProjectRepository(input.project);
-    const issue = await this.request<GitHubIssueResponse>('POST', `/repos/${repository.owner}/${repository.repo}/issues`, {
+    const issue = await this.requestWithSignal<GitHubIssueResponse>('POST', `/repos/${repository.owner}/${repository.repo}/issues`, {
       title: `[AI] ${input.task.title}`,
       body: renderIssueBody(input.task),
       labels: input.labels
-    });
+    }, signal);
 
     return {
       issueNumber: issue.number,
@@ -271,18 +280,20 @@ export class GitHubAppAdapter implements GitHubAdapter {
     };
   }
 
-  async createBranch(project: Project, branchName: string, fromBranch: string): Promise<void> {
+  async createBranch(project: Project, branchName: string, fromBranch: string, signal?: AbortSignal): Promise<void> {
     const repository = requireProjectRepository(project);
-    const ref = await this.request<GitHubRefResponse>(
+    const ref = await this.requestWithSignal<GitHubRefResponse>(
       'GET',
-      `/repos/${repository.owner}/${repository.repo}/git/ref/heads/${encodeURIComponent(fromBranch)}`
+      `/repos/${repository.owner}/${repository.repo}/git/ref/heads/${encodeURIComponent(fromBranch)}`,
+      undefined,
+      signal
     );
 
     try {
-      await this.request('POST', `/repos/${repository.owner}/${repository.repo}/git/refs`, {
+      await this.requestWithSignal('POST', `/repos/${repository.owner}/${repository.repo}/git/refs`, {
         ref: `refs/heads/${branchName}`,
         sha: ref.object.sha
-      });
+      }, signal);
     } catch (error) {
       if (error instanceof Error && error.message.includes('Reference already exists')) {
         return;
@@ -301,7 +312,8 @@ export class GitHubAppAdapter implements GitHubAdapter {
       ?? `https://x-access-token:${encodeURIComponent(this.options.token)}@github.com/${repository.owner}/${repository.repo}.git`;
   }
 
-  async commitAndPush(project: Project, branchName: string, message: string, workspacePath?: string): Promise<void> {
+  async commitAndPush(project: Project, branchName: string, message: string, workspacePath?: string, signal?: AbortSignal): Promise<void> {
+    throwIfAborted(signal);
     if (!workspacePath) return;
 
     const git = simpleGit({ baseDir: workspacePath });
@@ -313,15 +325,18 @@ export class GitHubAppAdapter implements GitHubAdapter {
     }
 
     await git.push(['-u', 'origin', branchName]);
+    throwIfAborted(signal);
   }
 
-  async createDraftPullRequest(input: CreateDraftPullRequestInput): Promise<CreateDraftPullRequestResult> {
+  async createDraftPullRequest(input: CreateDraftPullRequestInput, signal?: AbortSignal): Promise<CreateDraftPullRequestResult> {
     const repository = requireProjectRepository(input.project);
     const branchName = input.task.branchName;
     if (!branchName) throw new Error('A task branch is required before creating a pull request.');
-    const existing = await this.request<GitHubPullResponse[]>(
+    const existing = await this.requestWithSignal<GitHubPullResponse[]>(
       'GET',
-      `/repos/${repository.owner}/${repository.repo}/pulls?state=open&head=${encodeURIComponent(`${repository.owner}:${branchName}`)}&base=${encodeURIComponent(input.project.defaultBranch)}`
+      `/repos/${repository.owner}/${repository.repo}/pulls?state=open&head=${encodeURIComponent(`${repository.owner}:${branchName}`)}&base=${encodeURIComponent(input.project.defaultBranch)}`,
+      undefined,
+      signal
     );
     if (existing[0]) {
       return {
@@ -329,13 +344,13 @@ export class GitHubAppAdapter implements GitHubAdapter {
         pullRequestUrl: existing[0].html_url
       };
     }
-    const pull = await this.request<GitHubPullResponse>('POST', `/repos/${repository.owner}/${repository.repo}/pulls`, {
+    const pull = await this.requestWithSignal<GitHubPullResponse>('POST', `/repos/${repository.owner}/${repository.repo}/pulls`, {
       title: input.title,
       body: input.body,
       head: input.task.branchName,
       base: input.project.defaultBranch,
       draft: input.draft ?? true
-    });
+    }, signal);
 
     return {
       pullRequestNumber: pull.number,
@@ -343,9 +358,9 @@ export class GitHubAppAdapter implements GitHubAdapter {
     };
   }
 
-  async mergePullRequest(project: Project, pullRequestNumber: number): Promise<MergePullRequestResult> {
+  async mergePullRequest(project: Project, pullRequestNumber: number, signal?: AbortSignal): Promise<MergePullRequestResult> {
     const repository = requireProjectRepository(project);
-    const existing = await this.request<GitHubPullResponse>('GET', `/repos/${repository.owner}/${repository.repo}/pulls/${pullRequestNumber}`);
+    const existing = await this.requestWithSignal<GitHubPullResponse>('GET', `/repos/${repository.owner}/${repository.repo}/pulls/${pullRequestNumber}`, undefined, signal);
     if (existing.merged) {
       return {
         merged: true,
@@ -353,10 +368,11 @@ export class GitHubAppAdapter implements GitHubAdapter {
         message: 'Pull request was already merged.'
       };
     }
-    const result = await this.request<GitHubMergePullResponse>(
+    const result = await this.requestWithSignal<GitHubMergePullResponse>(
       'PUT',
       `/repos/${repository.owner}/${repository.repo}/pulls/${pullRequestNumber}/merge`,
-      { merge_method: 'squash' }
+      { merge_method: 'squash' },
+      signal
     );
 
     return {
@@ -366,11 +382,21 @@ export class GitHubAppAdapter implements GitHubAdapter {
     };
   }
 
-  async commentOnIssue(project: Project, issueNumber: number, body: string): Promise<void> {
+  async getPullRequestState(project: Project, pullRequestNumber: number): Promise<PullRequestState> {
     const repository = requireProjectRepository(project);
-    await this.request('POST', `/repos/${repository.owner}/${repository.repo}/issues/${issueNumber}/comments`, {
+    const pull = await this.request<GitHubPullResponse>('GET', `/repos/${repository.owner}/${repository.repo}/pulls/${pullRequestNumber}`);
+    return {
+      merged: pull.merged === true,
+      state: pull.state ?? 'unknown',
+      mergeCommitSha: pull.merge_commit_sha || undefined
+    };
+  }
+
+  async commentOnIssue(project: Project, issueNumber: number, body: string, signal?: AbortSignal): Promise<void> {
+    const repository = requireProjectRepository(project);
+    await this.requestWithSignal('POST', `/repos/${repository.owner}/${repository.repo}/issues/${issueNumber}/comments`, {
       body
-    });
+    }, signal);
   }
 
   async readCheckStatus(project: Project, ref: string): Promise<'pending' | 'success' | 'failure'> {
@@ -393,10 +419,11 @@ export class GitHubAppAdapter implements GitHubAdapter {
     let lastProgress = '';
 
     while (Date.now() - startedAt < timeoutMs) {
-      const checks = await this.request<GitHubCheckRunsResponse>(
-        'GET',
-        `/repos/${repository.owner}/${repository.repo}/commits/${encodeURIComponent(ref)}/check-runs?filter=latest&per_page=100`
-      );
+      throwIfAborted(options.signal);
+      const checksPath = `/repos/${repository.owner}/${repository.repo}/commits/${encodeURIComponent(ref)}/check-runs?filter=latest&per_page=100`;
+      const checks = options.signal
+        ? await this.request<GitHubCheckRunsResponse>('GET', checksPath, undefined, options.signal)
+        : await this.request<GitHubCheckRunsResponse>('GET', checksPath);
       const runs = checks.check_runs ?? [];
 
       if (runs.length === 0) {
@@ -408,7 +435,7 @@ export class GitHubAppAdapter implements GitHubAdapter {
           };
         }
         lastProgress = await reportCheckProgress(options, lastProgress, 'Waiting for GitHub checks to start.');
-        await delay(pollIntervalMs);
+        await delay(pollIntervalMs, options.signal);
         continue;
       }
 
@@ -419,7 +446,7 @@ export class GitHubAppAdapter implements GitHubAdapter {
           lastProgress,
           `GitHub checks are running (${runs.length - pending.length}/${runs.length} completed).`
         );
-        await delay(pollIntervalMs);
+        await delay(pollIntervalMs, options.signal);
         continue;
       }
 
@@ -432,7 +459,7 @@ export class GitHubAppAdapter implements GitHubAdapter {
         };
       }
 
-      const failures = await Promise.all(failedRuns.map((run) => this.describeCheckFailure(repository, run)));
+      const failures = await Promise.all(failedRuns.map((run) => this.describeCheckFailure(repository, run, options.signal)));
       return {
         status: 'failure',
         summary: compactCheckOutput(failures.map((failure) => `${failure.name}: ${failure.output}`).join('\n\n')),
@@ -449,7 +476,8 @@ export class GitHubAppAdapter implements GitHubAdapter {
 
   private async describeCheckFailure(
     repository: { owner: string; repo: string },
-    run: GitHubCheckRunResponse
+    run: GitHubCheckRunResponse,
+    signal?: AbortSignal
   ): Promise<GitHubCheckFailure> {
     const fallback = compactCheckOutput([
       run.output?.title,
@@ -462,7 +490,7 @@ export class GitHubAppAdapter implements GitHubAdapter {
 
     if (jobId) {
       try {
-        const log = await this.requestText('GET', `/repos/${repository.owner}/${repository.repo}/actions/jobs/${jobId}/logs`);
+        const log = await this.requestText('GET', `/repos/${repository.owner}/${repository.repo}/actions/jobs/${jobId}/logs`, signal);
         output = compactCheckOutput(log) || fallback;
       } catch (error) {
         output = `${fallback}\nUnable to read the failed job log: ${toSafeGitHubError(error)}`.trim();
@@ -476,9 +504,10 @@ export class GitHubAppAdapter implements GitHubAdapter {
     };
   }
 
-  private async requestText(method: string, path: string): Promise<string> {
+  private async requestText(method: string, path: string, signal?: AbortSignal): Promise<string> {
     const response = await fetch(`${this.apiBaseUrl}${path}`, {
       method,
+      signal,
       headers: {
         Accept: 'application/vnd.github+json',
         Authorization: `Bearer ${this.options.token}`,
@@ -494,9 +523,16 @@ export class GitHubAppAdapter implements GitHubAdapter {
     return response.text();
   }
 
-  private async request<T = unknown>(method: string, path: string, body?: unknown): Promise<T> {
+  private requestWithSignal<T = unknown>(method: string, path: string, body: unknown, signal?: AbortSignal): Promise<T> {
+    if (signal) return this.request<T>(method, path, body, signal);
+    if (body === undefined) return this.request<T>(method, path);
+    return this.request<T>(method, path, body);
+  }
+
+  private async request<T = unknown>(method: string, path: string, body?: unknown, signal?: AbortSignal): Promise<T> {
     const response = await fetch(`${this.apiBaseUrl}${path}`, {
       method,
+      signal,
       headers: {
         Accept: 'application/vnd.github+json',
         Authorization: `Bearer ${this.options.token}`,
@@ -567,8 +603,26 @@ function readPositiveIntegerEnv(name: string, fallback: number): number {
   return Number.isFinite(parsed) && parsed >= 0 ? parsed : fallback;
 }
 
-function delay(ms: number): Promise<void> {
-  return new Promise((resolvePromise) => setTimeout(resolvePromise, Math.max(0, ms)));
+function delay(ms: number, signal?: AbortSignal): Promise<void> {
+  throwIfAborted(signal);
+  return new Promise((resolvePromise, rejectPromise) => {
+    const onAbort = () => {
+      clearTimeout(timer);
+      signal?.removeEventListener('abort', onAbort);
+      const reason = signal?.reason;
+      rejectPromise(reason instanceof Error ? reason : new Error('GitHub operation was cancelled.'));
+    };
+    const timer = setTimeout(() => {
+      signal?.removeEventListener('abort', onAbort);
+      resolvePromise();
+    }, Math.max(0, ms));
+    signal?.addEventListener('abort', onAbort, { once: true });
+  });
+}
+
+function throwIfAborted(signal?: AbortSignal): void {
+  if (!signal?.aborted) return;
+  throw signal.reason instanceof Error ? signal.reason : new Error('GitHub operation was cancelled.');
 }
 
 function toSafeGitHubError(error: unknown): string {

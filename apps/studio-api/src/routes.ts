@@ -8,6 +8,7 @@ import {
   createGitHubBranch,
   createGitHubRepository,
   deleteGitHubRepository,
+  GitHubAppAdapter,
   getGitHubAdapterEnvStatus,
   listGitHubBranches,
   listGitHubRepositoryOwners,
@@ -19,7 +20,7 @@ import type { AuthService } from './auth.js';
 import { completeCodexOAuthBrowserLogin, readCodexOAuthBrowserLoginStatus, readCodexOAuthStatus, resolveCodexHome, startCodexOAuthBrowserLogin } from './codex-oauth.js';
 import { createTaskDispatchService } from './dispatch.js';
 import { sendBadRequest, sendNotFound } from './http.js';
-import { advanceRoadmapAfterTaskCompletion, buildRoadmapStepTaskPrompt, composeApprovedExtensionSpecification } from '@forgemind/db';
+import { advanceRoadmapAfterTaskCompletion, buildRoadmapStepTaskPrompt, composeApprovedExtensionSpecification, startNextRoadmapStep } from '@forgemind/db';
 import type { AIProviderConnectionKind, AIProviderConnectionSecret, ForgeMindRepository } from '@forgemind/db';
 import { parseGitHubWebhookPayload, projectGitHubWebhookEvent, verifyGitHubWebhookSignature } from './webhook.js';
 import type { NotificationService } from './notifications.js';
@@ -1184,9 +1185,10 @@ export function registerRoutes(app: FastifyInstance, repository: ForgeMindReposi
         return reply.code(409).send({ error: 'The latest roadmap cycle has no pending implementation step.' });
       }
 
-      return reply.code(201).send(
-        await createAndStartRoadmapTask(repository, dispatcher, project, nextStep, latestCycle.objective)
-      );
+      const task = await startNextRoadmapStep(repository, project.id, latestCycle.id);
+      return task
+        ? reply.code(201).send(task)
+        : reply.code(409).send({ error: 'The next implementation step was already reserved or started.' });
     } catch (error) {
       return sendBadRequest(reply, error);
     }
@@ -1200,6 +1202,7 @@ export function registerRoutes(app: FastifyInstance, repository: ForgeMindReposi
       if (!project) {
         return sendNotFound(reply, `Project "${id}" not found`);
       }
+      await repository.assertProjectRoadmapRegenerationAllowed(project.id);
 
       const objective = input.objective?.trim() || project.brief?.trim();
       if (!objective) {
@@ -1249,8 +1252,7 @@ export function registerRoutes(app: FastifyInstance, repository: ForgeMindReposi
 
       const firstStep = findFirstPendingStepForLatestCycle(roadmap);
       if (firstStep) {
-        const updatedProject = await repository.getProject(project.id);
-        await createAndStartRoadmapTask(repository, dispatcher, updatedProject ?? { ...project, projectContract }, firstStep, objective);
+        await startNextRoadmapStep(repository, project.id, firstStep.cycleId);
       }
 
       return reply.code(201).send((await repository.getProjectRoadmap(project.id))!);
@@ -1351,8 +1353,7 @@ export function registerRoutes(app: FastifyInstance, repository: ForgeMindReposi
 
       const firstStep = findFirstPendingStepForLatestCycle(nextRoadmap);
       if (firstStep) {
-        const updatedProject = await repository.getProject(project.id);
-        await createAndStartRoadmapTask(repository, dispatcher, updatedProject ?? { ...project, projectContract }, firstStep, objective);
+        await startNextRoadmapStep(repository, project.id, firstStep.cycleId);
       }
 
       return (await repository.getProjectRoadmap(id))!;
@@ -1431,6 +1432,24 @@ export function registerRoutes(app: FastifyInstance, repository: ForgeMindReposi
   app.post('/api/tasks/:id/complete', async (request, reply) => {
     try {
       const { id } = idParamsSchema.parse(request.params);
+      const existingTask = await repository.getTask(id);
+      if (!existingTask) return sendNotFound(reply, `Task "${id}" not found`);
+      const project = await repository.getProject(existingTask.projectId);
+      if (!project) return sendNotFound(reply, `Project "${existingTask.projectId}" not found`);
+      if (project.githubOwner && project.githubRepo) {
+        if (!existingTask.pullRequestNumber) {
+          return reply.code(409).send({ error: 'Task cannot be completed because it has no pull request.' });
+        }
+        const connection = await readGitHubConnectionSecret(repository);
+        if (!connection) {
+          return reply.code(409).send({ error: 'Task completion requires the configured GitHub connection to verify the pull request.' });
+        }
+        const github = new GitHubAppAdapter({ token: connection.token, apiBaseUrl: connection.apiBaseUrl });
+        const pullRequest = await github.getPullRequestState(project, existingTask.pullRequestNumber);
+        if (!pullRequest.merged) {
+          return reply.code(409).send({ error: `Pull request #${existingTask.pullRequestNumber} is not merged.` });
+        }
+      }
       const task = await repository.transitionTask(id, 'completed', { source: 'user' });
       await repository.recordCompletedTaskProjectMemory({ taskId: id });
       const roadmapAdvance = await advanceRoadmapAfterTaskCompletion(repository, id);
@@ -1446,7 +1465,7 @@ export function registerRoutes(app: FastifyInstance, repository: ForgeMindReposi
         });
       }
 
-      return task ? task : sendNotFound(reply, `Task "${id}" not found`);
+      return task;
     } catch (error) {
       return sendBadRequest(reply, error);
     }
@@ -2152,62 +2171,6 @@ export function findFirstPendingStepForLatestCycle<T extends {
   return roadmap.steps
     .filter((step) => step.cycleId === latestCycle.id && step.status === 'pending')
     .sort((left, right) => left.sequenceNumber - right.sequenceNumber)[0];
-}
-
-async function createAndStartRoadmapTask(
-  repository: ForgeMindRepository,
-  dispatcher: ReturnType<typeof createTaskDispatchService>,
-  project: { id: string; name: string; defaultTaskMode?: TaskMode; projectContract?: ProjectContract; currentArchitectureVersionId?: string },
-  step: {
-    id: string;
-    cycleId: string;
-    title: string;
-    description: string;
-    acceptanceCriteria: string[];
-    requirementIds: string[];
-    deliverables: string[];
-  },
-  objective: string
-) {
-  const roadmap = await repository.getProjectRoadmap(project.id);
-  const cycleSteps = roadmap?.steps
-    .filter((candidate) => candidate.cycleId === step.cycleId)
-    .sort((left, right) => left.sequenceNumber - right.sequenceNumber) ?? [];
-  const currentIndex = cycleSteps.findIndex((candidate) => candidate.id === step.id);
-  const cycleArchitectureVersionId = roadmap?.cycles.find((cycle) => cycle.id === step.cycleId)?.architectureVersionId;
-  const completedSteps = cycleSteps.slice(0, Math.max(0, currentIndex)).filter((candidate) => candidate.status === 'completed').map((candidate) => candidate.title);
-  const futureSteps = currentIndex >= 0 ? cycleSteps.slice(currentIndex + 1).map((candidate) => candidate.title) : [];
-  const task = await repository.createTask({
-    projectId: project.id,
-    title: `${project.name}: ${step.title}`,
-    prompt: buildRoadmapStepTaskPrompt({
-      projectName: project.name,
-      objective,
-      stepTitle: step.title,
-      stepDescription: step.description,
-      acceptanceCriteria: step.acceptanceCriteria,
-      requirementIds: step.requirementIds,
-      deliverables: step.deliverables,
-      changeRationale: step.changeRationale,
-      dependsOnStepTitles: step.dependsOnStepTitles,
-      validationFocus: step.validationFocus,
-      projectContract: project.projectContract,
-      completedSteps,
-      futureSteps
-    }),
-    mode: resolveTaskMode(undefined, project.defaultTaskMode),
-    maxIterations: 10,
-    maxBudgetUsd: 5,
-    architectureVersionId: project.currentArchitectureVersionId ?? cycleArchitectureVersionId
-  });
-
-  await repository.assignTaskToImplementationStep(step.id, task.id, 'running');
-  const startedTask = await repository.startTask(task.id);
-  if (startedTask) {
-    await dispatcher.enqueueTask(startedTask.id, 'roadmap_step_started');
-  }
-
-  return startedTask ?? task;
 }
 
 export function resolveTaskMode(taskMode: TaskMode | undefined, projectDefaultMode: TaskMode | undefined): TaskMode {

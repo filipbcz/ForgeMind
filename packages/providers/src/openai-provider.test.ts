@@ -63,6 +63,62 @@ describe('OpenAI provider', () => {
     expect(result.steps).toEqual(['one']);
   });
 
+  it('rejects malformed provider output instead of fabricating a successful plan', async () => {
+    process.env.OPENAI_API_KEY = 'test-key';
+    vi.mocked(fetch).mockResolvedValueOnce({
+      ok: true,
+      json: async () => ({ choices: [{ message: { content: 'not-json' } }] })
+    } as Response);
+
+    await expect(new OpenAIProvider().plan({ taskId: '1', title: 'Test', prompt: 'Plan this.' }))
+      .rejects.toThrow('OpenAI plan returned invalid JSON');
+  });
+
+  it('passes the complete validation failure and preserves the AI recovery decision', async () => {
+    process.env.OPENAI_API_KEY = 'test-key';
+    vi.mocked(fetch).mockResolvedValueOnce(successfulResponse({
+      choices: [{
+        message: {
+          content: JSON.stringify({
+            summary: 'Repair repository code.',
+            steps: [],
+            acceptanceCriteria: [],
+            validationChecks: [],
+            validationRecovery: {
+              action: 'repair_implementation',
+              rationale: 'The test correctly detected a broken implementation.'
+            }
+          })
+        }
+      }]
+    }));
+
+    const result = await new OpenAIProvider().plan({
+      taskId: 'validation-recovery',
+      title: 'Repair validation failure',
+      prompt: 'Diagnose the failed check.',
+      validationFailure: {
+        command: 'npm test',
+        exitCode: 1,
+        stdout: 'complete stdout',
+        stderr: 'complete stderr'
+      },
+      previousValidationChecks: [{ kind: 'command', command: 'npm test' }]
+    });
+
+    expect(result.validationRecovery).toEqual({
+      action: 'repair_implementation',
+      rationale: 'The test correctly detected a broken implementation.'
+    });
+    const request = vi.mocked(fetch).mock.calls.at(-1)?.[1];
+    const body = JSON.parse(String(request?.body)) as { messages: Array<{ content: string }> };
+    const prompt = body.messages.map((message) => message.content).join('\n');
+    expect(prompt).toContain('"command": "npm test"');
+    expect(prompt).toContain('"exitCode": 1');
+    expect(prompt).toContain('complete stdout');
+    expect(prompt).toContain('complete stderr');
+  });
+
   it('emits the actual token breakdown returned by the API', async () => {
     process.env.OPENAI_API_KEY = 'test-key';
     const onActivity = vi.fn();
@@ -104,10 +160,12 @@ describe('OpenAI provider', () => {
           {
             message: {
               content: JSON.stringify({
+                outcome: 'changes_made',
                 summary: 'implemented',
-                changedFiles: [{ path: 'src/demo.ts', content: 'export const demo = true;\n' }],
+                changedFiles: ['src/demo.ts'],
                 diffStat: { filesChanged: 1, insertions: 1, deletions: 0 },
                 requestedApprovals: [],
+                fileUpdates: [{ path: 'src/demo.ts', content: 'export const demo = true;\n' }],
                 validationChecks: [
                   {
                     kind: 'command',
@@ -149,6 +207,7 @@ describe('OpenAI provider', () => {
                 outcome: 'already_satisfied',
                 summary: 'The focused test already proves the requested behavior.',
                 changedFiles: [],
+                evidenceFiles: ['src/existing-behavior.test.ts'],
                 diffStat: { filesChanged: 0, insertions: 0, deletions: 0 },
                 requestedApprovals: [],
                 validationChecks: [
@@ -176,6 +235,7 @@ describe('OpenAI provider', () => {
 
     expect(result.outcome).toBe('already_satisfied');
     expect(result.changedFiles).toEqual([]);
+    expect(result.evidenceFiles).toEqual(['src/existing-behavior.test.ts']);
     expect(result.fileUpdates).toEqual([]);
     expect(result.diffStat).toEqual({ filesChanged: 0, insertions: 0, deletions: 0 });
   });
@@ -330,10 +390,12 @@ describe('Codex provider', () => {
             content: [
               {
                 text: JSON.stringify({
+                  outcome: 'changes_made',
                   summary: 'implemented',
-                  changedFiles: [{ path: 'src/codex.ts', content: 'export const codex = true;\n' }],
+                  changedFiles: ['src/codex.ts'],
                   diffStat: { filesChanged: 1, insertions: 1, deletions: 0 },
-                  requestedApprovals: []
+                  requestedApprovals: [],
+                  fileUpdates: [{ path: 'src/codex.ts', content: 'export const codex = true;\n' }]
                 })
               }
             ]
@@ -365,6 +427,7 @@ describe('Codex provider', () => {
                   outcome: 'already_satisfied',
                   summary: 'The requested behavior is already implemented.',
                   changedFiles: [],
+                  evidenceFiles: ['src/existing-behavior.test.ts'],
                   diffStat: { filesChanged: 0, insertions: 0, deletions: 0 },
                   requestedApprovals: [],
                   validationChecks: [
@@ -393,6 +456,7 @@ describe('Codex provider', () => {
 
     expect(result.outcome).toBe('already_satisfied');
     expect(result.changedFiles).toEqual([]);
+    expect(result.evidenceFiles).toEqual(['src/existing-behavior.test.ts']);
     expect(result.fileUpdates).toEqual([]);
     expect(result.diffStat).toEqual({ filesChanged: 0, insertions: 0, deletions: 0 });
   });

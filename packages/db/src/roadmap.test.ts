@@ -7,7 +7,13 @@ describe('roadmap task completion', () => {
       { id: 'step_1', projectId: 'project_1', cycleId: 'cycle_1', sequenceNumber: 1, title: 'First', description: 'First step', acceptanceCriteria: ['Done'], status: 'running', taskId: 'task_1' },
       { id: 'step_2', projectId: 'project_1', cycleId: 'cycle_1', sequenceNumber: 2, title: 'Second', description: 'Second step', acceptanceCriteria: ['Done too'], status: 'pending' }
     ];
-    const createTask = vi.fn(async (input) => ({ id: 'task_2', createdByUserId: 'user_1', status: 'draft', createdAt: '', updatedAt: '', ...input }));
+    const createAndStartRoadmapStepTask = vi.fn(async (_stepId, input) => {
+      const step = steps.find((candidate) => candidate.status === 'pending');
+      if (!step || steps.some((candidate) => candidate.status === 'running')) return undefined;
+      step.status = 'running';
+      step.taskId = 'task_2';
+      return { id: 'task_2', createdByUserId: 'user_1', status: 'submitted', createdAt: '', updatedAt: '', ...input };
+    });
     const repository = {
       getImplementationStepByTaskId: vi.fn(async (taskId: string) => steps.find((step) => step.taskId === taskId)),
       updateImplementationStepStatus: vi.fn(async (stepId: string, status: string) => {
@@ -28,16 +34,7 @@ describe('roadmap task completion', () => {
           releaseCriteria: ['Build passes.']
         }
       })),
-      createTask,
-      assignTaskToImplementationStep: vi.fn(async (stepId: string, taskId: string, status: string) => {
-        const step = steps.find((candidate) => candidate.id === stepId)!;
-        step.taskId = taskId;
-        step.status = status;
-        return step;
-      }),
-      startTask: vi.fn(async () => ({ id: 'task_2', projectId: 'project_1', title: 'Project: Second', prompt: 'Prompt', mode: 'auto', status: 'submitted' })),
-      enqueueTask: vi.fn(async () => ({ enqueued: true })),
-      writeAudit: vi.fn(async () => ({ id: 'audit_1' })),
+      createAndStartRoadmapStepTask,
       updateProjectRoadmapCycleStatus: vi.fn(),
       enqueueProjectAudit: vi.fn()
     };
@@ -47,8 +44,7 @@ describe('roadmap task completion', () => {
 
     expect(first.nextTask?.id).toBe('task_2');
     expect(steps.map((step) => step.status)).toEqual(['completed', 'running']);
-    expect(createTask).toHaveBeenCalledTimes(1);
-    expect(repository.enqueueTask).toHaveBeenCalledTimes(1);
+    expect(createAndStartRoadmapStepTask).toHaveBeenCalledTimes(1);
     expect(second.nextTask).toBeUndefined();
   });
 
@@ -115,21 +111,17 @@ describe('roadmap task completion', () => {
         }
       })),
       enqueueProjectAudit,
-      createTask: vi.fn(async (input) => ({ id: 'task_2', createdByUserId: 'user_1', status: 'draft', createdAt: '', updatedAt: '', ...input })),
-      assignTaskToImplementationStep: vi.fn(async (_stepId: string, taskId: string, status: string) => {
-        steps[1]!.taskId = taskId;
-        steps[1]!.status = status;
-        return steps[1];
+      createAndStartRoadmapStepTask: vi.fn(async (_stepId: string, input) => {
+        steps[1]!.taskId = 'task_2';
+        steps[1]!.status = 'running';
+        return { id: 'task_2', createdByUserId: 'user_1', status: 'submitted', createdAt: '', updatedAt: '', ...input };
       }),
-      startTask: vi.fn(async () => ({ id: 'task_2', projectId: 'project_1', title: 'Project: UI', prompt: 'Prompt', mode: 'safe', status: 'submitted' })),
-      enqueueTask: vi.fn(async () => ({ enqueued: true })),
-      writeAudit: vi.fn(async () => ({ id: 'audit_1' }))
     };
 
     const result = await advanceRoadmapAfterTaskCompletion(repository as never, 'task_1');
 
     expect(result.nextTask?.id).toBe('task_2');
     expect(enqueueProjectAudit).not.toHaveBeenCalled();
-    expect(repository.createTask).toHaveBeenCalledTimes(1);
+    expect(repository.createAndStartRoadmapStepTask).toHaveBeenCalledTimes(1);
   });
 });

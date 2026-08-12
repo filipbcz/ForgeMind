@@ -39,7 +39,7 @@ describe('project roadmap generation', () => {
     expect(toProjectArchitectureUpdate({
       summary: 'Extension', steps: [], acceptanceCriteria: [],
       architectureUpdate: {
-        summary: null, modules: [], decisions: [], conventions: [], dependencyRules: [],
+        summary: undefined, modules: [], decisions: [], conventions: [], dependencyRules: [],
         knownDebt: [], resolvedDebt: [], validationCommands: []
       }
     })).toMatchObject({ modules: [], decisions: [] });
@@ -250,8 +250,8 @@ describe('project roadmap generation', () => {
 
     const blueprints = toImplementationStepBlueprints(plan, projectContract);
 
-    expect(blueprints[0].validationFocus).toEqual(['implementation', 'regression']);
-    expect(blueprints[1].validationFocus).toEqual(['implementation']);
+    expect(blueprints[0]!.validationFocus).toEqual(['implementation', 'regression']);
+    expect(blueprints[1]!.validationFocus).toEqual(['implementation']);
   });
 
   it('rejects broad work items instead of accepting an epic as one task', () => {
@@ -338,8 +338,8 @@ describe('project roadmap generation', () => {
     });
 
     expect(repairRoadmap).toHaveBeenCalledTimes(1);
-    expect(repairRoadmap.mock.calls[0][0]).not.toHaveProperty('projectContract');
-    expect(plan.implementationSteps?.[0].changeRationale).toContain('changed generator');
+    expect(repairRoadmap.mock.calls[0]![0]).not.toHaveProperty('projectContract');
+    expect(plan.implementationSteps?.[0]?.changeRationale).toContain('changed generator');
   });
 
   it('revalidates targeted roadmap repairs and allows one bounded follow-up repair', async () => {

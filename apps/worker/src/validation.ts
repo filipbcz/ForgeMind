@@ -4,7 +4,6 @@ import { createWorkspaceEnvironment } from '@forgemind/shared';
 
 const VALIDATION_OUTPUT_FLUSH_MS = 350;
 const MAX_ACTIVITY_CHUNK_CHARS = 8_000;
-const MAX_FAILURE_CONTEXT_CHARS = 12_000;
 
 const forbiddenCommandPatterns = [
   /\bsudo\b/i,
@@ -28,19 +27,13 @@ export interface ValidationResult {
 }
 
 export function formatValidationFailure(
-  result: Pick<ValidationResult, 'stdout' | 'stderr' | 'exitCode'>
+  result: Pick<ValidationResult, 'command' | 'stdout' | 'stderr' | 'exitCode'>
 ): string {
-  const stdout = result.stdout.trim();
-  const stderr = result.stderr.trim();
-  if (!stdout && !stderr) return `Exit code ${result.exitCode}`;
-  if (!stdout) return stderr.slice(-MAX_FAILURE_CONTEXT_CHARS);
-  if (!stderr) return stdout.slice(-MAX_FAILURE_CONTEXT_CHARS);
-
-  const stderrBudget = Math.min(4_000, Math.floor(MAX_FAILURE_CONTEXT_CHARS / 3));
-  const stdoutBudget = MAX_FAILURE_CONTEXT_CHARS - stderrBudget;
   return [
-    `[stdout]\n${stdout.slice(-stdoutBudget)}`,
-    `[stderr]\n${stderr.slice(-stderrBudget)}`
+    `Command: ${result.command}`,
+    `Exit code: ${result.exitCode}`,
+    `[stdout]\n${result.stdout}`,
+    `[stderr]\n${result.stderr}`
   ].join('\n\n');
 }
 
@@ -177,8 +170,10 @@ export async function runValidationCommand(
   command: string,
   cwd: string,
   onOutput?: (stream: 'stdout' | 'stderr', message: string) => Promise<void> | void,
-  timeoutMinutes = 10
+  timeoutMinutes = 10,
+  signal?: AbortSignal
 ): Promise<ValidationResult> {
+  throwIfAborted(signal);
   const effectiveCommand = normalizeValidationCommandForEnvironment(command);
   assertAllowedValidationCommand(effectiveCommand);
 
@@ -188,6 +183,7 @@ export async function runValidationCommand(
       env: createValidationEnvironment(),
       shell: shouldUsePowerShell(effectiveCommand) ? 'powershell.exe' : true,
       timeout: Math.max(1, Math.min(60, timeoutMinutes)) * 60 * 1000,
+      cancelSignal: signal,
       reject: false
     });
     const pendingOutput: Record<'stdout' | 'stderr', string> = { stdout: '', stderr: '' };
@@ -232,6 +228,9 @@ export async function runValidationCommand(
       passed: result.exitCode === 0
     };
   } catch (error) {
+    if (signal?.aborted) {
+      throw signal.reason instanceof Error ? signal.reason : new Error('Validation was cancelled.');
+    }
     return {
       command: effectiveCommand,
       exitCode: 1,
@@ -247,8 +246,10 @@ export async function runValidationChecks(
   cwd: string,
   onActivity?: ValidationActivityHandler,
   passedCheckResults: ReadonlyMap<string, ValidationCheckExecutionResult> = new Map(),
-  inputHash?: string
+  inputHash?: string,
+  signal?: AbortSignal
 ): Promise<ValidationResult> {
+  throwIfAborted(signal);
   if (checks.length === 0) {
     return {
       command: 'no-executable-checks',
@@ -269,6 +270,7 @@ export async function runValidationChecks(
   let failingResult: ValidationResult | undefined;
 
   for (const [index, check] of checks.entries()) {
+    throwIfAborted(signal);
     const effectiveCommand = normalizeValidationCommandForEnvironment(check.command);
     const resultKey = validationCheckResultKey(effectiveCommand, inputHash);
     const passedResult = passedCheckResults.get(resultKey) ?? passedCheckResults.get(effectiveCommand);
@@ -319,7 +321,7 @@ export async function runValidationChecks(
         inputHash,
         category: check.category
       });
-    }, check.timeoutMinutes);
+    }, check.timeoutMinutes, signal);
     await onActivity?.({
       state: 'completed',
       command: effectiveCommand,
@@ -351,9 +353,7 @@ export async function runValidationChecks(
     });
 
     if (!result.passed) {
-      const normalizedError = result.stderr || result.stdout || `Exit code ${result.exitCode}`;
       failingResult = result;
-      failingResult.stderr = normalizedError;
       break;
     }
   }
@@ -369,6 +369,11 @@ export async function runValidationChecks(
     reusedCheckCount,
     failingCommand: failingResult?.command
   };
+}
+
+function throwIfAborted(signal?: AbortSignal): void {
+  if (!signal?.aborted) return;
+  throw signal.reason instanceof Error ? signal.reason : new Error('Validation was cancelled.');
 }
 
 export function collectPassedValidationCheckResults(

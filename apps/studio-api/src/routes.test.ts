@@ -133,6 +133,32 @@ describe('Studio API routes', () => {
     await app.close();
   });
 
+  it('blocks roadmap regeneration before invoking AI while project work is active', async () => {
+    const repository = {
+      getProject: vi.fn(async () => ({
+        id: 'project_1', name: 'Project', slug: 'project', defaultBranch: 'main',
+        brief: 'A sufficiently detailed project objective.', isActive: true, createdAt: '', updatedAt: ''
+      })),
+      assertProjectRoadmapRegenerationAllowed: vi.fn(async () => {
+        throw new Error('Roadmap cannot be regenerated while the project has an active task, running implementation step, or project audit.');
+      }),
+      getProjectSpecifications: vi.fn()
+    };
+    const app = Fastify();
+    registerRoutes(app, repository as never);
+
+    const response = await app.inject({
+      method: 'POST',
+      url: '/api/projects/project_1/implementation-steps/generate',
+      payload: {}
+    });
+
+    expect(response.statusCode).toBe(400);
+    expect(response.json().error).toContain('cannot be regenerated');
+    expect(repository.getProjectSpecifications).not.toHaveBeenCalled();
+    await app.close();
+  });
+
   it('exposes worker status endpoint', async () => {
     let queuePaused = false;
     const repository = {
@@ -328,6 +354,8 @@ describe('Studio API routes', () => {
         prompt: 'Do the thing',
         mode: 'safe',
         status: 'ready_for_user_review',
+        pullRequestNumber: 42,
+        pullRequestUrl: 'https://github.com/demo/repo/pull/42',
         maxIterations: 10,
         maxBudgetUsd: 2,
         createdAt: new Date().toISOString(),
@@ -498,6 +526,26 @@ describe('Studio API routes', () => {
     expect(getRunsResponse.statusCode).toBe(200);
     expect(repository.getTaskUsage).toHaveBeenCalledWith('task_1');
 
+    const unmergedPullRequestSpy = vi.spyOn(globalThis, 'fetch').mockResolvedValueOnce({
+      ok: true,
+      status: 200,
+      json: async () => ({ number: 42, html_url: 'https://github.com/demo/repo/pull/42', merged: false, state: 'open' })
+    } as Response);
+    const prematureCompletionResponse = await app.inject({
+      method: 'POST',
+      url: '/api/tasks/task_1/complete',
+      payload: {}
+    });
+    expect(prematureCompletionResponse.statusCode).toBe(409);
+    expect(prematureCompletionResponse.json().error).toContain('is not merged');
+    expect(repository.transitionTask).not.toHaveBeenCalled();
+    unmergedPullRequestSpy.mockRestore();
+
+    const pullRequestSpy = vi.spyOn(globalThis, 'fetch').mockResolvedValueOnce({
+      ok: true,
+      status: 200,
+      json: async () => ({ number: 42, html_url: 'https://github.com/demo/repo/pull/42', merged: true, state: 'closed', merge_commit_sha: 'abc1234' })
+    } as Response);
     const completeTaskResponse = await app.inject({
       method: 'POST',
       url: '/api/tasks/task_1/complete',
@@ -511,6 +559,7 @@ describe('Studio API routes', () => {
         status: 'completed'
       })
     );
+    pullRequestSpy.mockRestore();
 
     const getQueueResponse = await app.inject({
       method: 'GET',

@@ -16,7 +16,7 @@ import type {
   ReviewInput,
   ReviewResult
 } from './provider.js';
-import { normalizeValidationChecks } from './provider.js';
+import { normalizeValidationChecks, parseImplementResult, parsePlanResult, parseProviderJsonObject, parseReviewResult } from './provider.js';
 import { emitCapturedUsage, normalizeTokenBreakdown } from './provider-usage.js';
 import { buildReviewPrompt } from './review-prompt.js';
 import { buildCapabilityAuditPrompt, buildReleaseAuditPrompt, normalizeAuditContentWithSingleRepair, normalizeCapabilityAuditResult, normalizeReleaseAuditResult } from './audit-prompt.js';
@@ -52,66 +52,6 @@ export async function listOpenAIModels(apiKey: string, apiBaseUrl = process.env.
     .sort((left, right) => left.id.localeCompare(right.id));
 }
 
-function normalizeFileUpdates(result: ImplementResult, fallback: ImplementResult): ImplementResult['fileUpdates'] {
-  if (Array.isArray(result.fileUpdates) && result.fileUpdates.length > 0) {
-    return result.fileUpdates
-      .filter((item): item is { path: string; content: string } => typeof item?.path === 'string' && typeof item?.content === 'string')
-      .map((item) => ({ path: item.path, content: item.content }));
-  }
-
-  if (Array.isArray(result.changedFiles) && result.changedFiles.length > 0) {
-    return (result.changedFiles as unknown[])
-      .map((item) => {
-        if (typeof item === 'string') {
-          return {
-            path: item,
-            content: fallback.fileUpdates?.find((file) => file.path === item)?.content ?? `# Generated file\n\nPlaceholder content for ${item}.`
-          };
-        }
-
-        if (
-          item &&
-          typeof item === 'object' &&
-          'path' in item &&
-          'content' in item &&
-          typeof item.path === 'string' &&
-          typeof item.content === 'string'
-        ) {
-          return {
-            path: item.path,
-            content: item.content
-          };
-        }
-
-        return undefined;
-      })
-      .filter((item): item is { path: string; content: string } => Boolean(item));
-  }
-
-  return fallback.fileUpdates;
-}
-
-function parseJsonContent<T>(content: string, fallback: T): T {
-  try {
-    const jsonStart = content.indexOf('{');
-    const jsonEnd = content.lastIndexOf('}');
-    if (jsonStart >= 0 && jsonEnd > jsonStart) {
-      return JSON.parse(content.slice(jsonStart, jsonEnd + 1)) as T;
-    }
-    return JSON.parse(content) as T;
-  } catch {
-    return fallback;
-  }
-}
-
-function summarizeDiffStats(summary: string): { filesChanged: number; insertions: number; deletions: number } {
-  return {
-    filesChanged: 1,
-    insertions: Math.min(150, summary.length),
-    deletions: 0
-  };
-}
-
 function serializeMessages(messages: Array<{ role: 'system' | 'user' | 'assistant'; content: string }>): string {
   return messages.map((message) => `[${message.role}]\n${message.content}`).join('\n\n');
 }
@@ -134,11 +74,12 @@ export class OpenAIProvider implements AIProvider {
   }
 
   async plan(input: PlanInput): Promise<PlanResult> {
+    const isValidationRecovery = Boolean(input.validationFailure);
     const messages: Array<{ role: 'system' | 'user' | 'assistant'; content: string }> = [
       {
         role: 'system',
-        content: input.previousValidationError
-          ? 'Revise only the supplied failed validation check. Return JSON with a short summary, empty steps and implementationSteps arrays, the supplied acceptanceCriteria, and replacement validationChecks for that failed check only. Do not repeat successful or unrelated checks and do not propose implementation work. Respond only with JSON.'
+        content: isValidationRecovery
+          ? 'Diagnose the supplied validation failure. Decide whether to replace only the invalid validation check, repair the implementation, or report a genuine blocker. Return JSON with summary, empty steps, empty acceptanceCriteria, empty implementationSteps, validationChecks containing replacements only when action is replace_validation_check, and validationRecovery with action and rationale. Do not modify repository files. Respond only with JSON.'
           : 'You are an AI project planner. Provide a JSON object with summary, steps, acceptanceCriteria, validationChecks, implementationSteps, projectContract, contractDelta, and architectureUpdate. ' +
             'For ordinary task plans, implementationSteps must be an empty array and projectContract, contractDelta, and architectureUpdate must be omitted. For an initial project roadmap, include a full projectContract and set contractDelta to null. For an approved project extension, set projectContract to null and return a contractDelta against the supplied base contract, plus only implementationSteps required by that delta. Never silently omit an existing requirement: update, supersede, or remove it with an explicit rationale. Every new or replacement requirement must include briefReferences with short source phrases or section names from the brief. Include a compact architectureUpdate describing intended modules, boundaries, conventions, decisions, debt, and architecture validation commands. ' +
             'Every implementation step must include changeRationale, dependsOnStepTitles referencing only earlier steps, and validationFocus. Include regression validation for extensions and migration or compatibility validation when the delta declares those impacts. Architecture updates must include databaseSchemas. ' +
@@ -150,29 +91,26 @@ export class OpenAIProvider implements AIProvider {
         role: 'user',
         content: [
           `Create a plan for the task titled "${input.title}" with the prompt:\n${input.prompt}`,
-          input.previousValidationError ? `Previous validation error: ${input.previousValidationError}` : '',
+          input.validationFailure
+            ? `Complete validation failure:\n${JSON.stringify(input.validationFailure, null, 2)}`
+            : input.previousValidationError ? `Previous validation error: ${input.previousValidationError}` : '',
           input.previousValidationChecks?.length
             ? `Previous validation checks:\n${input.previousValidationChecks.map((check) => check.command).join('\n')}`
             : '',
-          input.previousValidationError
-            ? 'Return only corrected replacement check(s) for the supplied failed check. Do not repeat any other validation checks.'
+          isValidationRecovery
+            ? 'Inspect the repository before deciding. Return replacement checks only for replace_validation_check; use repair_implementation when repository changes are required; use blocked only when no autonomous correction is possible.'
             : ''
         ]
           .filter(Boolean)
           .join('\n\n')
       }
     ];
-    const response = await this.requestChat(messages);
+    const response = await this.requestChat(messages, input.signal);
     const content = response.content;
     await emitCapturedUsage(input.onActivity, response.usage);
 
     return {
-      ...parseJsonContent<PlanResult>(content, {
-        summary: `Plan for ${input.title}`,
-        steps: ['Review project context.', 'Create change plan.', 'Validate with configured workflow.'],
-        acceptanceCriteria: ['Task stays within configured limits.', 'Validation command is captured.', 'Draft PR is prepared.'],
-        validationChecks: []
-      }),
+      ...parsePlanResult(content, 'OpenAI plan'),
       providerPrompt: serializeMessages(messages),
       providerResponse: content
     };
@@ -200,7 +138,7 @@ export class OpenAIProvider implements AIProvider {
     const response = await this.requestChat(messages);
     await emitCapturedUsage(input.onActivity, response.usage);
     return {
-      ...parseJsonContent<RoadmapRepairResult>(response.content, { implementationSteps: [] }),
+      ...parseProviderJsonObject(response.content, 'OpenAI roadmap repair') as unknown as RoadmapRepairResult,
       providerPrompt: serializeMessages(messages),
       providerResponse: response.content
     };
@@ -210,7 +148,7 @@ export class OpenAIProvider implements AIProvider {
     const messages: Array<{ role: 'system' | 'user' | 'assistant'; content: string }> = [
       {
         role: 'system',
-        content: 'You are an AI implementation assistant. Make only the repository changes required by the supplied task and correction context. Do not perform broad validation that ForgeMind will run after implementation. Set outcome to changes_made when repository changes are required. If the repository already satisfies every acceptance criterion, do not modify files: set outcome to already_satisfied, return empty changedFiles, a zero diffStat, and executable validationChecks that prove the criteria. After editing, propose the smallest authoritative validationChecks set that verifies the acceptance criteria against the resulting repository and classify every check as setup, build, database, api, browser, or smoke. Provide a JSON object with outcome, summary, changedFiles, diffStat, requestedApprovals, validationChecks, architectureUpdate, and optional fileUpdates [{ path, content }]. architectureUpdate must be a compact delta containing only architectural facts introduced or changed by this attempt, including databaseSchemas; use empty arrays when nothing changed. Respond only with JSON.'
+        content: 'You are an AI implementation assistant. Make only the repository changes required by the supplied task and correction context. Do not perform broad validation that ForgeMind will run after implementation. Set outcome to changes_made when repository changes are required. If the repository already satisfies every acceptance criterion, do not modify files: set outcome to already_satisfied, return empty changedFiles, a zero diffStat, non-empty evidenceFiles naming repository files that prove the criteria, and executable validationChecks that prove the criteria. After editing, propose the smallest authoritative validationChecks set that verifies the acceptance criteria against the resulting repository and classify every check as setup, build, database, api, browser, or smoke. Provide a JSON object with outcome, summary, changedFiles, evidenceFiles, diffStat, requestedApprovals, validationChecks, architectureUpdate, and optional fileUpdates [{ path, content }]. architectureUpdate must be a compact delta containing only architectural facts introduced or changed by this attempt, including databaseSchemas; use empty arrays when nothing changed. Respond only with JSON.'
       },
       {
         role: 'user',
@@ -228,48 +166,15 @@ export class OpenAIProvider implements AIProvider {
           .join('\n')
       }
     ];
-    const response = await this.requestChat(messages);
+    const response = await this.requestChat(messages, input.signal);
     const content = response.content;
     await emitCapturedUsage(input.onActivity, response.usage);
 
-    const fallback: ImplementResult = {
-      outcome: 'changes_made',
-      summary: `OpenAI implementation summary for task ${input.taskId}.`,
-      changedFiles: ['OPENAI_IMPLEMENTATION.md'],
-      diffStat: summarizeDiffStats(input.prompt),
-      requestedApprovals: [],
-      validationChecks: [],
-      fileUpdates: [
-        {
-          path: 'OPENAI_IMPLEMENTATION.md',
-          content: [
-            `# Implementation for ${input.taskId}`,
-            '',
-            `## Prompt`,
-            input.prompt,
-            '',
-            '## Plan',
-            ...input.plan.steps.map((step, index) => `${index + 1}. ${step}`)
-          ].join('\n')
-        }
-      ]
-    };
-
-    const result = parseJsonContent<ImplementResult>(content, fallback);
-    result.outcome = result.outcome === 'already_satisfied' ? 'already_satisfied' : 'changes_made';
+    const result = parseImplementResult(content, 'OpenAI implementation', true);
     if (result.outcome === 'already_satisfied') {
       result.changedFiles = [];
       result.diffStat = { filesChanged: 0, insertions: 0, deletions: 0 };
       result.fileUpdates = [];
-    } else if (!result.changedFiles || !Array.isArray(result.changedFiles) || result.changedFiles.length === 0) {
-      result.changedFiles = ['OPENAI_IMPLEMENTATION.md'];
-    }
-    result.fileUpdates = result.outcome === 'already_satisfied' ? [] : normalizeFileUpdates(result, fallback);
-    if (!result.diffStat) {
-      result.diffStat = summarizeDiffStats(result.summary);
-    }
-    if (!Array.isArray(result.requestedApprovals)) {
-      result.requestedApprovals = [];
     }
     result.validationChecks = normalizeValidationChecks(result.validationChecks);
     result.providerPrompt = serializeMessages(messages);
@@ -283,24 +188,19 @@ export class OpenAIProvider implements AIProvider {
     const messages: Array<{ role: 'system' | 'user' | 'assistant'; content: string }> = [
       {
         role: 'system',
-        content: 'You are an AI code reviewer. Follow the review packet constraints and return JSON with summary, blockers, safeImprovements, and riskyChanges.'
+        content: 'You are an AI code reviewer. Follow the review packet constraints and return JSON with summary, blockers, safeImprovements, riskyChanges, and criterionResults when requested.'
       },
       {
         role: 'user',
         content: reviewPrompt
       }
     ];
-    const response = await this.requestChat(messages);
+    const response = await this.requestChat(messages, input.signal);
     const content = response.content;
     await emitCapturedUsage(input.onActivity, response.usage);
 
     return {
-      ...parseJsonContent<ReviewResult>(content, {
-        summary: `OpenAI review of ${input.changedFiles.length} changed file(s).`,
-        blockers: [],
-        safeImprovements: ['Add targeted tests to the changed files.'],
-        riskyChanges: []
-      }),
+      ...parseReviewResult(content, 'OpenAI review'),
       providerPrompt: serializeMessages(messages),
       providerResponse: content
     };
@@ -398,7 +298,8 @@ export class OpenAIProvider implements AIProvider {
   }
 
   protected async requestChat(
-    messages: Array<{ role: 'system' | 'user' | 'assistant'; content: string }>
+    messages: Array<{ role: 'system' | 'user' | 'assistant'; content: string }>,
+    signal?: AbortSignal
   ): Promise<{ content: string; usage?: import('./provider.js').ProviderUsageMeasurement }> {
     const response = await fetch(this.apiBaseUrl, {
       method: 'POST',
@@ -406,6 +307,7 @@ export class OpenAIProvider implements AIProvider {
         'Content-Type': 'application/json',
         Authorization: `Bearer ${this.apiKey}`
       },
+      signal,
       body: JSON.stringify({
         model: this.model,
         messages,

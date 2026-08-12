@@ -27,7 +27,7 @@ import type {
   ReviewInput,
   ReviewResult
 } from './provider.js';
-import { normalizeValidationChecks } from './provider.js';
+import { normalizeValidationChecks, parseImplementResult, parsePlanResult, parseProviderJsonObject, parseReviewResult } from './provider.js';
 import { emitCapturedUsage, normalizeTokenBreakdown } from './provider-usage.js';
 import { buildReviewPrompt } from './review-prompt.js';
 import { buildCapabilityAuditPrompt, buildReleaseAuditPrompt, normalizeAuditContentWithSingleRepair, normalizeCapabilityAuditResult, normalizeReleaseAuditResult } from './audit-prompt.js';
@@ -484,66 +484,6 @@ function releaseAuditJsonSchema(expectedCriteria: string[] = []): Record<string,
   };
 }
 
-function parseJsonContent<T>(content: string, fallback: T): T {
-  try {
-    const jsonStart = content.indexOf('{');
-    const jsonEnd = content.lastIndexOf('}');
-    if (jsonStart >= 0 && jsonEnd > jsonStart) {
-      return JSON.parse(content.slice(jsonStart, jsonEnd + 1)) as T;
-    }
-    return JSON.parse(content) as T;
-  } catch {
-    return fallback;
-  }
-}
-
-function summarizeDiffStats(summary: string): { filesChanged: number; insertions: number; deletions: number } {
-  return {
-    filesChanged: 1,
-    insertions: Math.min(150, summary.length),
-    deletions: 0
-  };
-}
-
-function normalizeFileUpdates(result: ImplementResult, fallback: ImplementResult): ImplementResult['fileUpdates'] {
-  if (Array.isArray(result.fileUpdates) && result.fileUpdates.length > 0) {
-    return result.fileUpdates
-      .filter((item): item is { path: string; content: string } => typeof item?.path === 'string' && typeof item?.content === 'string')
-      .map((item) => ({ path: item.path, content: item.content }));
-  }
-
-  if (Array.isArray(result.changedFiles) && result.changedFiles.length > 0) {
-    return (result.changedFiles as unknown[])
-      .map((item) => {
-        if (typeof item === 'string') {
-          return {
-            path: item,
-            content: fallback.fileUpdates?.find((file) => file.path === item)?.content ?? `# Generated file\n\nPlaceholder content for ${item}.`
-          };
-        }
-
-        if (
-          item &&
-          typeof item === 'object' &&
-          'path' in item &&
-          'content' in item &&
-          typeof item.path === 'string' &&
-          typeof item.content === 'string'
-        ) {
-          return {
-            path: item.path,
-            content: item.content
-          };
-        }
-
-        return undefined;
-      })
-      .filter((item): item is { path: string; content: string } => Boolean(item));
-  }
-
-  return fallback.fileUpdates;
-}
-
 export class CodexProvider implements AIProvider {
   readonly kind: ProviderKind = 'codex';
 
@@ -576,11 +516,12 @@ export class CodexProvider implements AIProvider {
       return this.planWithCli(input);
     }
 
+    const isValidationRecovery = Boolean(input.validationFailure);
     const messages: Array<{ role: 'system' | 'user' | 'assistant'; content: string }> = [
       {
         role: 'system',
-        content: input.previousValidationError
-          ? 'Revise only the supplied failed validation check. Return JSON with a short summary, empty steps and implementationSteps arrays, the supplied acceptanceCriteria, and replacement validationChecks for that failed check only. Do not repeat successful or unrelated checks and do not propose implementation work. Reply with JSON only.'
+        content: isValidationRecovery
+          ? 'Diagnose the supplied validation failure. Decide whether to replace only the invalid validation check, repair the implementation, or report a genuine blocker. Return JSON with summary, empty steps, empty acceptanceCriteria, empty implementationSteps, validationChecks containing replacements only when action is replace_validation_check, and validationRecovery with action and rationale. Do not modify repository files. Reply with JSON only.'
           : 'You are Codex. Return JSON with summary, steps, acceptanceCriteria, validationChecks, implementationSteps, projectContract, contractDelta, and architectureUpdate. ' +
             'For ordinary task plans, implementationSteps must be an empty array and projectContract, contractDelta, and architectureUpdate must be null. For an initial project roadmap, include a full projectContract, set contractDelta to null, and include implementationSteps and architectureUpdate. For an approved project extension, set projectContract to null and return contractDelta against the supplied base contract, plus only implementationSteps required by that delta and a compact architectureUpdate. Never silently omit an existing requirement: update, supersede, or remove it with an explicit rationale. Every new or replacement requirement must include briefReferences with short source phrases or section names from the brief. ' +
             'Every implementation step must include changeRationale, dependsOnStepTitles referencing only earlier steps, and validationFocus. Include regression validation for extensions and migration or compatibility validation when the delta declares those impacts. Architecture updates must include databaseSchemas. ' +
@@ -592,29 +533,26 @@ export class CodexProvider implements AIProvider {
         role: 'user',
         content: [
           `Create a plan for task "${input.title}". Prompt:\n${input.prompt}`,
-          input.previousValidationError ? `Previous validation error: ${input.previousValidationError}` : '',
+          input.validationFailure
+            ? `Complete validation failure:\n${JSON.stringify(input.validationFailure, null, 2)}`
+            : input.previousValidationError ? `Previous validation error: ${input.previousValidationError}` : '',
           input.previousValidationChecks?.length
             ? `Previous validation checks:\n${input.previousValidationChecks.map((check) => check.command).join('\n')}`
             : '',
-          input.previousValidationError
-            ? 'Return only corrected replacement check(s) for the supplied failed check. Do not repeat any other validation checks.'
+          isValidationRecovery
+            ? 'Inspect the repository before deciding. Return replacement checks only for replace_validation_check; use repair_implementation when repository changes are required; use blocked only when no autonomous correction is possible.'
             : ''
         ]
           .filter(Boolean)
           .join('\n\n')
       }
     ];
-    const response = await this.requestResponses(messages, input.session);
+    const response = await this.requestResponses(messages, input.session, input.signal);
     const content = response.content;
     await emitCapturedUsage(input.onActivity, response.usage);
 
     return {
-      ...parseJsonContent<PlanResult>(content, {
-        summary: `Codex plan for ${input.title}`,
-        steps: ['Inspect repository context.', 'Implement minimal safe changes.', 'Validate with configured command.'],
-        acceptanceCriteria: ['Task remains within policy limits.', 'Validation output is captured.', 'Draft PR is prepared.'],
-        validationChecks: []
-      }),
+      ...parsePlanResult(content, 'Codex plan'),
       providerPrompt: serializeMessages(messages),
       providerResponse: content
     };
@@ -657,7 +595,7 @@ export class CodexProvider implements AIProvider {
       await emitCapturedUsage(input.onActivity, response.usage);
     }
     return {
-      ...parseJsonContent<RoadmapRepairResult>(content, { implementationSteps: [] }),
+      ...parseProviderJsonObject(content, 'Codex roadmap repair') as unknown as RoadmapRepairResult,
       providerPrompt,
       providerResponse: content
     };
@@ -676,9 +614,9 @@ export class CodexProvider implements AIProvider {
           'You are Codex implementation agent. Make only the repository changes required by the supplied task and correction context. ' +
           'Do not run broad test suites, full builds, type checks, dependency installation, database validation, or repository-wide formatting; ForgeMind runs authoritative validation after implementation. ' +
           'Run a narrowly targeted check only when it is required to make the edit correctly. ' +
-          'Set outcome to changes_made when repository changes are required. If the current repository already satisfies every acceptance criterion, do not modify files: set outcome to already_satisfied, return empty changedFiles, a zero diffStat, and executable validationChecks that prove the criteria. ' +
+          'Set outcome to changes_made when repository changes are required. If the current repository already satisfies every acceptance criterion, do not modify files: set outcome to already_satisfied, return empty changedFiles, a zero diffStat, non-empty evidenceFiles naming the repository files that prove the criteria, and executable validationChecks that prove the criteria. ' +
           'After editing, propose the smallest authoritative validationChecks set that verifies the acceptance criteria against the resulting repository. Classify every check as setup, build, database, api, browser, or smoke. ' +
-          'Return JSON with outcome, summary, changedFiles, diffStat, requestedApprovals, validationChecks, architectureUpdate, and optional fileUpdates [{ path, content }]. architectureUpdate must contain only architectural facts introduced or changed by this attempt, including databaseSchemas; use empty arrays when nothing changed. Reply with JSON only.'
+          'Return JSON with outcome, summary, changedFiles, evidenceFiles, diffStat, requestedApprovals, validationChecks, architectureUpdate, and optional fileUpdates [{ path, content }]. architectureUpdate must contain only architectural facts introduced or changed by this attempt, including databaseSchemas; use empty arrays when nothing changed. Reply with JSON only.'
       },
       {
         role: 'user',
@@ -695,51 +633,17 @@ export class CodexProvider implements AIProvider {
           .join('\n')
       }
     ];
-    const response = await this.requestResponses(messages, input.session);
+    const response = await this.requestResponses(messages, input.session, input.signal);
     const content = response.content;
     await emitCapturedUsage(input.onActivity, response.usage);
 
-    const fallback: ImplementResult = {
-      outcome: 'changes_made',
-      summary: `Codex implementation summary for task ${input.taskId}.`,
-      changedFiles: ['CODEX_IMPLEMENTATION.md'],
-      diffStat: summarizeDiffStats(input.prompt),
-      requestedApprovals: [],
-      validationChecks: [],
-      fileUpdates: [
-        {
-          path: 'CODEX_IMPLEMENTATION.md',
-          content: [
-            `# Codex Implementation for ${input.taskId}`,
-            '',
-            '## Prompt',
-            input.prompt,
-            '',
-            '## Plan',
-            ...input.plan.steps.map((step, index) => `${index + 1}. ${step}`)
-          ].join('\n')
-        }
-      ]
-    };
-
-    const result = parseJsonContent<ImplementResult>(content, fallback);
-    result.outcome = result.outcome === 'already_satisfied' ? 'already_satisfied' : 'changes_made';
+    const result = parseImplementResult(content, 'Codex implementation', true);
     if (result.outcome === 'already_satisfied') {
       result.changedFiles = [];
       result.diffStat = { filesChanged: 0, insertions: 0, deletions: 0 };
       result.fileUpdates = [];
-    } else if (!Array.isArray(result.changedFiles) || result.changedFiles.length === 0) {
-      result.changedFiles = ['CODEX_IMPLEMENTATION.md'];
-    }
-    if (!result.diffStat) {
-      result.diffStat = summarizeDiffStats(result.summary);
-    }
-    if (!Array.isArray(result.requestedApprovals)) {
-      result.requestedApprovals = [];
     }
     result.validationChecks = normalizeValidationChecks(result.validationChecks);
-
-    result.fileUpdates = result.outcome === 'already_satisfied' ? [] : normalizeFileUpdates(result, fallback);
     result.providerPrompt = serializeMessages(messages);
     result.providerResponse = content;
     return result;
@@ -754,24 +658,19 @@ export class CodexProvider implements AIProvider {
     const messages: Array<{ role: 'system' | 'user' | 'assistant'; content: string }> = [
       {
         role: 'system',
-        content: 'You are Codex reviewer. Follow the review packet constraints and return JSON with summary, blockers, safeImprovements, and riskyChanges.'
+          content: 'You are Codex reviewer. Follow the review packet constraints and return JSON with summary, blockers, safeImprovements, riskyChanges, and criterionResults when requested.'
       },
       {
         role: 'user',
         content: reviewPrompt
       }
     ];
-    const response = await this.requestResponses(messages, input.session);
+    const response = await this.requestResponses(messages, input.session, input.signal);
     const content = response.content;
     await emitCapturedUsage(input.onActivity, response.usage);
 
     return {
-      ...parseJsonContent<ReviewResult>(content, {
-        summary: `Codex review of ${input.changedFiles.length} changed file(s).`,
-        blockers: [],
-        safeImprovements: ['Add targeted tests for changed files.'],
-        riskyChanges: []
-      }),
+      ...parseReviewResult(content, 'Codex review'),
       providerPrompt: serializeMessages(messages),
       providerResponse: content
     };
@@ -908,15 +807,10 @@ export class CodexProvider implements AIProvider {
   }
 
   private async planWithCli(input: PlanInput): Promise<PlanResult> {
-    const fallback: PlanResult = {
-      summary: `Codex plan for ${input.title}`,
-      steps: ['Inspect repository context.', 'Implement minimal safe changes.', 'Validate with configured command.'],
-      acceptanceCriteria: ['Task remains within configured limits.', 'Validation command is captured.', 'Draft PR is prepared.'],
-      validationChecks: []
-    };
+    const isValidationRecovery = Boolean(input.validationFailure);
     const providerPrompt = [
-      input.previousValidationError
-        ? 'Revise only the supplied failed validation check for this ForgeMind task. Do not repeat planning, implementation work, successful checks, or unrelated checks.'
+      isValidationRecovery
+        ? 'Diagnose the supplied validation failure for this ForgeMind task. Decide whether to replace only the invalid validation check, repair the implementation, or report a genuine blocker. Do not modify repository files.'
         : 'Create an implementation plan for this ForgeMind task.',
       'Return only JSON matching the provided schema.',
       'Translate acceptance criteria into concrete validation checks whenever possible.',
@@ -925,12 +819,14 @@ export class CodexProvider implements AIProvider {
       `Task id: ${input.taskId}`,
       `Title: ${input.title}`,
       `Prompt:\n${input.prompt}`,
-      input.previousValidationError ? `Previous validation error:\n${input.previousValidationError}` : '',
+      input.validationFailure
+        ? `Complete validation failure:\n${JSON.stringify(input.validationFailure, null, 2)}`
+        : input.previousValidationError ? `Previous validation error:\n${input.previousValidationError}` : '',
       input.previousValidationChecks?.length
         ? `Previous validation checks:\n${input.previousValidationChecks.map((check) => check.command).join('\n')}`
         : '',
-      input.previousValidationError
-        ? 'Return only corrected replacement check(s) for the supplied failed check. Do not repeat any other validation checks.'
+      isValidationRecovery
+        ? 'Inspect the repository before deciding. Return validationRecovery.action as replace_validation_check, repair_implementation, or blocked. Return replacement validationChecks only for replace_validation_check; otherwise return an empty array.'
         : ''
     ].join('\n\n');
     const content = await this.runCodexExec({
@@ -938,7 +834,27 @@ export class CodexProvider implements AIProvider {
       onActivity: input.onActivity,
       session: input.session,
       maxRuntimeMs: input.maxRuntimeMs,
-      schema: {
+      signal: input.signal,
+      schema: isValidationRecovery ? {
+        type: 'object',
+        additionalProperties: false,
+        required: ['summary', 'steps', 'acceptanceCriteria', 'validationChecks', 'validationRecovery'],
+        properties: {
+          summary: { type: 'string' },
+          steps: { type: 'array', items: { type: 'string' } },
+          acceptanceCriteria: { type: 'array', items: { type: 'string' } },
+          validationChecks: validationChecksJsonSchema(),
+          validationRecovery: {
+            type: 'object',
+            additionalProperties: false,
+            required: ['action', 'rationale'],
+            properties: {
+              action: { type: 'string', enum: ['replace_validation_check', 'repair_implementation', 'blocked'] },
+              rationale: { type: 'string' }
+            }
+          }
+        }
+      } : {
         type: 'object',
         additionalProperties: false,
         required: ['summary', 'steps', 'acceptanceCriteria', 'implementationSteps', 'projectContract', 'contractDelta', 'architectureUpdate', 'validationChecks'],
@@ -963,21 +879,13 @@ export class CodexProvider implements AIProvider {
     });
 
     return {
-      ...parseJsonContent<PlanResult>(content, fallback),
+      ...parsePlanResult(content, 'Codex CLI plan'),
       providerPrompt,
       providerResponse: content
     };
   }
 
   private async implementWithCli(input: ImplementInput): Promise<ImplementResult> {
-    const fallback: ImplementResult = {
-      outcome: 'changes_made',
-      summary: `Codex implementation summary for task ${input.taskId}.`,
-      changedFiles: [],
-      diffStat: { filesChanged: 0, insertions: 0, deletions: 0 },
-      requestedApprovals: [],
-      validationChecks: []
-    };
     const providerPrompt = buildCodexImplementationPrompt(
       input,
       Boolean(resolveCompatibleSessionId(input.session, 'codex', this.model))
@@ -991,14 +899,16 @@ export class CodexProvider implements AIProvider {
         sandbox: 'workspace-write',
         onActivity: input.onActivity,
         session: input.session,
+        signal: input.signal,
         schema: {
           type: 'object',
           additionalProperties: false,
-          required: ['outcome', 'summary', 'changedFiles', 'diffStat', 'requestedApprovals', 'validationChecks', 'architectureUpdate'],
+          required: ['outcome', 'summary', 'changedFiles', 'evidenceFiles', 'diffStat', 'requestedApprovals', 'validationChecks', 'architectureUpdate'],
           properties: {
             outcome: { type: 'string', enum: ['changes_made', 'already_satisfied'] },
             summary: { type: 'string' },
             changedFiles: { type: 'array', items: { type: 'string' } },
+            evidenceFiles: { type: 'array', items: { type: 'string' } },
             diffStat: {
               type: 'object',
               additionalProperties: false,
@@ -1035,23 +945,24 @@ export class CodexProvider implements AIProvider {
       });
     }
 
-    const result = parseJsonContent<ImplementResult>(content, fallback);
     const changedFiles = await collectChangedFiles(input.repositoryPath);
-    result.outcome = result.outcome === 'already_satisfied' ? 'already_satisfied' : 'changes_made';
+    const result: ImplementResult = recoveredFromTimeout
+      ? {
+          outcome: 'changes_made',
+          summary: `Codex stopped after inactivity; preserved ${changedFiles.length} changed file(s) for validation and review.`,
+          changedFiles,
+          diffStat: await collectDiffStat(input.repositoryPath, changedFiles),
+          requestedApprovals: [],
+          validationChecks: []
+        }
+      : parseImplementResult(content, 'Codex CLI implementation');
     if (!Array.isArray(result.changedFiles) || result.changedFiles.length === 0) {
       result.changedFiles = changedFiles;
     }
     if (!result.diffStat || result.diffStat.filesChanged === 0) {
       result.diffStat = await collectDiffStat(input.repositoryPath, result.changedFiles);
     }
-    if (!Array.isArray(result.requestedApprovals)) {
-      result.requestedApprovals = [];
-    }
     result.validationChecks = normalizeValidationChecks(result.validationChecks);
-    if (recoveredFromTimeout) {
-      result.outcome = 'changes_made';
-      result.summary = `Codex stopped after inactivity; preserved ${changedFiles.length} changed file(s) for validation and review.`;
-    }
     result.fileUpdates = undefined;
     result.providerPrompt = providerPrompt;
     result.providerResponse = content;
@@ -1059,17 +970,12 @@ export class CodexProvider implements AIProvider {
   }
 
   private async reviewWithCli(input: ReviewInput, providerPrompt: string): Promise<ReviewResult> {
-    const fallback: ReviewResult = {
-      summary: `Codex review of ${input.changedFiles.length} changed file(s).`,
-      blockers: [],
-      safeImprovements: ['Add targeted tests for changed files.'],
-      riskyChanges: []
-    };
     const content = await this.runCodexExec({
       repositoryPath: input.repositoryPath,
       sandbox: 'read-only',
       onActivity: input.onActivity,
       session: input.session,
+      signal: input.signal,
       schema: {
         type: 'object',
         additionalProperties: false,
@@ -1078,14 +984,27 @@ export class CodexProvider implements AIProvider {
           summary: { type: 'string' },
           blockers: { type: 'array', items: { type: 'string' } },
           safeImprovements: { type: 'array', items: { type: 'string' } },
-          riskyChanges: { type: 'array', items: { type: 'string', enum: APPROVAL_TYPES } }
+          riskyChanges: { type: 'array', items: { type: 'string', enum: APPROVAL_TYPES } },
+          criterionResults: {
+            type: 'array',
+            items: {
+              type: 'object',
+              additionalProperties: false,
+              required: ['criterion', 'status', 'evidence'],
+              properties: {
+                criterion: { type: 'string' },
+                status: { type: 'string', enum: ['satisfied', 'not_satisfied', 'insufficient_evidence'] },
+                evidence: { type: 'array', items: { type: 'string' } }
+              }
+            }
+          }
         }
       },
       prompt: providerPrompt
     });
 
     return {
-      ...parseJsonContent<ReviewResult>(content, fallback),
+      ...parseReviewResult(content, 'Codex CLI review'),
       providerPrompt,
       providerResponse: content
     };
@@ -1130,6 +1049,7 @@ export class CodexProvider implements AIProvider {
     onActivity?: ProviderActivityHandler;
     session?: ProviderSessionContext;
     maxRuntimeMs?: number;
+    signal?: AbortSignal;
   }): Promise<string> {
     await this.verifyOAuthSession();
 
@@ -1159,6 +1079,7 @@ export class CodexProvider implements AIProvider {
         cwd: executionDirectory,
         env: this.commandEnv,
         maxRuntimeMs: input.maxRuntimeMs,
+        signal: input.signal,
         onActivity: input.onActivity,
         onSessionId: async (id) => {
           if (!input.session) return;
@@ -1209,7 +1130,8 @@ export class CodexProvider implements AIProvider {
 
   private async requestResponses(
     messages: Array<{ role: 'system' | 'user' | 'assistant'; content: string }>,
-    session?: ProviderSessionContext
+    session?: ProviderSessionContext,
+    signal?: AbortSignal
   ): Promise<{ content: string; usage?: ProviderUsageMeasurement }> {
     if (!this.apiKey) {
       throw new Error('CODEX_API_KEY is required for Codex API key provider mode.');
@@ -1221,6 +1143,7 @@ export class CodexProvider implements AIProvider {
         'Content-Type': 'application/json',
         Authorization: `Bearer ${this.apiKey}`
       },
+      signal,
       body: JSON.stringify({
         model: this.model,
         previous_response_id: resolveCompatibleSessionId(session, 'codex', this.model),
@@ -1339,6 +1262,7 @@ export interface CodexProcessOptions {
   maxRuntimeMs?: number;
   onActivity?: ProviderActivityHandler;
   onSessionId?: (sessionId: string) => void | Promise<void>;
+  signal?: AbortSignal;
 }
 
 export interface CodexProcessResult {
@@ -1388,6 +1312,7 @@ export async function runCodexProcess(
     let stderr = '';
     let settled = false;
     let timeoutReason: CodexExecutionTimeoutError['reason'] | undefined;
+    let abortError: Error | undefined;
     let inactivityTimer: NodeJS.Timeout;
     let maxRuntimeTimer: NodeJS.Timeout;
     let terminationTimer: NodeJS.Timeout | undefined;
@@ -1406,6 +1331,7 @@ export async function runCodexProcess(
       if (terminationTimer) clearTimeout(terminationTimer);
       if (activityFlushTimer) clearTimeout(activityFlushTimer);
       workspaceWatcher?.close();
+      options.signal?.removeEventListener('abort', stopForAbort);
     };
     const enqueueActivity = (kind: 'lifecycle' | 'stdout' | 'stderr' | 'workspace', message: string) => {
       activityQueue = activityQueue
@@ -1459,6 +1385,15 @@ export async function runCodexProcess(
         finish(new CodexExecutionTimeoutError(reason, Date.now() - startedAt, stdout, stderr));
       }, 5_000);
     };
+    const stopForAbort = () => {
+      if (settled || abortError) return;
+      abortError = options.signal?.reason instanceof Error
+        ? options.signal.reason
+        : new Error('Codex provider execution was cancelled.');
+      emitActivity('lifecycle', 'Stopping Codex because the task was cancelled.');
+      child.kill();
+      terminationTimer = setTimeout(() => finish(abortError), 5_000);
+    };
     const resetInactivityTimer = () => {
       clearTimeout(inactivityTimer);
       inactivityTimer = setTimeout(() => stopForTimeout('inactivity'), inactivityTimeoutMs);
@@ -1495,6 +1430,8 @@ export async function runCodexProcess(
 
     inactivityTimer = setTimeout(() => stopForTimeout('inactivity'), inactivityTimeoutMs);
     maxRuntimeTimer = setTimeout(() => stopForTimeout('max_runtime'), maxRuntimeMs);
+    options.signal?.addEventListener('abort', stopForAbort, { once: true });
+    if (options.signal?.aborted) stopForAbort();
 
     if (options.cwd) {
       try {
@@ -1534,6 +1471,10 @@ export async function runCodexProcess(
       }
       if (timeoutReason) {
         finish(new CodexExecutionTimeoutError(timeoutReason, Date.now() - startedAt, stdout, stderr));
+        return;
+      }
+      if (abortError) {
+        finish(abortError);
         return;
       }
       if (code === 0) {
@@ -1750,7 +1691,7 @@ export function buildCodexImplementationPrompt(input: ImplementInput, continueSe
     'Do not create commits, branches, issues, or pull requests. ForgeMind handles those steps.',
     'Do not run broad test suites, full builds, type checks, dependency installation, database validation, or repository-wide formatting. ForgeMind runs authoritative validation after implementation.',
     'Run a narrowly targeted check only when it is required to make the edit correctly.',
-    'Set outcome to changes_made when repository changes are required. If the current repository already satisfies every acceptance criterion, do not modify files: set outcome to already_satisfied, return empty changedFiles, a zero diffStat, and executable validationChecks that prove the criteria.',
+    'Set outcome to changes_made when repository changes are required. If the current repository already satisfies every acceptance criterion, do not modify files: set outcome to already_satisfied, return empty changedFiles, a zero diffStat, non-empty evidenceFiles naming repository files that prove the criteria, and executable validationChecks that prove the criteria.',
     'After editing, return the smallest authoritative validationChecks set for the resulting repository and acceptance criteria. Do not use environment-only smoke checks such as node --version unless the task explicitly requires them.',
     'Return architectureUpdate as a compact delta containing only modules, databaseSchemas, interfaces, dependencies, decisions, conventions, debt, or architecture validation commands introduced or changed by this attempt. Use empty arrays when architecture did not change.',
     'Validation checks must be executable commands that prove a criterion through their exit code. Omit criteria that cannot be verified automatically.',

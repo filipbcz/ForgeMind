@@ -18,11 +18,13 @@ function roadmap(overrides: Partial<ProjectRoadmapApi> = {}): ProjectRoadmapApi 
       {
         id: 'step_1', projectId: 'project_1', cycleId: 'cycle_1', sequenceNumber: 1,
         title: 'Foundation', description: '', acceptanceCriteria: [], requirementIds: [], deliverables: [],
+        changeRationale: '', dependsOnStepTitles: [], validationFocus: ['implementation'],
         status: 'completed', taskId: 'task_1', createdAt: '', updatedAt: ''
       },
       {
         id: 'step_2', projectId: 'project_1', cycleId: 'cycle_1', sequenceNumber: 2,
         title: 'User flow', description: '', acceptanceCriteria: [], requirementIds: [], deliverables: [],
+        changeRationale: '', dependsOnStepTitles: [], validationFocus: ['implementation'],
         status: 'pending', createdAt: '', updatedAt: ''
       }
     ],

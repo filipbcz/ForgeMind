@@ -15,6 +15,7 @@ import {
 describe('validation runner', () => {
   it('preserves compiler diagnostics from stdout when stderr only contains an npm summary', () => {
     const context = formatValidationFailure({
+      command: 'npm run build',
       exitCode: 2,
       stdout: 'build output\nsrc/report.ts(4,2): error TS2345: Invalid aggregate input.',
       stderr: 'npm error Lifecycle script `build` failed'
@@ -22,6 +23,8 @@ describe('validation runner', () => {
 
     expect(context).toContain('error TS2345');
     expect(context).toContain('npm error Lifecycle script');
+    expect(context).toContain('Command: npm run build');
+    expect(context).toContain('Exit code: 2');
   });
 
   it('installs development dependencies for npm ci validation', () => {

@@ -18,6 +18,7 @@ workflow:
 ai:
   primary_provider: codex
   reviewer_provider: codex
+  reviewer_connection_id: reviewer-connection
   model_profile: balanced
 limits:
   max_iterations: 7
@@ -51,6 +52,7 @@ describe('agent config parser', () => {
     const config = parseAgentConfigYaml(configYaml);
     expect(config.project.id).toBe('demo');
     expect(config.ai.primary_provider).toBe('codex');
+    expect(config.ai.reviewer_connection_id).toBe('reviewer-connection');
     expect(toCoreLimits(config).maxIterations).toBe(7);
     expect(toCoreLimits(config).maxDiffLines).toBe(500);
   });

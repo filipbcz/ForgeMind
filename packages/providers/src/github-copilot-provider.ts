@@ -20,7 +20,7 @@ import type {
   ProviderUsageMeasurement,
   ProviderActivityHandler
 } from './provider.js';
-import { normalizeValidationChecks } from './provider.js';
+import { normalizeValidationChecks, parseImplementResult, parsePlanResult, parseReviewResult } from './provider.js';
 import { emitCapturedUsage } from './provider-usage.js';
 import type { ProviderRuntimeConfig } from './index.js';
 import type { ProviderModelOption } from './openai-provider.js';
@@ -74,12 +74,7 @@ export class GitHubCopilotProvider implements AIProvider {
     const content = await this.requestText(messages, input.onActivity, 'plan');
 
     return {
-      ...parseJsonContent<PlanResult>(content, {
-        summary: `Copilot plan for ${input.title}`,
-        steps: ['Review project context.', 'Propose a minimal change plan.', 'Validate the result.'],
-        acceptanceCriteria: ['Plan is concise and actionable.', 'Validation commands are executable.'],
-        validationChecks: []
-      }),
+      ...parsePlanResult(content, 'GitHub Copilot plan'),
       providerPrompt: messages,
       providerResponse: content
     };
@@ -88,7 +83,7 @@ export class GitHubCopilotProvider implements AIProvider {
   async implement(input: ImplementInput): Promise<ImplementResult> {
     const messages = [
       'You are GitHub Copilot acting as a code editing assistant inside ForgeMind.',
-      'Return only valid JSON with summary, changedFiles, diffStat, requestedApprovals, validationChecks, architectureUpdate, and optional fileUpdates.',
+      'Return only valid JSON with outcome, summary, changedFiles, evidenceFiles, diffStat, requestedApprovals, validationChecks, architectureUpdate, and fileUpdates.',
       'changedFiles should list files actually changed or created.',
       'fileUpdates should include exact file contents for each changed file when you can provide them.',
       'Do not add any markdown, code fences, or extra commentary.',
@@ -101,42 +96,8 @@ export class GitHubCopilotProvider implements AIProvider {
     ].filter(Boolean).join('\n\n');
     const content = await this.requestText(messages, input.onActivity, 'implement');
 
-    const fallback: ImplementResult = {
-      summary: `Copilot implementation summary for task ${input.taskId}.`,
-      changedFiles: ['COPILOT_IMPLEMENTATION.md'],
-      diffStat: { filesChanged: 1, insertions: Math.min(150, input.prompt.length), deletions: 0 },
-      requestedApprovals: [],
-      validationChecks: [],
-      fileUpdates: [
-        {
-          path: 'COPILOT_IMPLEMENTATION.md',
-          content: [
-            `# Copilot Implementation for ${input.taskId}`,
-            '',
-            '## Prompt',
-            input.prompt,
-            '',
-            '## Plan',
-            ...input.plan.steps.map((step, index) => `${index + 1}. ${step}`)
-          ].join('\n')
-        }
-      ]
-    };
-
-    const result = parseJsonContent<ImplementResult>(content, fallback);
-    if (!Array.isArray(result.changedFiles) || result.changedFiles.length === 0) {
-      result.changedFiles = fallback.changedFiles;
-    }
-    if (!result.diffStat) {
-      result.diffStat = fallback.diffStat;
-    }
-    if (!Array.isArray(result.requestedApprovals)) {
-      result.requestedApprovals = [];
-    }
+    const result = parseImplementResult(content, 'GitHub Copilot implementation', true);
     result.validationChecks = normalizeValidationChecks(result.validationChecks);
-    if (!Array.isArray(result.fileUpdates) || result.fileUpdates.length === 0) {
-      result.fileUpdates = fallback.fileUpdates;
-    }
 
     result.providerPrompt = messages;
     result.providerResponse = content;
@@ -146,7 +107,7 @@ export class GitHubCopilotProvider implements AIProvider {
   async review(input: ReviewInput): Promise<ReviewResult> {
     const messages = [
       'You are GitHub Copilot acting as a code reviewer inside ForgeMind.',
-      'Return only valid JSON with summary, blockers, safeImprovements, and riskyChanges.',
+      'Return only valid JSON with summary, blockers, safeImprovements, riskyChanges, and criterionResults when requested.',
       'Do not add any markdown, code fences, or extra commentary.',
       `Task title: ${input.taskTitle}`,
       `Changed files: ${input.changedFiles.join(', ')}`,
@@ -158,12 +119,7 @@ export class GitHubCopilotProvider implements AIProvider {
     const content = await this.requestText(messages, input.onActivity, 'review');
 
     return {
-      ...parseJsonContent<ReviewResult>(content, {
-        summary: `Copilot review of ${input.changedFiles.length} changed file(s).`,
-        blockers: [],
-        safeImprovements: ['Add targeted tests for changed files.'],
-        riskyChanges: []
-      }),
+      ...parseReviewResult(content, 'GitHub Copilot review'),
       providerPrompt: messages,
       providerResponse: content
     };
@@ -260,18 +216,5 @@ export class GitHubCopilotProvider implements AIProvider {
       useLoggedInUser: !this.token,
       sessionIdleTimeoutSeconds: 900
     });
-  }
-}
-
-function parseJsonContent<T>(content: string, fallback: T): T {
-  try {
-    const jsonStart = content.indexOf('{');
-    const jsonEnd = content.lastIndexOf('}');
-    if (jsonStart >= 0 && jsonEnd > jsonStart) {
-      return JSON.parse(content.slice(jsonStart, jsonEnd + 1)) as T;
-    }
-    return JSON.parse(content) as T;
-  } catch {
-    return fallback;
   }
 }

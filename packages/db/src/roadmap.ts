@@ -75,8 +75,7 @@ export async function startNextRoadmapStep(
   const cycleSteps = roadmap.steps
     .filter((candidate) => candidate.cycleId === cycleId)
     .sort((left, right) => left.sequenceNumber - right.sequenceNumber);
-  if (cycleSteps.some((candidate) => candidate.status === 'running')) return undefined;
-  const nextStep = cycleSteps.find((candidate) => candidate.status === 'pending');
+  const nextStep = cycleSteps.find((candidate) => candidate.status === 'pending' && !candidate.taskId);
   if (!nextStep) return undefined;
 
   const currentIndex = cycleSteps.findIndex((candidate) => candidate.id === nextStep.id);
@@ -85,46 +84,29 @@ export async function startNextRoadmapStep(
     .filter((candidate) => candidate.status === 'completed')
     .map((candidate) => candidate.title);
   const futureSteps = cycleSteps.slice(currentIndex + 1).map((candidate) => candidate.title);
-  const task = await repository.createTask({
-    projectId: project.id,
-    title: `${project.name}: ${nextStep.title}`,
-    prompt: buildRoadmapStepTaskPrompt({
-      projectName: project.name,
-      objective: cycle.objective,
-      stepTitle: nextStep.title,
-      stepDescription: nextStep.description,
-      acceptanceCriteria: nextStep.acceptanceCriteria,
-      requirementIds: nextStep.requirementIds,
-      deliverables: nextStep.deliverables,
-      changeRationale: nextStep.changeRationale,
-      dependsOnStepTitles: nextStep.dependsOnStepTitles,
-      validationFocus: nextStep.validationFocus,
-      projectContract: project.projectContract,
-      completedSteps,
-      futureSteps
-    }),
-    mode: project.defaultTaskMode ?? 'safe',
-    maxIterations: 10,
-    maxBudgetUsd: 5
+  return repository.createAndStartRoadmapStepTask(nextStep.id, {
+      projectId: project.id,
+      title: `${project.name}: ${nextStep.title}`,
+      prompt: buildRoadmapStepTaskPrompt({
+        projectName: project.name,
+        objective: cycle.objective,
+        stepTitle: nextStep.title,
+        stepDescription: nextStep.description,
+        acceptanceCriteria: nextStep.acceptanceCriteria,
+        requirementIds: nextStep.requirementIds,
+        deliverables: nextStep.deliverables,
+        changeRationale: nextStep.changeRationale,
+        dependsOnStepTitles: nextStep.dependsOnStepTitles,
+        validationFocus: nextStep.validationFocus,
+        projectContract: project.projectContract,
+        completedSteps,
+        futureSteps
+      }),
+      mode: project.defaultTaskMode ?? 'safe',
+      maxIterations: 10,
+      maxBudgetUsd: 5,
+      architectureVersionId: project.currentArchitectureVersionId ?? cycle.architectureVersionId
   });
-
-  await repository.assignTaskToImplementationStep(nextStep.id, task.id, 'running');
-  const startedTask = await repository.startTask(task.id);
-  if (!startedTask) {
-    await repository.updateImplementationStepStatus(nextStep.id, 'pending');
-    throw new Error(`Roadmap task "${task.id}" could not be started.`);
-  }
-
-  await repository.enqueueTask(startedTask.id, 'roadmap_step_started');
-  await repository.writeAudit({
-    actorType: 'system',
-    eventType: 'task_enqueued',
-    projectId: project.id,
-    taskId: startedTask.id,
-    payload: { reason: 'roadmap_step_started' }
-  });
-
-  return startedTask;
 }
 
 export function buildRoadmapStepTaskPrompt(input: {

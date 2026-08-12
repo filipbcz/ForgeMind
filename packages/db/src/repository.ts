@@ -1148,9 +1148,21 @@ export class ForgeMindRepository {
     await this.ensureLocalUser();
     try {
       await this.prisma.$transaction(async (tx) => {
+        await tx.$queryRawUnsafe(WORKER_QUEUE_ADVISORY_LOCK_SQL);
         const project = await tx.project.findUnique({ where: { id: input.projectId } });
         if (!project) {
           throw new Error(`Project "${input.projectId}" does not exist`);
+        }
+
+        if (!input.approvedExtension && await tx.projectRoadmapCycle.count({ where: { projectId: input.projectId } }) > 0) {
+          const [activeTaskCount, runningStepCount, activeAuditCount] = await Promise.all([
+            tx.task.count({ where: { projectId: input.projectId, status: { in: [...ACTIVE_TASK_STATUSES] } } }),
+            tx.projectImplementationStep.count({ where: { projectId: input.projectId, status: 'running' } }),
+            tx.projectAuditJob.count({ where: { projectId: input.projectId, status: { in: ['pending', 'claimed'] } } })
+          ]);
+          if (activeTaskCount > 0 || runningStepCount > 0 || activeAuditCount > 0) {
+            throw new Error('Roadmap cannot be regenerated while the project has an active task, running implementation step, or project audit.');
+          }
         }
 
         if (input.approvedExtension) {
@@ -1355,6 +1367,19 @@ export class ForgeMindRepository {
     }
 
     return (await this.getProjectRoadmap(input.projectId))!;
+  }
+
+  async assertProjectRoadmapRegenerationAllowed(projectId: string): Promise<void> {
+    const cycleCount = await this.prisma.projectRoadmapCycle.count({ where: { projectId } });
+    if (cycleCount === 0) return;
+    const [activeTaskCount, runningStepCount, activeAuditCount] = await Promise.all([
+      this.prisma.task.count({ where: { projectId, status: { in: [...ACTIVE_TASK_STATUSES] } } }),
+      this.prisma.projectImplementationStep.count({ where: { projectId, status: 'running' } }),
+      this.prisma.projectAuditJob.count({ where: { projectId, status: { in: ['pending', 'claimed'] } } })
+    ]);
+    if (activeTaskCount > 0 || runningStepCount > 0 || activeAuditCount > 0) {
+      throw new Error('Roadmap cannot be regenerated while the project has an active task, running implementation step, or project audit.');
+    }
   }
 
   async setProjectRoadmapCycleExtensionProposal(
@@ -1653,6 +1678,107 @@ export class ForgeMindRepository {
     return toProjectImplementationStep(updated);
   }
 
+  async createAndStartRoadmapStepTask(
+    stepId: string,
+    input: CreateTaskInput
+  ): Promise<ForgeTask | undefined> {
+    await this.ensureLocalUser();
+    return this.prisma.$transaction(async (tx) => {
+      await tx.$queryRawUnsafe(WORKER_QUEUE_ADVISORY_LOCK_SQL);
+      const step = await tx.projectImplementationStep.findFirst({
+        where: {
+          id: stepId,
+          projectId: input.projectId,
+          status: 'pending',
+          taskId: null,
+          cycle: { status: 'active' }
+        }
+      });
+      if (!step) return undefined;
+      const running = await tx.projectImplementationStep.count({
+        where: { projectId: input.projectId, cycleId: step.cycleId, status: 'running' }
+      });
+      if (running > 0) return undefined;
+      const next = await tx.projectImplementationStep.findFirst({
+        where: { projectId: input.projectId, cycleId: step.cycleId, status: 'pending', taskId: null },
+        orderBy: { sequenceNumber: 'asc' },
+        select: { id: true }
+      });
+      if (next?.id !== step.id) return undefined;
+
+      const project = await tx.project.findUnique({ where: { id: input.projectId } });
+      if (!project) throw new Error(`Project "${input.projectId}" does not exist`);
+      const architectureVersionId = input.architectureVersionId ?? project.currentArchitectureVersionId ?? undefined;
+      if (architectureVersionId) {
+        const architectureVersion = await tx.projectArchitectureVersion.findUnique({
+          where: { id: architectureVersionId },
+          select: { projectId: true }
+        });
+        if (!architectureVersion || architectureVersion.projectId !== project.id) {
+          throw new Error('Task architecture version does not belong to the selected project.');
+        }
+      }
+
+      const startedAt = new Date();
+      const task = await tx.task.create({
+        data: {
+          projectId: project.id,
+          createdByUserId: LOCAL_USER_ID,
+          title: input.title,
+          prompt: input.prompt,
+          mode: input.mode,
+          status: 'submitted',
+          architectureVersionId,
+          maxIterations: input.maxIterations,
+          maxBudgetUsd: input.maxBudgetUsd,
+          startedAt
+        }
+      });
+      await tx.projectImplementationStep.update({
+        where: { id: step.id },
+        data: { taskId: task.id, status: 'running', completedAt: null }
+      });
+      await tx.taskRun.create({
+        data: {
+          taskId: task.id,
+          provider: resolveProjectProvider(project.configYaml ?? undefined),
+          model: 'queued',
+          status: 'queued'
+        }
+      });
+      await tx.taskQueueJob.create({
+        data: {
+          taskId: task.id,
+          reason: 'roadmap_step_started',
+          status: 'pending',
+          nextAttemptAt: startedAt
+        }
+      });
+
+      await this.writeAuditTx(tx, {
+        actorType: 'user', actorId: LOCAL_USER_ID, eventType: 'task_created', projectId: project.id, taskId: task.id,
+        payload: { title: task.title, mode: task.mode }
+      });
+      await this.writeAuditTx(tx, {
+        actorType: 'system', eventType: 'project_implementation_step_task_assigned', projectId: project.id, taskId: task.id,
+        payload: { stepId: step.id, status: 'running' }
+      });
+      await this.writeAuditTx(tx, {
+        actorType: 'user', actorId: LOCAL_USER_ID, eventType: 'task_started', projectId: project.id, taskId: task.id,
+        payload: { status: task.status }
+      });
+      await this.writeAuditTx(tx, {
+        actorType: 'system', eventType: 'task_run_queued', projectId: project.id, taskId: task.id,
+        payload: { status: 'queued' }
+      });
+      await this.writeAuditTx(tx, {
+        actorType: 'system', eventType: 'task_enqueued', projectId: project.id, taskId: task.id,
+        payload: { reason: 'roadmap_step_started' }
+      });
+      return toTask(task);
+    });
+  }
+
   async updateImplementationStepStatus(
     stepId: string,
     status: ProjectImplementationStepStatus
@@ -1664,6 +1790,7 @@ export class ForgeMindRepository {
       where: { id: stepId },
       data: {
         status,
+        taskId: status === 'pending' ? null : undefined,
         completedAt: status === 'completed' ? new Date() : null
       }
     });
@@ -3056,6 +3183,14 @@ export class ForgeMindRepository {
         taskId,
         status: { in: [...ACTIVE_QUEUE_STATUSES] }
       },
+      data: {
+        status: 'cancelled',
+        errorMessage: 'Task cancelled by user.',
+        finishedAt: new Date()
+      }
+    });
+    await this.prisma.taskRun.updateMany({
+      where: { taskId, status: 'running' },
       data: {
         status: 'cancelled',
         errorMessage: 'Task cancelled by user.',

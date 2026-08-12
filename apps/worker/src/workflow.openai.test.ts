@@ -12,7 +12,14 @@ vi.stubGlobal('fetch', vi.fn(async (_url: string, init?: RequestInit) => {
   if (body.includes('Create a plan')) {
     content = JSON.stringify({ summary: 'Plan summary', steps: ['step1'], acceptanceCriteria: ['ac1'] });
   } else if (body.includes('Implement the following task') || body.includes('Implement the following')) {
-    content = JSON.stringify({ summary: 'Impl summary', changedFiles: ['OPENAI_IMPLEMENTATION.md'], diffStat: { filesChanged: 1, insertions: 5, deletions: 0 }, requestedApprovals: [] });
+    content = JSON.stringify({
+      outcome: 'changes_made',
+      summary: 'Impl summary',
+      changedFiles: ['OPENAI_IMPLEMENTATION.md'],
+      diffStat: { filesChanged: 1, insertions: 5, deletions: 0 },
+      requestedApprovals: [],
+      fileUpdates: [{ path: 'OPENAI_IMPLEMENTATION.md', content: '# OpenAI implementation\n' }]
+    });
   } else if (body.includes('Review only the supplied ForgeMind review packet')) {
     content = JSON.stringify({ summary: 'Review summary', blockers: [], safeImprovements: [], riskyChanges: [] });
   }

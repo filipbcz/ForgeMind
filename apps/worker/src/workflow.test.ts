@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from 'vitest';
 import { join } from 'node:path';
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { tmpdir } from 'node:os';
 import { access, mkdir, readFile, writeFile } from 'node:fs/promises';
 import { simpleGit } from 'simple-git';
@@ -8,11 +8,9 @@ import {
   buildTaskExecutionPrompt,
   compactTaskExecutionPrompt,
   createRoadmapTaskPlan,
-  getMissingSystemValidationTool,
   inferRepositoryInstallCommand,
   isInspectionOnlyValidationCommand,
   isReviewSummaryOnlyPath,
-  isValidationCommandDefinitionFailure,
   normalizeValidationChecks,
   replaceFailedValidationCheck,
   resolveValidationChecks,
@@ -200,8 +198,10 @@ describe('worker workflow', () => {
   it('runs the local provider workflow end-to-end without GitHub operations', async () => {
     const workspaceRoot = join(tmpdir(), `forgemind-worker-test-${randomUUID()}`);
     let capturedReviewInput: ReviewInput | undefined;
-    const provider = createProviderStub({
-      async review(input): Promise<ReviewResult> {
+    const implementationReview = vi.fn();
+    const provider = createProviderStub({ review: implementationReview });
+    const reviewProvider = createProviderStub({
+      review: vi.fn(async (input): Promise<ReviewResult> => {
         capturedReviewInput = input;
         return {
           summary: 'Review passed',
@@ -209,13 +209,14 @@ describe('worker workflow', () => {
           safeImprovements: [],
           riskyChanges: []
         };
-      }
+      })
     });
 
     const result = await runWorkerTask({
       project: demoProject,
       task: demoTask,
       provider,
+      reviewProvider,
       verifyCommand: 'node --version',
       workspaceRoot
     });
@@ -230,6 +231,7 @@ describe('worker workflow', () => {
       expect.objectContaining({
         taskId: demoTask.id,
         taskTitle: demoTask.title,
+        taskPrompt: demoTask.prompt,
         acceptanceCriteria: ['Validation passes'],
         validation: expect.objectContaining({
           command: 'node --version',
@@ -239,6 +241,8 @@ describe('worker workflow', () => {
         diff: expect.stringContaining('diff --git a/status.txt b/status.txt')
       })
     );
+    expect(implementationReview).not.toHaveBeenCalled();
+    expect(reviewProvider.review).toHaveBeenCalledOnce();
     expect(capturedReviewInput?.diff).toContain('+ok');
 
     const workspaceGit = simpleGit({ baseDir: result.workspacePath });
@@ -354,8 +358,8 @@ describe('worker workflow', () => {
 
     expect(result.status).toBe('completed');
     expect(result.commitSha).toBe(mergeCommitSha);
-    expect(createPullRequest).toHaveBeenCalledWith(expect.objectContaining({ draft: false }));
-    expect(mergePullRequest).toHaveBeenCalledWith(expect.objectContaining({ defaultBranch: 'main' }), 4321);
+    expect(createPullRequest).toHaveBeenCalledWith(expect.objectContaining({ draft: false }), undefined);
+    expect(mergePullRequest).toHaveBeenCalledWith(expect.objectContaining({ defaultBranch: 'main' }), 4321, undefined);
   }, 10000);
 
   it('feeds failed GitHub Actions output back to AI and merges only after the corrected commit passes', async () => {
@@ -449,6 +453,33 @@ describe('worker workflow', () => {
       operation: 'wait_for_checks',
       errorMessage: 'GitHub Checks API unavailable'
     }));
+  }, 10000);
+
+  it('fails closed when green CI is required but no GitHub check is discovered', async () => {
+    const workspaceRoot = join(tmpdir(), `forgemind-worker-ci-required-${randomUUID()}`);
+    const mergePullRequest = vi.fn(async () => ({ merged: true, sha: 'unexpected', message: 'Unexpected merge' }));
+
+    await expect(runWorkerTask({
+      project: {
+        ...gitEnabledProject,
+        configYaml: gitProjectConfig.replace('auto_push: false', 'auto_push: true'),
+        autoCreatePullRequest: true,
+        autoMergePullRequest: true,
+        autoCompleteTask: true
+      },
+      task: { ...demoTask, id: `task_${randomUUID()}` },
+      provider: createProviderStub(),
+      github: createGitHubStub({
+        mergePullRequest,
+        async waitForChecks() {
+          return { status: 'not_configured', summary: 'No GitHub check run was discovered.', failures: [] };
+        }
+      }),
+      verifyCommand: 'node --version',
+      workspaceRoot
+    })).rejects.toThrow('CI is required, but no GitHub check was discovered');
+
+    expect(mergePullRequest).not.toHaveBeenCalled();
   }, 10000);
 
   it('keeps a task ready for review when GitHub does not confirm the automatic merge', async () => {
@@ -788,6 +819,25 @@ describe('worker workflow', () => {
     const attempts: ImplementInput[] = [];
     const provider: AIProvider = {
       ...createProviderStub(),
+      async plan(input: PlanInput): Promise<PlanResult> {
+        if (input.validationFailure) {
+          return {
+            summary: 'Repair the implementation after validation detected the failed state.',
+            steps: [],
+            acceptanceCriteria: [],
+            validationChecks: [],
+            validationRecovery: {
+              action: 'repair_implementation',
+              rationale: 'The configured validation command correctly detected invalid content.'
+            }
+          };
+        }
+        return {
+          summary: 'Plan summary',
+          steps: ['Implement task'],
+          acceptanceCriteria: ['Validation passes']
+        };
+      },
       async implement(input: ImplementInput): Promise<ImplementResult> {
         attempts.push(input);
         return {
@@ -859,6 +909,8 @@ describe('worker workflow', () => {
         resumeFrom: 'implementation',
         attempt: 2,
         planSummary: 'Original plan',
+        planSteps: ['Preserve the existing implementation.'],
+        acceptanceCriteria: ['The resumed review receives the original criterion.'],
         implementationSummary: 'Partial implementation is preserved.',
         previousReviewBlockers: ['Fix adapter lookup.'],
         previousSafeImprovements: ['Keep the focused test.'],
@@ -871,6 +923,9 @@ describe('worker workflow', () => {
     expect(plan).not.toHaveBeenCalled();
     expect(implement).toHaveBeenCalledOnce();
     expect(review).toHaveBeenCalledOnce();
+    expect(review).toHaveBeenCalledWith(expect.objectContaining({
+      acceptanceCriteria: ['The resumed review receives the original criterion.']
+    }));
     expect(await readFile(join(workspacePath, 'status.txt'), 'utf8')).toBe('corrected\n');
   }, 15000);
 
@@ -985,12 +1040,22 @@ describe('worker workflow', () => {
     await writeFile(join(workspacePath, 'status.txt'), 'implemented\n', 'utf8');
 
     const plan = vi.fn(async (input: PlanInput): Promise<PlanResult> => {
-      expect(input.previousValidationError).toBe('missing-tool: not found');
+      expect(input.previousValidationError).toContain('missing-tool: not found');
+      expect(input.validationFailure).toEqual({
+        command: 'missing-tool test',
+        exitCode: 1,
+        stdout: '',
+        stderr: 'missing-tool: not found'
+      });
       return {
         summary: 'Replaced unavailable validation command.',
         steps: [],
         acceptanceCriteria: [],
-        validationChecks: [{ kind: 'command', command: 'node --version' }]
+        validationChecks: [{ kind: 'command', command: 'node --version' }],
+        validationRecovery: {
+          action: 'replace_validation_check',
+          rationale: 'The original command is unavailable; use an executable repository-safe replacement.'
+        }
       };
     });
     const implement = vi.fn();
@@ -1457,6 +1522,10 @@ describe('worker workflow', () => {
             summary: 'Updated plan with the first corrected validation command.',
             steps: [],
             acceptanceCriteria: ['Build passes'],
+            validationRecovery: {
+              action: 'replace_validation_check',
+              rationale: 'Replace the unavailable validation command.'
+            },
             validationChecks: [
               {
                 kind: 'command',
@@ -1484,6 +1553,10 @@ describe('worker workflow', () => {
           summary: 'Updated plan with the second corrected validation command.',
           steps: [],
           acceptanceCriteria: ['Build passes'],
+          validationRecovery: {
+            action: 'replace_validation_check',
+            rationale: 'Replace the second unavailable validation command.'
+          },
           validationChecks: [
             {
               kind: 'command',
@@ -1576,10 +1649,14 @@ describe('worker workflow', () => {
     expect(implementCalls).toHaveLength(1);
     expect(validationStatuses).toEqual(['validating']);
     expect(planCalls[0]?.prompt).not.toContain('very long project brief');
-    expect(planCalls[1]?.prompt).toContain('Revise the single failed validation check only');
+    expect(planCalls[1]?.prompt).toContain('Diagnose the single failed validation check');
     expect(planCalls[1]?.prompt).toContain('Do not repeat successful or unrelated checks');
     expect(planCalls[1]?.prompt).not.toContain('very long project brief');
     expect(planCalls[1]?.previousValidationError).toContain('tsc: not found');
+    expect(planCalls[1]?.validationFailure).toEqual(expect.objectContaining({
+      exitCode: 1,
+      stderr: expect.stringContaining('tsc: not found')
+    }));
     expect(planCalls[1]?.previousValidationChecks).toEqual([
       expect.objectContaining({
         kind: 'command',
@@ -1642,6 +1719,67 @@ describe('worker workflow', () => {
     );
   }, 20000);
 
+  it('continues AI validation recovery beyond two failed replacement commands', async () => {
+    const workspaceRoot = join(tmpdir(), `forgemind-worker-validation-recovery-depth-${randomUUID()}`);
+    const projectWithoutVerify = {
+      ...demoProject,
+      configYaml: noGitProjectConfig.replace('commands:\n  verify: "node --version"\n', 'commands: {}\n')
+    };
+    const failingCommands = [1, 2, 3].map((number) => (
+      `node -e "process.stderr.write('validation-failure-${number}'); process.exit(1)"`
+    ));
+    const planCalls: PlanInput[] = [];
+    const provider = createProviderStub({
+      plan: vi.fn(async (input: PlanInput): Promise<PlanResult> => {
+        planCalls.push(input);
+        if (!input.validationFailure) {
+          return {
+            summary: 'Initial validation plan.',
+            steps: ['Implement and validate'],
+            acceptanceCriteria: ['Validation passes'],
+            validationChecks: [{ kind: 'command', command: failingCommands[0]! }]
+          };
+        }
+        const recoveryIndex = planCalls.length - 2;
+        const replacement = failingCommands[recoveryIndex + 1] ?? 'node --version';
+        return {
+          summary: `Validation recovery ${recoveryIndex + 1}.`,
+          steps: [],
+          acceptanceCriteria: [],
+          validationChecks: [{ kind: 'command', command: replacement }],
+          validationRecovery: {
+            action: 'replace_validation_check',
+            rationale: 'Replace only the failed validation command.'
+          }
+        };
+      }),
+      implement: vi.fn(async (input: ImplementInput): Promise<ImplementResult> => ({
+        summary: 'Implementation summary.',
+        changedFiles: ['status.txt'],
+        diffStat: { filesChanged: 1, insertions: 1, deletions: 0 },
+        requestedApprovals: [],
+        validationChecks: input.plan.validationChecks,
+        fileUpdates: [{ path: 'status.txt', content: 'implemented\n' }]
+      }))
+    });
+
+    const result = await runWorkerTask({
+      project: projectWithoutVerify,
+      task: { ...demoTask, id: `task_${randomUUID()}` },
+      provider,
+      workspaceRoot
+    });
+
+    expect(result.status).toBe('ready_for_user_review');
+    expect(result.validation.passed).toBe(true);
+    expect(planCalls).toHaveLength(4);
+    expect(planCalls.slice(1).map((call) => call.validationFailure?.stderr)).toEqual([
+      'validation-failure-1',
+      'validation-failure-2',
+      'validation-failure-3'
+    ]);
+  }, 20000);
+
   it('reuses successful validation checks across implementation retries when repository inputs did not change', async () => {
     const workspaceRoot = join(tmpdir(), `forgemind-worker-validation-retry-checkpoint-${randomUUID()}`);
     const projectWithoutVerify = {
@@ -1655,7 +1793,19 @@ describe('worker workflow', () => {
     let implementationAttempt = 0;
     const provider: AIProvider = {
       ...createProviderStub(),
-      async plan(): Promise<PlanResult> {
+      async plan(input: PlanInput): Promise<PlanResult> {
+        if (input.validationFailure) {
+          return {
+            summary: 'The implementation must be corrected.',
+            steps: [],
+            acceptanceCriteria: [],
+            validationChecks: [],
+            validationRecovery: {
+              action: 'repair_implementation',
+              rationale: 'The command correctly detected the failed implementation state.'
+            }
+          };
+        }
         return {
           summary: 'Validate the implementation.',
           steps: ['Implement', 'Validate'],
@@ -1704,22 +1854,33 @@ describe('worker workflow', () => {
     }));
   }, 15000);
 
-  it('does not spend another provider call replacing a missing system toolchain', async () => {
+  it('lets AI decide how to recover from a missing system toolchain', async () => {
     const workspaceRoot = join(tmpdir(), `forgemind-worker-missing-toolchain-${randomUUID()}`);
     const projectWithoutVerify = {
       ...demoProject,
       configYaml: noGitProjectConfig.replace('commands:\n  verify: "node --version"\n', 'commands: {}\n')
     };
-    const plan = vi.fn(async (): Promise<PlanResult> => ({
-      summary: 'Build with CMake.',
-      steps: ['Build'],
-      acceptanceCriteria: ['CMake build passes'],
-      validationChecks: [{
-        kind: 'command',
-        command: `node -e "process.stderr.write('/bin/sh: 1: cmake: not found'); process.exit(127)"`,
-        criterion: 'CMake build passes'
-      }]
-    }));
+    const plan = vi.fn(async (input: PlanInput): Promise<PlanResult> => input.validationFailure
+      ? {
+          summary: 'The required CMake toolchain is unavailable.',
+          steps: [],
+          acceptanceCriteria: [],
+          validationChecks: [],
+          validationRecovery: {
+            action: 'blocked',
+            rationale: 'CMake is required for this criterion and cannot be installed safely in the current runtime.'
+          }
+        }
+      : {
+          summary: 'Build with CMake.',
+          steps: ['Build'],
+          acceptanceCriteria: ['CMake build passes'],
+          validationChecks: [{
+            kind: 'command',
+            command: `node -e "process.stderr.write('/bin/sh: 1: cmake: not found'); process.exit(127)"`,
+            criterion: 'CMake build passes'
+          }]
+        });
     const provider: AIProvider = {
       ...createProviderStub(),
       plan,
@@ -1743,8 +1904,12 @@ describe('worker workflow', () => {
     });
 
     expect(result.status).toBe('validation_failed');
-    expect(result.summary).toContain('missing required executable "cmake"');
-    expect(plan).toHaveBeenCalledTimes(1);
+    expect(result.summary).toContain('cannot be installed safely');
+    expect(plan).toHaveBeenCalledTimes(2);
+    expect(plan.mock.calls[1]?.[0].validationFailure).toEqual(expect.objectContaining({
+      exitCode: 127,
+      stderr: '/bin/sh: 1: cmake: not found'
+    }));
   }, 10000);
 
   it('keeps only the current roadmap step in provider execution context', () => {
@@ -1971,54 +2136,6 @@ describe('worker workflow', () => {
     });
   });
 
-  it('distinguishes invalid validation commands from implementation failures', () => {
-    expect(isValidationCommandDefinitionFailure({
-      command: 'npm run missing',
-      exitCode: 1,
-      stdout: '',
-      stderr: 'Missing script: "missing"',
-      passed: false
-    })).toBe(true);
-    expect(isValidationCommandDefinitionFailure({
-      command: 'npm test',
-      exitCode: 1,
-      stdout: 'Expected 2 but received 1',
-      stderr: '',
-      passed: false
-    })).toBe(false);
-    expect(isValidationCommandDefinitionFailure({
-      command: 'npm run typecheck',
-      exitCode: 127,
-      stdout: '',
-      stderr: 'sh: 1: tsc: not found',
-      passed: false
-    })).toBe(true);
-    expect(isValidationCommandDefinitionFailure({
-      command: 'cmake --build --preset ninja-debug',
-      exitCode: 1,
-      stdout: '',
-      stderr: 'Error: /workspace/build/ninja-debug is not a directory',
-      passed: false
-    })).toBe(true);
-  });
-
-  it('classifies missing system toolchains as infrastructure failures', () => {
-    expect(getMissingSystemValidationTool({
-      command: 'cmake --preset test',
-      exitCode: 127,
-      stdout: '',
-      stderr: '/bin/sh: 1: cmake: not found',
-      passed: false
-    })).toBe('cmake');
-    expect(getMissingSystemValidationTool({
-      command: 'npm run typecheck',
-      exitCode: 127,
-      stdout: '',
-      stderr: 'sh: 1: tsc: not found',
-      passed: false
-    })).toBeUndefined();
-  });
-
   it('drops repository inspection and manual checks from executable validation', () => {
     const command = 'git diff -- README.md docs AGENTS.md 2>/dev/null || git diff -- README.md';
 
@@ -2048,7 +2165,19 @@ describe('worker workflow', () => {
 
     const provider: AIProvider = {
       kind: 'codex',
-      async plan(_input: PlanInput): Promise<PlanResult> {
+      async plan(input: PlanInput): Promise<PlanResult> {
+        if (input.validationFailure) {
+          return {
+            summary: 'The validation command is correct and the implementation marker must be repaired.',
+            steps: [],
+            acceptanceCriteria: [],
+            validationChecks: [],
+            validationRecovery: {
+              action: 'repair_implementation',
+              rationale: 'The command correctly detected invalid repository content.'
+            }
+          };
+        }
         return {
           summary: 'Plan summary',
           steps: ['Write validation marker'],
@@ -2113,7 +2242,7 @@ describe('worker workflow', () => {
     expect(attempts[0]?.attemptNumber).toBe(1);
     expect(attempts[0]?.previousValidationError).toBeUndefined();
     expect(attempts[1]?.attemptNumber).toBe(2);
-    expect(attempts[1]?.previousValidationError).toContain('Exit code 1');
+    expect(attempts[1]?.previousValidationError).toContain('Exit code: 1');
   }, 10000);
 
   it('does not synthesize placeholder implementation output for local providers without task changes', async () => {
@@ -2171,18 +2300,34 @@ describe('worker workflow', () => {
     await expect(readFile(join(workspaceRoot, task.id, 'MOCK_IMPLEMENTATION.md'), 'utf8')).rejects.toThrow();
   });
 
-  it('completes an explicitly already-satisfied task after authoritative validation without a synthetic diff', async () => {
+  it('completes an already-satisfied task only after independent evidence review', async () => {
     const workspaceRoot = join(tmpdir(), `forgemind-worker-already-satisfied-${randomUUID()}`);
-    const review = vi.fn(async (): Promise<ReviewResult> => ({
-      summary: 'Review should not be needed.',
+    const task = { ...demoTask, id: `task_${randomUUID()}`, maxIterations: 2 };
+    const workspacePath = join(workspaceRoot, task.id);
+    await mkdir(workspacePath, { recursive: true });
+    await writeFile(join(workspacePath, 'status.txt'), 'existing proof\n', 'utf8');
+    const existingGit = simpleGit({ baseDir: workspacePath });
+    await existingGit.init();
+    await existingGit.addConfig('user.name', 'Test');
+    await existingGit.addConfig('user.email', 'test@example.com');
+    await existingGit.add('.');
+    await existingGit.commit('Existing implementation');
+    const review = vi.fn(async (input: ReviewInput): Promise<ReviewResult> => ({
+      summary: 'Independent review confirmed the existing implementation.',
       blockers: [],
       safeImprovements: [],
-      riskyChanges: []
+      riskyChanges: [],
+      criterionResults: [{
+        criterion: 'Validation passes',
+        status: 'satisfied',
+        evidence: ['status.txt contains the existing implementation and validation passed.']
+      }]
     }));
     const implement = vi.fn(async (): Promise<ImplementResult> => ({
       outcome: 'already_satisfied',
       summary: 'Existing implementation and tests already satisfy the task.',
       changedFiles: [],
+      evidenceFiles: ['status.txt'],
       diffStat: { filesChanged: 0, insertions: 0, deletions: 0 },
       requestedApprovals: [],
       validationChecks: [{ kind: 'command', command: 'node --version', category: 'smoke' }]
@@ -2192,7 +2337,7 @@ describe('worker workflow', () => {
 
     const result = await runWorkerTask({
       project: demoProject,
-      task: { ...demoTask, id: `task_${randomUUID()}`, maxIterations: 2 },
+      task,
       provider,
       workspaceRoot,
       hooks: {
@@ -2204,11 +2349,178 @@ describe('worker workflow', () => {
 
     expect(result.status).toBe('completed');
     expect(result.validation.passed).toBe(true);
-    expect(result.summary).toContain('already satisfy');
+    expect(result.summary).toContain('Independent review confirmed');
     expect(implement).toHaveBeenCalledTimes(1);
-    expect(review).not.toHaveBeenCalled();
+    expect(review).toHaveBeenCalledWith(expect.objectContaining({
+      taskPrompt: task.prompt,
+      reviewMode: 'existing_state',
+      changedFiles: ['status.txt'],
+      repositoryEvidence: expect.stringContaining('existing proof')
+    }));
     expect(statuses).toContain('reviewing');
   });
+
+  it('resumes an already-satisfied implementation without invoking implementation again', async () => {
+    const workspaceRoot = join(tmpdir(), `forgemind-worker-already-satisfied-validation-resume-${randomUUID()}`);
+    const task = { ...demoTask, id: `task_${randomUUID()}`, maxIterations: 2 };
+    const workspacePath = join(workspaceRoot, task.id);
+    await mkdir(workspacePath, { recursive: true });
+    await writeFile(join(workspacePath, 'status.txt'), 'existing proof\n', 'utf8');
+    const existingGit = simpleGit({ baseDir: workspacePath });
+    await existingGit.init();
+    await existingGit.addConfig('user.name', 'Test');
+    await existingGit.addConfig('user.email', 'test@example.com');
+    await existingGit.add('.');
+    await existingGit.commit('Existing implementation');
+    const implement = vi.fn(async () => {
+      throw new Error('Implementation must not be repeated.');
+    });
+    const review = vi.fn(async (): Promise<ReviewResult> => ({
+      summary: 'Resumed existing state verified.',
+      blockers: [],
+      safeImprovements: [],
+      riskyChanges: [],
+      criterionResults: [{ criterion: 'Validation passes', status: 'satisfied', evidence: ['status.txt'] }]
+    }));
+
+    const result = await runWorkerTask({
+      project: demoProject,
+      task,
+      provider: createProviderStub({ implement, review }),
+      workspaceRoot,
+      resume: {
+        kind: 'phase_retry',
+        resumeFrom: 'validation',
+        implementationSummary: 'Existing implementation.',
+        implementationOutcome: 'already_satisfied',
+        evidenceFiles: ['status.txt'],
+        diffStat: { filesChanged: 0, insertions: 0, deletions: 0 },
+        acceptanceCriteria: ['Validation passes'],
+        validationChecks: [{ kind: 'command', command: 'node --version', category: 'smoke' }]
+      }
+    });
+
+    expect(result.status).toBe('completed');
+    expect(implement).not.toHaveBeenCalled();
+    expect(review).toHaveBeenCalledWith(expect.objectContaining({ reviewMode: 'existing_state' }));
+  });
+
+  it('reuses a completed already-satisfied audit only while the workspace hash is unchanged', async () => {
+    const workspaceRoot = join(tmpdir(), `forgemind-worker-already-satisfied-resume-${randomUUID()}`);
+    const task = { ...demoTask, id: `task_${randomUUID()}`, maxIterations: 2 };
+    const workspacePath = join(workspaceRoot, task.id);
+    await mkdir(workspacePath, { recursive: true });
+    await writeFile(join(workspacePath, 'status.txt'), 'existing proof\n', 'utf8');
+    const existingGit = simpleGit({ baseDir: workspacePath });
+    await existingGit.init();
+    await existingGit.addConfig('user.name', 'Test');
+    await existingGit.addConfig('user.email', 'test@example.com');
+    await existingGit.add('.');
+    await existingGit.commit('Existing implementation');
+    const validationInputHash = createHash('sha256').digest('hex');
+    const repositoryStateHash = createHash('sha256')
+      .update((await existingGit.revparse(['HEAD^{tree}'])).trim())
+      .update('\0')
+      .update(validationInputHash)
+      .digest('hex');
+    const inputHash = createHash('sha256').update(JSON.stringify({
+      repositoryStateHash,
+      taskPrompt: task.prompt,
+      acceptanceCriteria: ['Validation passes'],
+      evidenceFiles: ['status.txt']
+    })).digest('hex');
+    const provider = createProviderStub({
+      implement: vi.fn(async () => {
+        throw new Error('Implementation must not be repeated.');
+      }),
+      review: vi.fn(async () => {
+        throw new Error('Review must not be repeated.');
+      })
+    });
+
+    const result = await runWorkerTask({
+      project: demoProject,
+      task,
+      provider,
+      workspaceRoot,
+      resume: {
+        kind: 'phase_retry',
+        resumeFrom: 'review',
+        implementationSummary: 'Existing implementation.',
+        evidenceFiles: ['status.txt'],
+        acceptanceCriteria: ['Validation passes'],
+        validation: { command: 'node --version', exitCode: 0, stdout: 'ok', stderr: '', passed: true },
+        completedSatisfactionReview: {
+          inputHash,
+          summary: 'Existing state independently verified.',
+          criterionResults: [{ criterion: 'Validation passes', status: 'satisfied', evidence: ['status.txt'] }]
+        }
+      }
+    });
+
+    expect(result.status).toBe('completed');
+    expect(result.summary).toBe('Existing state independently verified.');
+    expect(provider.implement).not.toHaveBeenCalled();
+    expect(provider.review).not.toHaveBeenCalled();
+  });
+
+  it('returns insufficient already-satisfied evidence to implementation with exact blockers', async () => {
+    const workspaceRoot = join(tmpdir(), `forgemind-worker-already-satisfied-repair-${randomUUID()}`);
+    const task = { ...demoTask, id: `task_${randomUUID()}`, maxIterations: 2 };
+    const workspacePath = join(workspaceRoot, task.id);
+    await mkdir(workspacePath, { recursive: true });
+    await writeFile(join(workspacePath, 'status.txt'), 'incomplete\n', 'utf8');
+    const existingGit = simpleGit({ baseDir: workspacePath });
+    await existingGit.init();
+    await existingGit.addConfig('user.name', 'Test');
+    await existingGit.addConfig('user.email', 'test@example.com');
+    await existingGit.add('.');
+    await existingGit.commit('Incomplete implementation');
+
+    const implement = vi.fn(async (input: ImplementInput): Promise<ImplementResult> => input.attemptNumber === 1
+      ? {
+          outcome: 'already_satisfied',
+          summary: 'Claimed existing implementation.',
+          changedFiles: [],
+          evidenceFiles: ['status.txt'],
+          diffStat: { filesChanged: 0, insertions: 0, deletions: 0 },
+          requestedApprovals: [],
+          validationChecks: [{ kind: 'command', command: 'node --version', category: 'smoke' }]
+        }
+      : {
+          outcome: 'changes_made',
+          summary: 'Implemented the missing behavior.',
+          changedFiles: ['status.txt'],
+          evidenceFiles: [],
+          diffStat: { filesChanged: 1, insertions: 1, deletions: 1 },
+          requestedApprovals: [],
+          validationChecks: [{ kind: 'command', command: 'node --version', category: 'smoke' }],
+          fileUpdates: [{ path: 'status.txt', content: 'complete\n' }]
+        });
+    const review = vi.fn(async (input: ReviewInput): Promise<ReviewResult> => input.reviewMode === 'existing_state'
+      ? {
+          summary: 'The supplied file does not prove the criterion.',
+          blockers: [],
+          safeImprovements: [],
+          riskyChanges: [],
+          criterionResults: [{ criterion: 'Validation passes', status: 'insufficient_evidence', evidence: [] }]
+        }
+      : { summary: 'Correction passed review.', blockers: [], safeImprovements: [], riskyChanges: [] });
+
+    const result = await runWorkerTask({
+      project: demoProject,
+      task,
+      provider: createProviderStub({ implement, review }),
+      workspaceRoot
+    });
+
+    expect(result.status).toBe('ready_for_user_review');
+    expect(implement).toHaveBeenCalledTimes(2);
+    expect(implement.mock.calls[1]?.[0].previousReviewBlockers).toContain(
+      'Acceptance criterion is insufficient_evidence: Validation passes'
+    );
+    expect(review).toHaveBeenCalledTimes(2);
+  }, 10_000);
 
   it('reports actual diff stats for newly created untracked files', async () => {
     const workspaceRoot = join(tmpdir(), `forgemind-worker-untracked-diff-${randomUUID()}`);
@@ -2652,7 +2964,19 @@ describe('worker workflow', () => {
 
     const provider: AIProvider = {
       kind: 'codex',
-      async plan(_input: PlanInput): Promise<PlanResult> {
+      async plan(input: PlanInput): Promise<PlanResult> {
+        if (input.validationFailure) {
+          return {
+            summary: 'Repair the implementation detected by the configured validation command.',
+            steps: [],
+            acceptanceCriteria: [],
+            validationChecks: [],
+            validationRecovery: {
+              action: 'repair_implementation',
+              rationale: 'The validation command correctly detected the failed implementation state.'
+            }
+          };
+        }
         return {
           summary: 'Plan summary',
           steps: ['Implement fix'],
@@ -2747,7 +3071,7 @@ describe('worker workflow', () => {
     expect(createdPrs[0]?.body).toContain('## Průběh běhu');
     expect(createdPrs[0]?.body).toContain('Total implementation attempts: 2');
     expect(createdPrs[0]?.body).toContain('Validation retry before attempt 2:');
-    expect(createdPrs[0]?.body).toContain('Exit code 1');
+    expect(createdPrs[0]?.body).toContain('Exit code: 1');
     expect(createdPrs[0]?.body).toContain('Input tokens: 12, output tokens: 6, estimated cost: 0.0042 USD');
     expect(createdPrs[0]?.body).toContain('## Poslední validace');
     expect(createdPrs[0]?.body).toContain('## Vyřešené review blokery');

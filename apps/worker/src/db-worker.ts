@@ -3,8 +3,8 @@ import { join, resolve } from 'node:path';
 import { parseAgentConfigYaml, toCoreLimits, type AgentConfig } from '@forgemind/config';
 import { activeProjectContractRequirements, DEFAULT_LIMITS, evaluateLimits, requiresApproval, type Limits, type LimitUsage } from '@forgemind/core';
 import { advanceRoadmapAfterTaskCompletion, createRepository, getPrismaClient, startNextRoadmapStep, type AIProviderConnectionSecret, type ForgeMindRepository } from '@forgemind/db';
-import { GitHubAppAdapter, createGitHubAdapterFromEnv } from '@forgemind/github';
-import { buildProjectExtensionProposalPrompt, createProvider, formatProjectExtensionProposal, type AIProvider, type ProviderSessionContext } from '@forgemind/providers';
+import { GitHubAppAdapter, createGitHubAdapterFromEnv, type GitHubChecksResult } from '@forgemind/github';
+import { buildProjectExtensionProposalPrompt, createProvider, formatProjectExtensionProposal, type AIProvider, type ProviderSessionContext, type ReviewResult, type ValidationCheck } from '@forgemind/providers';
 import type { AcceptanceEvidence, ApprovalType, Project, ProjectArchitectureUpdate, ProjectContract, ProviderKind, TaskStatus } from '@forgemind/core';
 import { toErrorMessage, type JsonValue } from '@forgemind/shared';
 import { formatProjectArchitectureContext, runWorkerTask, type WorkerTaskResult, type WorkerTaskResume } from './workflow.js';
@@ -12,6 +12,13 @@ import { buildTargetedRepositoryContext, prepareCapabilityAuditWorkspace, runCap
 import { formatValidationFailure } from './validation.js';
 
 type ApprovedLimitSignal = 'diff_lines_limit_reached' | 'changed_files_limit_reached';
+
+class TaskCancellationError extends Error {
+  constructor() {
+    super('Task execution was cancelled by the user.');
+    this.name = 'TaskCancellationError';
+  }
+}
 
 interface TaskResumeContext {
   workflowResume: WorkerTaskResume;
@@ -82,6 +89,8 @@ export async function runDatabaseWorkerOnce(options: { deferInterruptSignals?: b
     };
   }
   const stopQueueHeartbeat = startQueueClaimHeartbeat(repository, claimed.queueJobId, claimTimeoutMinutes);
+  const taskAbortController = new AbortController();
+  const stopCancellationWatcher = startTaskCancellationWatcher(repository, claimed.task.id, taskAbortController);
   const stopInterruptionRecovery = installWorkerInterruptionRecovery({
     repository,
     queueJobId: claimed.queueJobId,
@@ -95,6 +104,7 @@ export async function runDatabaseWorkerOnce(options: { deferInterruptSignals?: b
     errorMessage?: string
   ) => {
     stopQueueHeartbeat();
+    stopCancellationWatcher();
     stopInterruptionRecovery();
     if (errorMessage === undefined) {
       await repository.finalizeQueueJob(claimed.queueJobId, status);
@@ -164,6 +174,15 @@ export async function runDatabaseWorkerOnce(options: { deferInterruptSignals?: b
     primary: primaryRuntimeProvider,
     fallback: fallbackRuntimeProvider
   });
+  const reviewerSelection = await resolveReviewerSelection({
+    repository,
+    projectConfig,
+    primary: selection.primary,
+    fallback: selection.fallback,
+    defaultConnection: defaultAIProviderConnection
+  });
+  const reviewProvider = buildRuntimeProvider(reviewerSelection.kind, reviewerSelection.connection).provider;
+  const reviewProviderModel = resolveProviderModel(reviewerSelection.kind, reviewerSelection.connection);
   const primaryConnectionId = selection.primary.connection?.id;
   const hasCompatibleProviderSession = claimed.task.providerSessionProvider === selection.primary.kind
     && claimed.task.providerSessionModel === selectedProviderModel
@@ -237,12 +256,18 @@ export async function runDatabaseWorkerOnce(options: { deferInterruptSignals?: b
       task: claimed.task,
       providerKind: selection.primary.kind,
       provider,
+      reviewProvider,
       verifyCommand,
       workspaceRoot,
       usageSummary: `Pre-run estimate: ${costEstimate.inputTokens} input tokens, ${costEstimate.outputTokens} output tokens, ${costEstimate.estimatedCostUsd.toFixed(4)} USD`,
       resume: resumeContext?.workflowResume,
       providerSession,
+      reviewProviderSession: {
+        provider: reviewerSelection.kind,
+        model: reviewProviderModel
+      },
       github,
+      signal: taskAbortController.signal,
       hooks: {
         onActivity: async (activity) => {
           await repository.writeAudit({
@@ -263,6 +288,7 @@ export async function runDatabaseWorkerOnce(options: { deferInterruptSignals?: b
           });
         },
         onStatus: async (status, payload = {}) => {
+          throwIfTaskCancelled(taskAbortController.signal);
           await repository.transitionTask(claimed.task.id, status, payload);
         },
         onIterationStarted: async (iteration) => {
@@ -369,7 +395,7 @@ export async function runDatabaseWorkerOnce(options: { deferInterruptSignals?: b
               kind: activity.kind,
               message: activity.message,
               elapsedMs: activity.elapsedMs,
-              provider: activity.usage?.provider ?? getLastProviderKind(),
+              provider: activity.usage?.provider ?? (activity.phase === 'review' ? reviewerSelection.kind : getLastProviderKind()),
               usage: activity.usage
                 ? {
                     provider: activity.usage.provider,
@@ -431,6 +457,7 @@ export async function runDatabaseWorkerOnce(options: { deferInterruptSignals?: b
         }
       }
     });
+    throwIfTaskCancelled(taskAbortController.signal);
 
     await recordTaskAcceptanceEvidence(repository, {
       project: claimed.project,
@@ -526,6 +553,21 @@ export async function runDatabaseWorkerOnce(options: { deferInterruptSignals?: b
       result
     };
   } catch (error) {
+    if (error instanceof TaskCancellationError || taskAbortController.signal.aborted) {
+      await repository.finishTaskRun({
+        taskRunId: claimed.taskRun.id,
+        status: 'cancelled',
+        errorMessage: 'Task cancelled by user.',
+        iterationCount: attemptCount,
+        ...getRunUsageFields()
+      });
+      await finalizeQueueJob('cancelled', 'Task cancelled by user.');
+      return {
+        claimed: true,
+        taskId: claimed.task.id,
+        status: 'cancelled'
+      };
+    }
     if (error instanceof WorkerApprovalRequiredError) {
       await repository.finishTaskRun({
         taskRunId: claimed.taskRun.id,
@@ -559,6 +601,39 @@ export async function runDatabaseWorkerOnce(options: { deferInterruptSignals?: b
       status
     };
   }
+}
+
+function startTaskCancellationWatcher(
+  repository: Pick<ForgeMindRepository, 'getTask'>,
+  taskId: string,
+  controller: AbortController
+): () => void {
+  let stopped = false;
+  let checking = false;
+  const check = async () => {
+    if (stopped || checking || controller.signal.aborted) return;
+    checking = true;
+    try {
+      const task = await repository.getTask(taskId);
+      if (task?.status === 'cancelled') controller.abort(new TaskCancellationError());
+    } catch {
+      // A transient read failure must not terminate the worker; the next poll retries it.
+    } finally {
+      checking = false;
+    }
+  };
+  const timer = setInterval(() => void check(), 500);
+  timer.unref?.();
+  void check();
+  return () => {
+    stopped = true;
+    clearInterval(timer);
+  };
+}
+
+function throwIfTaskCancelled(signal: AbortSignal): void {
+  if (!signal.aborted) return;
+  throw signal.reason instanceof Error ? signal.reason : new TaskCancellationError();
 }
 
 async function runNextProjectAudit(input: {
@@ -684,7 +759,10 @@ async function runNextProjectAudit(input: {
             description: formatGapStepDescription(step),
             acceptanceCriteria: step.acceptanceCriteria,
             requirementIds: step.requirementIds,
-            deliverables: step.deliverables
+            deliverables: step.deliverables,
+            changeRationale: step.changeRationale,
+            dependsOnStepTitles: step.dependsOnStepTitles,
+            validationFocus: step.validationFocus
           }))
         });
         if (created.length === 0) {
@@ -766,7 +844,10 @@ async function runNextProjectAudit(input: {
             description: formatGapStepDescription(step),
             acceptanceCriteria: step.acceptanceCriteria,
             requirementIds: step.requirementIds,
-            deliverables: step.deliverables
+            deliverables: step.deliverables,
+            changeRationale: step.changeRationale,
+            dependsOnStepTitles: step.dependsOnStepTitles,
+            validationFocus: step.validationFocus
           }))
         });
         if (created.length === 0) {
@@ -907,12 +988,15 @@ function createPolicyAwareProvider(input: {
 }): { provider: AIProvider; getLastProviderKind: () => ProviderKind } {
   let lastProviderKind: ProviderKind = input.primary.kind;
 
-  const callWithFallback = async <T>(operation: string, action: (provider: AIProvider) => Promise<T>): Promise<T> => {
+  const callWithFallback = async <T>(operation: string, action: (provider: AIProvider) => Promise<T>, signal?: AbortSignal): Promise<T> => {
     try {
       const result = await action(input.primary.provider);
       lastProviderKind = input.primary.kind;
       return result;
     } catch (primaryError) {
+      if (signal?.aborted) {
+        throw signal.reason instanceof Error ? signal.reason : new TaskCancellationError();
+      }
       const fallback = input.fallback;
       const shouldUseFallback = Boolean(
         fallback
@@ -937,13 +1021,13 @@ function createPolicyAwareProvider(input: {
     supportsLocalRepo: () => input.primary.provider.supportsLocalRepo(),
     supportsGitHubNativeFlow: () => input.primary.provider.supportsGitHubNativeFlow(),
     async plan(planInput) {
-      return callWithFallback('plan', (provider) => provider.plan(planInput));
+      return callWithFallback('plan', (provider) => provider.plan(planInput), planInput.signal);
     },
     async implement(implementInput) {
-      return callWithFallback('implement', (provider) => provider.implement(implementInput));
+      return callWithFallback('implement', (provider) => provider.implement(implementInput), implementInput.signal);
     },
     async review(reviewInput) {
-      return callWithFallback('review', (provider) => provider.review(reviewInput));
+      return callWithFallback('review', (provider) => provider.review(reviewInput), reviewInput.signal);
     },
     async auditCapability(auditInput) {
       return callWithFallback('audit_capability', (provider) => {
@@ -1056,6 +1140,31 @@ async function resolveProviderSelection(input: {
     primary: { kind: primaryKind, connection: normalizedPrimaryConnection },
     fallback: { kind: fallbackKind, connection: normalizedFallbackConnection }
   };
+}
+
+async function resolveReviewerSelection(input: {
+  repository: {
+    getAIProviderConnectionSecretById?: (connectionId: string) => Promise<AIProviderConnectionSecret | undefined>;
+  };
+  projectConfig: AgentConfig | undefined;
+  primary: { kind: ProviderKind; connection?: AIProviderConnectionSecret };
+  fallback?: { kind: ProviderKind; connection?: AIProviderConnectionSecret };
+  defaultConnection?: AIProviderConnectionSecret;
+}): Promise<{ kind: ProviderKind; connection?: AIProviderConnectionSecret }> {
+  const kind = input.projectConfig?.ai.reviewer_provider ?? input.primary.kind;
+  const connectionId = input.projectConfig?.ai.reviewer_connection_id?.trim();
+  if (connectionId) {
+    const connection = await readAIProviderConnectionSecretById(input.repository, connectionId);
+    if (!connection) throw new Error(`Reviewer provider connection "${connectionId}" does not exist.`);
+    if (connection.provider !== kind) {
+      throw new Error(`Reviewer provider connection "${connectionId}" is configured for ${connection.provider}, not ${kind}.`);
+    }
+    return { kind, connection };
+  }
+  if (input.primary.kind === kind) return { kind, connection: input.primary.connection };
+  if (input.fallback?.kind === kind) return { kind, connection: input.fallback.connection };
+  if (input.defaultConnection?.provider === kind) return { kind, connection: input.defaultConnection };
+  return { kind };
 }
 
 function resolveProviderModel(provider: ProviderKind, connection: AIProviderConnectionSecret | undefined): string {
@@ -1413,6 +1522,7 @@ async function resolveTaskResumeContext(
   const lastValidationIteration = findLastIteration(diff.iterations, 'validation');
   const lastReviewIteration = findLastIteration(diff.iterations, 'review');
   const architectureUpdate = extractArchitectureUpdate(lastImplementationIteration);
+  const implementationResume = extractImplementationResume(lastImplementationIteration);
   const approvedReviewResume = buildApprovedReviewResume(lastPlanningIteration, lastImplementationIteration, lastReviewIteration, approvedTypes);
   if (approvedReviewResume) approvedReviewResume.architectureUpdate = architectureUpdate;
   const latestApprovedLargeDiffAt = getLatestApprovedLargeDiffAt(taskApprovals);
@@ -1435,9 +1545,12 @@ async function resolveTaskResumeContext(
       workflowResume: {
         kind: 'worker_interrupted',
         planSummary: lastPlanningIteration?.resultSummary,
+        planSteps: extractStringArray(lastPlanningIteration?.validationResult, 'steps'),
+        acceptanceCriteria: extractStringArray(lastPlanningIteration?.validationResult, 'acceptanceCriteria'),
         implementationSummary:
           lastImplementationIteration?.resultSummary
           ?? 'Continue the implementation preserved in the workspace after the worker was interrupted.',
+        ...implementationResume,
         validationChecks: extractLatestValidationChecks(diff.iterations),
         architectureUpdate,
         approvedApprovals: Array.from(approvedTypes)
@@ -1451,7 +1564,10 @@ async function resolveTaskResumeContext(
       workflowResume: {
         kind: 'validation_retry',
         planSummary: lastPlanningIteration?.resultSummary,
+        planSteps: extractStringArray(lastPlanningIteration?.validationResult, 'steps'),
+        acceptanceCriteria: extractStringArray(lastPlanningIteration?.validationResult, 'acceptanceCriteria'),
         implementationSummary: lastImplementationIteration.resultSummary || 'Resume the preserved implementation for validation.',
+        ...implementationResume,
         validationChecks: extractLatestValidationChecks(diff.iterations),
         architectureUpdate,
         approvedApprovals: Array.from(approvedTypes)
@@ -1469,7 +1585,10 @@ async function resolveTaskResumeContext(
       workflowResume: {
         kind: 'approved_large_diff',
         planSummary: lastPlanningIteration?.resultSummary,
+        planSteps: extractStringArray(lastPlanningIteration?.validationResult, 'steps'),
+        acceptanceCriteria: extractStringArray(lastPlanningIteration?.validationResult, 'acceptanceCriteria'),
         implementationSummary: lastImplementationIteration.resultSummary || 'Resuming previously approved implementation.',
+        ...implementationResume,
         validationChecks: extractLatestValidationChecks(diff.iterations),
         architectureUpdate,
         approvedApprovals: Array.from(approvedTypes)
@@ -1493,9 +1612,12 @@ async function resolveTaskResumeContext(
       workflowResume: {
         kind: 'approved_operation',
         planSummary: lastPlanningIteration?.resultSummary,
+        planSteps: extractStringArray(lastPlanningIteration?.validationResult, 'steps'),
+        acceptanceCriteria: extractStringArray(lastPlanningIteration?.validationResult, 'acceptanceCriteria'),
         implementationSummary:
           lastImplementationIteration?.resultSummary
           ?? 'Resume workspace changes after the requested operation was approved.',
+        ...implementationResume,
         validationChecks: extractLatestValidationChecks(diff.iterations),
         architectureUpdate,
         approvedApprovals: Array.from(approvedTypes)
@@ -1551,11 +1673,15 @@ function buildPhaseRetryResume(
   } else if (latestIteration?.phase === 'review') {
     resumeFrom = extractReviewBlockers(latestReview).length > 0 ? 'implementation' : 'delivery';
   } else if (latestIteration?.phase === 'validation') {
-    resumeFrom = isFailedValidationIteration(latestValidation) ? 'implementation' : 'review';
+    resumeFrom = isFailedValidationIteration(latestValidation) ? 'validation' : 'review';
   } else if (latestIteration?.phase === 'implementation') {
     resumeFrom = 'validation';
   } else if (latestIteration?.phase === 'planning') {
-    resumeFrom = 'implementation';
+    const planningResult = asRecord(latestIteration.validationResult);
+    const recoveryDecision = asRecord(planningResult?.validationRecovery);
+    resumeFrom = planningResult?.revisedValidationChecksOnly === true || recoveryDecision?.action === 'blocked'
+      ? 'validation'
+      : 'implementation';
   } else {
     resumeFrom = 'planning';
   }
@@ -1618,19 +1744,24 @@ function buildPhaseRetryResume(
       inputHash: checkpoint.inputHash
     });
   }
+  const latestPlanningResult = latestIteration?.phase === 'planning'
+    ? asRecord(latestIteration.validationResult)
+    : undefined;
+  const completedValidationReplacement = latestPlanningResult?.revisedValidationChecksOnly === true;
   const resumeValidationPlanRevision = (
-    inFlightPhase === 'planning'
+    resumeFrom === 'validation'
+    && !completedValidationReplacement
     && Boolean(validation && !validation.passed && validation.failingCommand)
   );
   const githubChecksCheckpoint = [...checkpoints].reverse().find((checkpoint) => (
     checkpoint.status === 'completed' && checkpoint.key === 'external:wait_for_checks'
   ));
   const githubChecksOutput = asRecord(githubChecksCheckpoint?.output);
-  const githubChecks = githubChecksOutput
+  const githubChecks: GitHubChecksResult | undefined = githubChecksOutput
     && (githubChecksOutput.status === 'success' || githubChecksOutput.status === 'not_configured')
     && typeof githubChecksOutput.summary === 'string'
     ? {
-        status: githubChecksOutput.status,
+        status: githubChecksOutput.status as 'success' | 'not_configured',
         summary: githubChecksOutput.summary,
         failures: Array.isArray(githubChecksOutput.failures)
           ? githubChecksOutput.failures.flatMap((failure) => {
@@ -1646,14 +1777,29 @@ function buildPhaseRetryResume(
           : []
       }
     : undefined;
+  const satisfactionReviewCheckpoint = [...checkpoints].reverse().find((checkpoint) => (
+    checkpoint.status === 'completed' && checkpoint.key === 'review:already_satisfied'
+  ));
+  const satisfactionReviewOutput = asRecord(satisfactionReviewCheckpoint?.output);
+  const completedSatisfactionReview = satisfactionReviewCheckpoint
+    && typeof satisfactionReviewOutput?.summary === 'string'
+    ? {
+        inputHash: satisfactionReviewCheckpoint.inputHash,
+        summary: satisfactionReviewOutput.summary,
+        criterionResults: extractCriterionResults(satisfactionReviewOutput.criterionResults)
+      }
+    : undefined;
 
   return {
     kind: 'phase_retry',
     resumeFrom,
     attempt,
     planSummary: latestPlanning?.resultSummary,
+    planSteps: extractStringArray(latestPlanning?.validationResult, 'steps'),
+    acceptanceCriteria: extractStringArray(latestPlanning?.validationResult, 'acceptanceCriteria'),
     implementationSummary: latestImplementation?.resultSummary
       ?? 'Continue from the implementation preserved in the workspace.',
+    ...extractImplementationResume(latestImplementation),
     changedFiles,
     diffStat,
     architectureUpdate: extractArchitectureUpdate(latestImplementation),
@@ -1670,7 +1816,47 @@ function buildPhaseRetryResume(
     validationChecks: extractLatestValidationChecks(completedIterations),
     approvedApprovals: Array.from(approvedTypes),
     completedOperations: Array.from(new Set(completedOperations)),
-    githubChecks
+    githubChecks,
+    completedSatisfactionReview
+  };
+}
+
+function extractCriterionResults(value: unknown): ReviewResult['criterionResults'] | undefined {
+  if (!Array.isArray(value)) return undefined;
+  const results = value.flatMap((entry) => {
+    const item = asRecord(entry);
+    if (
+      !item
+      || typeof item.criterion !== 'string'
+      || (item.status !== 'satisfied' && item.status !== 'not_satisfied' && item.status !== 'insufficient_evidence')
+      || !Array.isArray(item.evidence)
+      || item.evidence.some((evidence) => typeof evidence !== 'string')
+    ) {
+      return [];
+    }
+    const status = item.status as 'satisfied' | 'not_satisfied' | 'insufficient_evidence';
+    return [{
+      criterion: item.criterion,
+      status,
+      evidence: item.evidence as string[]
+    }];
+  });
+  return results.length > 0 ? results : undefined;
+}
+
+function extractImplementationResume(
+  iteration: TaskDiffIterationSnapshot | undefined
+): Pick<WorkerTaskResume, 'implementationOutcome' | 'evidenceFiles'> {
+  const payload = asRecord(iteration?.validationResult);
+  const implementationOutcome = payload?.outcome === 'already_satisfied' || payload?.alreadySatisfied === true
+    ? 'already_satisfied'
+    : payload?.outcome === 'changes_made'
+      ? 'changes_made'
+      : undefined;
+  const evidenceFiles = extractStringArray(iteration?.validationResult, 'evidenceFiles');
+  return {
+    implementationOutcome,
+    evidenceFiles: evidenceFiles.length > 0 ? evidenceFiles : undefined
   };
 }
 
@@ -1708,7 +1894,11 @@ function extractValidationResult(value: unknown): WorkerTaskResume['validation']
     passed,
     executedCheckCount: typeof payload.executedCheckCount === 'number' ? payload.executedCheckCount : undefined,
     reusedCheckCount: typeof payload.reusedCheckCount === 'number' ? payload.reusedCheckCount : undefined,
-    failingCommand: !passed && typeof payload.failingCommand === 'string' ? payload.failingCommand : undefined
+    failingCommand: !passed
+      ? typeof payload.failingCommand === 'string'
+        ? payload.failingCommand
+        : typeof payload.command === 'string' ? payload.command : undefined
+      : undefined
   };
 }
 
@@ -1813,6 +2003,8 @@ function buildApprovedReviewResume(
   return {
     kind: 'approved_review',
     planSummary: planningIteration?.resultSummary,
+    planSteps: extractStringArray(planningIteration?.validationResult, 'steps'),
+    acceptanceCriteria: extractStringArray(planningIteration?.validationResult, 'acceptanceCriteria'),
     implementationSummary: implementationIteration.resultSummary || 'Resuming previously reviewed implementation.',
     reviewSummary: reviewIteration.resultSummary || 'Previously reviewed implementation resumed.',
     riskyChanges,
@@ -1876,7 +2068,7 @@ function getLatestApprovedReviewAt(
   return Math.max(...timestamps);
 }
 
-function normalizeValidationCheckSnapshot(item: unknown) {
+function normalizeValidationCheckSnapshot(item: unknown): ValidationCheck | undefined {
   if (!item || typeof item !== 'object' || Array.isArray(item)) {
     return undefined;
   }

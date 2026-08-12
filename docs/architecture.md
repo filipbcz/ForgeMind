@@ -48,7 +48,7 @@ Worker flow (apps/worker/src/db-worker.ts):
 2. recoverStuckQueueJobs vrati zasekle claimed joby zpet do pending.
 3. claimNextSubmittedTask claimne nejstarsi pending job, ktery je ready podle next_attempt_at.
 4. provider estimate se ulozi pro reporting; pouze provider fail zastavi beh pred execute.
-5. implementacni provider vrati zmeny i minimalni autoritativni spustitelne validationChecks ve stejne odpovedi; worker je pote spusti pred review. Manualni kontroly se negeneruji ani nevyhodnocuji; pokud zadne kriterium nelze automatizovat, validation faze se oznaci jako preskocena a workflow pokracuje.
+5. implementacni provider vrati zmeny i minimalni spustitelne validationChecks ve stejne odpovedi; worker je pote spusti pred review. Pri selhani dostane AI kompletni prikaz, exit code, stdout a stderr a strukturovane rozhodne mezi nahrazenim kontroly, opravou implementace a skutecnym blockerem. Manualni kontroly se negeneruji ani nevyhodnocuji; pokud zadne kriterium nelze automatizovat, validation faze se oznaci jako preskocena a workflow pokracuje.
    Ve stejne odpovedi provider vraci malou architectureUpdate deltu. Nevznika tim dalsi AI volani.
 6. runWorkerTask provede planning/implementation/validation/review/GitHub kroky.
 7. hooks zapisuji status prechody, iteration data, GitHub IDs a audit eventy.
@@ -57,7 +57,7 @@ Worker flow (apps/worker/src/db-worker.ts):
 - failed po limitu -> final failed
 - succeeded/cancelled -> final stav
 
-Retry a obnova workeru jsou phase-aware. Z iteration checkpointu a audit udalosti se urci posledni nedokoncena faze. Planning, implementation, validation, review a delivery se obnovuji samostatne; uspesne predchozi faze ani dokoncene commit/push operace se neopakuji. U validacni sady se zachovaji i jednotlive uspesne prikazy a pad pri AI oprave validacniho planu navaze primo novym pokusem o opravu. Implementacni retry dostane posledni validation error nebo review blockers a pokracuje nad zachovanym workspace.
+Retry a obnova workeru jsou phase-aware. Z iteration checkpointu a audit udalosti se urci posledni nedokoncena faze. Planning, implementation, validation, review a delivery se obnovuji samostatne; uspesne predchozi faze ani dokoncene commit/push operace se neopakuji. U validacni sady se zachovaji jednotlive uspesne prikazy, dokoncena AI nahrada kontroly navaze jejim spustenim a prerusena diagnostika navaze novym AI rozhodnutim. Pouze AI rozhodnuti `repair_implementation` vraci task do implementace. Implementacni retry dostane kompletni posledni validation error nebo review blockers a pokracuje nad zachovanym workspace.
 
 Komplexni validacni prostredi:
 

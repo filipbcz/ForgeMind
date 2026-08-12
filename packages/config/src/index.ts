@@ -26,6 +26,7 @@ export const agentConfigSchema = z.object({
     primary_connection_id: z.string().min(1).optional(),
     fallback_connection_id: z.string().min(1).optional(),
     reviewer_provider: z.enum(['codex', 'github_copilot', 'openai']).default('codex'),
+    reviewer_connection_id: z.string().min(1).optional(),
     model_profile: z.enum(['fast', 'balanced', 'deep']).default('balanced')
   }),
   limits: z.object({

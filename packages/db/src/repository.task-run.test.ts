@@ -567,6 +567,14 @@ describe('ForgeMindRepository task runs', () => {
         finishedAt: expect.any(Date)
       }
     });
+    expect(prisma.taskRun.updateMany).toHaveBeenCalledWith({
+      where: { taskId: 'task_1', status: 'running' },
+      data: {
+        status: 'cancelled',
+        errorMessage: 'Task cancelled by user.',
+        finishedAt: expect.any(Date)
+      }
+    });
   });
 
   it('finalizes queue job only when it is still active', async () => {

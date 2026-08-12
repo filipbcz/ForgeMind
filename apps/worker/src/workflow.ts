@@ -25,7 +25,7 @@ import {
   type GitHubChecksResult,
   type GitHubAdapter
 } from '@forgemind/github';
-import { createProvider, type AIProvider, type ImplementResult, type PlanResult, type ProviderSessionContext, type ValidationCheck } from '@forgemind/providers';
+import { createProvider, type AIProvider, type ImplementResult, type PlanResult, type ProviderSessionContext, type ReviewResult, type ValidationCheck } from '@forgemind/providers';
 import { parseAgentConfigYaml, type AgentConfig } from '@forgemind/config';
 import { nowIso, toErrorMessage, type JsonValue } from '@forgemind/shared';
 import {
@@ -47,10 +47,13 @@ export interface WorkerTaskInput {
   verifyCommand?: string;
   usageSummary?: string;
   provider?: AIProvider;
+  reviewProvider?: AIProvider;
   github?: GitHubAdapter;
   resume?: WorkerTaskResume;
   providerSession?: ProviderSessionContext;
+  reviewProviderSession?: ProviderSessionContext;
   hooks?: WorkerTaskHooks;
+  signal?: AbortSignal;
 }
 
 type GitHubOperation = 'create_issue' | 'create_branch' | 'commit_and_push' | 'create_draft_pr' | 'create_pull_request' | 'wait_for_checks' | 'merge_pr' | 'comment_on_issue';
@@ -60,7 +63,11 @@ export interface WorkerTaskResume {
   resumeFrom?: 'planning' | 'implementation' | 'validation' | 'review' | 'delivery';
   attempt?: number;
   planSummary?: string;
+  planSteps?: string[];
+  acceptanceCriteria?: string[];
   implementationSummary: string;
+  implementationOutcome?: 'changes_made' | 'already_satisfied';
+  evidenceFiles?: string[];
   changedFiles?: string[];
   diffStat?: ImplementResult['diffStat'];
   architectureUpdate?: ProjectArchitectureUpdate;
@@ -76,6 +83,11 @@ export interface WorkerTaskResume {
   approvedApprovals?: ApprovalType[];
   completedOperations?: string[];
   githubChecks?: GitHubChecksResult;
+  completedSatisfactionReview?: {
+    inputHash: string;
+    summary: string;
+    criterionResults?: ReviewResult['criterionResults'];
+  };
 }
 
 export interface WorkerTaskHooks {
@@ -135,8 +147,10 @@ export interface WorkerTaskResult {
 }
 
 export async function runWorkerTask(input: WorkerTaskInput): Promise<WorkerTaskResult> {
+  throwIfTaskAborted(input.signal);
   const config = resolveWorkerConfig(input.project, input);
   const provider = input.provider ?? createProvider(config.providerKind);
+  const reviewProvider = input.reviewProvider ?? provider;
   const taskPrompt = compactTaskExecutionPrompt(input.task.prompt);
   const executionPrompt = buildTaskExecutionPrompt(taskPrompt, input.project.projectMemory, input.project.projectArchitecture);
   const github = input.github;
@@ -167,8 +181,8 @@ export async function runWorkerTask(input: WorkerTaskInput): Promise<WorkerTaskR
           project: input.project,
           task: input.task,
           labels: [config.issueLabel]
-        });
-      });
+        }, input.signal);
+      }, input.signal);
       await input.hooks?.onIssue?.(issue);
     }
   }
@@ -193,7 +207,8 @@ export async function runWorkerTask(input: WorkerTaskInput): Promise<WorkerTaskR
       input.hooks,
       'create_branch',
       { branchName, fromBranch: input.project.defaultBranch },
-      async () => github!.createBranch(input.project, branchName, input.project.defaultBranch)
+      async () => github!.createBranch(input.project, branchName, input.project.defaultBranch, input.signal),
+      input.signal
     );
   }
   const git = await prepareWorkspaceGit(workspacePath, branchName, input.project.defaultBranch, reuseExistingWorkspaceRepo ? undefined : remoteUrl, {
@@ -208,6 +223,48 @@ export async function runWorkerTask(input: WorkerTaskInput): Promise<WorkerTaskR
     elapsedMs: Date.now() - workspaceStartedAt
   });
   await input.hooks?.onBranch?.(branchName);
+
+  const completedSatisfactionReview = input.resume?.completedSatisfactionReview;
+  if (completedSatisfactionReview && input.resume?.validation?.passed) {
+    const currentInputHash = await collectSatisfactionReviewInputHash(
+      git,
+      workspacePath,
+      input.task.prompt,
+      input.resume.acceptanceCriteria ?? [],
+      input.resume.evidenceFiles ?? []
+    );
+    if (currentInputHash === completedSatisfactionReview.inputHash) {
+      await input.hooks?.onStatus?.('validating', { resumed: true, reused: true });
+      await input.hooks?.onStatus?.('reviewing', { resumed: true, reused: true });
+      await emitTaskActivity(input.hooks, {
+        phase: 'review',
+        state: 'completed',
+        title: 'Audit existujiciho stavu byl obnoven',
+        detail: completedSatisfactionReview.summary,
+        operation: 'provider_review',
+        elapsedMs: 0
+      });
+      await emitTaskActivity(input.hooks, {
+        phase: 'completion',
+        state: 'completed',
+        title: 'Task je dokoncen bez zbytecnych zmen',
+        detail: completedSatisfactionReview.summary,
+        operation: 'finish_task'
+      });
+      return {
+        taskId: input.task.id,
+        status: 'completed',
+        issueUrl: issue.issueUrl,
+        branchName,
+        workspacePath,
+        validation: input.resume.validation,
+        commitSha: await resolveHeadSha(git),
+        summary: completedSatisfactionReview.summary,
+        approvals: [],
+        completedAt: nowIso()
+      };
+    }
+  }
 
   const isResumeRun = Boolean(input.resume);
   await input.hooks?.onStatus?.('running_ai', isResumeRun && input.resume ? { resumed: true, kind: input.resume.kind } : undefined);
@@ -242,6 +299,7 @@ export async function runWorkerTask(input: WorkerTaskInput): Promise<WorkerTaskR
           prompt: executionPrompt,
           repositoryPath: workspacePath,
           session: input.providerSession,
+          signal: input.signal,
           onActivity: (activity) => input.hooks?.onProviderActivity?.({ phase: 'planning', attempt: 0, ...activity })
         });
         await emitTaskActivity(input.hooks, {
@@ -285,7 +343,12 @@ export async function runWorkerTask(input: WorkerTaskInput): Promise<WorkerTaskR
       providerPrompt: plan.providerPrompt,
       providerResponse: plan.providerResponse,
       diffStat: { filesChanged: 0, insertions: 0, deletions: 0 },
-      validationResult: { passed: true, validationChecks: validationChecksToJson(validationChecks) }
+      validationResult: {
+        passed: true,
+        steps: plan.steps,
+        acceptanceCriteria: plan.acceptanceCriteria,
+        validationChecks: validationChecksToJson(validationChecks)
+      }
     });
   }
 
@@ -333,16 +396,7 @@ export async function runWorkerTask(input: WorkerTaskInput): Promise<WorkerTaskR
       completedAt: nowIso()
     };
   }
-  let review:
-    | {
-      summary: string;
-      blockers: string[];
-      safeImprovements: string[];
-      riskyChanges: ApprovalType[];
-      providerPrompt?: string;
-      providerResponse?: string;
-      }
-    | undefined = input.resume?.previousReviewBlockers?.length
+  let review: ReviewResult | undefined = input.resume?.previousReviewBlockers?.length
       ? {
           summary: input.resume.reviewSummary ?? 'Resume correction for previously reported review blockers.',
           blockers: input.resume.previousReviewBlockers,
@@ -401,6 +455,7 @@ export async function runWorkerTask(input: WorkerTaskInput): Promise<WorkerTaskR
         plan,
         repositoryPath: workspacePath,
         session: input.providerSession,
+        signal: input.signal,
         attemptNumber: attempt,
         previousValidationError: input.resume?.previousValidationError
           ?? (validation && !validation.passed ? formatValidationFailure(validation) : undefined),
@@ -466,6 +521,8 @@ export async function runWorkerTask(input: WorkerTaskInput): Promise<WorkerTaskR
           attempt,
           changedFiles: substantiveChangedFiles,
           alreadySatisfied,
+          outcome: implementation.outcome ?? 'changes_made',
+          evidenceFiles: implementation.evidenceFiles ?? [],
           architectureUpdate: implementation.architectureUpdate
             ? implementation.architectureUpdate as unknown as JsonValue
             : null,
@@ -579,7 +636,8 @@ export async function runWorkerTask(input: WorkerTaskInput): Promise<WorkerTaskR
     let validationPlanRevisionCount = 0;
     const isFirstResumedAttempt = attempt === firstAttempt;
     let resumeValidationPlanRevision = isFirstResumedAttempt && input.resume?.resumeValidationPlanRevision === true;
-    let missingSystemValidationTool: string | undefined;
+    let validationRecoveryFeedback: string | undefined;
+    let invalidValidationRecoveryResponseCount = 0;
     let validationStatusEmitted = false;
     while (true) {
       if (!validationStatusEmitted) {
@@ -658,9 +716,8 @@ export async function runWorkerTask(input: WorkerTaskInput): Promise<WorkerTaskR
             output: { command: activity.command, category: activity.category ?? null, exitCode: activity.exitCode ?? null },
             errorMessage: activity.exitCode === 0 ? undefined : `Validation command exited with ${activity.exitCode ?? 1}.`
           });
-        }, passedValidationCheckResults, validationInputHash);
+        }, passedValidationCheckResults, validationInputHash, input.signal);
         collectPassedValidationCheckResults(validation, passedValidationCheckResults);
-        missingSystemValidationTool = getMissingSystemValidationTool(validation);
         await input.hooks?.onIteration?.({
           phase: 'validation',
           prompt: validation.command,
@@ -690,14 +747,7 @@ export async function runWorkerTask(input: WorkerTaskInput): Promise<WorkerTaskR
         throw new Error('Validation checkpoint is missing while resuming validation-plan correction.');
       }
 
-      if (
-        !resumeValidationPlanRevision
-        && (validation.passed
-          || Boolean(missingSystemValidationTool)
-          || config.verifyCommand?.trim()
-          || !isValidationCommandDefinitionFailure(validation)
-          || validationPlanRevisionCount >= 2)
-      ) {
+      if (validation.passed) {
         break;
       }
 
@@ -710,12 +760,22 @@ export async function runWorkerTask(input: WorkerTaskInput): Promise<WorkerTaskR
         };
         break;
       }
-      const validationRevisionContext = buildValidationRevisionContext(failedValidationCheck);
+      const failedExecution = validation.checkResults?.find((result) => (
+        normalizeValidationCommandForEnvironment(result.command)
+          === normalizeValidationCommandForEnvironment(failedValidationCheck.command)
+      ));
+      const validationFailure = {
+        command: failedExecution?.command ?? validation.failingCommand ?? failedValidationCheck.command,
+        exitCode: failedExecution?.exitCode ?? validation.exitCode,
+        stdout: failedExecution?.stdout ?? validation.stdout,
+        stderr: failedExecution?.stderr ?? validation.stderr
+      };
+      const validationRevisionContext = buildValidationRevisionContext(failedValidationCheck, validationRecoveryFeedback);
       const replanningStartedAt = Date.now();
       await emitTaskActivity(input.hooks, {
         phase: 'planning',
         state: 'started',
-        title: 'AI opravuje validační příkazy',
+        title: 'AI vyhodnocuje chybu validace',
         operation: 'provider_plan',
         attempt
       });
@@ -731,31 +791,102 @@ export async function runWorkerTask(input: WorkerTaskInput): Promise<WorkerTaskR
         repositoryPath: workspacePath,
         previousValidationError: formatValidationFailure(validation),
         previousValidationChecks: [failedValidationCheck],
+        validationFailure,
         session: input.providerSession,
+        signal: input.signal,
         onActivity: (activity) => input.hooks?.onProviderActivity?.({ phase: 'planning', attempt, ...activity })
       });
       await emitTaskActivity(input.hooks, {
         phase: 'planning',
         state: 'completed',
-        title: 'Validační příkazy jsou opravené',
+        title: 'AI rozhodla o dalším postupu',
         detail: revisedValidationPlan.summary,
         operation: 'provider_plan',
         attempt,
         elapsedMs: Date.now() - replanningStartedAt
       });
+      const recoveryDecision = normalizeValidationRecoveryDecision(revisedValidationPlan);
+      if (!recoveryDecision) {
+        invalidValidationRecoveryResponseCount += 1;
+        if (invalidValidationRecoveryResponseCount >= 3) {
+          throw new Error('AI returned three invalid validation recovery decisions.');
+        }
+        validationRecoveryFeedback = 'Previous AI response did not contain a valid validationRecovery action and rationale.';
+        resumeValidationPlanRevision = true;
+        continue;
+      }
+      validationRecoveryFeedback = undefined;
+
+      if (recoveryDecision.action === 'blocked') {
+        invalidValidationRecoveryResponseCount = 0;
+        await input.hooks?.onIteration?.({
+          phase: 'planning',
+          prompt: validationRevisionContext,
+          resultSummary: revisedValidationPlan.summary,
+          providerPrompt: revisedValidationPlan.providerPrompt,
+          providerResponse: revisedValidationPlan.providerResponse,
+          diffStat: implementation.diffStat,
+          validationResult: {
+            passed: false,
+            validationRecovery: recoveryDecision as unknown as JsonValue,
+            attempt,
+            validationPlanRevision: validationPlanRevisionCount
+          }
+        });
+        return {
+          taskId: input.task.id,
+          status: 'validation_failed',
+          issueUrl: issue.issueUrl,
+          branchName,
+          workspacePath,
+          validation,
+          summary: recoveryDecision.rationale,
+          approvals: [],
+          completedAt: nowIso()
+        };
+      }
+
+      if (recoveryDecision.action === 'repair_implementation') {
+        invalidValidationRecoveryResponseCount = 0;
+        validation = {
+          ...validation,
+          ...validationFailure,
+          passed: false,
+          failingCommand: validationFailure.command
+        };
+        await input.hooks?.onIteration?.({
+          phase: 'planning',
+          prompt: validationRevisionContext,
+          resultSummary: revisedValidationPlan.summary,
+          providerPrompt: revisedValidationPlan.providerPrompt,
+          providerResponse: revisedValidationPlan.providerResponse,
+          diffStat: implementation.diffStat,
+          validationResult: {
+            passed: true,
+            validationRecovery: recoveryDecision as unknown as JsonValue,
+            attempt,
+            validationPlanRevision: validationPlanRevisionCount
+          }
+        });
+        break;
+      }
+
       const revisedValidationChecks = replaceFailedValidationCheck(
         validationChecks,
         validation.failingCommand,
         revisedValidationPlan.validationChecks
       );
       if (!revisedValidationChecks) {
-        validation = {
-          ...validation,
-          stderr: `${validation.stderr}\nAI did not provide a distinct replacement for the failed validation check.`.trim()
-        };
-        break;
+        invalidValidationRecoveryResponseCount += 1;
+        if (invalidValidationRecoveryResponseCount >= 3) {
+          throw new Error('AI returned three invalid replacement validation check sets.');
+        }
+        validationRecoveryFeedback = 'Previous AI response selected replace_validation_check but did not provide a distinct executable replacement.';
+        resumeValidationPlanRevision = true;
+        continue;
       }
       validationChecks = revisedValidationChecks;
+      invalidValidationRecoveryResponseCount = 0;
       resumeValidationPlanRevision = false;
       await input.hooks?.onIteration?.({
         phase: 'planning',
@@ -767,6 +898,7 @@ export async function runWorkerTask(input: WorkerTaskInput): Promise<WorkerTaskR
         validationResult: {
           passed: true,
           validationChecks: validationChecksToJson(validationChecks),
+          validationRecovery: recoveryDecision as unknown as JsonValue,
           revisedValidationChecksOnly: true,
           attempt,
           validationPlanRevision: validationPlanRevisionCount
@@ -797,63 +929,8 @@ export async function runWorkerTask(input: WorkerTaskInput): Promise<WorkerTaskR
       }
     }
 
-    if (!validation.passed && isValidationCommandDefinitionFailure(validation)) {
-      return {
-        taskId: input.task.id,
-        status: 'validation_failed',
-        issueUrl: issue.issueUrl,
-        branchName,
-        workspacePath,
-        validation,
-        summary: missingSystemValidationTool
-          ? `Validation infrastructure is missing required executable "${missingSystemValidationTool}".`
-          : `Validation command could not be executed after ${validationPlanRevisionCount} revision(s).`,
-        approvals: [],
-        completedAt: nowIso()
-      };
-    }
-
     if (validation.passed) {
-      if (alreadySatisfied && substantiveChangedFiles.length === 0) {
-        await input.hooks?.onStatus?.('reviewing', { attempt, alreadySatisfied: true });
-        const summary = implementation.summary.trim() || 'Existing implementation already satisfies the task.';
-        await emitTaskActivity(input.hooks, {
-          phase: 'review',
-          state: 'completed',
-          title: 'Existujici reseni splnuje zadani',
-          detail: summary,
-          operation: 'verify_existing_implementation',
-          attempt,
-          elapsedMs: 0
-        });
-        await input.hooks?.onIteration?.({
-          phase: 'review',
-          prompt: 'Verify existing implementation without repository changes.',
-          resultSummary: summary,
-          diffStat: implementation.diffStat,
-          validationResult: { blockers: [], riskyChanges: [], alreadySatisfied: true, attempt }
-        });
-        await emitTaskActivity(input.hooks, {
-          phase: 'completion',
-          state: 'completed',
-          title: 'Task je dokonceny bez zbytecnych zmen',
-          detail: summary,
-          operation: 'finish_task'
-        });
-        return {
-          taskId: input.task.id,
-          status: 'completed',
-          issueUrl: issue.issueUrl,
-          branchName,
-          workspacePath,
-          validation,
-          commitSha: await resolveHeadSha(git),
-          summary,
-          approvals: [],
-          completedAt: nowIso()
-        };
-      }
-
+      const satisfactionReview = alreadySatisfied && substantiveChangedFiles.length === 0;
       const reviewResume = input.resume;
       if (reviewResume && (reviewResume.kind === 'approved_review' || resumeDelivery)) {
         await input.hooks?.onStatus?.('reviewing', { attempt, resumed: true, kind: reviewResume.kind });
@@ -866,6 +943,15 @@ export async function runWorkerTask(input: WorkerTaskInput): Promise<WorkerTaskR
       } else {
         await input.hooks?.onStatus?.('reviewing', { attempt });
       const reviewStartedAt = Date.now();
+      const satisfactionReviewInputHash = satisfactionReview
+        ? await collectSatisfactionReviewInputHash(
+            git,
+            workspacePath,
+            input.task.prompt,
+            plan.acceptanceCriteria,
+            implementation.evidenceFiles ?? []
+          )
+        : undefined;
       await emitTaskActivity(input.hooks, {
         phase: 'review',
         state: 'started',
@@ -879,14 +965,27 @@ export async function runWorkerTask(input: WorkerTaskInput): Promise<WorkerTaskR
         attempt
       });
       let providerReview;
+      let satisfactionEvidenceErrors: string[] = [];
       try {
-        const reviewChangedFiles = previousReviewForCorrection
-          ? correctionChangedFiles
-          : implementation.changedFiles;
-        const reviewDiff = await collectReviewDiff(git, workspacePath, reviewChangedFiles);
-        const reviewPromise = provider.review({
+        if (satisfactionReviewInputHash) {
+          await input.hooks?.onCheckpoint?.({
+            key: 'review:already_satisfied',
+            phase: 'review',
+            status: 'started',
+            inputHash: satisfactionReviewInputHash
+          });
+        }
+        const satisfactionEvidence = satisfactionReview
+          ? await collectSatisfactionEvidence(git, workspacePath, implementation.evidenceFiles ?? [])
+          : undefined;
+        satisfactionEvidenceErrors = satisfactionEvidence?.errors ?? [];
+        const reviewChangedFiles = satisfactionEvidence?.files
+          ?? (previousReviewForCorrection ? correctionChangedFiles : implementation.changedFiles);
+        const reviewDiff = satisfactionReview ? '' : await collectReviewDiff(git, workspacePath, reviewChangedFiles);
+        const reviewPromise = reviewProvider.review({
             taskId: input.task.id,
             taskTitle: input.task.title,
+            taskPrompt: input.task.prompt,
             repositoryPath: workspacePath,
             changedFiles: reviewChangedFiles,
             acceptanceCriteria: plan.acceptanceCriteria,
@@ -894,15 +993,18 @@ export async function runWorkerTask(input: WorkerTaskInput): Promise<WorkerTaskR
             previousReviewBlockers: previousReviewForCorrection?.blockers,
             validation,
             diff: reviewDiff,
+            reviewMode: satisfactionReview ? 'existing_state' : 'changes',
+            repositoryEvidence: satisfactionEvidence?.packet,
             architectureContext: formatProjectArchitectureContext(
               input.project.projectArchitecture,
               reviewChangedFiles.join(' ')
             ),
             architectureUpdate: implementation.architectureUpdate,
-            session: input.providerSession,
+            session: input.reviewProviderSession,
+            signal: input.signal,
             onActivity: (activity) => input.hooks?.onProviderActivity?.({ phase: 'review', attempt, ...activity })
           });
-        providerReview = provider.kind === 'codex' && process.env.FORGEMIND_REVIEW_TIMEOUT_MS === undefined
+        providerReview = reviewProvider.kind === 'codex' && process.env.FORGEMIND_REVIEW_TIMEOUT_MS === undefined
           ? await reviewPromise
           : await withTimeout(
               reviewPromise,
@@ -910,6 +1012,15 @@ export async function runWorkerTask(input: WorkerTaskInput): Promise<WorkerTaskR
               () => new Error(`Review timed out after ${resolveReviewTimeoutMs()} ms.`)
             );
       } catch (error) {
+        if (satisfactionReviewInputHash) {
+          await input.hooks?.onCheckpoint?.({
+            key: 'review:already_satisfied',
+            phase: 'review',
+            status: 'failed',
+            inputHash: satisfactionReviewInputHash,
+            errorMessage: toErrorMessage(error)
+          });
+        }
         return {
           taskId: input.task.id,
           status: 'failed',
@@ -926,6 +1037,9 @@ export async function runWorkerTask(input: WorkerTaskInput): Promise<WorkerTaskR
         ...providerReview,
         riskyChanges: normalizeRuntimeApprovals(providerReview.riskyChanges)
       });
+      if (satisfactionReview) {
+        review = normalizeSatisfactionReview(review, plan.acceptanceCriteria, satisfactionEvidenceErrors);
+      }
       await emitTaskActivity(input.hooks, {
         phase: 'review',
         state: review.blockers.length > 0 ? 'failed' : 'completed',
@@ -942,11 +1056,52 @@ export async function runWorkerTask(input: WorkerTaskInput): Promise<WorkerTaskR
         providerPrompt: review.providerPrompt,
         providerResponse: review.providerResponse,
         diffStat: implementation.diffStat,
-        validationResult: { blockers: review.blockers, riskyChanges: review.riskyChanges, attempt }
+        validationResult: {
+          blockers: review.blockers,
+          riskyChanges: review.riskyChanges,
+          criterionResults: review.criterionResults ?? [],
+          alreadySatisfied: satisfactionReview,
+          attempt
+        }
       });
+      if (satisfactionReviewInputHash) {
+        await input.hooks?.onCheckpoint?.({
+          key: 'review:already_satisfied',
+          phase: 'review',
+          status: review.blockers.length === 0 ? 'completed' : 'failed',
+          inputHash: satisfactionReviewInputHash,
+          output: {
+            summary: review.summary,
+            criterionResults: review.criterionResults ?? []
+          },
+          errorMessage: review.blockers.length === 0 ? undefined : review.blockers.join('\n')
+        });
+      }
       }
 
       if (review.blockers.length === 0) {
+        if (satisfactionReview) {
+          const summary = review.summary.trim() || implementation.summary.trim() || 'Existing implementation satisfies the task.';
+          await emitTaskActivity(input.hooks, {
+            phase: 'completion',
+            state: 'completed',
+            title: 'Task je dokoncen bez zbytecnych zmen',
+            detail: summary,
+            operation: 'finish_task'
+          });
+          return {
+            taskId: input.task.id,
+            status: 'completed',
+            issueUrl: issue.issueUrl,
+            branchName,
+            workspacePath,
+            validation,
+            commitSha: await resolveHeadSha(git),
+            summary,
+            approvals: [],
+            completedAt: nowIso()
+          };
+        }
         const resumedApprovedReview = reviewResume
           && (reviewResume.kind === 'approved_review' || resumeDelivery);
         const reviewRiskApprovals = resumedApprovedReview
@@ -1185,8 +1340,10 @@ async function deliverWorkerAttempt(input: {
     state
   } = input;
   const taskInput = input.input;
+  throwIfTaskAborted(taskInput.signal);
 
   if (!state.skipCommitFromResume) {
+    throwIfTaskAborted(taskInput.signal);
     const commitStartedAt = Date.now();
     const commitInputHash = await collectValidationInputHash(git, workspacePath);
     await taskInput.hooks?.onCheckpoint?.({ key: 'external:commit', phase: 'git', status: 'started', inputHash: commitInputHash });
@@ -1221,7 +1378,8 @@ async function deliverWorkerAttempt(input: {
       taskInput.hooks,
       'commit_and_push',
       { branchName, workspacePath },
-      async () => github!.commitAndPush(taskInput.project, branchName, `AI: ${taskInput.task.title}`, workspacePath)
+      async () => github!.commitAndPush(taskInput.project, branchName, `AI: ${taskInput.task.title}`, workspacePath, taskInput.signal),
+      taskInput.signal
     );
   }
   state.skipPushFromResume = false;
@@ -1254,7 +1412,8 @@ async function deliverWorkerAttempt(input: {
           title: `[AI] ${taskInput.task.title}`,
           body: pullRequestBody,
           draft: !config.autoMergePullRequest
-        })
+        }, taskInput.signal),
+        taskInput.signal
       );
       await taskInput.hooks?.onPullRequest?.(state.pullRequest);
     }
@@ -1265,13 +1424,15 @@ async function deliverWorkerAttempt(input: {
       taskInput.hooks,
       'comment_on_issue',
       { issueNumber: issue.issueNumber },
-      async () => github!.commentOnIssue(taskInput.project, issue.issueNumber, renderIssueBody(taskInput.task))
+      async () => github!.commentOnIssue(taskInput.project, issue.issueNumber, renderIssueBody(taskInput.task), taskInput.signal),
+      taskInput.signal
     );
     state.issueCommented = true;
   }
 
   let githubChecks: GitHubChecksResult | undefined = state.skipChecksFromResume ? state.resumedGitHubChecks : undefined;
   if (config.requireCiGreen && config.autoPush && state.pullRequest && github?.waitForChecks && !state.skipChecksFromResume) {
+    throwIfTaskAborted(taskInput.signal);
     const headSha = (await git.revparse(['HEAD'])).trim();
     const checksInputHash = hashCheckpointValue(`${headSha}:${state.pullRequest.pullRequestNumber}`);
     await taskInput.hooks?.onCheckpoint?.({ key: 'external:wait_for_checks', phase: 'github', status: 'started', inputHash: checksInputHash });
@@ -1287,6 +1448,7 @@ async function deliverWorkerAttempt(input: {
     let checks: GitHubChecksResult;
     try {
       checks = await github.waitForChecks(taskInput.project, headSha, {
+        signal: taskInput.signal,
         onProgress: async (message) => emitTaskActivity(taskInput.hooks, {
           phase: 'github',
           state: 'progress',
@@ -1297,6 +1459,7 @@ async function deliverWorkerAttempt(input: {
           elapsedMs: Date.now() - checksStartedAt
         })
       });
+      throwIfTaskAborted(taskInput.signal);
     } catch (error) {
       const errorMessage = toErrorMessage(error);
       await emitTaskActivity(taskInput.hooks, {
@@ -1317,11 +1480,11 @@ async function deliverWorkerAttempt(input: {
       throw error;
     }
 
-    if (checks.status === 'timeout') {
+    if (checks.status === 'timeout' || checks.status === 'not_configured') {
       await emitTaskActivity(taskInput.hooks, {
         phase: 'github',
         state: 'failed',
-        title: 'Cekani na GitHub Actions vyprselo',
+        title: checks.status === 'not_configured' ? 'GitHub Actions nebylo nalezeno' : 'Cekani na GitHub Actions vyprselo',
         detail: checks.summary,
         operation: 'wait_for_checks',
         attempt,
@@ -1333,7 +1496,9 @@ async function deliverWorkerAttempt(input: {
         context: { headSha, pullRequestNumber: state.pullRequest.pullRequestNumber }
       });
       await taskInput.hooks?.onCheckpoint?.({ key: 'external:wait_for_checks', phase: 'github', status: 'failed', inputHash: checksInputHash, errorMessage: checks.summary });
-      throw new Error(checks.summary);
+      throw new Error(checks.status === 'not_configured'
+        ? `CI is required, but no GitHub check was discovered for ${headSha}.`
+        : checks.summary);
     }
 
     if (checks.status === 'failure') {
@@ -1380,7 +1545,15 @@ async function deliverWorkerAttempt(input: {
     githubChecks = checks;
     await taskInput.hooks?.onCheckpoint?.({
       key: 'external:wait_for_checks', phase: 'github', status: 'completed', inputHash: checksInputHash,
-      output: { status: checks.status, summary: checks.summary, failures: checks.failures }
+      output: {
+        status: checks.status,
+        summary: checks.summary,
+        failures: checks.failures.map((failure) => ({
+          name: failure.name,
+          output: failure.output,
+          detailsUrl: failure.detailsUrl ?? null
+        }))
+      }
     });
   }
   state.skipChecksFromResume = false;
@@ -1398,7 +1571,8 @@ async function deliverWorkerAttempt(input: {
         taskInput.hooks,
         'merge_pr',
         { pullRequestNumber: state.pullRequest.pullRequestNumber, targetBranch: taskInput.project.defaultBranch },
-        async () => github.mergePullRequest!(taskInput.project, state.pullRequest!.pullRequestNumber)
+        async () => github.mergePullRequest!(taskInput.project, state.pullRequest!.pullRequestNumber, taskInput.signal),
+        taskInput.signal
       );
       mergeConfirmed = merge.merged;
       mergeCommitSha = merge.merged && merge.sha && /^[a-f0-9]{7,64}$/i.test(merge.sha)
@@ -1469,10 +1643,15 @@ function createResumePlan(resume: WorkerTaskResume, fallback?: PlanResult): Plan
           : resume.kind === 'validation_retry'
             ? 'Resume the preserved implementation and rerun validation only.'
           : 'Resume previously approved implementation.'),
-    steps: fallback?.steps ?? [],
-    acceptanceCriteria: fallback?.acceptanceCriteria ?? [],
+    steps: resume.planSteps ?? fallback?.steps ?? [],
+    acceptanceCriteria: resume.acceptanceCriteria ?? fallback?.acceptanceCriteria ?? [],
     validationChecks: normalizeValidationChecks(resume.validationChecks)
   };
+}
+
+function throwIfTaskAborted(signal?: AbortSignal): void {
+  if (!signal?.aborted) return;
+  throw signal.reason instanceof Error ? signal.reason : new Error('Task execution was cancelled.');
 }
 
 export function compactTaskExecutionPrompt(prompt: string): string {
@@ -1607,17 +1786,34 @@ function readPromptSection(prompt: string, heading: string): string {
   return (nextHeading < 0 ? remainder : remainder.slice(0, nextHeading)).trim();
 }
 
-function buildValidationRevisionContext(failedCheck: ValidationCheck): string {
+function buildValidationRevisionContext(failedCheck: ValidationCheck, previousDecisionError?: string): string {
   return [
-    'Revise the single failed validation check only. Do not create or repeat an implementation plan.',
-    'Return only replacement validationChecks for the failed check. Do not repeat successful or unrelated checks.',
-    'Inspect repository scripts only as needed to replace this invalid check.',
-    'Return only executable checks that verify a criterion through their exit code. Omit criteria that cannot be verified automatically.',
+    'Diagnose the single failed validation check. Do not create or repeat a general implementation plan.',
+    'Inspect the repository and decide whether the check is wrong, the implementation must be repaired, or progress is genuinely blocked.',
+    'Return replacement validationChecks only when validationRecovery.action is replace_validation_check.',
+    'Do not repeat successful or unrelated checks.',
+    'Return only executable replacement checks that verify a criterion through their exit code.',
     'Do not use shell redirection or fallback command chains in validation commands.',
-    'Do not modify repository files.',
+    'Do not modify repository files during this diagnosis.',
     `Failed check: ${failedCheck.command}`,
-    `Criterion: ${failedCheck.criterion ?? 'Preserve the criterion of the failed check.'}`
-  ].join('\n');
+    `Criterion: ${failedCheck.criterion ?? 'Preserve the criterion of the failed check.'}`,
+    previousDecisionError ? `Correction required: ${previousDecisionError}` : ''
+  ].filter(Boolean).join('\n');
+}
+
+function normalizeValidationRecoveryDecision(plan: PlanResult): PlanResult['validationRecovery'] | undefined {
+  const decision = plan.validationRecovery;
+  if (!decision || typeof decision.rationale !== 'string' || !decision.rationale.trim()) {
+    return undefined;
+  }
+  if (
+    decision.action !== 'replace_validation_check'
+    && decision.action !== 'repair_implementation'
+    && decision.action !== 'blocked'
+  ) {
+    return undefined;
+  }
+  return { action: decision.action, rationale: decision.rationale.trim() };
 }
 
 function findFailedValidationCheck(
@@ -1671,45 +1867,6 @@ export function replaceFailedValidationCheck(
 
 function validationCheckIdentity(check: ValidationCheck): string {
   return `command:${normalizeValidationCommandForEnvironment(check.command)}`;
-}
-
-export function isValidationCommandDefinitionFailure(validation: ValidationResult): boolean {
-  const output = `${validation.stderr}\n${validation.stdout}`;
-  return [
-    /validation command is not allowed/i,
-    /missing script:/i,
-    /unknown command/i,
-    /command not found/i,
-    /(?:^|\n)(?:\/bin\/)?(?:ba)?sh:\s*\d+:\s*[^:\r\n]+:\s*not found\b/im,
-    /is not recognized as (?:the name of a cmdlet|an internal or external command)/i,
-    /unexpected argument .* found/i,
-    /(?:unknown|unrecognized|invalid) (?:option|argument|flag)/i,
-    /no such file or directory/i,
-    /cannot find (?:module|package).*requested by the validation command/i,
-    /(?:error:\s*)?[^\r\n]+ is not a directory/i,
-    /could not load cache/i,
-    /unexpected eof while looking for matching/i
-  ].some((pattern) => pattern.test(output));
-}
-
-const systemValidationTools = new Set([
-  'cmake',
-  'ctest',
-  'make',
-  'ninja',
-  'gcc',
-  'g++',
-  'clang',
-  'clang++',
-  'rg'
-]);
-
-export function getMissingSystemValidationTool(validation: ValidationResult): string | undefined {
-  const output = `${validation.stderr}\n${validation.stdout}`;
-  const unixMatch = output.match(/(?:^|\n)(?:\/bin\/)?(?:ba)?sh:\s*\d+:\s*([^:\s\r\n]+):\s*not found\b/im);
-  const windowsMatch = output.match(/'([^']+)' is not recognized as (?:the name of a cmdlet|an internal or external command)/i);
-  const executable = (unixMatch?.[1] ?? windowsMatch?.[1])?.trim().toLowerCase();
-  return executable && systemValidationTools.has(executable) ? executable : undefined;
 }
 
 export async function resolveValidationChecks(input: {
@@ -1901,10 +2058,13 @@ async function applyProjectValidationProfile(
 
   const preparation: ValidationCheck[] = [];
   if (profile.dockerComposeFiles.length > 0 || profile.dockerComposeServices.length > 0) {
+    if (!workspacePath) {
+      throw new Error('Workspace path is required for Docker Compose validation.');
+    }
     const composeArguments: string[] = [];
     for (const file of profile.dockerComposeFiles) {
-      const resolvedFile = workspacePath ? resolve(workspacePath, file) : undefined;
-      const relativeFile = workspacePath && resolvedFile ? relative(resolve(workspacePath), resolvedFile) : undefined;
+      const resolvedFile = resolve(workspacePath, file);
+      const relativeFile = relative(resolve(workspacePath), resolvedFile);
       if (!relativeFile || isAbsolute(file) || isAbsolute(relativeFile) || relativeFile.startsWith('..')) {
         throw new Error(`Docker Compose file must be a workspace-relative path: ${file}`);
       }
@@ -1962,6 +2122,33 @@ async function collectValidationInputHash(git: SimpleGit, workspacePath: string)
     }
   }
   return hash.digest('hex');
+}
+
+async function collectRepositoryStateInputHash(git: SimpleGit, workspacePath: string): Promise<string> {
+  const hash = createHash('sha256');
+  try {
+    hash.update((await git.revparse(['HEAD^{tree}'])).trim());
+  } catch {
+    hash.update('[no-head]');
+  }
+  hash.update('\0');
+  hash.update(await collectValidationInputHash(git, workspacePath));
+  return hash.digest('hex');
+}
+
+async function collectSatisfactionReviewInputHash(
+  git: SimpleGit,
+  workspacePath: string,
+  taskPrompt: string,
+  acceptanceCriteria: string[],
+  evidenceFiles: string[]
+): Promise<string> {
+  return createHash('sha256').update(JSON.stringify({
+    repositoryStateHash: await collectRepositoryStateInputHash(git, workspacePath),
+    taskPrompt,
+    acceptanceCriteria,
+    evidenceFiles
+  })).digest('hex');
 }
 
 function hashCheckpointValue(value: string): string {
@@ -2134,8 +2321,10 @@ async function runGitHubOperation<T>(
   hooks: WorkerTaskHooks | undefined,
   operation: GitHubOperation,
   context: JsonValue | undefined,
-  action: () => Promise<T>
+  action: () => Promise<T>,
+  signal?: AbortSignal
 ): Promise<T> {
+  throwIfTaskAborted(signal);
   const startedAt = Date.now();
   const label = describeGitHubOperation(operation);
   const phase = operation === 'commit_and_push' ? 'git' : 'github';
@@ -2155,6 +2344,7 @@ async function runGitHubOperation<T>(
   });
   try {
     const result = await action();
+    throwIfTaskAborted(signal);
     await emitTaskActivity(hooks, {
       phase,
       state: 'completed',
@@ -2508,22 +2698,47 @@ function computeChangedPathApprovals(
   return uniqueApprovals(approvals);
 }
 
-function normalizeReviewAfterValidation(review: {
-  summary: string;
-  blockers: string[];
-  safeImprovements: string[];
-  riskyChanges: ApprovalType[];
-}): {
-  summary: string;
-  blockers: string[];
-  safeImprovements: string[];
-  riskyChanges: ApprovalType[];
-} {
+function normalizeReviewAfterValidation(review: ReviewResult): ReviewResult {
   const blockers = review.blockers.filter((blocker) => !isValidationExecutionLimitationBlocker(blocker));
   return {
     ...review,
     blockers
   };
+}
+
+function normalizeSatisfactionReview(
+  review: ReviewResult,
+  acceptanceCriteria: string[],
+  evidenceErrors: string[]
+): ReviewResult {
+  const blockers = [...review.blockers, ...evidenceErrors];
+  const results = review.criterionResults ?? [];
+  const byCriterion = new Map<string, typeof results>();
+  for (const result of results) {
+    const key = result.criterion.trim();
+    if (!acceptanceCriteria.some((criterion) => criterion.trim() === key)) {
+      blockers.push(`Existing-state review evaluated an unknown acceptance criterion: ${result.criterion}`);
+    }
+    byCriterion.set(key, [...(byCriterion.get(key) ?? []), result]);
+  }
+
+  for (const criterion of acceptanceCriteria) {
+    const matches = byCriterion.get(criterion.trim()) ?? [];
+    if (matches.length !== 1) {
+      blockers.push(matches.length === 0
+        ? `Existing-state review did not evaluate acceptance criterion: ${criterion}`
+        : `Existing-state review returned duplicate verdicts for acceptance criterion: ${criterion}`);
+      continue;
+    }
+    const verdict = matches[0]!;
+    if (verdict.status !== 'satisfied') {
+      blockers.push(`Acceptance criterion is ${verdict.status}: ${criterion}`);
+    } else if (verdict.evidence.length === 0 || verdict.evidence.every((item) => !item.trim())) {
+      blockers.push(`Acceptance criterion has no concrete evidence: ${criterion}`);
+    }
+  }
+
+  return { ...review, blockers: uniqueStrings(blockers) };
 }
 
 function isValidationExecutionLimitationBlocker(blocker: string): boolean {
@@ -2695,6 +2910,75 @@ async function collectWorkspaceDiffStat(
 }
 
 const MAX_REVIEW_DIFF_CHARS = 120_000;
+const MAX_SATISFACTION_EVIDENCE_FILES = 12;
+const MAX_SATISFACTION_EVIDENCE_CHARS = 48_000;
+const MAX_SATISFACTION_FILE_CHARS = 8_000;
+
+async function collectSatisfactionEvidence(
+  git: SimpleGit,
+  workspacePath: string,
+  requestedPaths: string[]
+): Promise<{ files: string[]; packet: string; errors: string[] }> {
+  const trackedPaths = (await git.raw(['ls-files']))
+    .split(/\r?\n/)
+    .map((path) => path.trim())
+    .filter(Boolean);
+  const trackedByNormalizedPath = new Map(trackedPaths.map((path) => [normalizeRepoPath(path), path]));
+  const requested = uniqueStrings(requestedPaths.map((path) => path.trim()).filter(Boolean));
+  const errors: string[] = [];
+  if (requested.length > MAX_SATISFACTION_EVIDENCE_FILES) {
+    errors.push(`Existing-state evidence lists ${requested.length} files; at most ${MAX_SATISFACTION_EVIDENCE_FILES} are allowed.`);
+  }
+
+  const files: string[] = [];
+  const sections: string[] = [];
+  let remaining = MAX_SATISFACTION_EVIDENCE_CHARS;
+  const workspaceRoot = resolve(workspacePath);
+  for (const requestedPath of requested.slice(0, MAX_SATISFACTION_EVIDENCE_FILES)) {
+    if (isAbsolute(requestedPath)) {
+      errors.push(`Evidence file must be repository-relative: ${requestedPath}`);
+      continue;
+    }
+    const trackedPath = trackedByNormalizedPath.get(normalizeRepoPath(requestedPath));
+    if (!trackedPath || !isSubstantiveImplementationPath(trackedPath)) {
+      errors.push(`Evidence file is not a tracked repository file: ${requestedPath}`);
+      continue;
+    }
+    const target = resolve(workspaceRoot, trackedPath);
+    const relativeTarget = relative(workspaceRoot, target);
+    if (relativeTarget.startsWith('..') || isAbsolute(relativeTarget)) {
+      errors.push(`Evidence file resolves outside the repository: ${requestedPath}`);
+      continue;
+    }
+    try {
+      const content = await readFile(target, 'utf8');
+      if (content.includes('\0')) {
+        errors.push(`Evidence file is binary and cannot be reviewed: ${trackedPath}`);
+        continue;
+      }
+      if (remaining <= 0) {
+        errors.push('Existing-state evidence exceeded the total character limit.');
+        break;
+      }
+      const limit = Math.min(MAX_SATISFACTION_FILE_CHARS, remaining);
+      const bounded = content.length > limit
+        ? `${content.slice(0, limit)}\n[file truncated: ${content.length} characters total]`
+        : content;
+      sections.push(`--- ${trackedPath} ---\n${bounded}`);
+      files.push(trackedPath);
+      remaining -= bounded.length;
+    } catch {
+      errors.push(`Evidence file could not be read: ${trackedPath}`);
+    }
+  }
+
+  if (files.length === 0) errors.push('No readable tracked evidence file was supplied for existing-state review.');
+  return {
+    files,
+    packet: sections.join('\n\n'),
+    errors: uniqueStrings(errors)
+  };
+}
 
 async function collectReviewDiff(
   git: SimpleGit,
@@ -2830,13 +3114,15 @@ async function loadResumedImplementation(
   const status = await git.status();
   const workspaceChangedFiles = collectStageablePaths(status).filter(isSubstantiveImplementationPath);
   const changedFiles = uniqueStrings([...workspaceChangedFiles, ...(resume.changedFiles ?? [])]).filter(isSubstantiveImplementationPath);
-  if (changedFiles.length === 0 && !resume.diffStat) {
+  if (changedFiles.length === 0 && !resume.diffStat && resume.implementationOutcome !== 'already_satisfied') {
     return undefined;
   }
 
   return {
+    outcome: resume.implementationOutcome,
     summary: resume.implementationSummary,
     changedFiles: uniqueStrings(changedFiles),
+    evidenceFiles: resume.evidenceFiles,
     diffStat: workspaceChangedFiles.length > 0
       ? await collectWorkspaceDiffStat(git, workspacePath, status)
       : resume.diffStat ?? { filesChanged: changedFiles.length, insertions: 0, deletions: 0 },

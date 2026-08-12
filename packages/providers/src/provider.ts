@@ -41,8 +41,10 @@ export interface PlanInput {
   maxRuntimeMs?: number;
   previousValidationError?: string;
   previousValidationChecks?: ValidationCheck[];
+  validationFailure?: ValidationFailureDetails;
   onActivity?: ProviderActivityHandler;
   session?: ProviderSessionContext;
+  signal?: AbortSignal;
 }
 
 export interface PlanResult {
@@ -54,8 +56,21 @@ export interface PlanResult {
   contractDelta?: ProjectContractDelta;
   architectureUpdate?: ProjectArchitectureUpdate;
   validationChecks?: ValidationCheck[];
+  validationRecovery?: ValidationRecoveryDecision;
   providerPrompt?: string;
   providerResponse?: string;
+}
+
+export interface ValidationFailureDetails {
+  command: string;
+  exitCode: number;
+  stdout: string;
+  stderr: string;
+}
+
+export interface ValidationRecoveryDecision {
+  action: 'replace_validation_check' | 'repair_implementation' | 'blocked';
+  rationale: string;
 }
 
 export interface ImplementationStepPlan {
@@ -132,6 +147,7 @@ export interface ImplementInput {
   previousSafeImprovements?: string[];
   onActivity?: ProviderActivityHandler;
   session?: ProviderSessionContext;
+  signal?: AbortSignal;
 }
 
 export interface FileUpdate {
@@ -143,6 +159,7 @@ export interface ImplementResult {
   outcome?: 'changes_made' | 'already_satisfied';
   summary: string;
   changedFiles: string[];
+  evidenceFiles?: string[];
   diffStat: {
     filesChanged: number;
     insertions: number;
@@ -159,6 +176,7 @@ export interface ImplementResult {
 export interface ReviewInput {
   taskId: string;
   taskTitle: string;
+  taskPrompt: string;
   repositoryPath: string;
   changedFiles: string[];
   acceptanceCriteria: string[];
@@ -172,10 +190,13 @@ export interface ReviewInput {
     passed: boolean;
   };
   diff: string;
+  reviewMode?: 'changes' | 'existing_state';
+  repositoryEvidence?: string;
   architectureContext?: string;
   architectureUpdate?: ProjectArchitectureUpdate;
   onActivity?: ProviderActivityHandler;
   session?: ProviderSessionContext;
+  signal?: AbortSignal;
 }
 
 export interface ReviewResult {
@@ -183,8 +204,114 @@ export interface ReviewResult {
   blockers: string[];
   safeImprovements: string[];
   riskyChanges: ApprovalType[];
+  criterionResults?: Array<{
+    criterion: string;
+    status: 'satisfied' | 'not_satisfied' | 'insufficient_evidence';
+    evidence: string[];
+  }>;
   providerPrompt?: string;
   providerResponse?: string;
+}
+
+export class ProviderContractError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'ProviderContractError';
+  }
+}
+
+export function parseProviderJsonObject(content: string, operation: string): Record<string, unknown> {
+  const jsonStart = content.indexOf('{');
+  const jsonEnd = content.lastIndexOf('}');
+  const candidate = jsonStart >= 0 && jsonEnd > jsonStart
+    ? content.slice(jsonStart, jsonEnd + 1)
+    : content;
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(candidate);
+  } catch (error) {
+    throw new ProviderContractError(`${operation} returned invalid JSON: ${error instanceof Error ? error.message : String(error)}`);
+  }
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+    throw new ProviderContractError(`${operation} must return a JSON object.`);
+  }
+  return parsed as Record<string, unknown>;
+}
+
+export function parsePlanResult(content: string, operation: string): PlanResult {
+  const value = parseProviderJsonObject(content, operation);
+  requireString(value, 'summary', operation);
+  requireStringArray(value, 'steps', operation);
+  requireStringArray(value, 'acceptanceCriteria', operation);
+  return value as unknown as PlanResult;
+}
+
+export function parseImplementResult(content: string, operation: string, requireFileUpdates = false): ImplementResult {
+  const value = parseProviderJsonObject(content, operation);
+  requireString(value, 'summary', operation);
+  requireStringArray(value, 'changedFiles', operation);
+  if (value.evidenceFiles !== undefined) requireStringArray(value, 'evidenceFiles', operation);
+  requireStringArray(value, 'requestedApprovals', operation);
+  const outcome = value.outcome;
+  if (outcome !== 'changes_made' && outcome !== 'already_satisfied') {
+    throw new ProviderContractError(`${operation} field "outcome" must be "changes_made" or "already_satisfied".`);
+  }
+  const diffStat = value.diffStat;
+  if (!diffStat || typeof diffStat !== 'object' || Array.isArray(diffStat)) {
+    throw new ProviderContractError(`${operation} field "diffStat" must be an object.`);
+  }
+  for (const field of ['filesChanged', 'insertions', 'deletions']) {
+    if (typeof (diffStat as Record<string, unknown>)[field] !== 'number') {
+      throw new ProviderContractError(`${operation} field "diffStat.${field}" must be a number.`);
+    }
+  }
+  if (requireFileUpdates && outcome === 'changes_made') {
+    const updates = value.fileUpdates;
+    if (!Array.isArray(updates) || updates.length === 0 || updates.some((item) => {
+      if (!item || typeof item !== 'object' || Array.isArray(item)) return true;
+      const update = item as Record<string, unknown>;
+      return typeof update.path !== 'string' || !update.path.trim() || typeof update.content !== 'string';
+    })) {
+      throw new ProviderContractError(`${operation} must return non-empty fileUpdates for outcome "changes_made".`);
+    }
+  }
+  if (outcome === 'already_satisfied' && (!Array.isArray(value.evidenceFiles) || value.evidenceFiles.length === 0)) {
+    throw new ProviderContractError(`${operation} must return non-empty evidenceFiles for outcome "already_satisfied".`);
+  }
+  return value as unknown as ImplementResult;
+}
+
+export function parseReviewResult(content: string, operation: string): ReviewResult {
+  const value = parseProviderJsonObject(content, operation);
+  requireString(value, 'summary', operation);
+  requireStringArray(value, 'blockers', operation);
+  requireStringArray(value, 'safeImprovements', operation);
+  requireStringArray(value, 'riskyChanges', operation);
+  if (value.criterionResults !== undefined) {
+    if (!Array.isArray(value.criterionResults) || value.criterionResults.some((item) => {
+      if (!item || typeof item !== 'object' || Array.isArray(item)) return true;
+      const result = item as Record<string, unknown>;
+      return typeof result.criterion !== 'string'
+        || !['satisfied', 'not_satisfied', 'insufficient_evidence'].includes(String(result.status))
+        || !Array.isArray(result.evidence)
+        || result.evidence.some((entry) => typeof entry !== 'string');
+    })) {
+      throw new ProviderContractError(`${operation} field "criterionResults" must contain structured criterion verdicts.`);
+    }
+  }
+  return value as unknown as ReviewResult;
+}
+
+function requireString(value: Record<string, unknown>, field: string, operation: string): void {
+  if (typeof value[field] !== 'string' || !(value[field] as string).trim()) {
+    throw new ProviderContractError(`${operation} field "${field}" must be a non-empty string.`);
+  }
+}
+
+function requireStringArray(value: Record<string, unknown>, field: string, operation: string): void {
+  if (!Array.isArray(value[field]) || (value[field] as unknown[]).some((item) => typeof item !== 'string')) {
+    throw new ProviderContractError(`${operation} field "${field}" must be an array of strings.`);
+  }
 }
 
 export interface CapabilityAuditInput {
