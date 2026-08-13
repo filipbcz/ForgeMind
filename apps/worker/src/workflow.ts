@@ -83,6 +83,7 @@ export interface WorkerTaskResume {
   approvedApprovals?: ApprovalType[];
   completedOperations?: string[];
   githubChecks?: GitHubChecksResult;
+  githubChecksInputHash?: string;
   completedSatisfactionReview?: {
     inputHash: string;
     summary: string;
@@ -417,7 +418,8 @@ export async function runWorkerTask(input: WorkerTaskInput): Promise<WorkerTaskR
     issueCommented: completedOperations.has('comment_on_issue'),
     skipChecksFromResume: completedOperations.has('wait_for_checks'),
     skipMergeFromResume: completedOperations.has('merge_pr'),
-    resumedGitHubChecks: input.resume?.githubChecks
+    resumedGitHubChecks: input.resume?.githubChecks,
+    resumedGitHubChecksInputHash: input.resume?.githubChecksInputHash
   };
   const firstAttempt = Math.max(1, Math.min(input.task.maxIterations, input.resume?.attempt ?? 1));
   const passedValidationCheckResults = new Map<string, ValidationCheckExecutionResult>(
@@ -1289,6 +1291,7 @@ interface DeliveryState {
   skipChecksFromResume: boolean;
   skipMergeFromResume: boolean;
   resumedGitHubChecks?: GitHubChecksResult;
+  resumedGitHubChecksInputHash?: string;
 }
 
 type DeliveryAttemptOutcome =
@@ -1430,7 +1433,18 @@ async function deliverWorkerAttempt(input: {
     state.issueCommented = true;
   }
 
-  let githubChecks: GitHubChecksResult | undefined = state.skipChecksFromResume ? state.resumedGitHubChecks : undefined;
+  let githubChecks: GitHubChecksResult | undefined;
+  if (config.requireCiGreen && config.autoPush && state.pullRequest && github?.waitForChecks && state.skipChecksFromResume) {
+    const headSha = (await git.revparse(['HEAD'])).trim();
+    const currentInputHash = hashCheckpointValue(`${headSha}:${state.pullRequest.pullRequestNumber}`);
+    if (state.resumedGitHubChecks && state.resumedGitHubChecksInputHash === currentInputHash) {
+      githubChecks = state.resumedGitHubChecks;
+    } else {
+      state.skipChecksFromResume = false;
+    }
+  } else if (state.skipChecksFromResume) {
+    githubChecks = state.resumedGitHubChecks;
+  }
   if (config.requireCiGreen && config.autoPush && state.pullRequest && github?.waitForChecks && !state.skipChecksFromResume) {
     throwIfTaskAborted(taskInput.signal);
     const headSha = (await git.revparse(['HEAD'])).trim();

@@ -628,6 +628,23 @@ github:
       }
     },
     {
+      label: 'new implementation after an older failed GitHub validation',
+      iterations: [
+        { phase: 'implementation', prompt: 'Implement', resultSummary: 'Initial implementation', diffStat: { filesChanged: 1, insertions: 5, deletions: 0 }, validationResult: { changedFiles: ['src/a.ts'], validationChecks: [{ kind: 'command', command: 'npm test' }], attempt: 1 }, createdAt: '2026-08-02T10:00:20.000Z' },
+        { phase: 'validation', prompt: 'github-actions old-sha', resultSummary: 'GitHub Actions failed', validationResult: { command: 'github-actions old-sha', exitCode: 1, stdout: '', stderr: 'Old commit failed', passed: false, failingCommand: 'github-actions', attempt: 1 }, createdAt: '2026-08-02T10:00:30.000Z' },
+        { phase: 'implementation', prompt: 'Fix CI', resultSummary: 'CI correction', diffStat: { filesChanged: 1, insertions: 3, deletions: 1 }, validationResult: { changedFiles: ['tools/validate.mjs'], validationChecks: [{ kind: 'command', command: 'npm run validate' }], attempt: 2 }, createdAt: '2026-08-02T10:00:40.000Z' }
+      ],
+      audit: [
+        { eventType: 'task_failed', payload: { status: 'iteration_limit_reached' }, createdAt: '2026-08-02T10:00:50.000Z' }
+      ],
+      expected: {
+        resumeFrom: 'validation',
+        validation: undefined,
+        resumeValidationPlanRevision: false,
+        validationChecks: [{ kind: 'command', command: 'npm run validate' }]
+      }
+    },
+    {
       label: 'delivery failure after completed review',
       iterations: [
         { phase: 'implementation', prompt: 'Implement', resultSummary: 'Implementation', diffStat: { filesChanged: 1, insertions: 5, deletions: 0 }, validationResult: { changedFiles: ['src/a.ts'], validationChecks: [{ kind: 'command', command: 'npm test' }], attempt: 1 }, createdAt: '2026-08-02T10:00:20.000Z' },
@@ -669,6 +686,55 @@ github:
 
     expect(runWorkerTaskMock).toHaveBeenCalledWith(expect.objectContaining({
       resume: expect.objectContaining({ kind: 'phase_retry', ...expected })
+    }));
+  });
+
+  it('restores a completed GitHub checks checkpoint with its commit input hash', async () => {
+    repositoryMock.claimNextSubmittedTask.mockResolvedValueOnce(createClaimedTask('task_retried'));
+    repositoryMock.getTaskDiff.mockResolvedValueOnce({
+      taskId: 'task_1',
+      filesChanged: 1,
+      insertions: 5,
+      deletions: 0,
+      iterations: [
+        { phase: 'implementation', prompt: 'Implement', resultSummary: 'Implementation', diffStat: { filesChanged: 1, insertions: 5, deletions: 0 }, validationResult: { changedFiles: ['src/a.ts'], validationChecks: [{ kind: 'command', command: 'npm test' }], attempt: 1 }, createdAt: '2026-08-02T10:00:20.000Z' },
+        { phase: 'validation', prompt: 'npm test', resultSummary: 'Validation passed', validationResult: { command: 'npm test', exitCode: 0, stdout: 'ok', stderr: '', passed: true, attempt: 1 }, createdAt: '2026-08-02T10:00:30.000Z' },
+        { phase: 'review', prompt: 'Review', resultSummary: 'Review passed', validationResult: { blockers: [], riskyChanges: [], attempt: 1 }, createdAt: '2026-08-02T10:00:40.000Z' }
+      ]
+    });
+    repositoryMock.listTaskAudit.mockResolvedValueOnce([
+      { eventType: 'task_failed', payload: { status: 'failed' }, createdAt: '2026-08-02T10:00:50.000Z' }
+    ]);
+    repositoryMock.listTaskCheckpoints.mockResolvedValueOnce([{
+      key: 'external:wait_for_checks',
+      phase: 'github',
+      status: 'completed',
+      inputHash: 'current-head-and-pr-hash',
+      output: { status: 'success', summary: 'Current commit passed.', failures: [] }
+    }]);
+    runWorkerTaskMock.mockResolvedValueOnce({
+      taskId: 'task_1',
+      status: 'ready_for_user_review',
+      issueUrl: 'https://github.com/demo/repo/issues/1',
+      branchName: 'ai/1-task',
+      workspacePath: 'C:/tmp/worker',
+      validation: { command: 'npm test', exitCode: 0, stdout: 'ok', stderr: '', passed: true },
+      summary: 'Resumed successfully.',
+      approvals: [],
+      completedAt: new Date().toISOString()
+    });
+
+    const { runDatabaseWorkerOnce } = await import('./db-worker.js');
+    await runDatabaseWorkerOnce();
+
+    expect(runWorkerTaskMock).toHaveBeenCalledWith(expect.objectContaining({
+      resume: expect.objectContaining({
+        kind: 'phase_retry',
+        resumeFrom: 'delivery',
+        completedOperations: expect.arrayContaining(['wait_for_checks']),
+        githubChecksInputHash: 'current-head-and-pr-hash',
+        githubChecks: { status: 'success', summary: 'Current commit passed.', failures: [] }
+      })
     }));
   });
 
@@ -1894,7 +1960,7 @@ github:
     expect(repositoryMock.failTask).toHaveBeenCalledWith('task_1', expect.stringContaining('repeated_error_detected'), 'repeated_error_detected');
   });
 
-  it('stops with iteration_limit_reached when max iterations are exhausted', async () => {
+  it('allows the final configured iteration to finish the workflow', async () => {
     repositoryMock.claimNextSubmittedTask.mockResolvedValueOnce({
       task: {
         id: 'task_2',
@@ -1959,10 +2025,10 @@ github:
       expect.objectContaining({
         claimed: true,
         taskId: 'task_2',
-        status: 'iteration_limit_reached'
+        result: expect.objectContaining({ status: 'ready_for_user_review' })
       })
     );
-    expect(repositoryMock.failTask).toHaveBeenCalledWith('task_2', expect.stringContaining('iteration_limit_reached'), 'iteration_limit_reached');
+    expect(repositoryMock.failTask).not.toHaveBeenCalled();
   });
   it('marks a successfully auto-merged task as completed after entering review-ready state', async () => {
     runWorkerTaskMock.mockResolvedValueOnce({

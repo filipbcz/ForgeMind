@@ -1686,7 +1686,14 @@ function buildPhaseRetryResume(
     resumeFrom = 'planning';
   }
 
-  const validation = extractValidationResult(latestValidation?.validationResult);
+  const latestImplementationAt = timestampOf(latestImplementation?.createdAt);
+  const validationIsCurrent = Boolean(
+    latestValidation
+    && timestampOf(latestValidation.createdAt) >= latestImplementationAt
+  );
+  const validation = validationIsCurrent
+    ? extractValidationResult(latestValidation?.validationResult)
+    : undefined;
   const reviewBlockers = extractReviewBlockers(latestReview);
   const reviewSafeImprovements = extractStringArray(latestReview?.validationResult, 'safeImprovements');
   const reviewRisks = normalizeRuntimeApprovals(extractUnknownArray(latestReview?.validationResult, 'riskyChanges'));
@@ -1720,7 +1727,9 @@ function buildPhaseRetryResume(
       && typeof payload.detail === 'string'
     ))
     .map((payload) => payload!.detail as string);
-  const persistedValidationCommands = extractStringArray(latestValidation?.validationResult, 'passedValidationCommands');
+  const persistedValidationCommands = validationIsCurrent
+    ? extractStringArray(latestValidation?.validationResult, 'passedValidationCommands')
+    : [];
   const passedValidationChecks: NonNullable<WorkerTaskResume['passedValidationChecks']> = Array.from(new Set([
     ...completedValidationCommands,
     ...persistedValidationCommands
@@ -1817,6 +1826,7 @@ function buildPhaseRetryResume(
     approvedApprovals: Array.from(approvedTypes),
     completedOperations: Array.from(new Set(completedOperations)),
     githubChecks,
+    githubChecksInputHash: githubChecksCheckpoint?.inputHash,
     completedSatisfactionReview
   };
 }

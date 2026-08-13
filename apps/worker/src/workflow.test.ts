@@ -1226,6 +1226,67 @@ describe('worker workflow', () => {
     expect(createDraftPullRequest).toHaveBeenCalledOnce();
   }, 15000);
 
+  it('reruns GitHub checks when the resumed checkpoint belongs to an older commit', async () => {
+    const workspaceRoot = join(tmpdir(), `forgemind-worker-resume-stale-checks-${randomUUID()}`);
+    const task = {
+      ...demoTask,
+      id: `task_${randomUUID()}`,
+      githubIssueNumber: 1234,
+      githubIssueUrl: `https://github.com/${demoProject.githubOwner}/${demoProject.githubRepo}/issues/1234`,
+      branchName: 'ai/1234-resume-stale-checks',
+      pullRequestNumber: 4321,
+      pullRequestUrl: `https://github.com/${demoProject.githubOwner}/${demoProject.githubRepo}/pull/4321`
+    };
+    const workspacePath = join(workspaceRoot, task.id);
+    await mkdir(workspacePath, { recursive: true });
+    await writeFile(join(workspacePath, 'status.txt'), 'corrected\n', 'utf8');
+    const git = simpleGit({ baseDir: workspacePath });
+    await git.init();
+    await git.addConfig('user.name', 'ForgeMind Test');
+    await git.addConfig('user.email', 'forgemind-test@example.com');
+    await git.add('.');
+    await git.commit('Correct CI');
+    await git.checkoutLocalBranch(task.branchName);
+    const currentHead = (await git.revparse(['HEAD'])).trim();
+
+    const waitForChecks = vi.fn(async () => ({
+      status: 'success' as const,
+      summary: 'Current commit passed.',
+      failures: []
+    }));
+    const commitAndPush = vi.fn(async () => undefined);
+
+    const result = await runWorkerTask({
+      project: {
+        ...gitEnabledProject,
+        configYaml: gitProjectConfig.replace('auto_push: false', 'auto_push: true')
+      },
+      task,
+      provider: createProviderStub({ plan: vi.fn(), implement: vi.fn(), review: vi.fn() }),
+      github: createGitHubStub({ commitAndPush, waitForChecks }),
+      workspaceRoot,
+      resume: {
+        kind: 'phase_retry',
+        resumeFrom: 'delivery',
+        attempt: 2,
+        planSummary: 'Original plan',
+        implementationSummary: 'CI correction already completed.',
+        changedFiles: ['status.txt'],
+        diffStat: { filesChanged: 1, insertions: 1, deletions: 1 },
+        validation: { command: 'npm run validate', exitCode: 0, stdout: 'passed', stderr: '', passed: true },
+        reviewSummary: 'Review already passed.',
+        completedOperations: ['commit', 'commit_and_push', 'wait_for_checks', 'comment_on_issue'],
+        githubChecks: { status: 'success', summary: 'Old commit passed.', failures: [] },
+        githubChecksInputHash: createHash('sha256').update(`old-head:${task.pullRequestNumber}`).digest('hex')
+      }
+    });
+
+    expect(result.status).toBe('ready_for_user_review');
+    expect(commitAndPush).not.toHaveBeenCalled();
+    expect(waitForChecks).toHaveBeenCalledWith(expect.anything(), currentHead, expect.anything());
+    expect(result.githubChecks?.summary).toBe('Current commit passed.');
+  }, 15000);
+
   it('resumes approved review risk changes without rerunning planning, implementation, or review', async () => {
     const workspaceRoot = join(tmpdir(), `forgemind-worker-resume-approved-review-${randomUUID()}`);
     const task = {

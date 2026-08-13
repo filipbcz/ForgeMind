@@ -31,7 +31,7 @@ export interface LimitEvaluation {
 export function evaluateLimits(usage: LimitUsage, limits: Limits): LimitEvaluation {
   const signals: LimitSignal[] = [];
 
-  if (usage.iterations >= limits.maxIterations) signals.push('iteration_limit_reached');
+  if (usage.iterations > limits.maxIterations) signals.push('iteration_limit_reached');
   if (usage.runtimeMinutes >= limits.maxRuntimeMinutes) signals.push('runtime_limit_reached');
   if (usage.changedFiles > limits.maxChangedFiles) signals.push('changed_files_limit_reached');
   if (usage.diffLines > limits.maxDiffLines) signals.push('diff_lines_limit_reached');

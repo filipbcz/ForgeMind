@@ -2,10 +2,26 @@ import { describe, expect, it } from 'vitest';
 import { DEFAULT_LIMITS, evaluateLimits } from './limits.js';
 
 describe('limit evaluation', () => {
-  it('stops when iteration limit is reached', () => {
+  it('allows the final configured iteration to finish', () => {
     const result = evaluateLimits(
       {
         iterations: DEFAULT_LIMITS.maxIterations,
+        runtimeMinutes: 0,
+        changedFiles: 0,
+        diffLines: 0,
+        repeatedErrorCount: 0
+      },
+      DEFAULT_LIMITS
+    );
+
+    expect(result.ok).toBe(true);
+    expect(result.signals).toEqual([]);
+  });
+
+  it('stops when the iteration limit is exceeded', () => {
+    const result = evaluateLimits(
+      {
+        iterations: DEFAULT_LIMITS.maxIterations + 1,
         runtimeMinutes: 0,
         changedFiles: 0,
         diffLines: 0,
