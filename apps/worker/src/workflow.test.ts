@@ -1174,6 +1174,63 @@ describe('worker workflow', () => {
     expect(implement).not.toHaveBeenCalled();
   }, 15000);
 
+  it('keeps an authoritative resume validation plan after a correction implementation', async () => {
+    const workspaceRoot = join(tmpdir(), `forgemind-worker-correction-authoritative-validation-${randomUUID()}`);
+    const task = { ...demoTask, id: `task_${randomUUID()}` };
+    const workspacePath = join(workspaceRoot, task.id);
+    await mkdir(workspacePath, { recursive: true });
+    await writeFile(join(workspacePath, 'status.txt'), 'implemented\n', 'utf8');
+    const review = vi.fn(async (): Promise<ReviewResult> => ({
+      summary: 'Review passed.',
+      blockers: [],
+      safeImprovements: [],
+      riskyChanges: []
+    }));
+    const implement = vi.fn(async (): Promise<ImplementResult> => ({
+      outcome: 'already_satisfied',
+      summary: 'The current implementation already satisfies the task.',
+      changedFiles: [],
+      evidenceFiles: ['status.txt'],
+      diffStat: { filesChanged: 0, insertions: 0, deletions: 0 },
+      requestedApprovals: [],
+      validationChecks: [{ kind: 'command', command: 'node --version' }]
+    }));
+
+    const result = await runWorkerTask({
+      project: {
+        ...demoProject,
+        configYaml: noGitProjectConfig.replace('commands:\n  verify: "node --version"', 'commands: {}'),
+        projectArchitecture: {
+          version: 1,
+          summary: 'Validation architecture.',
+          modules: [],
+          decisions: [],
+          conventions: [],
+          dependencyRules: [],
+          knownDebt: [],
+          validationCommands: ['missing-tool architecture'],
+          updatedAt: new Date().toISOString()
+        }
+      },
+      task,
+      provider: createProviderStub({ implement, review }),
+      workspaceRoot,
+      resume: {
+        kind: 'phase_retry',
+        resumeFrom: 'implementation',
+        attempt: 1,
+        implementationSummary: 'Previous implementation.',
+        previousReviewBlockers: ['Review lacked cumulative evidence.'],
+        validationChecks: [{ kind: 'command', command: 'node --version' }]
+      }
+    });
+
+    expect(result.status).toBe('ready_for_user_review');
+    expect(result.validation.command).toBe('node --version');
+    expect(implement).toHaveBeenCalledOnce();
+    expect(review).toHaveBeenCalledOnce();
+  }, 15000);
+
   it('resumes delivery without repeating AI, commit, or push checkpoints', async () => {
     const workspaceRoot = join(tmpdir(), `forgemind-worker-resume-delivery-${randomUUID()}`);
     const task = {
@@ -2661,6 +2718,58 @@ describe('worker workflow', () => {
     );
   }, 10000);
 
+  it('excludes dependency and build output directories from diff metrics and review', async () => {
+    const workspaceRoot = join(tmpdir(), `forgemind-worker-generated-output-diff-${randomUUID()}`);
+    const task = { ...demoTask, id: `task_${randomUUID()}` };
+    const review = vi.fn(async (): Promise<ReviewResult> => ({
+      summary: 'Review passed.',
+      blockers: [],
+      safeImprovements: [],
+      riskyChanges: []
+    }));
+    const diffStats: ImplementResult['diffStat'][] = [];
+    const implement = vi.fn(async (input: ImplementInput): Promise<ImplementResult> => {
+      await mkdir(join(input.repositoryPath, 'node_modules', 'yaml'), { recursive: true });
+      await writeFile(join(input.repositoryPath, 'node_modules', 'yaml', 'index.js'), 'generated\n', 'utf8');
+      await mkdir(join(input.repositoryPath, 'out', 'build', 'test'), { recursive: true });
+      await writeFile(join(input.repositoryPath, 'out', 'build', 'test', 'artifact.txt'), 'generated\n', 'utf8');
+      return {
+        summary: 'Created one source file.',
+        changedFiles: ['src/result.ts'],
+        diffStat: { filesChanged: 1, insertions: 1, deletions: 0 },
+        requestedApprovals: [],
+        fileUpdates: [{ path: 'src/result.ts', content: 'export const result = true;\n' }]
+      };
+    });
+
+    const result = await runWorkerTask({
+      project: demoProject,
+      task,
+      provider: createProviderStub({ implement, review }),
+      verifyCommand: 'node --version',
+      workspaceRoot,
+      hooks: {
+        onIteration: async (iteration) => {
+          if (iteration.phase === 'implementation') diffStats.push(iteration.diffStat as ImplementResult['diffStat']);
+        }
+      }
+    });
+
+    expect(result.status).toBe('ready_for_user_review');
+    expect(diffStats[0]).toEqual({ filesChanged: 1, insertions: 1, deletions: 0 });
+    expect(review).toHaveBeenCalledWith(expect.objectContaining({
+      changedFiles: ['src/result.ts'],
+      diff: expect.not.stringContaining('node_modules')
+    }));
+    expect(review.mock.calls[0]?.[0].diff).not.toContain('out/build');
+    const committedFiles = (await simpleGit({ baseDir: join(workspaceRoot, task.id) }).show([
+      '--name-only',
+      '--format=',
+      'HEAD'
+    ])).split(/\r?\n/).filter(Boolean);
+    expect(committedFiles).toEqual(['src/result.ts']);
+  }, 10000);
+
   it('normalizes free-form provider approval reasons to ApprovalType values', async () => {
     const workspaceRoot = join(tmpdir(), `forgemind-worker-approval-normalize-${randomUUID()}`);
 
@@ -2809,6 +2918,77 @@ describe('worker workflow', () => {
     expect(reviewInputs[1]?.diff).not.toContain('stable.txt');
     expect(reviewInputs[1]?.previousReviewBlockers).toEqual(['Add missing guard clause']);
   }, 10000);
+
+  it('includes committed task-branch changes in every correction review packet', async () => {
+    const workspaceRoot = join(tmpdir(), `forgemind-worker-cumulative-review-${randomUUID()}`);
+    const task = { ...demoTask, id: `task_${randomUUID()}`, maxIterations: 2 };
+    const workspacePath = join(workspaceRoot, task.id);
+    await mkdir(workspacePath, { recursive: true });
+    const git = simpleGit({ baseDir: workspacePath });
+    await git.init();
+    await git.addConfig('user.name', 'ForgeMind Test');
+    await git.addConfig('user.email', 'forgemind-test@example.com');
+    await writeFile(join(workspacePath, 'base.txt'), 'base\n', 'utf8');
+    await git.add('.');
+    await git.commit('Base');
+    await git.raw(['branch', 'main', 'HEAD']);
+    await git.checkoutLocalBranch('ai/task-review');
+    await mkdir(join(workspacePath, '.github', 'workflows'), { recursive: true });
+    await writeFile(join(workspacePath, '.github', 'workflows', 'native-soak.yml'), 'name: Native soak\n', 'utf8');
+    await git.add('.');
+    await git.commit('Add soak workflow');
+    await writeFile(join(workspacePath, 'validator.mjs'), 'export const valid = true;\n', 'utf8');
+
+    const reviewInputs: ReviewInput[] = [];
+    const review = vi.fn(async (input: ReviewInput): Promise<ReviewResult> => {
+      reviewInputs.push(input);
+      return {
+        summary: 'Cumulative review passed.',
+        blockers: [],
+        safeImprovements: [],
+        riskyChanges: []
+      };
+    });
+    const implement = vi.fn(async (): Promise<ImplementResult> => ({
+      outcome: 'already_satisfied',
+      summary: 'The branch already contains the requested workflow.',
+      changedFiles: [],
+      evidenceFiles: ['.github/workflows/native-soak.yml', 'validator.mjs'],
+      diffStat: { filesChanged: 0, insertions: 0, deletions: 0 },
+      requestedApprovals: [],
+      validationChecks: [{ kind: 'command', command: 'node --version' }]
+    }));
+
+    const result = await runWorkerTask({
+      project: {
+        ...demoProject,
+        defaultBranch: 'main',
+        configYaml: noGitProjectConfig.replace('create_branch: false', 'create_branch: true')
+      },
+      task: { ...task, branchName: 'ai/task-review' },
+      provider: createProviderStub({ implement, review }),
+      github: createGitHubStub(),
+      verifyCommand: 'node --version',
+      workspaceRoot,
+      resume: {
+        kind: 'phase_retry',
+        resumeFrom: 'implementation',
+        attempt: 2,
+        implementationSummary: 'Previous implementation.',
+        previousReviewBlockers: ['Review did not see committed task changes.'],
+        validationChecks: [{ kind: 'command', command: 'node --version' }]
+      }
+    });
+
+    expect(result.status).toBe('ready_for_user_review');
+    expect(reviewInputs).toHaveLength(1);
+    expect(reviewInputs[0]?.changedFiles).toEqual(expect.arrayContaining([
+      '.github/workflows/native-soak.yml',
+      'validator.mjs'
+    ]));
+    expect(reviewInputs[0]?.diff).toContain('native-soak.yml');
+    expect(reviewInputs[0]?.diff).toContain('validator.mjs');
+  }, 15000);
 
   it('ignores review blockers caused only by read-only validation limitations after successful validation', async () => {
     const workspaceRoot = join(tmpdir(), `forgemind-worker-review-validation-limit-${randomUUID()}`);

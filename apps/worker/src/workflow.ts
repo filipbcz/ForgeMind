@@ -326,6 +326,7 @@ export async function runWorkerTask(input: WorkerTaskInput): Promise<WorkerTaskR
     });
   }
   const installCommand = config.installCommand ?? await inferRepositoryInstallCommand(workspacePath);
+  const hasAuthoritativeResumeValidationPlan = Boolean(input.resume?.validationChecks?.length);
   let validationChecks = await resolveValidationChecks({
     plan,
     installCommand,
@@ -496,7 +497,7 @@ export async function runWorkerTask(input: WorkerTaskInput): Promise<WorkerTaskR
       changedFiles: uniqueStrings([...implementation.changedFiles, ...substantiveChangedFiles]).filter(isSubstantiveImplementationPath),
       diffStat: actualDiffStat
     };
-    if (!isResumedImplementation && !config.verifyCommand?.trim()) {
+    if (!isResumedImplementation && !config.verifyCommand?.trim() && !hasAuthoritativeResumeValidationPlan) {
       validationChecks = await resolveValidationChecks({
         plan: { ...plan, validationChecks: implementation.validationChecks },
         installCommand,
@@ -981,9 +982,23 @@ export async function runWorkerTask(input: WorkerTaskInput): Promise<WorkerTaskR
           ? await collectSatisfactionEvidence(git, workspacePath, implementation.evidenceFiles ?? [])
           : undefined;
         satisfactionEvidenceErrors = satisfactionEvidence?.errors ?? [];
-        const reviewChangedFiles = satisfactionEvidence?.files
-          ?? (previousReviewForCorrection ? correctionChangedFiles : implementation.changedFiles);
-        const reviewDiff = satisfactionReview ? '' : await collectReviewDiff(git, workspacePath, reviewChangedFiles);
+        const requestedReviewFiles = satisfactionEvidence?.files
+          ?? (previousReviewForCorrection
+            ? uniqueStrings([
+                ...correctionChangedFiles,
+                ...(implementation.outcome === 'already_satisfied' ? implementation.evidenceFiles ?? [] : [])
+              ])
+            : implementation.changedFiles);
+        const reviewPacket = satisfactionReview
+          ? { changedFiles: requestedReviewFiles, diff: '' }
+          : await collectReviewPacket(
+              git,
+              workspacePath,
+              requestedReviewFiles,
+              input.project.defaultBranch
+            );
+        const reviewChangedFiles = reviewPacket.changedFiles;
+        const reviewDiff = reviewPacket.diff;
         const reviewPromise = reviewProvider.review({
             taskId: input.task.id,
             taskTitle: input.task.title,
@@ -2994,18 +3009,28 @@ async function collectSatisfactionEvidence(
   };
 }
 
-async function collectReviewDiff(
+async function collectReviewPacket(
   git: SimpleGit,
   workspacePath: string,
-  requestedPaths?: string[]
-): Promise<string> {
+  requestedPaths: string[] | undefined,
+  baseBranch: string
+): Promise<{ changedFiles: string[]; diff: string }> {
   const status = await git.status();
   const requestedPathSet = requestedPaths
     ? new Set(requestedPaths.map(normalizeRepoPath))
     : undefined;
-  const changedPaths = collectStageablePaths(status)
+  const workspaceChangedPaths = collectStageablePaths(status)
     .filter(isSubstantiveImplementationPath)
     .filter((path) => !requestedPathSet || requestedPathSet.has(normalizeRepoPath(path)));
+  const baseRef = await resolveReviewBaseRef(git, baseBranch);
+  const committedPaths = baseRef
+    ? (await git.diff(['--name-only', `${baseRef}...HEAD`]))
+        .split(/\r?\n/)
+        .map((path) => path.trim())
+        .filter(Boolean)
+        .filter(isSubstantiveImplementationPath)
+    : [];
+  const changedPaths = uniqueStrings([...committedPaths, ...workspaceChangedPaths]);
   const summaryOnlyPaths = changedPaths.filter(isReviewSummaryOnlyPath);
   const reviewPaths = changedPaths.filter((path) => !isReviewSummaryOnlyPath(path));
   const untrackedPaths = new Set(status.not_added.map(normalizeRepoPath));
@@ -3019,9 +3044,27 @@ async function collectReviewDiff(
     ].join('\n'));
   }
 
-  if (trackedPaths.length > 0) {
+  const committedTrackedPaths = trackedPaths.filter((path) => committedPaths.some(
+    (committedPath) => normalizeRepoPath(committedPath) === normalizeRepoPath(path)
+  ));
+  const workspaceTrackedPaths = trackedPaths.filter((path) => workspaceChangedPaths.some(
+    (workspacePath) => normalizeRepoPath(workspacePath) === normalizeRepoPath(path)
+  ));
+
+  if (baseRef && committedTrackedPaths.length > 0) {
     try {
-      const trackedDiff = await git.diff(['--unified=3', 'HEAD', '--', ...trackedPaths]);
+      const committedDiff = await git.diff(['--unified=3', `${baseRef}...HEAD`, '--', ...committedTrackedPaths]);
+      if (committedDiff.trim()) {
+        sections.push(committedDiff);
+      }
+    } catch {
+      // If the base ref cannot be compared, the current workspace diff still remains reviewable below.
+    }
+  }
+
+  if (workspaceTrackedPaths.length > 0) {
+    try {
+      const trackedDiff = await git.diff(['--unified=3', 'HEAD', '--', ...workspaceTrackedPaths]);
       if (trackedDiff.trim()) {
         sections.push(trackedDiff);
       }
@@ -3038,7 +3081,24 @@ async function collectReviewDiff(
     sections.push(await renderUntrackedFileDiff(workspacePath, path));
   }
 
-  return truncateReviewDiff(sections.filter(Boolean).join('\n'));
+  return {
+    changedFiles: changedPaths,
+    diff: truncateReviewDiff(sections.filter(Boolean).join('\n'))
+  };
+}
+
+async function resolveReviewBaseRef(git: SimpleGit, baseBranch: string): Promise<string | undefined> {
+  for (const candidate of [`origin/${baseBranch}`, baseBranch]) {
+    try {
+      const head = (await git.raw(['rev-parse', '--verify', 'HEAD'])).trim();
+      const candidateHead = (await git.raw(['rev-parse', '--verify', `${candidate}^{commit}`])).trim();
+      const mergeBase = (await git.raw(['merge-base', candidate, 'HEAD'])).trim();
+      if (head !== candidateHead && mergeBase === candidateHead) return candidate;
+    } catch {
+      // Try the next candidate. Local workspaces do not always have a remote-tracking base branch.
+    }
+  }
+  return undefined;
 }
 
 async function collectChangedPathSnapshot(
@@ -3247,7 +3307,7 @@ async function checkoutWorkspaceBranch(git: SimpleGit, branchName: string, hasRe
 
 async function stageAndCommitChanges(git: SimpleGit, message: string) {
   const initialStatus = await git.status();
-  const pathsToStage = collectStageablePaths(initialStatus);
+  const pathsToStage = collectStageablePaths(initialStatus).filter(isSubstantiveImplementationPath);
   if (pathsToStage.length === 0 && initialStatus.staged.length === 0) {
     return;
   }
@@ -3302,7 +3362,15 @@ function isSubstantiveImplementationPath(path: string): boolean {
 
 function isGeneratedWorkerPath(path: string): boolean {
   const normalized = normalizeRepoPath(path);
-  return normalized === 'agents.md' || normalized === 'mock_implementation.md';
+  const segments = normalized.split('/');
+  return normalized === 'agents.md'
+    || normalized === 'mock_implementation.md'
+    || segments.includes('node_modules')
+    || normalized === 'out/build'
+    || normalized.startsWith('out/build/')
+    || normalized === 'build'
+    || normalized.startsWith('build/')
+    || segments.some((segment) => segment.startsWith('cmake-build-'));
 }
 
 function normalizeRepoPath(path: string): string {
