@@ -151,6 +151,8 @@ describe('validation runner', () => {
     expect(correctedResult.passed).toBe(true);
     expect(correctedResult.executedCheckCount).toBe(2);
     expect(correctedResult.reusedCheckCount).toBe(1);
+    expect(correctedResult.stdout).toContain('Reused successful validation evidence for the unchanged workspace input.');
+    expect(correctedResult.stdout).toContain('[command]');
     expect(await readFile(join(cwd, 'passed-count.txt'), 'utf8')).toBe('1');
     expect(await readFile(join(cwd, 'corrected.txt'), 'utf8')).toBe('ok');
     expect(await readFile(join(cwd, 'later.txt'), 'utf8')).toBe('ok');
@@ -177,6 +179,33 @@ describe('validation runner', () => {
     expect(resumed.reusedCheckCount).toBe(1);
     expect(changed.executedCheckCount).toBe(1);
     expect(await readFile(join(cwd, 'count.txt'), 'utf8')).toBe('2');
+  });
+
+  it('does not reuse a legacy unscoped validation result for a changed workspace', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'forgemind-validation-legacy-checkpoint-'));
+    const command = `node -e "require('node:fs').writeFileSync('executed.txt','fresh')"`;
+    const legacy = new Map([[
+      command,
+      {
+        command,
+        exitCode: 0,
+        stdout: 'stale output',
+        stderr: '',
+        passed: true
+      }
+    ]]);
+
+    const result = await runValidationChecks(
+      [{ kind: 'command', command }],
+      cwd,
+      undefined,
+      legacy,
+      'current-workspace-hash'
+    );
+
+    expect(result.executedCheckCount).toBe(1);
+    expect(result.reusedCheckCount).toBe(0);
+    expect(await readFile(join(cwd, 'executed.txt'), 'utf8')).toBe('fresh');
   });
 
   it('rejects shell output redirection outside quoted arguments', () => {

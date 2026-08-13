@@ -995,6 +995,10 @@ describe('worker workflow', () => {
       riskyChanges: []
     }));
     const provider = createProviderStub({ plan, implement, review });
+    const validationInputHash = createHash('sha256')
+      .update('status.txt')
+      .update('implemented\n')
+      .digest('hex');
 
     const result = await runWorkerTask({
       project,
@@ -1017,7 +1021,8 @@ describe('worker workflow', () => {
           exitCode: 0,
           stdout: 'Passed before interruption.',
           stderr: '',
-          passed: true
+          passed: true,
+          inputHash: validationInputHash
         }]
       }
     });
@@ -1026,6 +1031,10 @@ describe('worker workflow', () => {
     expect(result.validation.passed).toBe(true);
     expect(result.validation.executedCheckCount).toBe(1);
     expect(result.validation.reusedCheckCount).toBe(1);
+    expect(result.validation.stdout).toContain('Passed before interruption.');
+    expect(review).toHaveBeenCalledWith(expect.objectContaining({
+      validation: expect.objectContaining({ stdout: expect.stringContaining('Passed before interruption.') })
+    }));
     expect(plan).not.toHaveBeenCalled();
     expect(implement).not.toHaveBeenCalled();
     expect(review).toHaveBeenCalledOnce();

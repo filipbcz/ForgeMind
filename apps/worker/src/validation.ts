@@ -60,6 +60,10 @@ export interface ValidationActivity {
   reused?: boolean;
   inputHash?: string;
   category?: ValidationCheck['category'];
+  stdout?: string;
+  stderr?: string;
+  criterion?: string;
+  rationale?: string;
 }
 
 export type ValidationActivityHandler = (activity: ValidationActivity) => Promise<void> | void;
@@ -273,7 +277,7 @@ export async function runValidationChecks(
     throwIfAborted(signal);
     const effectiveCommand = normalizeValidationCommandForEnvironment(check.command);
     const resultKey = validationCheckResultKey(effectiveCommand, inputHash);
-    const passedResult = passedCheckResults.get(resultKey) ?? passedCheckResults.get(effectiveCommand);
+    const passedResult = passedCheckResults.get(resultKey);
     if (passedResult?.passed) {
       reusedCheckCount += 1;
       checkResults.push({
@@ -283,7 +287,19 @@ export async function runValidationChecks(
         inputHash
       });
       outputs.push(`[command] ${effectiveCommand}`);
-      outputs.push('[result] Previously passed; not executed again.');
+      if (check.criterion) {
+        outputs.push(`[criterion] ${check.criterion}`);
+      }
+      if (check.rationale) {
+        outputs.push(`[rationale] ${check.rationale}`);
+      }
+      outputs.push('[result] Reused successful validation evidence for the unchanged workspace input.');
+      if (passedResult.stdout) {
+        outputs.push(passedResult.stdout);
+      }
+      if (passedResult.stderr) {
+        outputs.push(passedResult.stderr);
+      }
       await onActivity?.({
         state: 'completed',
         command: effectiveCommand,
@@ -293,7 +309,11 @@ export async function runValidationChecks(
         exitCode: 0,
         reused: true,
         inputHash,
-        category: check.category
+        category: check.category,
+        stdout: passedResult.stdout,
+        stderr: passedResult.stderr,
+        criterion: check.criterion,
+        rationale: check.rationale
       });
       continue;
     }
@@ -330,7 +350,11 @@ export async function runValidationChecks(
       elapsedMs: Date.now() - startedAt,
       exitCode: result.exitCode,
       inputHash,
-      category: check.category
+      category: check.category,
+      stdout: result.stdout,
+      stderr: result.stderr,
+      criterion: check.criterion,
+      rationale: check.rationale
     });
     outputs.push(`[command] ${effectiveCommand}`);
     if (check.criterion) {

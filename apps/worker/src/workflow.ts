@@ -716,7 +716,16 @@ export async function runWorkerTask(input: WorkerTaskInput): Promise<WorkerTaskR
             phase: 'validation',
             status: activity.exitCode === 0 ? 'completed' : 'failed',
             inputHash: activity.inputHash ?? validationInputHash,
-            output: { command: activity.command, category: activity.category ?? null, exitCode: activity.exitCode ?? null },
+            output: {
+              evidenceVersion: 1,
+              command: activity.command,
+              category: activity.category ?? null,
+              exitCode: activity.exitCode ?? null,
+              stdout: activity.stdout ?? '',
+              stderr: activity.stderr ?? '',
+              criterion: activity.criterion ?? null,
+              rationale: activity.rationale ?? null
+            },
             errorMessage: activity.exitCode === 0 ? undefined : `Validation command exited with ${activity.exitCode ?? 1}.`
           });
         }, passedValidationCheckResults, validationInputHash, input.signal);
@@ -737,7 +746,16 @@ export async function runWorkerTask(input: WorkerTaskInput): Promise<WorkerTaskR
               .map((result) => result.command),
             passedValidationChecks: (validation.checkResults ?? [])
               .filter((result) => result.passed)
-              .map((result) => ({ command: result.command, inputHash: result.inputHash ?? null })),
+              .map((result) => ({
+                command: result.command,
+                inputHash: result.inputHash ?? null,
+                exitCode: result.exitCode,
+                stdout: result.stdout,
+                stderr: result.stderr,
+                passed: result.passed,
+                criterion: result.criterion ?? null,
+                rationale: result.rationale ?? null
+              })),
             executedCheckCount: validation.executedCheckCount ?? 0,
             reusedCheckCount: validation.reusedCheckCount ?? 0,
             failingCommand: validation.failingCommand ?? null,

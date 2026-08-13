@@ -1715,42 +1715,26 @@ function buildPhaseRetryResume(
   completedOperations.push(...checkpoints
     .filter((checkpoint) => checkpoint.status === 'completed' && checkpoint.key.startsWith('external:'))
     .map((checkpoint) => checkpoint.key.slice('external:'.length)));
-  const completedValidationCommands = relevantAudit
-    .filter((event) => timestampOf(event.createdAt) >= timestampOf(latestImplementation?.createdAt))
-    .filter((event) => event.eventType === 'task_activity')
-    .map((event) => asRecord(event.payload))
-    .filter((payload) => (
-      payload?.phase === 'validation'
-      && payload.operation === 'validation_command'
-      && payload.state === 'completed'
-      && payload.exitCode === 0
-      && typeof payload.detail === 'string'
-    ))
-    .map((payload) => payload!.detail as string);
-  const persistedValidationCommands = validationIsCurrent
-    ? extractStringArray(latestValidation?.validationResult, 'passedValidationCommands')
+  const persistedValidationChecks = validationIsCurrent
+    ? extractPassedValidationChecks(latestValidation?.validationResult)
     : [];
-  const passedValidationChecks: NonNullable<WorkerTaskResume['passedValidationChecks']> = Array.from(new Set([
-    ...completedValidationCommands,
-    ...persistedValidationCommands
-  ])).map((command) => ({
-      command,
-      exitCode: 0,
-      stdout: 'Previously passed before the worker retry.',
-      stderr: '',
-      passed: true
-  }));
+  const passedValidationChecks: NonNullable<WorkerTaskResume['passedValidationChecks']> = [
+    ...persistedValidationChecks
+  ];
   for (const checkpoint of checkpoints.filter((item) => item.status === 'completed' && item.key.startsWith('validation:'))) {
     const output = asRecord(checkpoint.output);
+    if (output?.evidenceVersion !== 1) continue;
     const command = typeof output?.command === 'string' ? output.command : undefined;
     if (!command || passedValidationChecks.some((item) => item.command === command && item.inputHash === checkpoint.inputHash)) continue;
     passedValidationChecks.push({
       command,
-      exitCode: 0,
-      stdout: 'Previously passed before the worker retry.',
-      stderr: '',
+      exitCode: typeof output?.exitCode === 'number' ? output.exitCode : 0,
+      stdout: typeof output?.stdout === 'string' ? output.stdout : '',
+      stderr: typeof output?.stderr === 'string' ? output.stderr : '',
       passed: true,
-      inputHash: checkpoint.inputHash
+      inputHash: checkpoint.inputHash,
+      criterion: typeof output?.criterion === 'string' ? output.criterion : undefined,
+      rationale: typeof output?.rationale === 'string' ? output.rationale : undefined
     });
   }
   const latestPlanningResult = latestIteration?.phase === 'planning'
@@ -1943,6 +1927,36 @@ function extractLatestValidationChecks(iterations: TaskDiffIterationSnapshot[]):
     if (checks?.length) return checks;
   }
   return undefined;
+}
+
+function extractPassedValidationChecks(value: unknown): NonNullable<WorkerTaskResume['passedValidationChecks']> {
+  const payload = asRecord(value);
+  if (!Array.isArray(payload?.passedValidationChecks)) return [];
+  return payload.passedValidationChecks.flatMap((entry) => {
+    const check = asRecord(entry);
+    if (
+      !check
+      || typeof check.command !== 'string'
+      || typeof check.inputHash !== 'string'
+      || check.inputHash.length === 0
+      || typeof check.exitCode !== 'number'
+      || typeof check.stdout !== 'string'
+      || typeof check.stderr !== 'string'
+      || typeof check.passed !== 'boolean'
+    ) {
+      return [];
+    }
+    return [{
+      command: check.command,
+      exitCode: check.exitCode,
+      stdout: check.stdout,
+      stderr: check.stderr,
+      passed: check.passed,
+      inputHash: check.inputHash,
+      criterion: typeof check.criterion === 'string' ? check.criterion : undefined,
+      rationale: typeof check.rationale === 'string' ? check.rationale : undefined
+    }];
+  });
 }
 
 function normalizeResumeDiffStat(value: unknown): WorkerTaskResume['diffStat'] | undefined {
