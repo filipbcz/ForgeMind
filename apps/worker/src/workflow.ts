@@ -92,6 +92,14 @@ export interface WorkerTaskResume {
   };
 }
 
+interface ResumedWorkspaceSync {
+  previousHead: string;
+  currentHead: string;
+  treeChanged: boolean;
+  changedFiles: string[];
+  diffStat: ImplementResult['diffStat'];
+}
+
 export interface WorkerTaskHooks {
   onStatus?: (status: TaskStatus, payload?: JsonValue) => Promise<void>;
   onActivity?: (activity: TaskActivity) => Promise<void>;
@@ -203,7 +211,6 @@ export async function runWorkerTask(input: WorkerTaskInput): Promise<WorkerTaskR
   }
 
   const remoteUrl = github ? resolveGitRemoteUrl(github, input.project) : process.env.FORGEMIND_GITHUB_REMOTE_URL;
-  const reuseExistingWorkspaceRepo = Boolean(input.resume) && await hasExistingWorkspaceRepo(workspacePath);
   if (config.createBranch && !existingBranchName) {
     await runGitHubOperation(
       input.hooks,
@@ -213,9 +220,25 @@ export async function runWorkerTask(input: WorkerTaskInput): Promise<WorkerTaskR
       input.signal
     );
   }
-  const git = await prepareWorkspaceGit(workspacePath, branchName, input.project.defaultBranch, reuseExistingWorkspaceRepo ? undefined : remoteUrl, {
-    skipRemoteFetchForExistingRepo: Boolean(input.resume)
+  const workspace = await prepareWorkspaceGit(workspacePath, branchName, input.project.defaultBranch, remoteUrl, {
+    syncRemoteBranch: Boolean(input.resume)
   });
+  const git = workspace.git;
+  if (input.resume && workspace.resumedSync) {
+    input = {
+      ...input,
+      resume: reconcileResumeAfterRemoteSync(input.resume, workspace.resumedSync)
+    };
+    await emitTaskActivity(input.hooks, {
+      phase: 'workspace',
+      state: 'completed',
+      title: 'Pracovni vetev byla aktualizovana',
+      detail: workspace.resumedSync.treeChanged
+        ? `Vzdaleny commit ${workspace.resumedSync.currentHead} zmenil obsah; validace a review probehnou znovu.`
+        : `Vzdaleny commit ${workspace.resumedSync.currentHead} nezmenil obsah; zopakuji se pouze GitHub checks.`,
+      operation: 'sync_remote_branch'
+    });
+  }
   await emitTaskActivity(input.hooks, {
     phase: 'workspace',
     state: 'completed',
@@ -3277,7 +3300,7 @@ async function prepareWorkspaceGit(
   baseBranch: string,
   remoteUrl: string | undefined,
   options?: {
-    skipRemoteFetchForExistingRepo?: boolean;
+    syncRemoteBranch?: boolean;
   }
 ) {
   const git = simpleGit({ baseDir: workspacePath });
@@ -3294,18 +3317,118 @@ async function prepareWorkspaceGit(
 
   if (remoteUrl) {
     const remotes = await git.getRemotes(true);
-    if (!remotes.some((item) => item.name === 'origin')) {
+    const hasOrigin = remotes.some((item) => item.name === 'origin');
+    if (!hasOrigin) {
       await git.addRemote('origin', remoteUrl);
+    } else {
+      await git.raw(['remote', 'set-url', 'origin', remoteUrl]);
     }
-    if (!(options?.skipRemoteFetchForExistingRepo && isRepo)) {
-      await git.fetch('origin');
-    }
+    await git.fetch('origin');
   }
 
   await configureWorkspaceGitIdentity(git);
   await removeStaleGeneratedInstructionsBeforeCheckout(git, workspacePath);
   await checkoutWorkspaceBranch(git, branchName, Boolean(remoteUrl));
-  return git;
+  const resumedSync = options?.syncRemoteBranch && remoteUrl
+    ? await fastForwardCleanWorkspaceToRemote(git, branchName)
+    : undefined;
+  return { git, resumedSync };
+}
+
+async function fastForwardCleanWorkspaceToRemote(
+  git: SimpleGit,
+  branchName: string
+): Promise<ResumedWorkspaceSync | undefined> {
+  const status = await git.status();
+  if (status.files.length > 0) return undefined;
+
+  const remoteRef = `origin/${branchName}`;
+  const branches = await git.branch(['-r']);
+  if (!branches.all.includes(remoteRef)) return undefined;
+
+  const previousHead = (await git.revparse(['HEAD'])).trim();
+  const currentRemoteHead = (await git.revparse([remoteRef])).trim();
+  if (previousHead === currentRemoteHead) return undefined;
+
+  try {
+    await git.raw(['merge-base', '--is-ancestor', previousHead, currentRemoteHead]);
+  } catch {
+    return undefined;
+  }
+
+  const previousTree = (await git.revparse([`${previousHead}^{tree}`])).trim();
+  await git.merge(['--ff-only', remoteRef]);
+  const currentHead = (await git.revparse(['HEAD'])).trim();
+  const currentTree = (await git.revparse([`${currentHead}^{tree}`])).trim();
+  const changedFiles = (await git.diff(['--name-only', `${previousHead}..${currentHead}`]))
+    .split(/\r?\n/)
+    .map((path) => path.trim())
+    .filter(Boolean)
+    .filter(isSubstantiveImplementationPath);
+  const diffStat = await collectCommittedRangeDiffStat(git, previousHead, currentHead, changedFiles);
+
+  return {
+    previousHead,
+    currentHead,
+    treeChanged: previousTree !== currentTree,
+    changedFiles,
+    diffStat
+  };
+}
+
+async function collectCommittedRangeDiffStat(
+  git: SimpleGit,
+  previousHead: string,
+  currentHead: string,
+  changedFiles: string[]
+): Promise<ImplementResult['diffStat']> {
+  let insertions = 0;
+  let deletions = 0;
+  const numstat = await git.diff(['--numstat', `${previousHead}..${currentHead}`]);
+  for (const line of numstat.split(/\r?\n/)) {
+    if (!line.trim()) continue;
+    const [added, removed, ...pathParts] = line.split(/\s+/);
+    const path = pathParts.join(' ');
+    if (!path || !isSubstantiveImplementationPath(path)) continue;
+    insertions += Number.parseInt(added ?? '0', 10) || 0;
+    deletions += Number.parseInt(removed ?? '0', 10) || 0;
+  }
+  return { filesChanged: changedFiles.length, insertions, deletions };
+}
+
+function reconcileResumeAfterRemoteSync(
+  resume: WorkerTaskResume,
+  sync: ResumedWorkspaceSync
+): WorkerTaskResume {
+  const withoutStaleDelivery = (resume.completedOperations ?? []).filter((operation) => (
+    operation !== 'wait_for_checks' && operation !== 'merge_pr'
+  ));
+  if (!sync.treeChanged) {
+    return {
+      ...resume,
+      completedOperations: withoutStaleDelivery,
+      githubChecks: undefined,
+      githubChecksInputHash: undefined,
+      mergeCommitSha: undefined
+    };
+  }
+
+  return {
+    ...resume,
+    resumeFrom: 'validation',
+    changedFiles: uniqueStrings([...(resume.changedFiles ?? []), ...sync.changedFiles]),
+    diffStat: sync.diffStat,
+    validation: undefined,
+    passedValidationChecks: [],
+    resumeValidationPlanRevision: false,
+    reviewSummary: undefined,
+    riskyChanges: undefined,
+    completedOperations: withoutStaleDelivery,
+    githubChecks: undefined,
+    githubChecksInputHash: undefined,
+    mergeCommitSha: undefined,
+    completedSatisfactionReview: undefined
+  };
 }
 
 async function configureWorkspaceGitIdentity(git: SimpleGit) {
@@ -3389,10 +3512,6 @@ async function isWorkspaceGitRoot(git: SimpleGit, workspacePath: string): Promis
   } catch {
     return false;
   }
-}
-
-async function hasExistingWorkspaceRepo(workspacePath: string): Promise<boolean> {
-  return await isWorkspaceGitRoot(simpleGit({ baseDir: workspacePath }), workspacePath);
 }
 
 function sameResolvedPath(left: string, right: string): boolean {

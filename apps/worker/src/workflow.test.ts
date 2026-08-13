@@ -1402,6 +1402,148 @@ describe('worker workflow', () => {
     expect(result.githubChecks?.summary).toBe('Current commit passed.');
   }, 15000);
 
+  it('fast-forwards a clean resumed workspace and reruns only GitHub checks for an empty remote commit', async () => {
+    const root = join(tmpdir(), `forgemind-worker-resume-remote-empty-${randomUUID()}`);
+    const remotePath = join(root, 'remote.git');
+    const sourcePath = join(root, 'source');
+    const workspaceRoot = join(root, 'workspaces');
+    const task = {
+      ...demoTask,
+      id: `task_${randomUUID()}`,
+      githubIssueNumber: 1234,
+      githubIssueUrl: 'https://github.com/demo/demo-static-gallery/issues/1234',
+      branchName: 'ai/1234-remote-empty',
+      pullRequestNumber: 4321,
+      pullRequestUrl: 'https://github.com/demo/demo-static-gallery/pull/4321'
+    };
+    const workspacePath = join(workspaceRoot, task.id);
+    await mkdir(remotePath, { recursive: true });
+    await simpleGit({ baseDir: remotePath }).init(true);
+    await mkdir(sourcePath, { recursive: true });
+    const sourceGit = simpleGit({ baseDir: sourcePath });
+    await sourceGit.init();
+    await sourceGit.addConfig('user.name', 'ForgeMind Test');
+    await sourceGit.addConfig('user.email', 'forgemind-test@example.com');
+    await writeFile(join(sourcePath, 'status.txt'), 'implemented\n', 'utf8');
+    await sourceGit.add('.');
+    await sourceGit.commit('Initial implementation');
+    await sourceGit.branch(['-M', 'main']);
+    await sourceGit.addRemote('origin', remotePath);
+    await sourceGit.push(['-u', 'origin', 'main']);
+    await sourceGit.checkoutLocalBranch(task.branchName);
+    await sourceGit.push(['-u', 'origin', task.branchName]);
+    await mkdir(workspaceRoot, { recursive: true });
+    await simpleGit().clone(remotePath, workspacePath, ['--branch', task.branchName]);
+    await sourceGit.commit('External empty commit', undefined, { '--allow-empty': null });
+    await sourceGit.push('origin', task.branchName);
+    const remoteHead = (await sourceGit.revparse(['HEAD'])).trim();
+
+    const plan = vi.fn();
+    const implement = vi.fn();
+    const review = vi.fn();
+    const waitForChecks = vi.fn(async () => ({ status: 'success' as const, summary: 'Fresh CI passed.', failures: [] }));
+    const result = await runWorkerTask({
+      project: { ...gitEnabledProject, configYaml: gitProjectConfig.replace('auto_push: false', 'auto_push: true') },
+      task,
+      provider: createProviderStub({ plan, implement, review }),
+      github: createGitHubStub({ getRemoteUrl: () => remotePath, waitForChecks }),
+      workspaceRoot,
+      resume: {
+        kind: 'phase_retry', resumeFrom: 'delivery', attempt: 1,
+        planSummary: 'Original plan', implementationSummary: 'Implementation complete.',
+        changedFiles: ['status.txt'], diffStat: { filesChanged: 1, insertions: 1, deletions: 0 },
+        validation: { command: 'node --version', exitCode: 0, stdout: 'passed', stderr: '', passed: true },
+        reviewSummary: 'Review passed.',
+        completedOperations: ['commit', 'commit_and_push', 'wait_for_checks'],
+        githubChecks: { status: 'success', summary: 'Old CI passed.', failures: [] },
+        githubChecksInputHash: createHash('sha256').update(`old-head:${task.pullRequestNumber}`).digest('hex')
+      }
+    });
+
+    expect(result.status).toBe('ready_for_user_review');
+    expect((await simpleGit({ baseDir: workspacePath }).revparse(['HEAD'])).trim()).toBe(remoteHead);
+    expect(plan).not.toHaveBeenCalled();
+    expect(implement).not.toHaveBeenCalled();
+    expect(review).not.toHaveBeenCalled();
+    expect(waitForChecks).toHaveBeenCalledWith(expect.anything(), remoteHead, expect.anything());
+  }, 20000);
+
+  it('reruns validation and review after a remote commit changes the resumed workspace tree', async () => {
+    const root = join(tmpdir(), `forgemind-worker-resume-remote-tree-${randomUUID()}`);
+    const remotePath = join(root, 'remote.git');
+    const sourcePath = join(root, 'source');
+    const workspaceRoot = join(root, 'workspaces');
+    const task = {
+      ...demoTask,
+      id: `task_${randomUUID()}`,
+      githubIssueNumber: 1234,
+      githubIssueUrl: 'https://github.com/demo/demo-static-gallery/issues/1234',
+      branchName: 'ai/1234-remote-tree',
+      pullRequestNumber: 4321,
+      pullRequestUrl: 'https://github.com/demo/demo-static-gallery/pull/4321'
+    };
+    const workspacePath = join(workspaceRoot, task.id);
+    await mkdir(remotePath, { recursive: true });
+    await simpleGit({ baseDir: remotePath }).init(true);
+    await mkdir(sourcePath, { recursive: true });
+    const sourceGit = simpleGit({ baseDir: sourcePath });
+    await sourceGit.init();
+    await sourceGit.addConfig('user.name', 'ForgeMind Test');
+    await sourceGit.addConfig('user.email', 'forgemind-test@example.com');
+    await writeFile(join(sourcePath, 'status.txt'), 'implemented\n', 'utf8');
+    await sourceGit.add('.');
+    await sourceGit.commit('Initial implementation');
+    await sourceGit.branch(['-M', 'main']);
+    await sourceGit.addRemote('origin', remotePath);
+    await sourceGit.push(['-u', 'origin', 'main']);
+    await sourceGit.checkoutLocalBranch(task.branchName);
+    await sourceGit.push(['-u', 'origin', task.branchName]);
+    await mkdir(workspaceRoot, { recursive: true });
+    await simpleGit().clone(remotePath, workspacePath, ['--branch', task.branchName]);
+    await writeFile(join(sourcePath, 'external-fix.txt'), 'fixed\n', 'utf8');
+    await sourceGit.add('external-fix.txt');
+    await sourceGit.commit('External implementation fix');
+    await sourceGit.push('origin', task.branchName);
+
+    const plan = vi.fn();
+    const implement = vi.fn();
+    const review = vi.fn(async (): Promise<ReviewResult> => ({
+      summary: 'Updated tree reviewed.', blockers: [], safeImprovements: [], riskyChanges: []
+    }));
+    const validationIterations: Array<{ validationResult: unknown }> = [];
+    const result = await runWorkerTask({
+      project: { ...gitEnabledProject, configYaml: gitProjectConfig.replace('auto_push: false', 'auto_push: true') },
+      task,
+      provider: createProviderStub({ plan, implement, review }),
+      github: createGitHubStub({
+        getRemoteUrl: () => remotePath,
+        waitForChecks: async () => ({ status: 'success', summary: 'Updated CI passed.', failures: [] })
+      }),
+      workspaceRoot,
+      hooks: {
+        onIteration: async (iteration) => {
+          if (iteration.phase === 'validation') validationIterations.push(iteration);
+        }
+      },
+      resume: {
+        kind: 'phase_retry', resumeFrom: 'delivery', attempt: 1,
+        planSummary: 'Original plan', implementationSummary: 'Implementation complete.',
+        changedFiles: ['status.txt'], diffStat: { filesChanged: 1, insertions: 1, deletions: 0 },
+        validationChecks: [{ kind: 'command', command: 'node --version', category: 'smoke' }],
+        validation: { command: 'node --version', exitCode: 0, stdout: 'old pass', stderr: '', passed: true },
+        reviewSummary: 'Old review passed.',
+        completedOperations: ['commit', 'commit_and_push', 'wait_for_checks']
+      }
+    });
+
+    expect(result.status).toBe('ready_for_user_review');
+    expect(plan).not.toHaveBeenCalled();
+    expect(implement).not.toHaveBeenCalled();
+    expect(review).toHaveBeenCalledOnce();
+    expect(validationIterations).toHaveLength(1);
+    expect(validationIterations[0]?.validationResult).toEqual(expect.objectContaining({ passed: true }));
+  }, 20000);
+
   it('resumes approved review risk changes without rerunning planning, implementation, or review', async () => {
     const workspaceRoot = join(tmpdir(), `forgemind-worker-resume-approved-review-${randomUUID()}`);
     const task = {

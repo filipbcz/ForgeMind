@@ -208,7 +208,8 @@ export async function runDatabaseWorkerOnce(options: { deferInterruptSignals?: b
     repository,
     claimed.task.id,
     claimed.queueReason,
-    claimed.taskRun.id
+    claimed.taskRun.id,
+    claimed.task.maxIterations
   );
   let costEstimate;
   try {
@@ -1507,7 +1508,8 @@ async function resolveTaskResumeContext(
   },
   taskId: string,
   queueReason?: string,
-  currentTaskRunId?: string
+  currentTaskRunId?: string,
+  maxIterations?: number
 ): Promise<TaskResumeContext | undefined> {
   const [approvals, diff, audit, checkpoints] = await Promise.all([
     repository.listApprovals(),
@@ -1531,7 +1533,15 @@ async function resolveTaskResumeContext(
     : undefined;
 
   if (queueReason === 'task_retried' || queueReason === 'worker_interrupted' || queueReason === 'phase_retry') {
-    const phaseRetryResume = buildPhaseRetryResume(diff.iterations, audit, approvedTypes, currentTaskRunId, checkpoints);
+    const phaseRetryResume = buildPhaseRetryResume(
+      diff.iterations,
+      audit,
+      approvedTypes,
+      currentTaskRunId,
+      checkpoints,
+      queueReason === 'task_retried',
+      maxIterations
+    );
     if (phaseRetryResume) {
       return {
         workflowResume: phaseRetryResume,
@@ -1634,7 +1644,9 @@ function buildPhaseRetryResume(
   audit: TaskAuditSnapshot[],
   approvedTypes: ReadonlySet<ApprovalType>,
   currentTaskRunId?: string,
-  checkpoints: TaskCheckpointSnapshot[] = []
+  checkpoints: TaskCheckpointSnapshot[] = [],
+  resetExhaustedAttempt = false,
+  maxIterations?: number
 ): WorkerTaskResume | undefined {
   const completedIterations = [...iterations].sort((left, right) => timestampOf(left.createdAt) - timestampOf(right.createdAt));
   const latestIteration = completedIterations.at(-1);
@@ -1728,9 +1740,14 @@ function buildPhaseRetryResume(
     : [];
   const diffStat = normalizeResumeDiffStat(latestImplementation?.diffStat);
   const startedPayload = asRecord(latestIterationStarted?.payload);
-  const attempt = typeof startedPayload?.attempt === 'number' && Number.isFinite(startedPayload.attempt)
+  const persistedAttempt = typeof startedPayload?.attempt === 'number' && Number.isFinite(startedPayload.attempt)
     ? Math.max(1, Math.trunc(startedPayload.attempt))
     : extractLatestAttempt(completedIterations);
+  const attempt = resetExhaustedAttempt
+    && typeof maxIterations === 'number'
+    && persistedAttempt >= maxIterations
+      ? 1
+      : persistedAttempt;
   const completedOperations = relevantAudit
     .filter((event) => timestampOf(event.createdAt) >= timestampOf(latestImplementation?.createdAt))
     .filter((event) => event.eventType === 'task_activity')

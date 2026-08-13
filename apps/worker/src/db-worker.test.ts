@@ -931,6 +931,35 @@ github:
     }));
   });
 
+  it('starts a new attempt budget when the user retries after the previous run exhausted attempt ten', async () => {
+    repositoryMock.claimNextSubmittedTask.mockResolvedValueOnce(createClaimedTask('task_retried'));
+    repositoryMock.getTaskDiff.mockResolvedValueOnce({
+      taskId: 'task_1', filesChanged: 1, insertions: 5, deletions: 0,
+      iterations: [
+        { phase: 'implementation', prompt: 'Implement', resultSummary: 'Implementation', diffStat: { filesChanged: 1, insertions: 5, deletions: 0 }, validationResult: { changedFiles: ['src/a.ts'], attempt: 10 }, createdAt: '2026-08-02T10:00:20.000Z' },
+        { phase: 'validation', prompt: 'npm test', resultSummary: 'Validation passed', validationResult: { command: 'npm test', exitCode: 0, stdout: 'ok', stderr: '', passed: true, attempt: 10 }, createdAt: '2026-08-02T10:00:30.000Z' },
+        { phase: 'review', prompt: 'Review', resultSummary: 'Review passed', validationResult: { blockers: [], riskyChanges: [], attempt: 10 }, createdAt: '2026-08-02T10:00:40.000Z' }
+      ]
+    });
+    repositoryMock.listTaskAudit.mockResolvedValueOnce([
+      { eventType: 'task_iteration_started', payload: { taskRunId: 'run_old', phase: 'review', attempt: 10 }, createdAt: '2026-08-02T10:00:35.000Z' },
+      { eventType: 'task_github_operation_failed', payload: { taskRunId: 'run_old', operation: 'wait_for_checks' }, createdAt: '2026-08-02T10:00:45.000Z' },
+      { eventType: 'task_failed', payload: { status: 'failed' }, createdAt: '2026-08-02T10:00:50.000Z' }
+    ]);
+    runWorkerTaskMock.mockResolvedValueOnce({
+      taskId: 'task_1', status: 'ready_for_user_review', issueUrl: '', branchName: 'ai/1-task', workspacePath: 'C:/tmp/worker',
+      validation: { command: 'npm test', exitCode: 0, stdout: 'ok', stderr: '', passed: true },
+      summary: 'Retry pending.', approvals: [], completedAt: new Date().toISOString()
+    });
+
+    const { runDatabaseWorkerOnce } = await import('./db-worker.js');
+    await runDatabaseWorkerOnce();
+
+    expect(runWorkerTaskMock).toHaveBeenCalledWith(expect.objectContaining({
+      resume: expect.objectContaining({ resumeFrom: 'delivery', attempt: 1 })
+    }));
+  });
+
   it('does not restore merge completion from a legacy checkpoint without confirmation', async () => {
     repositoryMock.claimNextSubmittedTask.mockResolvedValueOnce(createClaimedTask('task_retried'));
     repositoryMock.getTaskDiff.mockResolvedValueOnce({
