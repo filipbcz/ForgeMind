@@ -124,4 +124,27 @@ describe('roadmap task completion', () => {
     expect(enqueueProjectAudit).not.toHaveBeenCalled();
     expect(repository.createAndStartRoadmapStepTask).toHaveBeenCalledTimes(1);
   });
+
+  it('does not start a later step while an earlier step is not completed', async () => {
+    const createAndStartRoadmapStepTask = vi.fn();
+    const repository = {
+      getProjectRoadmap: vi.fn(async () => ({
+        projectId: 'project_1',
+        cycles: [{ id: 'cycle_1', projectId: 'project_1', cycleNumber: 1, objective: 'Objective', status: 'active' }],
+        steps: [
+          { id: 'step_1', projectId: 'project_1', cycleId: 'cycle_1', sequenceNumber: 1, title: 'First', description: 'First', acceptanceCriteria: ['Done'], status: 'cancelled', taskId: 'task_1' },
+          { id: 'step_2', projectId: 'project_1', cycleId: 'cycle_1', sequenceNumber: 2, title: 'Second', description: 'Second', acceptanceCriteria: ['Done'], status: 'pending' }
+        ]
+      })),
+      getProject: vi.fn(async () => ({ id: 'project_1', name: 'Project', defaultTaskMode: 'auto' })),
+      createAndStartRoadmapStepTask
+    };
+
+    const result = await import('./roadmap.js').then(({ startNextRoadmapStep }) => (
+      startNextRoadmapStep(repository as never, 'project_1', 'cycle_1')
+    ));
+
+    expect(result).toBeUndefined();
+    expect(createAndStartRoadmapStepTask).not.toHaveBeenCalled();
+  });
 });

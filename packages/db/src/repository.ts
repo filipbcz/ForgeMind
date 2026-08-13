@@ -1699,6 +1699,15 @@ export class ForgeMindRepository {
         where: { projectId: input.projectId, cycleId: step.cycleId, status: 'running' }
       });
       if (running > 0) return undefined;
+      const incompletePredecessors = await tx.projectImplementationStep.count({
+        where: {
+          projectId: input.projectId,
+          cycleId: step.cycleId,
+          sequenceNumber: { lt: step.sequenceNumber },
+          status: { not: 'completed' }
+        }
+      });
+      if (incompletePredecessors > 0) return undefined;
       const next = await tx.projectImplementationStep.findFirst({
         where: { projectId: input.projectId, cycleId: step.cycleId, status: 'pending', taskId: null },
         orderBy: { sequenceNumber: 'asc' },
@@ -3227,13 +3236,20 @@ export class ForgeMindRepository {
       throw new Error(`Task "${taskId}" is currently active and cannot be retried.`);
     }
 
-    const updated = await this.prisma.task.update({
-      where: { id: taskId },
-      data: {
-        status: start ? 'submitted' : 'draft',
-        startedAt: start ? new Date() : null,
-        finishedAt: null
-      }
+    const updated = await this.prisma.$transaction(async (tx) => {
+      const retriedTask = await tx.task.update({
+        where: { id: taskId },
+        data: {
+          status: start ? 'submitted' : 'draft',
+          startedAt: start ? new Date() : null,
+          finishedAt: null
+        }
+      });
+      await tx.projectImplementationStep.updateMany({
+        where: { taskId, status: 'completed' },
+        data: { status: 'running', completedAt: null }
+      });
+      return retriedTask;
     });
 
     await this.writeAudit({

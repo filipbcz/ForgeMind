@@ -79,6 +79,9 @@ export async function startNextRoadmapStep(
   if (!nextStep) return undefined;
 
   const currentIndex = cycleSteps.findIndex((candidate) => candidate.id === nextStep.id);
+  if (cycleSteps.slice(0, currentIndex).some((candidate) => candidate.status !== 'completed')) {
+    return undefined;
+  }
   const completedSteps = cycleSteps
     .slice(0, Math.max(0, currentIndex))
     .filter((candidate) => candidate.status === 'completed')

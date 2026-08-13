@@ -84,6 +84,7 @@ export interface WorkerTaskResume {
   completedOperations?: string[];
   githubChecks?: GitHubChecksResult;
   githubChecksInputHash?: string;
+  mergeCommitSha?: string;
   completedSatisfactionReview?: {
     inputHash: string;
     summary: string;
@@ -226,7 +227,11 @@ export async function runWorkerTask(input: WorkerTaskInput): Promise<WorkerTaskR
   await input.hooks?.onBranch?.(branchName);
 
   const completedSatisfactionReview = input.resume?.completedSatisfactionReview;
-  if (completedSatisfactionReview && input.resume?.validation?.passed) {
+  if (
+    completedSatisfactionReview
+    && input.resume?.validation?.passed
+    && !requiresPullRequestIntegration(config, input.project)
+  ) {
     const currentInputHash = await collectSatisfactionReviewInputHash(
       git,
       workspacePath,
@@ -420,7 +425,8 @@ export async function runWorkerTask(input: WorkerTaskInput): Promise<WorkerTaskR
     skipChecksFromResume: completedOperations.has('wait_for_checks'),
     skipMergeFromResume: completedOperations.has('merge_pr'),
     resumedGitHubChecks: input.resume?.githubChecks,
-    resumedGitHubChecksInputHash: input.resume?.githubChecksInputHash
+    resumedGitHubChecksInputHash: input.resume?.githubChecksInputHash,
+    resumedMergeCommitSha: input.resume?.mergeCommitSha
   };
   const firstAttempt = Math.max(1, Math.min(input.task.maxIterations, input.resume?.attempt ?? 1));
   const passedValidationCheckResults = new Map<string, ValidationCheckExecutionResult>(
@@ -1115,7 +1121,7 @@ export async function runWorkerTask(input: WorkerTaskInput): Promise<WorkerTaskR
       }
 
       if (review.blockers.length === 0) {
-        if (satisfactionReview) {
+        if (satisfactionReview && !requiresPullRequestIntegration(config, input.project)) {
           const summary = review.summary.trim() || implementation.summary.trim() || 'Existing implementation satisfies the task.';
           await emitTaskActivity(input.hooks, {
             phase: 'completion',
@@ -1325,6 +1331,7 @@ interface DeliveryState {
   skipMergeFromResume: boolean;
   resumedGitHubChecks?: GitHubChecksResult;
   resumedGitHubChecksInputHash?: string;
+  resumedMergeCommitSha?: string;
 }
 
 type DeliveryAttemptOutcome =
@@ -1549,6 +1556,7 @@ async function deliverWorkerAttempt(input: {
     }
 
     if (checks.status === 'failure') {
+      const infrastructureFailure = isGitHubInfrastructureFailure(checks);
       await emitTaskActivity(taskInput.hooks, {
         phase: 'github',
         state: 'failed',
@@ -1566,6 +1574,15 @@ async function deliverWorkerAttempt(input: {
         output: { status: checks.status, summary: checks.summary },
         errorMessage: checks.summary
       });
+      if (infrastructureFailure) {
+        const errorMessage = `GitHub Actions infrastructure blocked execution: ${checks.summary}`;
+        await taskInput.hooks?.onGitHubOperationFailed?.({
+          operation: 'wait_for_checks',
+          errorMessage,
+          context: { headSha, pullRequestNumber: state.pullRequest.pullRequestNumber, infrastructureFailure: true }
+        });
+        throw new Error(errorMessage);
+      }
       return {
         kind: 'ci_failure',
         validation: {
@@ -1610,6 +1627,7 @@ async function deliverWorkerAttempt(input: {
   let mergeCommitSha: string | undefined;
   if (config.autoMergePullRequest && state.pullRequest && state.skipMergeFromResume) {
     mergeConfirmed = true;
+    mergeCommitSha = state.resumedMergeCommitSha;
   } else if (config.autoMergePullRequest && state.pullRequest) {
     if (!github?.mergePullRequest) {
       mergeFailure = 'The configured GitHub adapter does not support pull request merge.';
@@ -1618,8 +1636,20 @@ async function deliverWorkerAttempt(input: {
         taskInput.hooks,
         'merge_pr',
         { pullRequestNumber: state.pullRequest.pullRequestNumber, targetBranch: taskInput.project.defaultBranch },
-        async () => github.mergePullRequest!(taskInput.project, state.pullRequest!.pullRequestNumber, taskInput.signal),
-        taskInput.signal
+        async () => {
+          const result = await github.mergePullRequest!(taskInput.project, state.pullRequest!.pullRequestNumber, taskInput.signal);
+          if (!result.merged) {
+            throw new Error(`Pull request #${state.pullRequest!.pullRequestNumber} was not merged: ${result.message}`);
+          }
+          return result;
+        },
+        taskInput.signal,
+        (result) => ({
+          pullRequestNumber: state.pullRequest!.pullRequestNumber,
+          targetBranch: taskInput.project.defaultBranch,
+          merged: true,
+          sha: result.sha ?? null
+        })
       );
       mergeConfirmed = merge.merged;
       mergeCommitSha = merge.merged && merge.sha && /^[a-f0-9]{7,64}$/i.test(merge.sha)
@@ -2369,7 +2399,8 @@ async function runGitHubOperation<T>(
   operation: GitHubOperation,
   context: JsonValue | undefined,
   action: () => Promise<T>,
-  signal?: AbortSignal
+  signal?: AbortSignal,
+  completedOutput?: (result: T) => JsonValue
 ): Promise<T> {
   throwIfTaskAborted(signal);
   const startedAt = Date.now();
@@ -2404,7 +2435,7 @@ async function runGitHubOperation<T>(
       phase,
       status: 'completed',
       inputHash,
-      output: context
+      output: completedOutput ? completedOutput(result) : context
     });
     return result;
   } catch (error) {
@@ -2431,6 +2462,15 @@ async function runGitHubOperation<T>(
     });
     throw error;
   }
+}
+
+function requiresPullRequestIntegration(config: WorkerConfig, project: Project): boolean {
+  return config.createPullRequest && Boolean(project.githubOwner && project.githubRepo);
+}
+
+function isGitHubInfrastructureFailure(checks: GitHubChecksResult): boolean {
+  const message = [checks.summary, ...checks.failures.map((failure) => failure.output)].join('\n');
+  return /job was not started|account payments? (?:have )?failed|spending limit|billing (?:issue|problem|limit)|hosted runner.*(?:unavailable|quota)|no hosted compute minutes/i.test(message);
 }
 
 async function emitTaskActivity(hooks: WorkerTaskHooks | undefined, activity: TaskActivity): Promise<void> {

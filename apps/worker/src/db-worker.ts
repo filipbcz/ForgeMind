@@ -1636,27 +1636,50 @@ function buildPhaseRetryResume(
   currentTaskRunId?: string,
   checkpoints: TaskCheckpointSnapshot[] = []
 ): WorkerTaskResume | undefined {
-  const failureAt = findLatestFailureTimestamp(audit);
-  if (failureAt === undefined) {
-    return undefined;
-  }
-
   const completedIterations = [...iterations].sort((left, right) => timestampOf(left.createdAt) - timestampOf(right.createdAt));
   const latestIteration = completedIterations.at(-1);
   const latestImplementation = findLastIteration(completedIterations, 'implementation');
   const latestValidation = findLastIteration(completedIterations, 'validation');
+  const latestValidationPayload = asRecord(latestValidation?.validationResult);
+  const githubInfrastructureFailure = isPersistedGitHubInfrastructureFailure(latestValidationPayload);
+  const latestSuccessfulValidation = githubInfrastructureFailure
+    ? findLastSuccessfulValidationIteration(completedIterations)
+    : undefined;
+  const effectiveValidationIteration = latestSuccessfulValidation ?? latestValidation;
   const latestReview = findLastIteration(completedIterations, 'review');
   const latestPlanning = findLastIteration(completedIterations, 'planning');
+  const failureAt = findLatestFailureTimestamp(audit);
+  const hasDeliveryEvidence = checkpoints.some((checkpoint) => checkpoint.key.startsWith('external:'))
+    || audit.some((event) => {
+      const payload = asRecord(event.payload);
+      return event.eventType === 'task_github_operation_failed'
+        || (event.eventType === 'task_activity' && (
+          payload?.phase === 'git'
+          || payload?.phase === 'github'
+        ));
+    });
+  const canResumeCompletedDelivery = Boolean(
+    hasDeliveryEvidence
+    &&
+    latestImplementation
+    && resolveValidationPassed(asRecord(latestValidation?.validationResult)) === true
+    && latestReview
+    && extractReviewBlockers(latestReview).length === 0
+  );
+  if (failureAt === undefined && !canResumeCompletedDelivery) {
+    return undefined;
+  }
+  const resumeCutoff = failureAt ?? Number.POSITIVE_INFINITY;
   const relevantAudit = audit.filter((event) => {
     const payload = asRecord(event.payload);
     return !currentTaskRunId || payload?.taskRunId !== currentTaskRunId;
   });
   const latestGitHubFailure = [...relevantAudit]
     .reverse()
-    .find((event) => event.eventType === 'task_github_operation_failed' && timestampOf(event.createdAt) <= failureAt);
+    .find((event) => event.eventType === 'task_github_operation_failed' && timestampOf(event.createdAt) <= resumeCutoff);
   const latestIterationStarted = [...relevantAudit]
     .reverse()
-    .find((event) => event.eventType === 'task_iteration_started' && timestampOf(event.createdAt) <= failureAt);
+    .find((event) => event.eventType === 'task_iteration_started' && timestampOf(event.createdAt) <= resumeCutoff);
   const latestCompletedAt = timestampOf(latestIteration?.createdAt);
   const inFlightPhase = latestIterationStarted && timestampOf(latestIterationStarted.createdAt) > latestCompletedAt
     ? normalizeResumePhase(asRecord(latestIterationStarted.payload)?.phase)
@@ -1670,6 +1693,8 @@ function buildPhaseRetryResume(
     resumeFrom = 'validation';
   } else if (inFlightPhase) {
     resumeFrom = inFlightPhase;
+  } else if (githubInfrastructureFailure) {
+    resumeFrom = 'delivery';
   } else if (latestIteration?.phase === 'review') {
     resumeFrom = extractReviewBlockers(latestReview).length > 0 ? 'implementation' : 'delivery';
   } else if (latestIteration?.phase === 'validation') {
@@ -1688,11 +1713,11 @@ function buildPhaseRetryResume(
 
   const latestImplementationAt = timestampOf(latestImplementation?.createdAt);
   const validationIsCurrent = Boolean(
-    latestValidation
-    && timestampOf(latestValidation.createdAt) >= latestImplementationAt
+    effectiveValidationIteration
+    && timestampOf(effectiveValidationIteration.createdAt) >= latestImplementationAt
   );
   const validation = validationIsCurrent
-    ? extractValidationResult(latestValidation?.validationResult)
+    ? extractValidationResult(effectiveValidationIteration?.validationResult)
     : undefined;
   const reviewBlockers = extractReviewBlockers(latestReview);
   const reviewSafeImprovements = extractStringArray(latestReview?.validationResult, 'safeImprovements');
@@ -1710,11 +1735,28 @@ function buildPhaseRetryResume(
     .filter((event) => timestampOf(event.createdAt) >= timestampOf(latestImplementation?.createdAt))
     .filter((event) => event.eventType === 'task_activity')
     .map((event) => asRecord(event.payload))
-    .filter((payload) => payload?.state === 'completed' && typeof payload.operation === 'string')
+    .filter((payload) => (
+      payload?.state === 'completed'
+      && typeof payload.operation === 'string'
+      && payload.operation !== 'merge_pr'
+    ))
     .map((payload) => payload!.operation as string);
   completedOperations.push(...checkpoints
-    .filter((checkpoint) => checkpoint.status === 'completed' && checkpoint.key.startsWith('external:'))
+    .filter((checkpoint) => (
+      checkpoint.status === 'completed'
+      && checkpoint.key.startsWith('external:')
+      && checkpoint.key !== 'external:merge_pr'
+    ))
     .map((checkpoint) => checkpoint.key.slice('external:'.length)));
+  const mergeCheckpoint = checkpoints.find((checkpoint) => checkpoint.key === 'external:merge_pr');
+  const mergeCheckpointOutput = asRecord(mergeCheckpoint?.output);
+  const mergeConfirmed = mergeCheckpoint?.status === 'completed' && mergeCheckpointOutput?.merged === true;
+  const mergeCommitSha = mergeConfirmed
+    && typeof mergeCheckpointOutput?.sha === 'string'
+    && /^[a-f0-9]{7,64}$/i.test(mergeCheckpointOutput.sha)
+      ? mergeCheckpointOutput.sha
+      : undefined;
+  if (mergeConfirmed) completedOperations.push('merge_pr');
   const persistedValidationChecks = validationIsCurrent
     ? extractPassedValidationChecks(latestValidation?.validationResult)
     : [];
@@ -1811,6 +1853,7 @@ function buildPhaseRetryResume(
     completedOperations: Array.from(new Set(completedOperations)),
     githubChecks,
     githubChecksInputHash: githubChecksCheckpoint?.inputHash,
+    mergeCommitSha,
     completedSatisfactionReview
   };
 }
@@ -1858,6 +1901,7 @@ function findLatestFailureTimestamp(audit: TaskAuditSnapshot[]): number | undefi
   const failure = [...audit].reverse().find((event) => (
     event.eventType === 'task_failed'
     || event.eventType === 'task_worker_interrupted'
+    || event.eventType === 'task_cancelled'
     || event.eventType === 'task_status_validation_failed'
     || event.eventType === 'task_status_iteration_limit_reached'
     || event.eventType === 'task_status_repeated_error_detected'
@@ -2121,6 +2165,24 @@ function findLastIteration<T extends { phase: string }>(iterations: T[], phase: 
   }
 
   return undefined;
+}
+
+function findLastSuccessfulValidationIteration<T extends { phase: string; validationResult?: unknown }>(iterations: T[]): T | undefined {
+  for (let index = iterations.length - 1; index >= 0; index -= 1) {
+    const iteration = iterations[index];
+    if (iteration?.phase === 'validation' && resolveValidationPassed(asRecord(iteration.validationResult)) === true) {
+      return iteration;
+    }
+  }
+  return undefined;
+}
+
+function isPersistedGitHubInfrastructureFailure(payload: Record<string, unknown> | undefined): boolean {
+  if (payload?.failingCommand !== 'github-actions') return false;
+  const message = [payload.stderr, payload.stdout]
+    .filter((value): value is string => typeof value === 'string')
+    .join('\n');
+  return /job was not started|account payments? (?:have )?failed|spending limit|billing (?:issue|problem|limit)|hosted runner.*(?:unavailable|quota)|no hosted compute minutes/i.test(message);
 }
 
 export async function recordTaskAcceptanceEvidence(

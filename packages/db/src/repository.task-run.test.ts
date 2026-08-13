@@ -189,6 +189,9 @@ function createMockPrisma() {
       count: vi.fn(async () => 1),
       updateMany: vi.fn(async () => ({ count: 1 }))
     },
+    projectImplementationStep: {
+      updateMany: vi.fn(async () => ({ count: 1 }))
+    },
     taskIteration: { create: vi.fn(), findMany: vi.fn() },
     taskCheckpoint: {
       findMany: vi.fn(async () => []),
@@ -574,6 +577,24 @@ describe('ForgeMindRepository task runs', () => {
         errorMessage: 'Task cancelled by user.',
         finishedAt: expect.any(Date)
       }
+    });
+  });
+
+  it('reopens a completed roadmap step when its task is retried', async () => {
+    const { prisma } = createMockPrisma();
+    prisma.task.findUnique.mockResolvedValueOnce({
+      id: 'task_1', projectId: 'project_1', createdByUserId: 'user_local_owner', title: 'Task', prompt: 'Prompt',
+      mode: 'safe', status: 'completed', githubIssueNumber: 1, githubIssueUrl: 'https://github.com/demo/repo/issues/1',
+      branchName: 'ai/1-task', pullRequestNumber: 1, pullRequestUrl: 'https://github.com/demo/repo/pull/1',
+      maxIterations: 10, maxBudgetUsd: 2, createdAt: new Date(), updatedAt: new Date(), startedAt: new Date(), finishedAt: new Date()
+    });
+    const repository = new ForgeMindRepository(prisma);
+
+    await repository.retryTask('task_1', true);
+
+    expect(prisma.projectImplementationStep.updateMany).toHaveBeenCalledWith({
+      where: { taskId: 'task_1', status: 'completed' },
+      data: { status: 'running', completedAt: null }
     });
   });
 

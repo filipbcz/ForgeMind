@@ -482,9 +482,46 @@ describe('worker workflow', () => {
     expect(mergePullRequest).not.toHaveBeenCalled();
   }, 10000);
 
-  it('keeps a task ready for review when GitHub does not confirm the automatic merge', async () => {
+  it('does not ask AI to repair a GitHub billing failure', async () => {
+    const workspaceRoot = join(tmpdir(), `forgemind-worker-ci-billing-${randomUUID()}`);
+    const implement = vi.fn(createProviderStub().implement);
+    const onGitHubOperationFailed = vi.fn();
+
+    await expect(runWorkerTask({
+      project: {
+        ...gitEnabledProject,
+        configYaml: gitProjectConfig.replace('auto_push: false', 'auto_push: true'),
+        autoCreatePullRequest: true,
+        autoMergePullRequest: true,
+        autoCompleteTask: true
+      },
+      task: { ...demoTask, id: `task_${randomUUID()}`, maxIterations: 3 },
+      provider: createProviderStub({ implement }),
+      github: createGitHubStub({
+        async waitForChecks() {
+          return {
+            status: 'failure',
+            summary: 'The job was not started because recent account payments have failed or your spending limit needs to be increased.',
+            failures: []
+          };
+        }
+      }),
+      verifyCommand: 'node --version',
+      workspaceRoot,
+      hooks: { onGitHubOperationFailed }
+    })).rejects.toThrow('GitHub Actions infrastructure blocked execution');
+
+    expect(implement).toHaveBeenCalledOnce();
+    expect(onGitHubOperationFailed).toHaveBeenCalledWith(expect.objectContaining({
+      operation: 'wait_for_checks',
+      errorMessage: expect.stringContaining('spending limit')
+    }));
+  }, 10000);
+
+  it('fails delivery and records a failed checkpoint when GitHub does not confirm the automatic merge', async () => {
     const workspaceRoot = join(tmpdir(), `forgemind-worker-auto-merge-rejected-${randomUUID()}`);
-    const result = await runWorkerTask({
+    const checkpoints: Array<{ key: string; status: string; output?: unknown; errorMessage?: string }> = [];
+    await expect(runWorkerTask({
       project: {
         ...gitEnabledProject,
         autoCreatePullRequest: true,
@@ -499,11 +536,23 @@ describe('worker workflow', () => {
         }
       }),
       verifyCommand: 'node --version',
-      workspaceRoot
-    });
+      workspaceRoot,
+      hooks: {
+        async onCheckpoint(checkpoint) {
+          checkpoints.push(checkpoint);
+        }
+      }
+    })).rejects.toThrow('was not merged: Base branch protection blocked the merge.');
 
-    expect(result.status).toBe('ready_for_user_review');
-    expect(result.summary).toContain('Base branch protection blocked the merge.');
+    expect(checkpoints).toContainEqual(expect.objectContaining({
+      key: 'external:merge_pr',
+      status: 'failed',
+      errorMessage: expect.stringContaining('Base branch protection blocked the merge.')
+    }));
+    expect(checkpoints).not.toContainEqual(expect.objectContaining({
+      key: 'external:merge_pr',
+      status: 'completed'
+    }));
   }, 10000);
 
   it('reuses existing GitHub issue, branch, and draft pull request on retry', async () => {
