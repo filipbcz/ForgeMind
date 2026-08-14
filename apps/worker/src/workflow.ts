@@ -530,17 +530,33 @@ export async function runWorkerTask(input: WorkerTaskInput): Promise<WorkerTaskR
       changedFiles: uniqueStrings([...implementation.changedFiles, ...substantiveChangedFiles]).filter(isSubstantiveImplementationPath),
       diffStat: actualDiffStat
     };
-    if (!isResumedImplementation && !config.verifyCommand?.trim() && !hasAuthoritativeResumeValidationPlan) {
-      validationChecks = await resolveValidationChecks({
-        plan: { ...plan, validationChecks: implementation.validationChecks },
-        installCommand,
-        architectureCommands: [
-          ...(input.project.projectArchitecture?.validationCommands ?? []),
-          ...(implementation.architectureUpdate?.validationCommands ?? [])
-        ],
-        validationProfile: input.project.validationProfile,
-        workspacePath
-      });
+    if (!isResumedImplementation && !config.verifyCommand?.trim()) {
+      if (hasAuthoritativeResumeValidationPlan) {
+        const proposedChecks = normalizeValidationChecks(implementation.validationChecks);
+        const newArchitectureCommands = implementation.architectureUpdate?.validationCommands ?? [];
+        if (proposedChecks.length > 0 || newArchitectureCommands.length > 0) {
+          validationChecks = await resolveValidationChecks({
+            plan: {
+              ...plan,
+              validationChecks: mergeValidationCheckUpdates(validationChecks, proposedChecks)
+            },
+            architectureCommands: newArchitectureCommands,
+            validationProfile: input.project.validationProfile,
+            workspacePath
+          });
+        }
+      } else {
+        validationChecks = await resolveValidationChecks({
+          plan: { ...plan, validationChecks: implementation.validationChecks },
+          installCommand,
+          architectureCommands: [
+            ...(input.project.projectArchitecture?.validationCommands ?? []),
+            ...(implementation.architectureUpdate?.validationCommands ?? [])
+          ],
+          validationProfile: input.project.validationProfile,
+          workspacePath
+        });
+      }
     }
 
     if (!isResumedImplementation) {
@@ -2173,6 +2189,32 @@ export function deduplicateValidationChecks(checks: ValidationCheck[]): Validati
     if (coveringIndex === index || coveringSegments.length <= segments[index]!.length) return false;
     return segments[index]!.every((segment) => coveringSegments.includes(segment));
   }));
+}
+
+function mergeValidationCheckUpdates(
+  currentChecks: ValidationCheck[],
+  proposedChecks: ValidationCheck[]
+): ValidationCheck[] {
+  const merged = [...currentChecks];
+  for (const proposed of proposedChecks) {
+    const existingIndex = merged.findIndex((check) => validationCheckIdentity(check) === validationCheckIdentity(proposed));
+    if (existingIndex < 0) {
+      merged.push(proposed);
+      continue;
+    }
+
+    const existing = merged[existingIndex]!;
+    merged[existingIndex] = {
+      ...existing,
+      ...proposed,
+      category: proposed.category ?? existing.category,
+      criterion: proposed.criterion ?? existing.criterion,
+      rationale: proposed.rationale ?? existing.rationale,
+      timeoutMinutes: proposed.timeoutMinutes ?? existing.timeoutMinutes,
+      requiredCapabilities: proposed.requiredCapabilities ?? existing.requiredCapabilities
+    };
+  }
+  return deduplicateValidationChecks(merged);
 }
 
 function splitValidationConjunctions(command: string): string[] {

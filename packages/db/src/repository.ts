@@ -50,6 +50,7 @@ import {
   toProjectImplementationStep,
   toProjectRoadmapCycle,
   toProjectSpecificationVersion,
+  sanitizePostgresText,
   toTask,
   toTaskRun
 } from './mappers.js';
@@ -3617,10 +3618,10 @@ export class ForgeMindRepository {
         taskRunId: input.taskRunId,
         iterationNumber: input.iterationNumber,
         phase: input.phase,
-        prompt: input.prompt,
-        resultSummary: input.resultSummary,
-        providerPrompt: input.providerPrompt,
-        providerResponse: input.providerResponse,
+        prompt: sanitizePostgresText(input.prompt),
+        resultSummary: sanitizePostgresText(input.resultSummary),
+        providerPrompt: input.providerPrompt === undefined ? undefined : sanitizePostgresText(input.providerPrompt),
+        providerResponse: input.providerResponse === undefined ? undefined : sanitizePostgresText(input.providerResponse),
         diffStatJson: toPrismaJson(input.diffStat),
         validationResultJson: toPrismaJson(input.validationResult)
       }

@@ -242,6 +242,34 @@ function createMockPrisma() {
 }
 
 describe('ForgeMindRepository task runs', () => {
+  it('sanitizes PostgreSQL-incompatible null bytes in task iteration evidence', async () => {
+    const { prisma } = createMockPrisma();
+    const repository = new ForgeMindRepository(prisma);
+
+    await repository.createIteration({
+      taskRunId: 'run_1',
+      iterationNumber: 1,
+      phase: 'review',
+      prompt: 'review\u0000prompt',
+      resultSummary: 'review\u0000summary',
+      providerPrompt: 'provider\u0000prompt',
+      providerResponse: 'provider\u0000response',
+      diffStat: { filesChanged: 1, path: 'Binaries/CoreSim\u0000Headless' },
+      validationResult: { evidence: ['state\u0000sequence'] }
+    });
+
+    expect(prisma.taskIteration.create).toHaveBeenCalledWith({
+      data: expect.objectContaining({
+        prompt: 'review\\u0000prompt',
+        resultSummary: 'review\\u0000summary',
+        providerPrompt: 'provider\\u0000prompt',
+        providerResponse: 'provider\\u0000response',
+        diffStatJson: { filesChanged: 1, path: 'Binaries/CoreSim\\u0000Headless' },
+        validationResultJson: { evidence: ['state\\u0000sequence'] }
+      })
+    });
+  });
+
   it('merges architecture deltas without duplicates and resolves recorded debt', () => {
     const architecture = mergeProjectArchitecture({
       version: 1,

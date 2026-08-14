@@ -502,5 +502,20 @@ export function toAuditEvent(event: AuditLog): AuditEvent {
 }
 
 export function toPrismaJson(value: JsonValue): Prisma.InputJsonValue {
-  return value as Prisma.InputJsonValue;
+  return sanitizePostgresJson(value) as Prisma.InputJsonValue;
+}
+
+export function sanitizePostgresText(value: string): string {
+  return value.replace(/\u0000/g, '\\u0000');
+}
+
+function sanitizePostgresJson(value: JsonValue): JsonValue {
+  if (typeof value === 'string') return sanitizePostgresText(value);
+  if (Array.isArray(value)) return value.map(sanitizePostgresJson);
+  if (value && typeof value === 'object') {
+    return Object.fromEntries(
+      Object.entries(value).map(([key, item]) => [key, sanitizePostgresJson(item)])
+    );
+  }
+  return value;
 }

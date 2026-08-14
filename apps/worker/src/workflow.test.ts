@@ -1232,12 +1232,14 @@ describe('worker workflow', () => {
     expect(implement).not.toHaveBeenCalled();
   }, 15000);
 
-  it('keeps an authoritative resume validation plan after a correction implementation', async () => {
+  it('keeps an authoritative resume validation plan and adds checks from a correction implementation', async () => {
     const workspaceRoot = join(tmpdir(), `forgemind-worker-correction-authoritative-validation-${randomUUID()}`);
     const task = { ...demoTask, id: `task_${randomUUID()}` };
-    const workspacePath = join(workspaceRoot, task.id);
-    await mkdir(workspacePath, { recursive: true });
-    await writeFile(join(workspacePath, 'status.txt'), 'implemented\n', 'utf8');
+    const mergePullRequest = vi.fn(async () => ({
+      merged: true,
+      sha: 'merge-sha',
+      message: 'Pull Request successfully merged'
+    }));
     const review = vi.fn(async (): Promise<ReviewResult> => ({
       summary: 'Review passed.',
       blockers: [],
@@ -1245,19 +1247,30 @@ describe('worker workflow', () => {
       riskyChanges: []
     }));
     const implement = vi.fn(async (): Promise<ImplementResult> => ({
-      outcome: 'already_satisfied',
-      summary: 'The current implementation already satisfies the task.',
-      changedFiles: [],
-      evidenceFiles: ['status.txt'],
-      diffStat: { filesChanged: 0, insertions: 0, deletions: 0 },
+      outcome: 'changes_made',
+      summary: 'The correction adds an authoritative Windows validation command.',
+      changedFiles: ['validator.txt'],
+      diffStat: { filesChanged: 1, insertions: 1, deletions: 0 },
       requestedApprovals: [],
-      validationChecks: [{ kind: 'command', command: 'node --version' }]
+      fileUpdates: [{ path: 'validator.txt', content: 'windows validation\n' }],
+      validationChecks: [
+        { kind: 'command', command: 'node --version' },
+        {
+          kind: 'command',
+          command: `node -e "process.exit(0)"`,
+          criterion: 'Win64 application starts successfully.',
+          requiredCapabilities: ['windows', 'unreal-engine-5.8']
+        }
+      ]
     }));
 
     const result = await runWorkerTask({
       project: {
-        ...demoProject,
-        configYaml: noGitProjectConfig.replace('commands:\n  verify: "node --version"', 'commands: {}'),
+        ...gitEnabledProject,
+        configYaml: gitProjectConfig.replace('commands:\n  verify: "node --version"', 'commands: {}'),
+        autoCreatePullRequest: true,
+        autoMergePullRequest: true,
+        autoCompleteTask: true,
         projectArchitecture: {
           version: 1,
           summary: 'Validation architecture.',
@@ -1272,6 +1285,7 @@ describe('worker workflow', () => {
       },
       task,
       provider: createProviderStub({ implement, review }),
+      github: createGitHubStub({ mergePullRequest }),
       workspaceRoot,
       resume: {
         kind: 'phase_retry',
@@ -1283,8 +1297,17 @@ describe('worker workflow', () => {
       }
     });
 
-    expect(result.status).toBe('ready_for_user_review');
-    expect(result.validation.command).toBe('node --version');
+    expect(result.status).toBe('waiting_for_capability');
+    expect(result.validation.command).toBe(`node --version && node -e "process.exit(0)"`);
+    expect(result.validation.deferredChecks).toEqual([
+      expect.objectContaining({
+        command: `node -e "process.exit(0)"`,
+        requiredCapabilities: ['windows', 'unreal-engine-5.8'],
+        missingCapabilities: expect.arrayContaining(['unreal-engine-5.8'])
+      })
+    ]);
+    expect(result.requiredCapabilities).toContain('unreal-engine-5.8');
+    expect(mergePullRequest).toHaveBeenCalledOnce();
     expect(implement).toHaveBeenCalledOnce();
     expect(review).toHaveBeenCalledOnce();
   }, 15000);
