@@ -2,7 +2,7 @@ import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { parseAgentConfigYaml, toCoreLimits, type AgentConfig } from '@forgemind/config';
 import { activeProjectContractRequirements, DEFAULT_LIMITS, evaluateLimits, requiresApproval, type Limits, type LimitUsage } from '@forgemind/core';
-import { advanceRoadmapAfterTaskCompletion, createRepository, getPrismaClient, startNextRoadmapStep, type AIProviderConnectionSecret, type ForgeMindRepository } from '@forgemind/db';
+import { advanceRoadmapAfterTaskCapabilityWait, advanceRoadmapAfterTaskCompletion, createRepository, getPrismaClient, startNextRoadmapStep, type AIProviderConnectionSecret, type ForgeMindRepository } from '@forgemind/db';
 import { GitHubAppAdapter, createGitHubAdapterFromEnv, type GitHubChecksResult } from '@forgemind/github';
 import { buildProjectExtensionProposalPrompt, createProvider, formatProjectExtensionProposal, type AIProvider, type ProviderSessionContext, type ReviewResult, type ValidationCheck } from '@forgemind/providers';
 import type { AcceptanceEvidence, ApprovalType, Project, ProjectArchitectureUpdate, ProjectContract, ProviderKind, TaskStatus } from '@forgemind/core';
@@ -10,6 +10,7 @@ import { toErrorMessage, type JsonValue } from '@forgemind/shared';
 import { formatProjectArchitectureContext, runWorkerTask, type WorkerTaskResult, type WorkerTaskResume } from './workflow.js';
 import { buildTargetedRepositoryContext, prepareCapabilityAuditWorkspace, runCapabilityAudit, runReleaseAudit } from './capability-audit.js';
 import { formatValidationFailure } from './validation.js';
+import { resolveWorkerCapabilities } from './worker-capabilities.js';
 
 type ApprovedLimitSignal = 'diff_lines_limit_reached' | 'changed_files_limit_reached';
 
@@ -47,6 +48,7 @@ interface PlannedValidationCheckSnapshot {
   criterion?: string;
   rationale?: string;
   category?: string;
+  requiredCapabilities?: unknown;
 }
 
 interface TaskCheckpointSnapshot {
@@ -68,6 +70,8 @@ export async function runDatabaseWorkerOnce(options: { deferInterruptSignals?: b
   const providerModel = resolveProviderModel(providerKind, defaultAIProviderConnection);
   const claimTimeoutMinutes = Number(process.env.FORGEMIND_QUEUE_CLAIM_TIMEOUT_MINUTES ?? 2);
   const recovery = await repository.recoverStuckQueueJobs(claimTimeoutMinutes);
+  const workerCapabilities = resolveWorkerCapabilities();
+  const requeuedCapabilityTasks = await repository.requeueTasksWaitingForCapabilities(workerCapabilities);
   const recoveredProjectAudits = await repository.recoverStuckProjectAudits(claimTimeoutMinutes);
   const auditResult = await runNextProjectAudit({
     repository,
@@ -85,7 +89,8 @@ export async function runDatabaseWorkerOnce(options: { deferInterruptSignals?: b
       claimed: false,
       message: 'No submitted task or project audit found.',
       recoveredQueueJobs: recovery.recoveredCount,
-      recoveredProjectAudits
+      recoveredProjectAudits,
+      requeuedCapabilityTasks
     };
   }
   const stopQueueHeartbeat = startQueueClaimHeartbeat(repository, claimed.queueJobId, claimTimeoutMinutes);
@@ -101,12 +106,15 @@ export async function runDatabaseWorkerOnce(options: { deferInterruptSignals?: b
   });
   const finalizeQueueJob = async (
     status: 'succeeded' | 'failed' | 'cancelled',
-    errorMessage?: string
+    errorMessage?: string,
+    retryable = true
   ) => {
     stopQueueHeartbeat();
     stopCancellationWatcher();
     stopInterruptionRecovery();
-    if (errorMessage === undefined) {
+    if (!retryable) {
+      await repository.finalizeQueueJob(claimed.queueJobId, status, errorMessage, false);
+    } else if (errorMessage === undefined) {
       await repository.finalizeQueueJob(claimed.queueJobId, status);
     } else {
       await repository.finalizeQueueJob(claimed.queueJobId, status, errorMessage);
@@ -493,6 +501,31 @@ export async function runDatabaseWorkerOnce(options: { deferInterruptSignals?: b
         ...getRunUsageFields()
       });
       await finalizeQueueJob('succeeded');
+    } else if (result.status === 'waiting_for_capability') {
+      await repository.waitTaskForCapabilities(claimed.task.id, result.requiredCapabilities ?? [], {
+        validation: {
+          command: result.validation.command,
+          deferredChecks: (result.validation.deferredChecks ?? []).map((check) => ({
+            command: check.command,
+            category: check.category ?? null,
+            criterion: check.criterion ?? null,
+            rationale: check.rationale ?? null,
+            requiredCapabilities: check.requiredCapabilities,
+            missingCapabilities: check.missingCapabilities
+          }))
+        },
+        pullRequestUrl: result.pullRequestUrl ?? null,
+        commitSha: result.commitSha ?? null
+      });
+      await advanceRoadmapAfterTaskCapabilityWait(repository, claimed.task.id);
+      await repository.finishTaskRun({
+        taskRunId: claimed.taskRun.id,
+        status: 'succeeded',
+        summary: result.summary,
+        iterationCount: attemptCount,
+        ...getRunUsageFields()
+      });
+      await finalizeQueueJob('succeeded');
     } else if (result.status === 'validation_failed') {
       await repository.transitionTask(claimed.task.id, 'validation_failed', {
         validation: {
@@ -511,7 +544,7 @@ export async function runDatabaseWorkerOnce(options: { deferInterruptSignals?: b
         iterationCount: attemptCount,
         ...getRunUsageFields()
       });
-      await finalizeQueueJob('failed', result.validation.stderr || 'Validation failed.');
+      await finalizeQueueJob('failed', result.validation.stderr || 'Validation failed.', false);
     } else if (result.status === 'failed') {
       await repository.failTask(claimed.task.id, result.summary, 'failed');
       await repository.finishTaskRun({
@@ -522,8 +555,11 @@ export async function runDatabaseWorkerOnce(options: { deferInterruptSignals?: b
         iterationCount: attemptCount,
         ...getRunUsageFields()
       });
-      await finalizeQueueJob('failed', result.summary);
+      await finalizeQueueJob('failed', result.summary, false);
     } else {
+      if (result.requiredCapabilities?.length) {
+        await repository.setTaskWaitingCapabilities(claimed.task.id, result.requiredCapabilities);
+      }
       await repository.transitionTask(claimed.task.id, 'ready_for_user_review', {
         pullRequestUrl: result.pullRequestUrl ?? null,
         branchName: result.branchName
@@ -1532,6 +1568,38 @@ async function resolveTaskResumeContext(
     ? getLatestApprovedReviewAt(taskApprovals, approvedReviewResume.riskyChanges ?? [])
     : undefined;
 
+  if (queueReason === 'capability_available' && lastImplementationIteration) {
+    const checkpointResume = buildPhaseRetryResume(
+      diff.iterations,
+      audit,
+      approvedTypes,
+      currentTaskRunId,
+      checkpoints,
+      false,
+      maxIterations
+    );
+    return {
+      workflowResume: {
+        ...checkpointResume,
+        kind: 'capability_available',
+        resumeFrom: 'validation',
+        planSummary: lastPlanningIteration?.resultSummary,
+        planSteps: extractStringArray(lastPlanningIteration?.validationResult, 'steps'),
+        acceptanceCriteria: extractStringArray(lastPlanningIteration?.validationResult, 'acceptanceCriteria'),
+        implementationSummary: lastImplementationIteration.resultSummary || 'Resume authoritative validation on a capable worker.',
+        ...implementationResume,
+        validationChecks: extractLatestValidationChecks(diff.iterations),
+        validation: undefined,
+        passedValidationChecks: checkpointResume?.passedValidationChecks
+          ?? extractPassedValidationChecks(lastValidationIteration?.validationResult),
+        resumeValidationPlanRevision: false,
+        architectureUpdate,
+        approvedApprovals: Array.from(approvedTypes)
+      },
+      ignoredLimitSignals: []
+    };
+  }
+
   if (queueReason === 'task_retried' || queueReason === 'worker_interrupted' || queueReason === 'phase_retry') {
     const phaseRetryResume = buildPhaseRetryResume(
       diff.iterations,
@@ -1782,7 +1850,7 @@ function buildPhaseRetryResume(
   ];
   for (const checkpoint of checkpoints.filter((item) => item.status === 'completed' && item.key.startsWith('validation:'))) {
     const output = asRecord(checkpoint.output);
-    if (output?.evidenceVersion !== 1) continue;
+    if (output?.evidenceVersion !== 1 || output.deferred === true) continue;
     const command = typeof output?.command === 'string' ? output.command : undefined;
     if (!command || passedValidationChecks.some((item) => item.command === command && item.inputHash === checkpoint.inputHash)) continue;
     passedValidationChecks.push({
@@ -1882,13 +1950,13 @@ function extractCriterionResults(value: unknown): ReviewResult['criterionResults
     if (
       !item
       || typeof item.criterion !== 'string'
-      || (item.status !== 'satisfied' && item.status !== 'not_satisfied' && item.status !== 'insufficient_evidence')
+      || (item.status !== 'satisfied' && item.status !== 'not_satisfied' && item.status !== 'insufficient_evidence' && item.status !== 'deferred')
       || !Array.isArray(item.evidence)
       || item.evidence.some((evidence) => typeof evidence !== 'string')
     ) {
       return [];
     }
-    const status = item.status as 'satisfied' | 'not_satisfied' | 'insufficient_evidence';
+    const status = item.status as 'satisfied' | 'not_satisfied' | 'insufficient_evidence' | 'deferred';
     return [{
       criterion: item.criterion,
       status,
@@ -1953,8 +2021,31 @@ function extractValidationResult(value: unknown): WorkerTaskResume['validation']
       ? typeof payload.failingCommand === 'string'
         ? payload.failingCommand
         : typeof payload.command === 'string' ? payload.command : undefined
-      : undefined
+      : undefined,
+    deferredChecks: extractDeferredValidationChecks(payload.deferredChecks)
   };
+}
+
+function extractDeferredValidationChecks(value: unknown): NonNullable<WorkerTaskResume['validation']>['deferredChecks'] {
+  if (!Array.isArray(value)) return [];
+  return value.flatMap((entry) => {
+    const item = asRecord(entry);
+    if (!item || typeof item.command !== 'string') return [];
+    const requiredCapabilities = Array.isArray(item.requiredCapabilities)
+      ? item.requiredCapabilities.filter((capability): capability is string => typeof capability === 'string')
+      : [];
+    const missingCapabilities = Array.isArray(item.missingCapabilities)
+      ? item.missingCapabilities.filter((capability): capability is string => typeof capability === 'string')
+      : [];
+    return [{
+      command: item.command,
+      category: item.category === 'setup' || item.category === 'build' || item.category === 'database' || item.category === 'api' || item.category === 'browser' || item.category === 'smoke' ? item.category : undefined,
+      criterion: typeof item.criterion === 'string' ? item.criterion : undefined,
+      rationale: typeof item.rationale === 'string' ? item.rationale : undefined,
+      requiredCapabilities,
+      missingCapabilities
+    }];
+  });
 }
 
 function resolveValidationPassed(payload: Record<string, unknown> | undefined): boolean | undefined {
@@ -2167,7 +2258,10 @@ function normalizeValidationCheckSnapshot(item: unknown): ValidationCheck | unde
         ? check.category
         : undefined,
       criterion: typeof check.criterion === 'string' && check.criterion.trim() ? check.criterion.trim() : undefined,
-      rationale: typeof check.rationale === 'string' && check.rationale.trim() ? check.rationale.trim() : undefined
+      rationale: typeof check.rationale === 'string' && check.rationale.trim() ? check.rationale.trim() : undefined,
+      requiredCapabilities: Array.isArray(check.requiredCapabilities)
+        ? check.requiredCapabilities.filter((value): value is string => typeof value === 'string')
+        : undefined
     };
   }
 
@@ -2234,6 +2328,30 @@ export async function recordTaskAcceptanceEvidence(
           rationale: check.rationale ?? null,
           stdout: limitEvidenceText(check.stdout),
           stderr: limitEvidenceText(check.stderr)
+        }
+      });
+    }
+
+    for (const check of input.result.validation.deferredChecks ?? []) {
+      if (!check.criterion?.trim()) continue;
+      await repository.recordAcceptanceEvidence({
+        projectId: input.project.id,
+        cycleId: step.cycleId,
+        stepId: step.id,
+        taskId: input.taskId,
+        taskRunId: input.taskRunId,
+        requirementIds: step.requirementIds,
+        criterion: check.criterion,
+        source: 'validation_command',
+        status: 'blocked',
+        evidenceIdentity: `deferred:${check.command}`,
+        contractVersion: contract.version,
+        commitSha: input.result.commitSha,
+        command: check.command,
+        payload: {
+          rationale: check.rationale ?? null,
+          requiredCapabilities: check.requiredCapabilities,
+          missingCapabilities: check.missingCapabilities
         }
       });
     }

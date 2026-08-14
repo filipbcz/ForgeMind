@@ -93,6 +93,34 @@ describe('validation runner', () => {
     expect(result.stdout).toContain('validation was skipped');
   });
 
+  it('defers checks that require unavailable worker capabilities while running portable checks', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'forgemind-validation-capabilities-'));
+    const activities: string[] = [];
+    const result = await runValidationChecks([
+      {
+        kind: 'command',
+        command: 'UnrealEditor.exe Flying.uproject -run=Automation',
+        criterion: 'Win64 Unreal shell starts.',
+        requiredCapabilities: ['windows', 'unreal-engine-5.8']
+      },
+      { kind: 'command', command: 'node --version', criterion: 'Portable tooling is available.' }
+    ], cwd, (activity) => {
+      activities.push(activity.state);
+    }, new Map(), undefined, undefined, new Set(['linux']));
+
+    expect(result.passed).toBe(true);
+    expect(result.executedCheckCount).toBe(1);
+    expect(result.deferredChecks).toEqual([
+      expect.objectContaining({
+        criterion: 'Win64 Unreal shell starts.',
+        requiredCapabilities: ['windows', 'unreal-engine-5.8'],
+        missingCapabilities: ['windows', 'unreal-engine-5.8']
+      })
+    ]);
+    expect(activities).toContain('deferred');
+    expect(result.stdout).toContain('[missing-capabilities] windows, unreal-engine-5.8');
+  });
+
   it('executes quoted inline JavaScript containing arrow functions', async () => {
     const cwd = await mkdtemp(join(tmpdir(), 'forgemind-validation-inline-js-'));
     const command = `node --input-type=module -e "const items = [{ id: 1 }]; if (!items.some((item) => item.id === 1)) process.exit(1);"`;

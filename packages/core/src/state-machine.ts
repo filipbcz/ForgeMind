@@ -9,7 +9,8 @@ export const TERMINAL_TASK_STATUSES: ReadonlySet<TaskStatus> = new Set([
   'repeated_error_detected',
   'approval_rejected',
   'provider_failed',
-  'validation_failed'
+  'validation_failed',
+  'waiting_for_capability'
 ]);
 
 const transitions: Record<TaskStatus, TaskStatus[]> = {
@@ -20,12 +21,12 @@ const transitions: Record<TaskStatus, TaskStatus[]> = {
   creating_github_issue: ['creating_branch', 'running_ai', 'failed', 'cancelled'],
   creating_branch: ['running_ai', 'failed', 'cancelled'],
   running_ai: ['validating', 'needs_approval', 'provider_failed', 'budget_exceeded', 'iteration_limit_reached', 'cancelled'],
-  validating: ['reviewing', 'running_ai', 'needs_approval', 'validation_failed', 'repeated_error_detected', 'failed', 'cancelled'],
-  reviewing: ['improving', 'running_ai', 'creating_pr', 'ready_for_user_review', 'needs_approval', 'failed', 'cancelled'],
+  validating: ['reviewing', 'running_ai', 'needs_approval', 'validation_failed', 'repeated_error_detected', 'waiting_for_capability', 'failed', 'cancelled'],
+  reviewing: ['improving', 'running_ai', 'creating_pr', 'ready_for_user_review', 'needs_approval', 'waiting_for_capability', 'failed', 'cancelled'],
   improving: ['running_ai', 'validating', 'needs_approval', 'failed', 'cancelled'],
   needs_approval: ['running_ai', 'creating_pr', 'approval_rejected', 'cancelled'],
-  creating_pr: ['running_ai', 'ready_for_user_review', 'validation_failed', 'failed', 'cancelled'],
-  ready_for_user_review: ['completed', 'running_ai', 'cancelled'],
+  creating_pr: ['running_ai', 'ready_for_user_review', 'validation_failed', 'waiting_for_capability', 'failed', 'cancelled'],
+  ready_for_user_review: ['completed', 'running_ai', 'waiting_for_capability', 'cancelled'],
   completed: [],
   failed: [],
   cancelled: ['completed'],
@@ -34,7 +35,8 @@ const transitions: Record<TaskStatus, TaskStatus[]> = {
   repeated_error_detected: [],
   approval_rejected: [],
   provider_failed: [],
-  validation_failed: []
+  validation_failed: [],
+  waiting_for_capability: ['submitted', 'completed', 'cancelled']
 };
 
 export function canTransitionTask(from: TaskStatus, to: TaskStatus): boolean {

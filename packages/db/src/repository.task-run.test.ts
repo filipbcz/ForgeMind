@@ -593,7 +593,7 @@ describe('ForgeMindRepository task runs', () => {
     await repository.retryTask('task_1', true);
 
     expect(prisma.projectImplementationStep.updateMany).toHaveBeenCalledWith({
-      where: { taskId: 'task_1', status: 'completed' },
+      where: { taskId: 'task_1', status: { in: ['completed', 'waiting_for_capability'] } },
       data: { status: 'running', completedAt: null }
     });
   });

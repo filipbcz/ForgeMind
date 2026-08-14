@@ -72,7 +72,7 @@ export function buildCodexReviewSchema(): Record<string, unknown> {
           required: ['criterion', 'status', 'evidence'],
           properties: {
             criterion: { type: 'string' },
-            status: { type: 'string', enum: ['satisfied', 'not_satisfied', 'insufficient_evidence'] },
+            status: { type: 'string', enum: ['satisfied', 'not_satisfied', 'insufficient_evidence', 'deferred'] },
             evidence: { type: 'array', items: { type: 'string' } }
           }
         }
@@ -184,13 +184,14 @@ function validationChecksJsonSchema(): Record<string, unknown> {
     items: {
       type: 'object',
       additionalProperties: false,
-      required: ['kind', 'command', 'category', 'criterion', 'rationale'],
+      required: ['kind', 'command', 'category', 'criterion', 'rationale', 'requiredCapabilities'],
       properties: {
         kind: { type: 'string', enum: ['command'] },
         command: { type: 'string' },
         category: { type: 'string', enum: ['setup', 'build', 'database', 'api', 'browser', 'smoke'] },
         criterion: { type: ['string', 'null'] },
-        rationale: { type: ['string', 'null'] }
+        rationale: { type: ['string', 'null'] },
+        requiredCapabilities: { type: 'array', items: { type: 'string' } }
       }
     }
   };
@@ -554,7 +555,8 @@ export class CodexProvider implements AIProvider {
             'Every implementation step must include changeRationale, dependsOnStepTitles referencing only earlier steps, and validationFocus. Include regression validation for extensions and migration or compatibility validation when the delta declares those impacts. Architecture updates must include databaseSchemas. ' +
             'validationChecks must contain only executable command checks and classify each command as setup, build, database, api, browser, or smoke. Omit criteria that cannot be verified automatically. ' +
             'Commands must verify a criterion through their exit code and must not use shell redirection, fallback chains, or inspection-only git diff/status/log commands. ' +
-            'Use { "kind": "command", "command": "...", "criterion": "...", "rationale": "..." }. Reply with JSON only.'
+            'Declare non-installable platform or licensed-runtime requirements in requiredCapabilities, for example ["windows", "unreal-engine-5.8"]. Use an empty array when the current worker can run the check on any normal platform. Never replace an authoritative platform check with weaker static inspection. ' +
+            'Use { "kind": "command", "command": "...", "criterion": "...", "rationale": "...", "requiredCapabilities": [] }. Reply with JSON only.'
       },
       {
         role: 'user',
@@ -642,7 +644,7 @@ export class CodexProvider implements AIProvider {
           'Do not run broad test suites, full builds, type checks, dependency installation, database validation, or repository-wide formatting; ForgeMind runs authoritative validation after implementation. ' +
           'Run a narrowly targeted check only when it is required to make the edit correctly. ' +
           'Set outcome to changes_made when repository changes are required. If the current repository already satisfies every acceptance criterion, do not modify files: set outcome to already_satisfied, return empty changedFiles, a zero diffStat, non-empty evidenceFiles naming the repository files that prove the criteria, and executable validationChecks that prove the criteria. ' +
-          'After editing, propose the smallest authoritative validationChecks set that verifies the acceptance criteria against the resulting repository. Classify every check as setup, build, database, api, browser, or smoke. ' +
+          'After editing, propose the smallest authoritative validationChecks set that verifies the acceptance criteria against the resulting repository. Classify every check as setup, build, database, api, browser, or smoke. Declare non-installable platform or licensed-runtime requirements in requiredCapabilities (for example windows or unreal-engine-5.8); otherwise use an empty array. Never replace an authoritative platform check with weaker static inspection. ' +
           'Return JSON with outcome, summary, changedFiles, evidenceFiles, diffStat, requestedApprovals, validationChecks, architectureUpdate, and optional fileUpdates [{ path, content }]. architectureUpdate must contain only architectural facts introduced or changed by this attempt, including databaseSchemas; use empty arrays when nothing changed. Reply with JSON only.'
       },
       {
@@ -1696,7 +1698,7 @@ export function buildCodexImplementationPrompt(input: ImplementInput, continueSe
     'Do not run broad test suites, full builds, type checks, dependency installation, database validation, or repository-wide formatting. ForgeMind runs authoritative validation after implementation.',
     'Run a narrowly targeted check only when it is required to make the edit correctly.',
     'Set outcome to changes_made when repository changes are required. If the current repository already satisfies every acceptance criterion, do not modify files: set outcome to already_satisfied, return empty changedFiles, a zero diffStat, non-empty evidenceFiles naming repository files that prove the criteria, and executable validationChecks that prove the criteria.',
-    'After editing, return the smallest authoritative validationChecks set for the resulting repository and acceptance criteria. Do not use environment-only smoke checks such as node --version unless the task explicitly requires them.',
+    'After editing, return the smallest authoritative validationChecks set for the resulting repository and acceptance criteria. Every check must declare requiredCapabilities; use an empty array unless it requires a non-installable platform or licensed runtime such as windows or unreal-engine-5.8. Never replace an authoritative platform check with weaker static inspection. Do not use environment-only smoke checks such as node --version unless the task explicitly requires them.',
     'Return architectureUpdate as a compact delta containing only modules, databaseSchemas, interfaces, dependencies, decisions, conventions, debt, or architecture validation commands introduced or changed by this attempt. Use empty arrays when architecture did not change.',
     'Validation checks must be executable commands that prove a criterion through their exit code. Omit criteria that cannot be verified automatically.',
     input.attemptNumber && input.attemptNumber > 1

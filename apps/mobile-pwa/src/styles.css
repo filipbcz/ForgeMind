@@ -1023,6 +1023,20 @@ a {
   overflow-wrap: anywhere;
 }
 
+.task-capability-wait {
+  display: flex;
+  gap: 12px;
+  align-items: flex-start;
+  padding: 14px 16px;
+  border: 1px solid #d8b86a;
+  background: #fff9e8;
+  color: #6f4d0c;
+}
+
+.task-capability-wait p {
+  margin: 4px 0 0;
+}
+
 .task-disclosure {
   margin-top: 16px;
   border-top: 1px solid #dde5dd;

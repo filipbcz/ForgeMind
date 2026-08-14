@@ -20,7 +20,7 @@ import type { AuthService } from './auth.js';
 import { completeCodexOAuthBrowserLogin, readCodexOAuthBrowserLoginStatus, readCodexOAuthStatus, resolveCodexHome, startCodexOAuthBrowserLogin } from './codex-oauth.js';
 import { createTaskDispatchService } from './dispatch.js';
 import { sendBadRequest, sendNotFound } from './http.js';
-import { advanceRoadmapAfterTaskCompletion, buildRoadmapStepTaskPrompt, composeApprovedExtensionSpecification, startNextRoadmapStep } from '@forgemind/db';
+import { advanceRoadmapAfterTaskCapabilityWait, advanceRoadmapAfterTaskCompletion, buildRoadmapStepTaskPrompt, composeApprovedExtensionSpecification, startNextRoadmapStep } from '@forgemind/db';
 import type { AIProviderConnectionKind, AIProviderConnectionSecret, ForgeMindRepository } from '@forgemind/db';
 import { parseGitHubWebhookPayload, projectGitHubWebhookEvent, verifyGitHubWebhookSignature } from './webhook.js';
 import type { NotificationService } from './notifications.js';
@@ -1449,6 +1449,14 @@ export function registerRoutes(app: FastifyInstance, repository: ForgeMindReposi
         if (!pullRequest.merged) {
           return reply.code(409).send({ error: `Pull request #${existingTask.pullRequestNumber} is not merged.` });
         }
+      }
+      if (existingTask.waitingForCapabilities?.length) {
+        const task = await repository.waitTaskForCapabilities(id, existingTask.waitingForCapabilities, {
+          source: 'user',
+          pullRequestMerged: true
+        });
+        await advanceRoadmapAfterTaskCapabilityWait(repository, id);
+        return task;
       }
       const task = await repository.transitionTask(id, 'completed', { source: 'user' });
       await repository.recordCompletedTaskProjectMemory({ taskId: id });

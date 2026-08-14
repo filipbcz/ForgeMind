@@ -122,7 +122,8 @@ const terminalStatuses = new Set<TaskSummary['status']>([
   'repeated_error_detected',
   'approval_rejected',
   'provider_failed',
-  'validation_failed'
+  'validation_failed',
+  'waiting_for_capability'
 ]);
 
 const errorStatuses = new Set<TaskSummary['status']>([
@@ -170,7 +171,8 @@ const statusLabels: Record<TaskSummary['status'], string> = {
   repeated_error_detected: 'Repeated error',
   approval_rejected: 'Approval rejected',
   provider_failed: 'Provider failed',
-  validation_failed: 'Validation failed'
+  validation_failed: 'Validation failed',
+  waiting_for_capability: 'Waiting for environment'
 };
 
 const statusIcons: Record<TaskSummary['status'], typeof Clock3> = {
@@ -195,7 +197,8 @@ const statusIcons: Record<TaskSummary['status'], typeof Clock3> = {
   repeated_error_detected: AlertTriangle,
   approval_rejected: XCircle,
   provider_failed: XCircle,
-  validation_failed: XCircle
+  validation_failed: XCircle,
+  waiting_for_capability: Clock3
 };
 
 export function App() {
@@ -1498,7 +1501,7 @@ function TaskDetail(props: {
   onComplete: (taskId: string) => void;
 }) {
   const project = props.projects.find((item) => item.id === props.task.projectId);
-  const canRetry = terminalStatuses.has(props.task.status) || props.task.status === 'ready_for_user_review';
+  const canRetry = (terminalStatuses.has(props.task.status) && props.task.status !== 'waiting_for_capability') || props.task.status === 'ready_for_user_review';
   const canCancel = !terminalStatuses.has(props.task.status) && props.task.status !== 'ready_for_user_review';
   const canComplete = props.task.status === 'ready_for_user_review';
   const latestRun = props.usage?.runs.at(-1);
@@ -1546,6 +1549,19 @@ function TaskDetail(props: {
           <div>
             <strong>Task skoncil chybou</strong>
             <pre>{latestError}</pre>
+          </div>
+        </section>
+      ) : null}
+
+      {props.task.status === 'waiting_for_capability' ? (
+        <section className="task-capability-wait" role="status">
+          <Clock3 size={20} />
+          <div>
+            <strong>Validace ceka na vhodne prostredi</strong>
+            <p>
+              Zdrojove zmeny byly predany. Task bude automaticky obnoven, jakmile se pripoji worker se schopnostmi:{' '}
+              {(props.task.waitingForCapabilities ?? []).join(', ') || 'nespecifikovano'}.
+            </p>
           </div>
         </section>
       ) : null}
@@ -1703,6 +1719,7 @@ function buildTaskWorkflow(task: TaskSummary, logs: AuditEventApi[]): TaskWorkfl
     approval_rejected: 2,
     validating: 3,
     validation_failed: 3,
+    waiting_for_capability: 3,
     reviewing: 4,
     creating_pr: 5,
     ready_for_user_review: 5,
@@ -1710,7 +1727,10 @@ function buildTaskWorkflow(task: TaskSummary, logs: AuditEventApi[]): TaskWorkfl
   };
   const inferredStage = inferWorkflowStageFromLogs(logs);
   const currentStage = statusStage[task.status] ?? inferredStage;
-  const failed = terminalStatuses.has(task.status) && task.status !== 'completed' && task.status !== 'cancelled';
+  const failed = terminalStatuses.has(task.status)
+    && task.status !== 'completed'
+    && task.status !== 'cancelled'
+    && task.status !== 'waiting_for_capability';
   const activities = collectTaskActivityEntries(logs, task.id);
 
   return stages.map((stage, index) => {
@@ -2026,7 +2046,10 @@ function toTaskActivityEntry(event: AuditEventApi): TaskActivityEntry | undefine
     if (!Object.prototype.hasOwnProperty.call(statusLabels, status)) {
       return undefined;
     }
-    const failedStatus = terminalStatuses.has(status) && status !== 'completed' && status !== 'cancelled';
+    const failedStatus = terminalStatuses.has(status)
+      && status !== 'completed'
+      && status !== 'cancelled'
+      && status !== 'waiting_for_capability';
     return {
       id: event.id,
       createdAt: event.createdAt,
@@ -2095,7 +2118,7 @@ function toTaskActivityEntry(event: AuditEventApi): TaskActivityEntry | undefine
 
 function statusActivityPhase(status: TaskSummary['status']): string {
   if (status === 'creating_github_issue' || status === 'creating_branch') return 'github';
-  if (status === 'validating' || status === 'validation_failed') return 'validation';
+  if (status === 'validating' || status === 'validation_failed' || status === 'waiting_for_capability') return 'validation';
   if (status === 'reviewing') return 'review';
   if (status === 'creating_pr' || status === 'ready_for_user_review') return 'git';
   if (status === 'running_ai' || status === 'improving') return 'implementation';

@@ -59,7 +59,7 @@ export interface WorkerTaskInput {
 type GitHubOperation = 'create_issue' | 'create_branch' | 'commit_and_push' | 'create_draft_pr' | 'create_pull_request' | 'wait_for_checks' | 'merge_pr' | 'comment_on_issue';
 
 export interface WorkerTaskResume {
-  kind: 'approved_large_diff' | 'approved_operation' | 'approved_review' | 'validation_retry' | 'worker_interrupted' | 'phase_retry';
+  kind: 'approved_large_diff' | 'approved_operation' | 'approved_review' | 'validation_retry' | 'worker_interrupted' | 'phase_retry' | 'capability_available';
   resumeFrom?: 'planning' | 'implementation' | 'validation' | 'review' | 'delivery';
   attempt?: number;
   planSummary?: string;
@@ -142,7 +142,7 @@ export interface WorkerTaskHooks {
 
 export interface WorkerTaskResult {
   taskId: string;
-  status: 'ready_for_user_review' | 'completed' | 'needs_approval' | 'validation_failed' | 'failed';
+  status: 'ready_for_user_review' | 'completed' | 'needs_approval' | 'validation_failed' | 'waiting_for_capability' | 'failed';
   issueUrl: string;
   branchName: string;
   pullRequestUrl?: string;
@@ -153,6 +153,7 @@ export interface WorkerTaskResult {
   summary: string;
   approvals: ApprovalType[];
   architectureUpdate?: ProjectArchitectureUpdate;
+  requiredCapabilities?: string[];
   completedAt: string;
 }
 
@@ -698,6 +699,33 @@ export async function runWorkerTask(input: WorkerTaskInput): Promise<WorkerTaskR
         validation = await runValidationChecks(validationChecks, workspacePath, async (activity) => {
           const checkLabel = `${activity.checkIndex}/${activity.checkCount}`;
           const checkpointKey = `validation:${hashCheckpointValue(activity.command)}`;
+          if (activity.state === 'deferred') {
+            await emitTaskActivity(input.hooks, {
+              phase: 'validation',
+              state: 'completed',
+              title: `Validace ${checkLabel} ceka na jine prostredi`,
+              detail: activity.message,
+              operation: 'validation_deferred',
+              attempt,
+              elapsedMs: 0
+            });
+            await input.hooks?.onCheckpoint?.({
+              key: checkpointKey,
+              phase: 'validation',
+              status: 'completed',
+              inputHash: activity.inputHash ?? validationInputHash,
+              output: {
+                evidenceVersion: 1,
+                deferred: true,
+                command: activity.command,
+                category: activity.category ?? null,
+                criterion: activity.criterion ?? null,
+                rationale: activity.rationale ?? null,
+                requiredCapabilities: activity.requiredCapabilities ?? []
+              }
+            });
+            return;
+          }
           if (activity.state === 'started') {
             await input.hooks?.onCheckpoint?.({
               key: checkpointKey,
@@ -791,6 +819,14 @@ export async function runWorkerTask(input: WorkerTaskInput): Promise<WorkerTaskR
             executedCheckCount: validation.executedCheckCount ?? 0,
             reusedCheckCount: validation.reusedCheckCount ?? 0,
             failingCommand: validation.failingCommand ?? null,
+            deferredChecks: (validation.deferredChecks ?? []).map((check) => ({
+              command: check.command,
+              category: check.category ?? null,
+              criterion: check.criterion ?? null,
+              rationale: check.rationale ?? null,
+              requiredCapabilities: check.requiredCapabilities,
+              missingCapabilities: check.missingCapabilities
+            })),
             attempt,
             validationPlanRevision: validationPlanRevisionCount
           }
@@ -985,7 +1021,11 @@ export async function runWorkerTask(input: WorkerTaskInput): Promise<WorkerTaskR
     if (validation.passed) {
       const satisfactionReview = alreadySatisfied && substantiveChangedFiles.length === 0;
       const reviewResume = input.resume;
-      if (reviewResume && (reviewResume.kind === 'approved_review' || resumeDelivery)) {
+      if (reviewResume && (
+        reviewResume.kind === 'approved_review'
+        || resumeDelivery
+        || (reviewResume.kind === 'capability_available' && isFirstResumedAttempt)
+      )) {
         await input.hooks?.onStatus?.('reviewing', { attempt, resumed: true, kind: reviewResume.kind });
         review = {
           summary: reviewResume.reviewSummary ?? 'Previously approved review resumed.',
@@ -1036,8 +1076,8 @@ export async function runWorkerTask(input: WorkerTaskInput): Promise<WorkerTaskR
           ?? (previousReviewForCorrection
             ? (correctionChangedFiles.length > 0 ? uniqueStrings(correctionChangedFiles) : undefined)
             : implementation.changedFiles);
-        const reviewPacket = satisfactionReview
-          ? { changedFiles: requestedReviewFiles, diff: '' }
+        const reviewPacket: { changedFiles: string[]; diff: string } = satisfactionReview
+          ? { changedFiles: requestedReviewFiles ?? [], diff: '' }
           : await collectReviewPacket(
               git,
               workspacePath,
@@ -1100,9 +1140,14 @@ export async function runWorkerTask(input: WorkerTaskInput): Promise<WorkerTaskR
       review = normalizeReviewAfterValidation({
         ...providerReview,
         riskyChanges: normalizeRuntimeApprovals(providerReview.riskyChanges)
-      });
+      }, validation.deferredChecks ?? []);
       if (satisfactionReview) {
-        review = normalizeSatisfactionReview(review, plan.acceptanceCriteria, satisfactionEvidenceErrors);
+        review = normalizeSatisfactionReview(
+          review,
+          plan.acceptanceCriteria,
+          satisfactionEvidenceErrors,
+          new Set((validation.deferredChecks ?? []).flatMap((check) => check.criterion ? [check.criterion.trim()] : []))
+        );
       }
       await emitTaskActivity(input.hooks, {
         phase: 'review',
@@ -1153,9 +1198,10 @@ export async function runWorkerTask(input: WorkerTaskInput): Promise<WorkerTaskR
             detail: summary,
             operation: 'finish_task'
           });
+          const requiredCapabilities = uniqueStrings((validation.deferredChecks ?? []).flatMap((check) => check.missingCapabilities));
           return {
             taskId: input.task.id,
-            status: 'completed',
+            status: requiredCapabilities.length > 0 ? 'waiting_for_capability' : 'completed',
             issueUrl: issue.issueUrl,
             branchName,
             workspacePath,
@@ -1163,6 +1209,7 @@ export async function runWorkerTask(input: WorkerTaskInput): Promise<WorkerTaskR
             commitSha: await resolveHeadSha(git),
             summary,
             approvals: [],
+            requiredCapabilities: requiredCapabilities.length > 0 ? requiredCapabilities : undefined,
             completedAt: nowIso()
           };
         }
@@ -1210,7 +1257,19 @@ export async function runWorkerTask(input: WorkerTaskInput): Promise<WorkerTaskR
         });
 
         if (delivery.kind === 'completed') {
-          return delivery.result;
+          const requiredCapabilities = uniqueStrings((validation.deferredChecks ?? [])
+            .flatMap((check) => check.missingCapabilities));
+          if (requiredCapabilities.length > 0 && delivery.result.status === 'completed') {
+            return {
+              ...delivery.result,
+              status: 'waiting_for_capability',
+              requiredCapabilities,
+              summary: `${delivery.result.summary}\n\nSource delivery completed. Authoritative validation is waiting for worker capabilities: ${requiredCapabilities.join(', ')}.`
+            };
+          }
+          return requiredCapabilities.length > 0
+            ? { ...delivery.result, requiredCapabilities }
+            : delivery.result;
         }
 
         validation = delivery.validation;
@@ -2339,7 +2398,13 @@ export function normalizeValidationChecks(value: unknown): ValidationCheck[] {
           ? item.category
           : undefined,
         criterion: typeof item.criterion === 'string' && item.criterion.trim() ? item.criterion.trim() : undefined,
-        rationale: typeof item.rationale === 'string' && item.rationale.trim() ? item.rationale.trim() : undefined
+        rationale: typeof item.rationale === 'string' && item.rationale.trim() ? item.rationale.trim() : undefined,
+        requiredCapabilities: Array.isArray(item.requiredCapabilities)
+          ? Array.from(new Set(item.requiredCapabilities
+              .filter((capability: unknown): capability is string => typeof capability === 'string')
+              .map((capability: string) => capability.trim().toLowerCase())
+              .filter(Boolean)))
+          : undefined
       });
       continue;
     }
@@ -2355,7 +2420,8 @@ function validationChecksToJson(checks: ValidationCheck[]): JsonValue[] {
     command: check.command,
     category: check.category ?? null,
     criterion: check.criterion ?? null,
-    rationale: check.rationale ?? null
+    rationale: check.rationale ?? null,
+    requiredCapabilities: check.requiredCapabilities ?? []
   }));
 }
 
@@ -2818,8 +2884,14 @@ function computeChangedPathApprovals(
   return uniqueApprovals(approvals);
 }
 
-function normalizeReviewAfterValidation(review: ReviewResult): ReviewResult {
-  const blockers = review.blockers.filter((blocker) => !isValidationExecutionLimitationBlocker(blocker));
+function normalizeReviewAfterValidation(
+  review: ReviewResult,
+  deferredChecks: import('./validation.js').DeferredValidationCheck[] = []
+): ReviewResult {
+  const blockers = review.blockers.filter((blocker) => (
+    !isValidationExecutionLimitationBlocker(blocker)
+    && !isDeferredValidationOnlyBlocker(blocker, deferredChecks)
+  ));
   return {
     ...review,
     blockers
@@ -2829,7 +2901,8 @@ function normalizeReviewAfterValidation(review: ReviewResult): ReviewResult {
 function normalizeSatisfactionReview(
   review: ReviewResult,
   acceptanceCriteria: string[],
-  evidenceErrors: string[]
+  evidenceErrors: string[],
+  deferredCriteria: ReadonlySet<string> = new Set()
 ): ReviewResult {
   const blockers = [...review.blockers, ...evidenceErrors];
   const results = review.criterionResults ?? [];
@@ -2851,6 +2924,9 @@ function normalizeSatisfactionReview(
       continue;
     }
     const verdict = matches[0]!;
+    if (verdict.status === 'deferred' && deferredCriteria.has(criterion.trim())) {
+      continue;
+    }
     if (verdict.status !== 'satisfied') {
       blockers.push(`Acceptance criterion is ${verdict.status}: ${criterion}`);
     } else if (verdict.evidence.length === 0 || verdict.evidence.every((item) => !item.trim())) {
@@ -2859,6 +2935,25 @@ function normalizeSatisfactionReview(
   }
 
   return { ...review, blockers: uniqueStrings(blockers) };
+}
+
+function isDeferredValidationOnlyBlocker(
+  blocker: string,
+  deferredChecks: import('./validation.js').DeferredValidationCheck[]
+): boolean {
+  if (deferredChecks.length === 0) return false;
+  const normalized = blocker.toLowerCase();
+  const describesMissingEvidence = (
+    /\b(?:cannot|can't|could not|unable to)\b.*\b(?:verify|validate|run|execute|access)\b/.test(normalized)
+    || /\b(?:unavailable|not available|not verified|not run|blocked)\b/.test(normalized)
+    || /\bmissing\b.*\b(?:evidence|artifact|runtime|capabilit(?:y|ies)|worker|environment)\b/.test(normalized)
+  );
+  if (!describesMissingEvidence) return false;
+  return deferredChecks.some((check) => [
+    check.criterion,
+    ...check.requiredCapabilities,
+    ...check.missingCapabilities
+  ].filter(Boolean).some((token) => normalized.includes(String(token).toLowerCase())));
 }
 
 function isValidationExecutionLimitationBlocker(blocker: string): boolean {

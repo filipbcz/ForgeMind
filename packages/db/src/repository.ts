@@ -1699,21 +1699,20 @@ export class ForgeMindRepository {
         where: { projectId: input.projectId, cycleId: step.cycleId, status: 'running' }
       });
       if (running > 0) return undefined;
-      const incompletePredecessors = await tx.projectImplementationStep.count({
-        where: {
-          projectId: input.projectId,
-          cycleId: step.cycleId,
-          sequenceNumber: { lt: step.sequenceNumber },
-          status: { not: 'completed' }
-        }
-      });
-      if (incompletePredecessors > 0) return undefined;
-      const next = await tx.projectImplementationStep.findFirst({
-        where: { projectId: input.projectId, cycleId: step.cycleId, status: 'pending', taskId: null },
-        orderBy: { sequenceNumber: 'asc' },
-        select: { id: true }
-      });
-      if (next?.id !== step.id) return undefined;
+      const dependencyTitles = Array.isArray(step.dependsOnStepTitles)
+        ? step.dependsOnStepTitles.filter((value): value is string => typeof value === 'string')
+        : [];
+      if (dependencyTitles.length > 0) {
+        const completedDependencies = await tx.projectImplementationStep.count({
+          where: {
+            projectId: input.projectId,
+            cycleId: step.cycleId,
+            title: { in: dependencyTitles },
+            status: 'completed'
+          }
+        });
+        if (completedDependencies !== new Set(dependencyTitles).size) return undefined;
+      }
 
       const project = await tx.project.findUnique({ where: { id: input.projectId } });
       if (!project) throw new Error(`Project "${input.projectId}" does not exist`);
@@ -3241,12 +3240,13 @@ export class ForgeMindRepository {
         where: { id: taskId },
         data: {
           status: start ? 'submitted' : 'draft',
+          waitingForCapabilities: [],
           startedAt: start ? new Date() : null,
           finishedAt: null
         }
       });
       await tx.projectImplementationStep.updateMany({
-        where: { taskId, status: 'completed' },
+        where: { taskId, status: { in: ['completed', 'waiting_for_capability'] } },
         data: { status: 'running', completedAt: null }
       });
       return retriedTask;
@@ -3273,6 +3273,7 @@ export class ForgeMindRepository {
       where: { id: taskId },
       data: {
         status: nextStatus,
+        waitingForCapabilities: nextStatus === 'completed' ? [] : undefined,
         finishedAt: nextStatus === 'completed' ? new Date() : undefined
       }
     });
@@ -3286,6 +3287,94 @@ export class ForgeMindRepository {
     });
 
     return toTask(updated);
+  }
+
+  async waitTaskForCapabilities(taskId: string, capabilities: string[], payload: JsonValue = {}): Promise<ForgeTask> {
+    const current = await this.getTask(taskId);
+    if (!current) throw new Error(`Task "${taskId}" not found`);
+    assertTaskTransition(current.status, 'waiting_for_capability');
+    const normalized = Array.from(new Set(capabilities.map((item) => item.trim().toLowerCase()).filter(Boolean)));
+    const updated = await this.prisma.task.update({
+      where: { id: taskId },
+      data: {
+        status: 'waiting_for_capability',
+        waitingForCapabilities: normalized,
+        finishedAt: new Date()
+      }
+    });
+    await this.writeAudit({
+      actorType: 'system',
+      eventType: 'task_waiting_for_capability',
+      projectId: updated.projectId,
+      taskId: updated.id,
+      payload: { ...payload as Record<string, JsonValue>, requiredCapabilities: normalized }
+    });
+    return toTask(updated);
+  }
+
+  async setTaskWaitingCapabilities(taskId: string, capabilities: string[]): Promise<ForgeTask> {
+    const normalized = Array.from(new Set(capabilities.map((item) => item.trim().toLowerCase()).filter(Boolean)));
+    const updated = await this.prisma.task.update({
+      where: { id: taskId },
+      data: { waitingForCapabilities: normalized }
+    });
+    return toTask(updated);
+  }
+
+  async requeueTasksWaitingForCapabilities(availableCapabilities: ReadonlySet<string>): Promise<number> {
+    const waitingTasks = await this.prisma.task.findMany({ where: { status: 'waiting_for_capability' } });
+    let requeued = 0;
+    for (const candidate of waitingTasks) {
+      const required = jsonStringArray(candidate.waitingForCapabilities);
+      if (required.length === 0 || required.some((capability) => !availableCapabilities.has(capability))) continue;
+      const didRequeue = await this.prisma.$transaction(async (tx) => {
+        await tx.$queryRawUnsafe(WORKER_QUEUE_ADVISORY_LOCK_SQL);
+        const task = await tx.task.findUnique({ where: { id: candidate.id } });
+        if (!task || task.status !== 'waiting_for_capability') return false;
+        const activeQueueJobs = await tx.taskQueueJob.count({
+          where: { taskId: task.id, status: { in: ['pending', 'claimed'] } }
+        });
+        if (activeQueueJobs > 0) return false;
+        const linkedStep = await tx.projectImplementationStep.findFirst({ where: { taskId: task.id } });
+        if (linkedStep) {
+          const otherRunningSteps = await tx.projectImplementationStep.count({
+            where: {
+              projectId: linkedStep.projectId,
+              cycleId: linkedStep.cycleId,
+              status: 'running',
+              id: { not: linkedStep.id }
+            }
+          });
+          if (otherRunningSteps > 0) return false;
+        }
+        const now = new Date();
+        await tx.task.update({
+          where: { id: task.id },
+          data: { status: 'submitted', waitingForCapabilities: [], startedAt: now, finishedAt: null }
+        });
+        if (linkedStep) {
+          await tx.projectImplementationStep.update({
+            where: { id: linkedStep.id },
+            data: { status: 'running', completedAt: null }
+          });
+        }
+        await tx.taskRun.create({
+          data: { taskId: task.id, provider: resolveProjectProvider((await tx.project.findUnique({ where: { id: task.projectId } }))?.configYaml ?? undefined), model: 'queued', status: 'queued' }
+        });
+        await tx.taskQueueJob.create({
+          data: { taskId: task.id, reason: 'capability_available', status: 'pending', nextAttemptAt: now }
+        });
+        await tx.auditLog.create({
+          data: {
+            actorType: 'system', eventType: 'task_capability_available', projectId: task.projectId, taskId: task.id,
+            payload: { requiredCapabilities: required }
+          }
+        });
+        return true;
+      });
+      if (didRequeue) requeued += 1;
+    }
+    return requeued;
   }
 
   async updateTaskGitHubFields(
@@ -3433,7 +3522,12 @@ export class ForgeMindRepository {
     });
   }
 
-  async finalizeQueueJob(queueJobId: string | undefined, status: 'succeeded' | 'failed' | 'cancelled', errorMessage?: string): Promise<void> {
+  async finalizeQueueJob(
+    queueJobId: string | undefined,
+    status: 'succeeded' | 'failed' | 'cancelled',
+    errorMessage?: string,
+    retryable = true
+  ): Promise<void> {
     if (!queueJobId) return;
 
     const queueJob = await this.prisma.taskQueueJob.findUnique({
@@ -3448,7 +3542,7 @@ export class ForgeMindRepository {
     if (!queueJob) return;
     if (!isActiveQueueStatus(queueJob.status)) return;
 
-    if (status === 'failed') {
+    if (status === 'failed' && retryable) {
       const maxAttempts = Math.max(1, Number(process.env.FORGEMIND_QUEUE_MAX_ATTEMPTS ?? DEFAULT_QUEUE_MAX_ATTEMPTS));
       const backoffSeconds = Math.max(1, Number(process.env.FORGEMIND_QUEUE_RETRY_BACKOFF_SECONDS ?? DEFAULT_QUEUE_BACKOFF_SECONDS));
       const shouldRetry = queueJob.attemptCount < maxAttempts;

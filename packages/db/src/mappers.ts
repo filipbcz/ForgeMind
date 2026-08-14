@@ -429,6 +429,7 @@ export function toTask(task: Task): ForgeTask {
     prompt: task.prompt,
     mode: task.mode,
     status: task.status,
+    waitingForCapabilities: jsonStringArray(task.waitingForCapabilities),
     githubIssueNumber: task.githubIssueNumber ?? undefined,
     githubIssueUrl: task.githubIssueUrl ?? undefined,
     branchName: task.branchName ?? undefined,

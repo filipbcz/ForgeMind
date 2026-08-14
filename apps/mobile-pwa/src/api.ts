@@ -424,6 +424,7 @@ export function toTaskSummary(task: TaskApi): TaskSummary {
     branchName: task.branchName,
     issueUrl: task.githubIssueUrl,
     pullRequestUrl: task.pullRequestUrl,
+    waitingForCapabilities: task.waitingForCapabilities,
     plan: task.status === 'draft' ? [] : ['Create issue and branch', 'Run provider', 'Validate result', 'Prepare draft PR'],
     testResult: task.status === 'draft' ? 'Not started' : 'See worker log',
     diffSummary: task.status === 'draft' ? 'No changes' : 'See diff summary'
@@ -470,7 +471,8 @@ function currentStep(status: TaskApi['status']): string {
     repeated_error_detected: 'Repeated error detected',
     approval_rejected: 'Approval rejected',
     provider_failed: 'Provider failed',
-    validation_failed: 'Validation failed'
+    validation_failed: 'Validation failed',
+    waiting_for_capability: 'Waiting for a capable worker'
   };
   return labels[status];
 }

@@ -11,6 +11,22 @@ export interface RoadmapAdvanceResult {
   project?: Project;
 }
 
+export async function advanceRoadmapAfterTaskCapabilityWait(
+  repository: ForgeMindRepository,
+  taskId: string
+): Promise<RoadmapAdvanceResult> {
+  const linkedStep = await repository.getImplementationStepByTaskId(taskId);
+  if (!linkedStep || (linkedStep.status !== 'running' && linkedStep.status !== 'waiting_for_capability')) {
+    return { advanced: false };
+  }
+  const waitingStep = linkedStep.status === 'waiting_for_capability'
+    ? linkedStep
+    : await repository.updateImplementationStepStatus(linkedStep.id, 'waiting_for_capability');
+  if (!waitingStep) return { advanced: false };
+  const nextTask = await startNextRoadmapStep(repository, waitingStep.projectId, waitingStep.cycleId);
+  return { advanced: true, completedStep: waitingStep, nextTask };
+}
+
 export async function advanceRoadmapAfterTaskCompletion(
   repository: ForgeMindRepository,
   taskId: string
@@ -34,6 +50,9 @@ export async function advanceRoadmapAfterTaskCompletion(
     .filter((candidate) => candidate.cycleId === cycle.id)
     .sort((left, right) => left.sequenceNumber - right.sequenceNumber);
   if (cycleSteps.some((candidate) => candidate.status === 'running')) {
+    return { advanced: linkedStep.status !== 'completed', completedStep, project };
+  }
+  if (cycleSteps.some((candidate) => candidate.status === 'waiting_for_capability')) {
     return { advanced: linkedStep.status !== 'completed', completedStep, project };
   }
 
@@ -75,15 +94,18 @@ export async function startNextRoadmapStep(
   const cycleSteps = roadmap.steps
     .filter((candidate) => candidate.cycleId === cycleId)
     .sort((left, right) => left.sequenceNumber - right.sequenceNumber);
-  const nextStep = cycleSteps.find((candidate) => candidate.status === 'pending' && !candidate.taskId);
+  const completedTitles = new Set(cycleSteps
+    .filter((candidate) => candidate.status === 'completed')
+    .map((candidate) => candidate.title));
+  const nextStep = cycleSteps.find((candidate) => (
+    candidate.status === 'pending'
+    && !candidate.taskId
+    && (candidate.dependsOnStepTitles ?? []).every((title) => completedTitles.has(title))
+  ));
   if (!nextStep) return undefined;
 
   const currentIndex = cycleSteps.findIndex((candidate) => candidate.id === nextStep.id);
-  if (cycleSteps.slice(0, currentIndex).some((candidate) => candidate.status !== 'completed')) {
-    return undefined;
-  }
   const completedSteps = cycleSteps
-    .slice(0, Math.max(0, currentIndex))
     .filter((candidate) => candidate.status === 'completed')
     .map((candidate) => candidate.title);
   const futureSteps = cycleSteps.slice(currentIndex + 1).map((candidate) => candidate.title);

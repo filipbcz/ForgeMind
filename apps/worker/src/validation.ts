@@ -1,6 +1,7 @@
 import { execaCommand } from 'execa';
 import type { ValidationCheck } from '@forgemind/providers';
 import { createWorkspaceEnvironment } from '@forgemind/shared';
+import { missingValidationCapabilities, requiredValidationCapabilities, resolveWorkerCapabilities } from './worker-capabilities.js';
 
 const VALIDATION_OUTPUT_FLUSH_MS = 350;
 const MAX_ACTIVITY_CHUNK_CHARS = 8_000;
@@ -24,6 +25,16 @@ export interface ValidationResult {
   executedCheckCount?: number;
   reusedCheckCount?: number;
   failingCommand?: string;
+  deferredChecks?: DeferredValidationCheck[];
+}
+
+export interface DeferredValidationCheck {
+  command: string;
+  category?: ValidationCheck['category'];
+  criterion?: string;
+  rationale?: string;
+  requiredCapabilities: string[];
+  missingCapabilities: string[];
 }
 
 export function formatValidationFailure(
@@ -46,10 +57,11 @@ export interface ValidationCheckExecutionResult {
   inputHash?: string;
   criterion?: string;
   rationale?: string;
+  requiredCapabilities?: string[];
 }
 
 export interface ValidationActivity {
-  state: 'started' | 'output' | 'completed';
+  state: 'started' | 'output' | 'completed' | 'deferred';
   command: string;
   checkIndex: number;
   checkCount: number;
@@ -64,6 +76,7 @@ export interface ValidationActivity {
   stderr?: string;
   criterion?: string;
   rationale?: string;
+  requiredCapabilities?: string[];
 }
 
 export type ValidationActivityHandler = (activity: ValidationActivity) => Promise<void> | void;
@@ -251,7 +264,8 @@ export async function runValidationChecks(
   onActivity?: ValidationActivityHandler,
   passedCheckResults: ReadonlyMap<string, ValidationCheckExecutionResult> = new Map(),
   inputHash?: string,
-  signal?: AbortSignal
+  signal?: AbortSignal,
+  availableCapabilities: ReadonlySet<string> = resolveWorkerCapabilities()
 ): Promise<ValidationResult> {
   throwIfAborted(signal);
   if (checks.length === 0) {
@@ -272,10 +286,40 @@ export async function runValidationChecks(
   let executedCheckCount = 0;
   let reusedCheckCount = 0;
   let failingResult: ValidationResult | undefined;
+  const deferredChecks: DeferredValidationCheck[] = [];
 
   for (const [index, check] of checks.entries()) {
     throwIfAborted(signal);
     const effectiveCommand = normalizeValidationCommandForEnvironment(check.command);
+    const missingCapabilities = missingValidationCapabilities(check, availableCapabilities);
+    if (missingCapabilities.length > 0) {
+      const deferredCheck: DeferredValidationCheck = {
+        command: effectiveCommand,
+        category: check.category,
+        criterion: check.criterion,
+        rationale: check.rationale,
+        requiredCapabilities: requiredValidationCapabilities(check),
+        missingCapabilities
+      };
+      deferredChecks.push(deferredCheck);
+      outputs.push(`[deferred] ${effectiveCommand}`);
+      outputs.push(`[missing-capabilities] ${missingCapabilities.join(', ')}`);
+      if (check.criterion) outputs.push(`[criterion] ${check.criterion}`);
+      await onActivity?.({
+        state: 'deferred',
+        command: effectiveCommand,
+        checkIndex: index + 1,
+        checkCount: checks.length,
+        elapsedMs: 0,
+        inputHash,
+        category: check.category,
+        criterion: check.criterion,
+        rationale: check.rationale,
+        requiredCapabilities: deferredCheck.requiredCapabilities,
+        message: `Missing worker capabilities: ${missingCapabilities.join(', ')}`
+      });
+      continue;
+    }
     const resultKey = validationCheckResultKey(effectiveCommand, inputHash);
     const passedResult = passedCheckResults.get(resultKey);
     if (passedResult?.passed) {
@@ -284,6 +328,7 @@ export async function runValidationChecks(
         ...passedResult,
         criterion: check.criterion,
         rationale: check.rationale,
+        requiredCapabilities: check.requiredCapabilities,
         inputHash
       });
       outputs.push(`[command] ${effectiveCommand}`);
@@ -354,7 +399,8 @@ export async function runValidationChecks(
       stdout: result.stdout,
       stderr: result.stderr,
       criterion: check.criterion,
-      rationale: check.rationale
+      rationale: check.rationale,
+      requiredCapabilities: check.requiredCapabilities
     });
     outputs.push(`[command] ${effectiveCommand}`);
     if (check.criterion) {
@@ -373,7 +419,8 @@ export async function runValidationChecks(
       ...result,
       inputHash,
       criterion: check.criterion,
-      rationale: check.rationale
+      rationale: check.rationale,
+      requiredCapabilities: check.requiredCapabilities
     });
 
     if (!result.passed) {
@@ -391,7 +438,8 @@ export async function runValidationChecks(
     checkResults,
     executedCheckCount,
     reusedCheckCount,
-    failingCommand: failingResult?.command
+    failingCommand: failingResult?.command,
+    deferredChecks
   };
 }
 

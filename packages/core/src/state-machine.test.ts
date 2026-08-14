@@ -32,4 +32,10 @@ describe('task state machine', () => {
     expect(canTransitionTask('cancelled', 'completed')).toBe(true);
     expect(canTransitionTask('cancelled', 'running_ai')).toBe(false);
   });
+
+  it('allows validation to pause until a capable worker becomes available', () => {
+    expect(canTransitionTask('validating', 'waiting_for_capability')).toBe(true);
+    expect(TERMINAL_TASK_STATUSES.has('waiting_for_capability')).toBe(true);
+    expect(canTransitionTask('waiting_for_capability', 'submitted')).toBe(true);
+  });
 });

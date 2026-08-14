@@ -48,7 +48,7 @@ Worker flow (apps/worker/src/db-worker.ts):
 2. recoverStuckQueueJobs vrati zasekle claimed joby zpet do pending.
 3. claimNextSubmittedTask claimne nejstarsi pending job, ktery je ready podle next_attempt_at.
 4. provider estimate se ulozi pro reporting; pouze provider fail zastavi beh pred execute.
-5. implementacni provider vrati zmeny i minimalni spustitelne validationChecks ve stejne odpovedi; worker je pote spusti pred review. Pri selhani dostane AI kompletni prikaz, exit code, stdout a stderr a strukturovane rozhodne mezi nahrazenim kontroly, opravou implementace a skutecnym blockerem. Manualni kontroly se negeneruji ani nevyhodnocuji; pokud zadne kriterium nelze automatizovat, validation faze se oznaci jako preskocena a workflow pokracuje.
+5. implementacni provider vrati zmeny i minimalni spustitelne validationChecks ve stejne odpovedi; worker je pote spusti pred review. Kontrola muze deklarovat requiredCapabilities pro platformu nebo licencovany runtime. Worker spusti kompatibilni kontroly a autoritativni nekompatibilni kontrolu odlozi bez oslabeni na statickou nahradu; task po predani zdroju ceka na schopny worker a nezavisle roadmap kroky mohou pokracovat. Pri skutecnem selhani dostane AI kompletni prikaz, exit code, stdout a stderr a strukturovane rozhodne mezi nahrazenim kontroly, opravou implementace a skutecnym blockerem. Manualni kontroly se negeneruji ani nevyhodnocuji; pokud zadne kriterium nelze automatizovat, validation faze se oznaci jako preskocena a workflow pokracuje.
    Ve stejne odpovedi provider vraci malou architectureUpdate deltu. Nevznika tim dalsi AI volani.
 6. runWorkerTask provede planning/implementation/validation/review/GitHub kroky.
 7. hooks zapisuji status prechody, iteration data, GitHub IDs a audit eventy.

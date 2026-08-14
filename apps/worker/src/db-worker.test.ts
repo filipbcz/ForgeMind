@@ -4,6 +4,7 @@ import { resolve } from 'node:path';
 const createProviderMock = vi.fn();
 const runWorkerTaskMock = vi.fn();
 const advanceRoadmapAfterTaskCompletionMock = vi.fn(async () => ({ advanced: false }));
+const advanceRoadmapAfterTaskCapabilityWaitMock = vi.fn(async () => ({ advanced: false }));
 const startNextRoadmapStepMock = vi.fn(async (): Promise<{ id: string } | undefined> => undefined);
 const runCapabilityAuditMock = vi.fn();
 const runReleaseAuditMock = vi.fn();
@@ -52,6 +53,7 @@ function createClaimedTask(queueReason = 'task_started') {
 
 const repositoryMock = {
   recoverStuckQueueJobs: vi.fn(async () => ({ recoveredCount: 0, queueJobIds: [] })),
+  requeueTasksWaitingForCapabilities: vi.fn(async () => 0),
   recoverStuckProjectAudits: vi.fn(async () => 0),
   getGitHubConnectionSecret: vi.fn(async () => undefined),
   getAIProviderConnectionSecret: vi.fn(async () => undefined),
@@ -70,6 +72,8 @@ const repositoryMock = {
   recordCompletedTaskProjectMemory: vi.fn(async () => undefined),
   recordProviderUsage: vi.fn(async () => undefined),
   transitionTask: vi.fn(async () => undefined),
+  waitTaskForCapabilities: vi.fn(async () => undefined),
+  setTaskWaitingCapabilities: vi.fn(async () => undefined),
   createApproval: vi.fn(async () => ({ id: 'approval_1' })),
   createIteration: vi.fn(async () => undefined),
   listTaskCheckpoints: vi.fn(async (): Promise<unknown[]> => []),
@@ -113,6 +117,7 @@ const repositoryMock = {
 
 vi.mock('@forgemind/db', () => ({
   advanceRoadmapAfterTaskCompletion: advanceRoadmapAfterTaskCompletionMock,
+  advanceRoadmapAfterTaskCapabilityWait: advanceRoadmapAfterTaskCapabilityWaitMock,
   startNextRoadmapStep: startNextRoadmapStepMock,
   createRepository: vi.fn(() => repositoryMock),
   getPrismaClient: vi.fn(() => ({}))
@@ -513,6 +518,56 @@ github:
         implementationSummary: 'Implementation is already present.',
         validationChecks: [{ kind: 'command', command: 'cmake --preset test' }],
         architectureUpdate: expect.objectContaining({ modules: [expect.objectContaining({ name: 'Domain' })] })
+      })
+    }));
+  });
+
+  it('resumes a capability gate at validation while preserving completed delivery checkpoints', async () => {
+    repositoryMock.claimNextSubmittedTask.mockResolvedValueOnce(createClaimedTask('capability_available'));
+    repositoryMock.getTaskDiff.mockResolvedValueOnce({
+      taskId: 'task_1', filesChanged: 1, insertions: 5, deletions: 0,
+      iterations: [
+        { phase: 'planning', prompt: 'Plan', resultSummary: 'Plan', validationResult: { validationChecks: [
+          { kind: 'command', command: 'npm test', requiredCapabilities: [] },
+          { kind: 'command', command: 'UnrealEditor.exe Flying.uproject', requiredCapabilities: ['windows'] }
+        ] }, createdAt: '2026-08-02T10:00:10.000Z' },
+        { phase: 'implementation', prompt: 'Implement', resultSummary: 'Implemented', diffStat: { filesChanged: 1, insertions: 5, deletions: 0 }, validationResult: { changedFiles: ['src/a.cpp'] }, createdAt: '2026-08-02T10:00:20.000Z' },
+        { phase: 'validation', prompt: 'Validate', resultSummary: 'Portable checks passed; Win64 deferred', validationResult: {
+          command: 'npm test && UnrealEditor.exe Flying.uproject', exitCode: 0, stdout: '', stderr: '', passed: true,
+          passedValidationChecks: [{ command: 'npm test', inputHash: 'tree-hash', exitCode: 0, stdout: 'ok', stderr: '', passed: true }],
+          deferredChecks: [{ command: 'UnrealEditor.exe Flying.uproject', requiredCapabilities: ['windows'], missingCapabilities: ['windows'] }]
+        }, createdAt: '2026-08-02T10:00:30.000Z' },
+        { phase: 'review', prompt: 'Review', resultSummary: 'Review passed', validationResult: { blockers: [], riskyChanges: [] }, createdAt: '2026-08-02T10:00:40.000Z' }
+      ]
+    });
+    repositoryMock.listTaskAudit.mockResolvedValueOnce([
+      { eventType: 'task_activity', payload: { phase: 'git', state: 'completed', operation: 'commit_and_push' }, createdAt: '2026-08-02T10:00:45.000Z' }
+    ]);
+    repositoryMock.listTaskCheckpoints.mockResolvedValueOnce([
+      { key: 'validation:deferred', phase: 'validation', status: 'completed', inputHash: 'tree-hash', output: { evidenceVersion: 1, deferred: true, command: 'UnrealEditor.exe Flying.uproject' } },
+      { key: 'external:wait_for_checks', phase: 'github', status: 'completed', inputHash: 'checks-hash', output: { status: 'success', summary: 'passed', failures: [] } },
+      { key: 'external:merge_pr', phase: 'github', status: 'completed', inputHash: 'merge-hash', output: { merged: true, sha: 'abcdef1234567' } }
+    ]);
+    runWorkerTaskMock.mockResolvedValueOnce({
+      taskId: 'task_1', status: 'completed', issueUrl: '', branchName: 'ai/1-task', workspacePath: 'C:/tmp/worker',
+      validation: { command: 'UnrealEditor.exe Flying.uproject', exitCode: 0, stdout: 'passed', stderr: '', passed: true },
+      summary: 'Capability gate passed.', approvals: [], completedAt: new Date().toISOString()
+    });
+
+    const { runDatabaseWorkerOnce } = await import('./db-worker.js');
+    await runDatabaseWorkerOnce();
+
+    expect(runWorkerTaskMock).toHaveBeenCalledWith(expect.objectContaining({
+      resume: expect.objectContaining({
+        kind: 'capability_available',
+        resumeFrom: 'validation',
+        validation: undefined,
+        validationChecks: expect.arrayContaining([
+          expect.objectContaining({ command: 'UnrealEditor.exe Flying.uproject', requiredCapabilities: ['windows'] })
+        ]),
+        passedValidationChecks: [expect.objectContaining({ command: 'npm test' })],
+        completedOperations: expect.arrayContaining(['commit_and_push', 'wait_for_checks', 'merge_pr']),
+        mergeCommitSha: 'abcdef1234567'
       })
     }));
   });
@@ -2313,6 +2368,36 @@ github:
     });
     expect(repositoryMock.transitionTask).toHaveBeenNthCalledWith(2, 'task_1', 'completed');
     expect(advanceRoadmapAfterTaskCompletionMock).toHaveBeenCalledWith(repositoryMock, 'task_1');
+  });
+
+  it('persists a capability wait without failing or retrying the queue job', async () => {
+    runWorkerTaskMock.mockResolvedValueOnce({
+      taskId: 'task_1',
+      status: 'waiting_for_capability',
+      issueUrl: 'https://github.com/demo/repo/issues/1',
+      branchName: 'ai/1-task',
+      pullRequestUrl: 'https://github.com/demo/repo/pull/1',
+      workspacePath: 'C:/tmp/worker',
+      validation: {
+        command: 'UnrealEditor.exe Flying.uproject', exitCode: 0, stdout: '', stderr: '', passed: true,
+        deferredChecks: [{
+          command: 'UnrealEditor.exe Flying.uproject', criterion: 'Win64 starts',
+          requiredCapabilities: ['windows'], missingCapabilities: ['windows']
+        }]
+      },
+      requiredCapabilities: ['windows'],
+      summary: 'Source delivered; Win64 gate deferred.', approvals: [], completedAt: new Date().toISOString()
+    });
+
+    const { runDatabaseWorkerOnce } = await import('./db-worker.js');
+    await runDatabaseWorkerOnce();
+
+    expect(repositoryMock.waitTaskForCapabilities).toHaveBeenCalledWith(
+      'task_1', ['windows'], expect.objectContaining({ pullRequestUrl: 'https://github.com/demo/repo/pull/1' })
+    );
+    expect(advanceRoadmapAfterTaskCapabilityWaitMock).toHaveBeenCalledWith(repositoryMock, 'task_1');
+    expect(repositoryMock.finalizeQueueJob).toHaveBeenCalledWith('queue_1', 'succeeded');
+    expect(repositoryMock.failTask).not.toHaveBeenCalled();
   });
 
   it('runs capability and release audits before completing a roadmap cycle', async () => {

@@ -3056,7 +3056,8 @@ describe('worker workflow', () => {
       changedFiles: ['src/result.ts'],
       diff: expect.not.stringContaining('node_modules')
     }));
-    expect(review.mock.calls[0]?.[0].diff).not.toContain('out/build');
+    const firstReviewInput = (review.mock.calls as unknown as Array<[ReviewInput]>)[0]?.[0];
+    expect(firstReviewInput?.diff).not.toContain('out/build');
     const committedFiles = (await simpleGit({ baseDir: join(workspaceRoot, task.id) }).show([
       '--name-only',
       '--format=',

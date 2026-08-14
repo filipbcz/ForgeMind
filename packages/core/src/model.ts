@@ -26,7 +26,8 @@ export type TaskStatus =
   | 'repeated_error_detected'
   | 'approval_rejected'
   | 'provider_failed'
-  | 'validation_failed';
+  | 'validation_failed'
+  | 'waiting_for_capability';
 
 export type RunStatus = 'queued' | 'running' | 'succeeded' | 'failed' | 'cancelled';
 
@@ -399,7 +400,7 @@ export interface ProjectAuditJob {
   finishedAt?: IsoDateString;
 }
 
-export type ProjectImplementationStepStatus = 'pending' | 'running' | 'completed' | 'cancelled';
+export type ProjectImplementationStepStatus = 'pending' | 'running' | 'waiting_for_capability' | 'completed' | 'cancelled';
 
 export interface ProjectRoadmapCycle {
   id: string;
@@ -465,6 +466,7 @@ export interface ForgeTask {
   prompt: string;
   mode: TaskMode;
   status: TaskStatus;
+  waitingForCapabilities?: string[];
   githubIssueNumber?: number;
   githubIssueUrl?: string;
   branchName?: string;

@@ -20,7 +20,8 @@ export type TaskStatus =
   | 'repeated_error_detected'
   | 'approval_rejected'
   | 'provider_failed'
-  | 'validation_failed';
+  | 'validation_failed'
+  | 'waiting_for_capability';
 
 export interface ProjectApi {
   id: string;
@@ -180,7 +181,7 @@ export interface ProjectAuditJobApi {
   claimedAt?: string;
   finishedAt?: string;
 }
-export type ProjectImplementationStepStatus = 'pending' | 'running' | 'completed' | 'cancelled';
+export type ProjectImplementationStepStatus = 'pending' | 'running' | 'waiting_for_capability' | 'completed' | 'cancelled';
 
 export interface ProjectRoadmapCycleApi {
   id: string;
@@ -287,6 +288,7 @@ export interface TaskApi {
   prompt: string;
   mode: 'safe' | 'auto' | 'full_auto';
   status: TaskStatus;
+  waitingForCapabilities?: string[];
   githubIssueNumber?: number;
   githubIssueUrl?: string;
   branchName?: string;
@@ -787,6 +789,7 @@ export interface TaskSummary {
   branchName?: string;
   issueUrl?: string;
   pullRequestUrl?: string;
+  waitingForCapabilities?: string[];
   plan: string[];
   testResult: string;
   diffSummary: string;

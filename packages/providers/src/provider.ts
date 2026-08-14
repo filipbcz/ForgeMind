@@ -113,6 +113,7 @@ export interface ValidationCheck {
   timeoutMinutes?: number;
   criterion?: string;
   rationale?: string;
+  requiredCapabilities?: string[];
 }
 
 export function normalizeValidationChecks(value: unknown): ValidationCheck[] {
@@ -124,12 +125,22 @@ export function normalizeValidationChecks(value: unknown): ValidationCheck[] {
     const criterion = typeof check.criterion === 'string' ? check.criterion.trim() || undefined : undefined;
     const rationale = typeof check.rationale === 'string' ? check.rationale.trim() || undefined : undefined;
     const category = isValidationCheckCategory(check.category) ? check.category : undefined;
+    const requiredCapabilities = normalizeCapabilities(check.requiredCapabilities);
 
     if (check.kind === 'command' && typeof check.command === 'string' && check.command.trim()) {
-      return [{ kind: 'command', command: check.command.trim(), category, criterion, rationale }];
+      return [{ kind: 'command', command: check.command.trim(), category, criterion, rationale, requiredCapabilities }];
     }
     return [];
   });
+}
+
+function normalizeCapabilities(value: unknown): string[] | undefined {
+  if (!Array.isArray(value)) return undefined;
+  const normalized = Array.from(new Set(value
+    .filter((item): item is string => typeof item === 'string')
+    .map((item) => item.trim().toLowerCase())
+    .filter(Boolean)));
+  return normalized.length > 0 ? normalized : undefined;
 }
 
 function isValidationCheckCategory(value: unknown): value is ValidationCheckCategory {
@@ -188,6 +199,13 @@ export interface ReviewInput {
     stdout: string;
     stderr: string;
     passed: boolean;
+    deferredChecks?: Array<{
+      command: string;
+      criterion?: string;
+      rationale?: string;
+      requiredCapabilities: string[];
+      missingCapabilities: string[];
+    }>;
   };
   diff: string;
   reviewMode?: 'changes' | 'existing_state';
@@ -206,7 +224,7 @@ export interface ReviewResult {
   riskyChanges: ApprovalType[];
   criterionResults?: Array<{
     criterion: string;
-    status: 'satisfied' | 'not_satisfied' | 'insufficient_evidence';
+    status: 'satisfied' | 'not_satisfied' | 'insufficient_evidence' | 'deferred';
     evidence: string[];
   }>;
   providerPrompt?: string;
@@ -292,7 +310,7 @@ export function parseReviewResult(content: string, operation: string): ReviewRes
       if (!item || typeof item !== 'object' || Array.isArray(item)) return true;
       const result = item as Record<string, unknown>;
       return typeof result.criterion !== 'string'
-        || !['satisfied', 'not_satisfied', 'insufficient_evidence'].includes(String(result.status))
+        || !['satisfied', 'not_satisfied', 'insufficient_evidence', 'deferred'].includes(String(result.status))
         || !Array.isArray(result.evidence)
         || result.evidence.some((entry) => typeof entry !== 'string');
     })) {

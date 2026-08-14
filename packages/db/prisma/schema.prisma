@@ -41,6 +41,7 @@ enum TaskStatus {
   approval_rejected
   provider_failed
   validation_failed
+  waiting_for_capability
 }
 
 enum ProviderKind {
@@ -209,6 +210,7 @@ enum ProjectAuditJobStatus {
 enum ProjectImplementationStepStatus {
   pending
   running
+  waiting_for_capability
   completed
   cancelled
 }
@@ -318,6 +320,7 @@ model Task {
   prompt                      String
   mode                        TaskMode      @default(safe)
   status                      TaskStatus    @default(draft)
+  waitingForCapabilities      Json          @default("[]") @map("waiting_for_capabilities")
   githubIssueNumber           Int?          @map("github_issue_number")
   githubIssueUrl              String?       @map("github_issue_url")
   branchName                  String?       @map("branch_name")
