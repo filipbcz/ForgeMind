@@ -48,3 +48,7 @@ export function assertTaskTransition(from: TaskStatus, to: TaskStatus): void {
     throw new Error(`Invalid task status transition from "${from}" to "${to}"`);
   }
 }
+
+export function isNonBlockingDeferredValidation(capabilities: readonly string[]): boolean {
+  return capabilities.some((capability) => capability.trim().toLowerCase() === 'windows');
+}

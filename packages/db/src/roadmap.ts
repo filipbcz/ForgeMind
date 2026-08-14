@@ -1,4 +1,4 @@
-import { activeProjectContractRequirements } from '@forgemind/core';
+import { activeProjectContractRequirements, isNonBlockingDeferredValidation } from '@forgemind/core';
 import type { ForgeTask, Project, ProjectImplementationStep, ProjectRoadmapCycle } from '@forgemind/core';
 import type { ForgeMindRepository } from './repository.js';
 
@@ -53,7 +53,8 @@ export async function advanceRoadmapAfterTaskCompletion(
     return { advanced: linkedStep.status !== 'completed', completedStep, project };
   }
   if (cycleSteps.some((candidate) => candidate.status === 'waiting_for_capability')) {
-    return { advanced: linkedStep.status !== 'completed', completedStep, project };
+    const nextTask = await startNextRoadmapStep(repository, project.id, cycle.id);
+    return { advanced: Boolean(nextTask) || linkedStep.status !== 'completed', completedStep, nextTask, project };
   }
 
   const nextStep = cycleSteps.find((candidate) => candidate.status === 'pending');
@@ -94,13 +95,30 @@ export async function startNextRoadmapStep(
   const cycleSteps = roadmap.steps
     .filter((candidate) => candidate.cycleId === cycleId)
     .sort((left, right) => left.sequenceNumber - right.sequenceNumber);
-  const completedTitles = new Set(cycleSteps
+  const dependencySatisfiedTitles = new Set(cycleSteps
     .filter((candidate) => candidate.status === 'completed')
     .map((candidate) => candidate.title));
+  const pendingDependencyTitles = new Set(cycleSteps
+    .filter((candidate) => candidate.status === 'pending' && !candidate.taskId)
+    .flatMap((candidate) => candidate.dependsOnStepTitles ?? []));
+  const deferredValidationTitles = new Set<string>();
+  const deferredWindowsSteps = cycleSteps.filter((candidate) => (
+    candidate.status === 'waiting_for_capability'
+    && candidate.taskId
+    && pendingDependencyTitles.has(candidate.title)
+  ));
+  const deferredWindowsTasks = await Promise.all(deferredWindowsSteps.map((step) => repository.getTask(step.taskId!)));
+  deferredWindowsTasks.forEach((task, index) => {
+    if (task && isNonBlockingDeferredValidation(task.waitingForCapabilities ?? [])) {
+      const title = deferredWindowsSteps[index]!.title;
+      dependencySatisfiedTitles.add(title);
+      deferredValidationTitles.add(title);
+    }
+  });
   const nextStep = cycleSteps.find((candidate) => (
     candidate.status === 'pending'
     && !candidate.taskId
-    && (candidate.dependsOnStepTitles ?? []).every((title) => completedTitles.has(title))
+    && (candidate.dependsOnStepTitles ?? []).every((title) => dependencySatisfiedTitles.has(title))
   ));
   if (!nextStep) return undefined;
 
@@ -125,6 +143,7 @@ export async function startNextRoadmapStep(
         validationFocus: nextStep.validationFocus,
         projectContract: project.projectContract,
         completedSteps,
+        deferredValidationSteps: Array.from(deferredValidationTitles),
         futureSteps
       }),
       mode: project.defaultTaskMode ?? 'safe',
@@ -147,6 +166,7 @@ export function buildRoadmapStepTaskPrompt(input: {
   validationFocus?: ProjectImplementationStep['validationFocus'];
   projectContract?: Project['projectContract'];
   completedSteps: string[];
+  deferredValidationSteps?: string[];
   futureSteps: string[];
 }): string {
   const lines = [
@@ -205,6 +225,11 @@ export function buildRoadmapStepTaskPrompt(input: {
   if (input.completedSteps.length > 0) {
     lines.push('', 'Already completed roadmap steps (existing repository context):');
     for (const completedStep of input.completedSteps) lines.push(`- ${completedStep}`);
+  }
+  if (input.deferredValidationSteps?.length) {
+    lines.push('', 'Implemented predecessor steps with deferred environment validation:');
+    for (const deferredStep of input.deferredValidationSteps) lines.push(`- ${deferredStep}`);
+    lines.push('- Continue from their delivered implementation. Do not repeat their scope solely because environment-specific validation is still pending.');
   }
   if (input.futureSteps.length > 0) {
     lines.push('', 'Future roadmap steps (explicitly out of scope):');

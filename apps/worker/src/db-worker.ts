@@ -1,7 +1,7 @@
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { parseAgentConfigYaml, toCoreLimits, type AgentConfig } from '@forgemind/config';
-import { activeProjectContractRequirements, DEFAULT_LIMITS, evaluateLimits, requiresApproval, type Limits, type LimitUsage } from '@forgemind/core';
+import { activeProjectContractRequirements, DEFAULT_LIMITS, evaluateLimits, isNonBlockingDeferredValidation, requiresApproval, type Limits, type LimitUsage } from '@forgemind/core';
 import { advanceRoadmapAfterTaskCapabilityWait, advanceRoadmapAfterTaskCompletion, createRepository, getPrismaClient, startNextRoadmapStep, type AIProviderConnectionSecret, type ForgeMindRepository } from '@forgemind/db';
 import { GitHubAppAdapter, createGitHubAdapterFromEnv, type GitHubChecksResult } from '@forgemind/github';
 import { buildProjectExtensionProposalPrompt, createProvider, formatProjectExtensionProposal, type AIProvider, type ProviderSessionContext, type ReviewResult, type ValidationCheck } from '@forgemind/providers';
@@ -72,6 +72,12 @@ export async function runDatabaseWorkerOnce(options: { deferInterruptSignals?: b
   const recovery = await repository.recoverStuckQueueJobs(claimTimeoutMinutes);
   const workerCapabilities = resolveWorkerCapabilities();
   const requeuedCapabilityTasks = await repository.requeueTasksWaitingForCapabilities(workerCapabilities);
+  const deferredCapabilityTasks = await repository.listTasksWaitingForCapabilitiesWithPendingRoadmapSteps();
+  for (const task of deferredCapabilityTasks) {
+    if (isNonBlockingDeferredValidation(task.waitingForCapabilities ?? [])) {
+      await advanceRoadmapAfterTaskCapabilityWait(repository, task.id);
+    }
+  }
   const recoveredProjectAudits = await repository.recoverStuckProjectAudits(claimTimeoutMinutes);
   const auditResult = await runNextProjectAudit({
     repository,

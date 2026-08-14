@@ -1,5 +1,6 @@
 import {
   activeProjectContractRequirements,
+  isNonBlockingDeferredValidation,
   type AcceptanceEvidence,
   type AcceptanceEvidenceSource,
   type AcceptanceEvidenceStatus,
@@ -1703,16 +1704,32 @@ export class ForgeMindRepository {
       const dependencyTitles = Array.isArray(step.dependsOnStepTitles)
         ? step.dependsOnStepTitles.filter((value): value is string => typeof value === 'string')
         : [];
+      let deferredDependencyTitles: string[] = [];
       if (dependencyTitles.length > 0) {
-        const completedDependencies = await tx.projectImplementationStep.count({
+        const dependencies = await tx.projectImplementationStep.findMany({
           where: {
             projectId: input.projectId,
             cycleId: step.cycleId,
-            title: { in: dependencyTitles },
-            status: 'completed'
+            title: { in: dependencyTitles }
+          },
+          include: {
+            task: { select: { status: true, waitingForCapabilities: true } }
           }
         });
-        if (completedDependencies !== new Set(dependencyTitles).size) return undefined;
+        deferredDependencyTitles = dependencies
+          .filter((dependency) => (
+            dependency.status === 'waiting_for_capability'
+            && dependency.task?.status === 'waiting_for_capability'
+            && isNonBlockingDeferredValidation(jsonStringArray(dependency.task.waitingForCapabilities))
+          ))
+          .map((dependency) => dependency.title);
+        const satisfiedDependencies = new Set(dependencies
+          .filter((dependency) => (
+            dependency.status === 'completed'
+            || deferredDependencyTitles.includes(dependency.title)
+          ))
+          .map((dependency) => dependency.title));
+        if (dependencyTitles.some((title) => !satisfiedDependencies.has(title))) return undefined;
       }
 
       const project = await tx.project.findUnique({ where: { id: input.projectId } });
@@ -1784,6 +1801,12 @@ export class ForgeMindRepository {
         actorType: 'system', eventType: 'task_enqueued', projectId: project.id, taskId: task.id,
         payload: { reason: 'roadmap_step_started' }
       });
+      if (deferredDependencyTitles.length > 0) {
+        await this.writeAuditTx(tx, {
+          actorType: 'system', eventType: 'roadmap_dependency_validation_deferred', projectId: project.id, taskId: task.id,
+          payload: { stepId: step.id, deferredDependencyTitles, capability: 'windows' }
+        });
+      }
       return toTask(task);
     });
   }
@@ -3320,6 +3343,24 @@ export class ForgeMindRepository {
       data: { waitingForCapabilities: normalized }
     });
     return toTask(updated);
+  }
+
+  async listTasksWaitingForCapabilitiesWithPendingRoadmapSteps(): Promise<ForgeTask[]> {
+    const tasks = await this.prisma.task.findMany({
+      where: {
+        status: 'waiting_for_capability',
+        roadmapSteps: {
+          some: {
+            cycle: {
+              status: 'active',
+              steps: { some: { status: 'pending', taskId: null } }
+            }
+          }
+        }
+      },
+      orderBy: { createdAt: 'asc' }
+    });
+    return tasks.map(toTask);
   }
 
   async requeueTasksWaitingForCapabilities(availableCapabilities: ReadonlySet<string>): Promise<number> {

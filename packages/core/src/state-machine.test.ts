@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { canTransitionTask, TERMINAL_TASK_STATUSES } from './state-machine.js';
+import { canTransitionTask, isNonBlockingDeferredValidation, TERMINAL_TASK_STATUSES } from './state-machine.js';
 
 describe('task state machine', () => {
   it('allows the happy path from draft to submitted', () => {
@@ -37,5 +37,12 @@ describe('task state machine', () => {
     expect(canTransitionTask('validating', 'waiting_for_capability')).toBe(true);
     expect(TERMINAL_TASK_STATUSES.has('waiting_for_capability')).toBe(true);
     expect(canTransitionTask('waiting_for_capability', 'submitted')).toBe(true);
+  });
+
+  it('treats deferred Windows validation as non-blocking roadmap evidence', () => {
+    expect(isNonBlockingDeferredValidation(['windows'])).toBe(true);
+    expect(isNonBlockingDeferredValidation(['Windows', 'unreal-engine'])).toBe(true);
+    expect(isNonBlockingDeferredValidation(['linux'])).toBe(false);
+    expect(isNonBlockingDeferredValidation([])).toBe(false);
   });
 });

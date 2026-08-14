@@ -54,6 +54,7 @@ function createClaimedTask(queueReason = 'task_started') {
 const repositoryMock = {
   recoverStuckQueueJobs: vi.fn(async () => ({ recoveredCount: 0, queueJobIds: [] })),
   requeueTasksWaitingForCapabilities: vi.fn(async () => 0),
+  listTasksWaitingForCapabilitiesWithPendingRoadmapSteps: vi.fn(async () => []),
   recoverStuckProjectAudits: vi.fn(async () => 0),
   getGitHubConnectionSecret: vi.fn(async () => undefined),
   getAIProviderConnectionSecret: vi.fn(async () => undefined),
@@ -204,6 +205,20 @@ describe('db-worker policy enforcement', () => {
         process.env.FORGEMIND_WORKSPACE_ROOT = previousWorkspaceRoot;
       }
     }
+  });
+
+  it('keeps an existing Windows capability wait from blocking the next roadmap task', async () => {
+    repositoryMock.listTasksWaitingForCapabilitiesWithPendingRoadmapSteps.mockResolvedValueOnce([{
+      id: 'task_windows',
+      waitingForCapabilities: ['windows']
+    }] as never);
+    repositoryMock.claimNextSubmittedTask.mockResolvedValueOnce(undefined);
+
+    const { runDatabaseWorkerOnce } = await import('./db-worker.js');
+    const result = await runDatabaseWorkerOnce();
+
+    expect(advanceRoadmapAfterTaskCapabilityWaitMock).toHaveBeenCalledWith(repositoryMock, 'task_windows');
+    expect(result).toEqual(expect.objectContaining({ claimed: false }));
   });
 
   it('persists a redacted GitHub failure and keeps the daemon available for retries', async () => {
