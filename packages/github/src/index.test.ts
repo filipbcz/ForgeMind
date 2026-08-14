@@ -749,6 +749,48 @@ describe('GitHub helpers', () => {
     ]);
   });
 
+  it('falls back to check annotations when an expired Actions job log is unavailable', async () => {
+    const adapter = new GitHubAppAdapter({ token: 'test-token' });
+    const requestSpy = vi.spyOn(adapter as any, 'request');
+    requestSpy
+      .mockResolvedValueOnce({
+        total_count: 1,
+        check_runs: [{
+          id: 22,
+          name: 'Native modules and smoke test',
+          status: 'completed',
+          conclusion: 'failure',
+          details_url: 'https://github.com/demo/demo-repo/actions/runs/10/job/20',
+          output: { summary: 'Process completed with exit code 1.' }
+        }]
+      })
+      .mockResolvedValueOnce([{
+        path: 'core_sim/src/telemetry.cpp',
+        start_line: 101,
+        end_line: 101,
+        annotation_level: 'failure',
+        title: 'Build failed',
+        message: 'error C2589: illegal token on right side of ::',
+        raw_details: null
+      }]);
+    vi.spyOn(adapter as any, 'requestText').mockRejectedValueOnce(new Error('BlobNotFound'));
+
+    const result = await adapter.waitForChecks(projectFixture, 'head-sha', {
+      timeoutMs: 1_000,
+      discoveryTimeoutMs: 0,
+      pollIntervalMs: 0
+    });
+
+    expect(result.status).toBe('failure');
+    expect(result.summary).toContain('core_sim/src/telemetry.cpp:101: failure');
+    expect(result.summary).toContain('error C2589');
+    expect(result.summary).not.toContain('Unable to read the failed job log');
+    expect(requestSpy).toHaveBeenLastCalledWith(
+      'GET',
+      '/repos/demo/demo-repo/check-runs/22/annotations?per_page=100'
+    );
+  });
+
   it('does not block repositories where no GitHub checks start', async () => {
     const adapter = new GitHubAppAdapter({ token: 'test-token' });
     vi.spyOn(adapter as any, 'request').mockResolvedValueOnce({ total_count: 0, check_runs: [] });

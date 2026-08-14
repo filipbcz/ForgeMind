@@ -217,6 +217,16 @@ interface GitHubCheckRunResponse {
   };
 }
 
+interface GitHubCheckAnnotationResponse {
+  path: string;
+  start_line: number;
+  end_line: number;
+  annotation_level: string;
+  message: string;
+  title?: string | null;
+  raw_details?: string | null;
+}
+
 interface GitHubRepositoryResponse {
   full_name: string;
   name?: string;
@@ -493,7 +503,10 @@ export class GitHubAppAdapter implements GitHubAdapter {
         const log = await this.requestText('GET', `/repos/${repository.owner}/${repository.repo}/actions/jobs/${jobId}/logs`, signal);
         output = compactCheckOutput(log) || fallback;
       } catch (error) {
-        output = `${fallback}\nUnable to read the failed job log: ${toSafeGitHubError(error)}`.trim();
+        const annotations = await this.readCheckAnnotations(repository, run.id, signal);
+        output = annotations
+          ? compactCheckOutput([fallback, annotations].filter(Boolean).join('\n'))
+          : `${fallback}\nUnable to read the failed job log: ${toSafeGitHubError(error)}`.trim();
       }
     }
 
@@ -502,6 +515,34 @@ export class GitHubAppAdapter implements GitHubAdapter {
       detailsUrl: run.details_url ?? undefined,
       output: output || `GitHub check concluded with ${run.conclusion ?? 'an unknown failure'}.`
     };
+  }
+
+  private async readCheckAnnotations(
+    repository: { owner: string; repo: string },
+    checkRunId: number,
+    signal?: AbortSignal
+  ): Promise<string> {
+    try {
+      const annotations = await this.requestWithSignal<GitHubCheckAnnotationResponse[]>(
+        'GET',
+        `/repos/${repository.owner}/${repository.repo}/check-runs/${checkRunId}/annotations?per_page=100`,
+        undefined,
+        signal
+      );
+      return compactCheckOutput(annotations.map((annotation) => {
+        const line = annotation.start_line === annotation.end_line
+          ? `${annotation.start_line}`
+          : `${annotation.start_line}-${annotation.end_line}`;
+        return [
+          `${annotation.path}:${line}: ${annotation.annotation_level}`,
+          annotation.title,
+          annotation.message,
+          annotation.raw_details
+        ].filter((value): value is string => Boolean(value)).join('\n');
+      }).join('\n\n'));
+    } catch {
+      return '';
+    }
   }
 
   private async requestText(method: string, path: string, signal?: AbortSignal): Promise<string> {

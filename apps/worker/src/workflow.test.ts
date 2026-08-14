@@ -1468,6 +1468,101 @@ describe('worker workflow', () => {
     expect(waitForChecks).toHaveBeenCalledWith(expect.anything(), remoteHead, expect.anything());
   }, 20000);
 
+  it('preserves a dirty correction across an empty remote commit and delivers the corrected head', async () => {
+    const root = join(tmpdir(), `forgemind-worker-resume-dirty-remote-empty-${randomUUID()}`);
+    const remotePath = join(root, 'remote.git');
+    const sourcePath = join(root, 'source');
+    const workspaceRoot = join(root, 'workspaces');
+    const task = {
+      ...demoTask,
+      id: `task_${randomUUID()}`,
+      githubIssueNumber: 1234,
+      githubIssueUrl: 'https://github.com/demo/demo-static-gallery/issues/1234',
+      branchName: 'ai/1234-dirty-remote-empty',
+      pullRequestNumber: 4321,
+      pullRequestUrl: 'https://github.com/demo/demo-static-gallery/pull/4321'
+    };
+    const workspacePath = join(workspaceRoot, task.id);
+    await mkdir(remotePath, { recursive: true });
+    await simpleGit({ baseDir: remotePath }).init(true);
+    await mkdir(sourcePath, { recursive: true });
+    const sourceGit = simpleGit({ baseDir: sourcePath });
+    await sourceGit.init();
+    await sourceGit.addConfig('user.name', 'ForgeMind Test');
+    await sourceGit.addConfig('user.email', 'forgemind-test@example.com');
+    await writeFile(join(sourcePath, 'status.txt'), 'stale implementation\n', 'utf8');
+    await sourceGit.add('.');
+    await sourceGit.commit('Initial implementation');
+    await sourceGit.branch(['-M', 'main']);
+    await sourceGit.addRemote('origin', remotePath);
+    await sourceGit.push(['-u', 'origin', 'main']);
+    await sourceGit.checkoutLocalBranch(task.branchName);
+    await sourceGit.push(['-u', 'origin', task.branchName]);
+    await mkdir(workspaceRoot, { recursive: true });
+    await simpleGit().clone(remotePath, workspacePath, ['--branch', task.branchName]);
+    const workspaceGit = simpleGit({ baseDir: workspacePath });
+    const staleHead = (await workspaceGit.revparse(['HEAD'])).trim();
+    await writeFile(join(workspacePath, 'status.txt'), 'corrected implementation\n', 'utf8');
+    await sourceGit.commit('External empty commit', undefined, { '--allow-empty': null });
+    await sourceGit.push('origin', task.branchName);
+    const remoteEmptyHead = (await sourceGit.revparse(['HEAD'])).trim();
+
+    const reviewInputs: ReviewInput[] = [];
+    const implement = vi.fn(async (): Promise<ImplementResult> => ({
+      summary: 'The preserved workspace correction addresses the previous review blocker.',
+      changedFiles: ['status.txt'],
+      diffStat: { filesChanged: 1, insertions: 1, deletions: 1 },
+      requestedApprovals: [],
+      validationChecks: [{ kind: 'command', command: 'node --version' }]
+    }));
+    const review = vi.fn(async (reviewInput: ReviewInput): Promise<ReviewResult> => {
+      reviewInputs.push(reviewInput);
+      return { summary: 'Correction passed review.', blockers: [], safeImprovements: [], riskyChanges: [] };
+    });
+    const commitAndPush = vi.fn(async (_project: Project, branchName: string, _message: string, repositoryPath: string) => {
+      await simpleGit({ baseDir: repositoryPath }).push('origin', branchName);
+    });
+    const waitForChecks = vi.fn(async () => ({
+      status: 'success' as const,
+      summary: 'Corrected head passed.',
+      failures: []
+    }));
+
+    const result = await runWorkerTask({
+      project: { ...gitEnabledProject, configYaml: gitProjectConfig.replace('auto_push: false', 'auto_push: true') },
+      task,
+      provider: createProviderStub({ implement, review }),
+      github: createGitHubStub({ getRemoteUrl: () => remotePath, commitAndPush, waitForChecks }),
+      workspaceRoot,
+      resume: {
+        kind: 'phase_retry',
+        resumeFrom: 'implementation',
+        attempt: 2,
+        planSummary: 'Original plan',
+        acceptanceCriteria: ['The correction is delivered and CI passes.'],
+        implementationSummary: 'Previous implementation failed review.',
+        previousReviewBlockers: ['Replace the stale implementation.'],
+        validationChecks: [{ kind: 'command', command: 'node --version' }],
+        completedOperations: ['commit', 'commit_and_push', 'wait_for_checks'],
+        githubChecks: { status: 'success', summary: 'Stale head passed.', failures: [] },
+        githubChecksInputHash: createHash('sha256').update(`${staleHead}:${task.pullRequestNumber}`).digest('hex')
+      }
+    });
+
+    const deliveredHead = (await workspaceGit.revparse(['HEAD'])).trim();
+    await sourceGit.fetch('origin', task.branchName);
+    const remoteDeliveredHead = (await sourceGit.revparse([`origin/${task.branchName}`])).trim();
+    expect(result.status).toBe('ready_for_user_review');
+    expect((await workspaceGit.show(['HEAD:status.txt'])).trim()).toBe('corrected implementation');
+    expect((await workspaceGit.raw(['rev-parse', 'HEAD^'])).trim()).toBe(remoteEmptyHead);
+    expect(deliveredHead).not.toBe(staleHead);
+    expect(remoteDeliveredHead).toBe(deliveredHead);
+    expect(commitAndPush).toHaveBeenCalledOnce();
+    expect(waitForChecks).toHaveBeenCalledWith(expect.anything(), deliveredHead, expect.anything());
+    expect(reviewInputs[0]?.diff).toContain('+corrected implementation');
+    expect(reviewInputs[0]?.diff).not.toContain('+stale implementation');
+  }, 20000);
+
   it('reruns validation and review after a remote commit changes the resumed workspace tree', async () => {
     const root = join(tmpdir(), `forgemind-worker-resume-remote-tree-${randomUUID()}`);
     const remotePath = join(root, 'remote.git');
@@ -3188,6 +3283,66 @@ describe('worker workflow', () => {
     ]));
     expect(reviewInputs[0]?.diff).toContain('native-soak.yml');
     expect(reviewInputs[0]?.diff).toContain('validator.mjs');
+  }, 15000);
+
+  it('reviews the final corrected file instead of a stale committed version plus an overlay', async () => {
+    const workspaceRoot = join(tmpdir(), `forgemind-worker-final-correction-review-${randomUUID()}`);
+    const task = { ...demoTask, id: `task_${randomUUID()}`, maxIterations: 2 };
+    const workspacePath = join(workspaceRoot, task.id);
+    await mkdir(workspacePath, { recursive: true });
+    const git = simpleGit({ baseDir: workspacePath });
+    await git.init();
+    await git.addConfig('user.name', 'ForgeMind Test');
+    await git.addConfig('user.email', 'forgemind-test@example.com');
+    await writeFile(join(workspacePath, 'base.txt'), 'base\n', 'utf8');
+    await git.add('.');
+    await git.commit('Base');
+    await git.raw(['branch', 'main', 'HEAD']);
+    await git.checkoutLocalBranch('ai/task-final-review');
+    await writeFile(join(workspacePath, 'compatibility.cpp'), 'reject legacy data\n', 'utf8');
+    await git.add('.');
+    await git.commit('Initial incompatible implementation');
+    await writeFile(join(workspacePath, 'compatibility.cpp'), 'accept legacy data safely\n', 'utf8');
+
+    const reviewInputs: ReviewInput[] = [];
+    const result = await runWorkerTask({
+      project: {
+        ...demoProject,
+        defaultBranch: 'main',
+        configYaml: noGitProjectConfig.replace('create_branch: false', 'create_branch: true')
+      },
+      task: { ...task, branchName: 'ai/task-final-review' },
+      provider: createProviderStub({
+        implement: vi.fn(async (): Promise<ImplementResult> => ({
+          summary: 'The preserved correction resolves the compatibility blocker.',
+          changedFiles: ['compatibility.cpp'],
+          diffStat: { filesChanged: 1, insertions: 1, deletions: 1 },
+          requestedApprovals: [],
+          validationChecks: [{ kind: 'command', command: 'node --version' }]
+        })),
+        review: vi.fn(async (reviewInput: ReviewInput): Promise<ReviewResult> => {
+          reviewInputs.push(reviewInput);
+          return { summary: 'Final state passed review.', blockers: [], safeImprovements: [], riskyChanges: [] };
+        })
+      }),
+      github: createGitHubStub(),
+      verifyCommand: 'node --version',
+      workspaceRoot,
+      resume: {
+        kind: 'phase_retry',
+        resumeFrom: 'implementation',
+        attempt: 2,
+        implementationSummary: 'Initial implementation failed review.',
+        previousReviewBlockers: ['Preserve compatibility with legacy data.'],
+        validationChecks: [{ kind: 'command', command: 'node --version' }]
+      }
+    });
+
+    expect(result.status).toBe('ready_for_user_review');
+    expect(reviewInputs).toHaveLength(1);
+    expect(reviewInputs[0]?.diff).toContain('+accept legacy data safely');
+    expect(reviewInputs[0]?.diff).not.toContain('+reject legacy data');
+    expect((reviewInputs[0]?.diff.match(/diff --git/g) ?? [])).toHaveLength(1);
   }, 15000);
 
   it('ignores review blockers caused only by read-only validation limitations after successful validation', async () => {

@@ -516,6 +516,9 @@ export async function runWorkerTask(input: WorkerTaskInput): Promise<WorkerTaskR
 
     const implementationStatus = await git.status();
     const implementationChangedFiles = collectStageablePaths(implementationStatus);
+    if (implementationChangedFiles.length > 0) {
+      invalidateResumedDeliveryAfterWorkspaceChanges(deliveryState);
+    }
     const substantiveChangedFiles = implementationChangedFiles.filter(isSubstantiveImplementationPath);
     const correctionChangedFiles = previousReviewForCorrection
       ? await collectSnapshotChanges(beforeCorrectionSnapshot, implementationStatus, workspacePath)
@@ -1031,10 +1034,7 @@ export async function runWorkerTask(input: WorkerTaskInput): Promise<WorkerTaskR
         satisfactionEvidenceErrors = satisfactionEvidence?.errors ?? [];
         const requestedReviewFiles = satisfactionEvidence?.files
           ?? (previousReviewForCorrection
-            ? uniqueStrings([
-                ...correctionChangedFiles,
-                ...(implementation.outcome === 'already_satisfied' ? implementation.evidenceFiles ?? [] : [])
-              ])
+            ? (correctionChangedFiles.length > 0 ? uniqueStrings(correctionChangedFiles) : undefined)
             : implementation.changedFiles);
         const reviewPacket = satisfactionReview
           ? { changedFiles: requestedReviewFiles, diff: '' }
@@ -1355,6 +1355,16 @@ interface DeliveryState {
   resumedGitHubChecks?: GitHubChecksResult;
   resumedGitHubChecksInputHash?: string;
   resumedMergeCommitSha?: string;
+}
+
+function invalidateResumedDeliveryAfterWorkspaceChanges(state: DeliveryState) {
+  state.skipCommitFromResume = false;
+  state.skipPushFromResume = false;
+  state.skipChecksFromResume = false;
+  state.skipMergeFromResume = false;
+  state.resumedGitHubChecks = undefined;
+  state.resumedGitHubChecksInputHash = undefined;
+  state.resumedMergeCommitSha = undefined;
 }
 
 type DeliveryAttemptOutcome =
@@ -3110,6 +3120,7 @@ async function collectReviewPacket(
         .map((path) => path.trim())
         .filter(Boolean)
         .filter(isSubstantiveImplementationPath)
+        .filter((path) => !requestedPathSet || requestedPathSet.has(normalizeRepoPath(path)))
     : [];
   const changedPaths = uniqueStrings([...committedPaths, ...workspaceChangedPaths]);
   const summaryOnlyPaths = changedPaths.filter(isReviewSummaryOnlyPath);
@@ -3125,27 +3136,20 @@ async function collectReviewPacket(
     ].join('\n'));
   }
 
-  const committedTrackedPaths = trackedPaths.filter((path) => committedPaths.some(
-    (committedPath) => normalizeRepoPath(committedPath) === normalizeRepoPath(path)
-  ));
-  const workspaceTrackedPaths = trackedPaths.filter((path) => workspaceChangedPaths.some(
-    (workspacePath) => normalizeRepoPath(workspacePath) === normalizeRepoPath(path)
-  ));
-
-  if (baseRef && committedTrackedPaths.length > 0) {
+  if (baseRef && trackedPaths.length > 0) {
     try {
-      const committedDiff = await git.diff(['--unified=3', `${baseRef}...HEAD`, '--', ...committedTrackedPaths]);
-      if (committedDiff.trim()) {
-        sections.push(committedDiff);
+      const finalDiff = await git.diff(['--unified=3', baseRef, '--', ...trackedPaths]);
+      if (finalDiff.trim()) {
+        sections.push(finalDiff);
       }
     } catch {
-      // If the base ref cannot be compared, the current workspace diff still remains reviewable below.
+      // Fall back to the workspace-only diff below when the base ref cannot be compared.
     }
   }
 
-  if (workspaceTrackedPaths.length > 0) {
+  if (!baseRef && trackedPaths.length > 0) {
     try {
-      const trackedDiff = await git.diff(['--unified=3', 'HEAD', '--', ...workspaceTrackedPaths]);
+      const trackedDiff = await git.diff(['--unified=3', 'HEAD', '--', ...trackedPaths]);
       if (trackedDiff.trim()) {
         sections.push(trackedDiff);
       }
@@ -3340,7 +3344,6 @@ async function fastForwardCleanWorkspaceToRemote(
   branchName: string
 ): Promise<ResumedWorkspaceSync | undefined> {
   const status = await git.status();
-  if (status.files.length > 0) return undefined;
 
   const remoteRef = `origin/${branchName}`;
   const branches = await git.branch(['-r']);
@@ -3357,6 +3360,9 @@ async function fastForwardCleanWorkspaceToRemote(
   }
 
   const previousTree = (await git.revparse([`${previousHead}^{tree}`])).trim();
+  const remoteTree = (await git.revparse([`${currentRemoteHead}^{tree}`])).trim();
+  if (status.files.length > 0 && previousTree !== remoteTree) return undefined;
+
   await git.merge(['--ff-only', remoteRef]);
   const currentHead = (await git.revparse(['HEAD'])).trim();
   const currentTree = (await git.revparse([`${currentHead}^{tree}`])).trim();
