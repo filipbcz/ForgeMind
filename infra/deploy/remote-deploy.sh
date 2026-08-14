@@ -5,6 +5,7 @@ APP_ROOT="${APP_ROOT:-/opt/forgemind}"
 APP_DIR="${APP_ROOT}/app"
 ENV_FILE="${APP_ROOT}/shared/server.env"
 COMPOSE_FILE="${APP_DIR}/infra/docker-compose.prod.yml"
+COMPOSE_OVERRIDE="${FORGEMIND_COMPOSE_OVERRIDE:-}"
 
 : "${FORGEMIND_RUNTIME_IMAGE:?FORGEMIND_RUNTIME_IMAGE is required}"
 : "${FORGEMIND_RUNTIME_BASE_IMAGE:?FORGEMIND_RUNTIME_BASE_IMAGE is required}"
@@ -22,7 +23,16 @@ fi
 
 cd "${APP_DIR}"
 
-compose=(docker compose --env-file "${ENV_FILE}" -f "${COMPOSE_FILE}")
+export FORGEMIND_ENV_FILE="${ENV_FILE}"
+compose_files=(-f "${COMPOSE_FILE}")
+if [ -n "${COMPOSE_OVERRIDE}" ]; then
+  if [ ! -f "${COMPOSE_OVERRIDE}" ]; then
+    echo "Missing Compose override: ${COMPOSE_OVERRIDE}" >&2
+    exit 1
+  fi
+  compose_files+=(-f "${COMPOSE_OVERRIDE}")
+fi
+compose=(docker compose --env-file "${ENV_FILE}" "${compose_files[@]}")
 
 docker network inspect shared-edge >/dev/null 2>&1 || docker network create shared-edge >/dev/null
 

@@ -1,0 +1,217 @@
+name: Deploy to Raspberry Pi
+
+on:
+  workflow_dispatch:
+
+concurrency:
+  group: forgemind-raspberry-production
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  build_images:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      runtime_base_image: ${{ steps.image_names.outputs.runtime_base }}
+      runtime_image: ${{ steps.image_names.outputs.runtime }}
+      web_image: ${{ steps.image_names.outputs.web }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-qemu-action@v3
+        with:
+          platforms: arm64
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Resolve ARM64 image names
+        id: image_names
+        shell: bash
+        run: |
+          set -euo pipefail
+          repository="${GITHUB_REPOSITORY,,}"
+          dependency_hash="$(
+            {
+              printf '%s\n' infra/Dockerfile package.json package-lock.json packages/db/prisma/schema.prisma
+              find apps packages -mindepth 2 -maxdepth 2 -name package.json -type f -print
+            } | LC_ALL=C sort -u | xargs sha256sum | sha256sum | cut -d ' ' -f 1
+          )"
+          echo "runtime_base=ghcr.io/${repository}-runtime-base:deps-${dependency_hash}-arm64" >> "${GITHUB_OUTPUT}"
+          echo "runtime=ghcr.io/${repository}-runtime:${GITHUB_SHA}-arm64" >> "${GITHUB_OUTPUT}"
+          echo "web=ghcr.io/${repository}-web:${GITHUB_SHA}-arm64" >> "${GITHUB_OUTPUT}"
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Check ARM64 runtime base image
+        id: runtime_base
+        shell: bash
+        run: |
+          if docker buildx imagetools inspect "${{ steps.image_names.outputs.runtime_base }}" >/dev/null 2>&1; then
+            echo "exists=true" >> "${GITHUB_OUTPUT}"
+          else
+            echo "exists=false" >> "${GITHUB_OUTPUT}"
+          fi
+
+      - name: Build and push ARM64 runtime base image
+        if: steps.runtime_base.outputs.exists != 'true'
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: infra/Dockerfile
+          target: runtime-base
+          platforms: linux/arm64
+          push: true
+          tags: ${{ steps.image_names.outputs.runtime_base }}
+          cache-from: type=gha,scope=forgemind-raspberry-runtime-base
+          cache-to: type=gha,mode=max,scope=forgemind-raspberry-runtime-base
+          provenance: false
+          sbom: false
+
+      - name: Build and push ARM64 runtime image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: infra/Dockerfile
+          target: runtime
+          platforms: linux/arm64
+          push: true
+          tags: ${{ steps.image_names.outputs.runtime }}
+          cache-from: |
+            type=gha,scope=forgemind-raspberry-production
+            type=registry,ref=${{ steps.image_names.outputs.runtime_base }}
+          cache-to: type=gha,mode=max,scope=forgemind-raspberry-production
+          provenance: false
+          sbom: false
+
+      - name: Build and push ARM64 web image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: infra/Dockerfile
+          target: web
+          platforms: linux/arm64
+          push: true
+          tags: ${{ steps.image_names.outputs.web }}
+          cache-from: type=gha,scope=forgemind-raspberry-production
+          cache-to: type=gha,mode=max,scope=forgemind-raspberry-production
+          provenance: false
+          sbom: false
+
+  deploy:
+    needs: build_images
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: read
+    environment: raspberry-production
+    env:
+      APP_ROOT: /home/filip/forgemind
+      RELEASE_ARCHIVE: forgemind-${{ github.sha }}.tar.gz
+      FORGEMIND_RUNTIME_BASE_IMAGE: ${{ needs.build_images.outputs.runtime_base_image }}
+      FORGEMIND_RUNTIME_IMAGE: ${{ needs.build_images.outputs.runtime_image }}
+      FORGEMIND_WEB_IMAGE: ${{ needs.build_images.outputs.web_image }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Connect deployment runner to Tailscale
+        uses: tailscale/github-action@v4
+        with:
+          oauth-client-id: ${{ secrets.TS_OAUTH_CLIENT_ID }}
+          oauth-secret: ${{ secrets.TS_OAUTH_SECRET }}
+          tags: tag:ci
+          ping: ${{ secrets.RPI_DEPLOY_HOST }}
+
+      - name: Build release archive
+        run: git archive --format=tar.gz --output "${RELEASE_ARCHIVE}" HEAD
+
+      - name: Configure SSH
+        env:
+          RPI_DEPLOY_SSH_KEY_B64: ${{ secrets.RPI_DEPLOY_SSH_KEY_B64 }}
+          RPI_DEPLOY_HOST: ${{ secrets.RPI_DEPLOY_HOST }}
+          RPI_DEPLOY_PORT: ${{ secrets.RPI_DEPLOY_PORT }}
+        run: |
+          set -euo pipefail
+          DEPLOY_PORT="${RPI_DEPLOY_PORT:-22}"
+          mkdir -p ~/.ssh
+          printf '%s' "${RPI_DEPLOY_SSH_KEY_B64}" | base64 -d | tr -d '\r' > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          ssh-keyscan -p "${DEPLOY_PORT}" -H "${RPI_DEPLOY_HOST}" >> ~/.ssh/known_hosts
+
+      - name: Upload release archive
+        env:
+          RPI_DEPLOY_HOST: ${{ secrets.RPI_DEPLOY_HOST }}
+          RPI_DEPLOY_USER: ${{ secrets.RPI_DEPLOY_USER }}
+          RPI_DEPLOY_PORT: ${{ secrets.RPI_DEPLOY_PORT }}
+        run: |
+          set -euo pipefail
+          DEPLOY_PORT="${RPI_DEPLOY_PORT:-22}"
+          scp -o ServerAliveInterval=30 -o ServerAliveCountMax=20 -P "${DEPLOY_PORT}" \
+            "${RELEASE_ARCHIVE}" "${RPI_DEPLOY_USER}@${RPI_DEPLOY_HOST}:/tmp/${RELEASE_ARCHIVE}"
+
+      - name: Authenticate Raspberry Pi to GHCR
+        env:
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RPI_DEPLOY_HOST: ${{ secrets.RPI_DEPLOY_HOST }}
+          RPI_DEPLOY_USER: ${{ secrets.RPI_DEPLOY_USER }}
+          RPI_DEPLOY_PORT: ${{ secrets.RPI_DEPLOY_PORT }}
+        run: |
+          set -euo pipefail
+          DEPLOY_PORT="${RPI_DEPLOY_PORT:-22}"
+          printf '%s' "${GHCR_TOKEN}" | ssh -o ServerAliveInterval=30 -o ServerAliveCountMax=20 \
+            -p "${DEPLOY_PORT}" "${RPI_DEPLOY_USER}@${RPI_DEPLOY_HOST}" \
+            "docker login ghcr.io --username '${GITHUB_ACTOR}' --password-stdin"
+
+      - name: Deploy release
+        env:
+          RPI_DEPLOY_HOST: ${{ secrets.RPI_DEPLOY_HOST }}
+          RPI_DEPLOY_USER: ${{ secrets.RPI_DEPLOY_USER }}
+          RPI_DEPLOY_PORT: ${{ secrets.RPI_DEPLOY_PORT }}
+        run: |
+          set -euo pipefail
+          DEPLOY_PORT="${RPI_DEPLOY_PORT:-22}"
+          ssh -o ServerAliveInterval=30 -o ServerAliveCountMax=20 -p "${DEPLOY_PORT}" \
+            "${RPI_DEPLOY_USER}@${RPI_DEPLOY_HOST}" "
+              set -euo pipefail
+              APP_ROOT='${APP_ROOT}'
+              RELEASE_DIR=\"\${APP_ROOT}/releases/${{ github.sha }}\"
+              mkdir -p \"\${RELEASE_DIR}\" \"\${APP_ROOT}/app\"
+              tar -xzf \"/tmp/${RELEASE_ARCHIVE}\" -C \"\${RELEASE_DIR}\"
+              rsync -a --delete \"\${RELEASE_DIR}/\" \"\${APP_ROOT}/app/\"
+              rm -f \"/tmp/${RELEASE_ARCHIVE}\"
+              APP_ROOT=\"\${APP_ROOT}\" \
+              FORGEMIND_COMPOSE_OVERRIDE=\"\${APP_ROOT}/app/infra/docker-compose.raspberry.yml\" \
+              FORGEMIND_RUNTIME_BASE_IMAGE='${FORGEMIND_RUNTIME_BASE_IMAGE}' \
+              FORGEMIND_RUNTIME_IMAGE='${FORGEMIND_RUNTIME_IMAGE}' \
+              FORGEMIND_WEB_IMAGE='${FORGEMIND_WEB_IMAGE}' \
+              bash \"\${APP_ROOT}/app/infra/deploy/remote-deploy.sh\"
+            "
+
+      - name: Verify local Raspberry endpoint
+        env:
+          RPI_DEPLOY_HOST: ${{ secrets.RPI_DEPLOY_HOST }}
+          RPI_DEPLOY_USER: ${{ secrets.RPI_DEPLOY_USER }}
+          RPI_DEPLOY_PORT: ${{ secrets.RPI_DEPLOY_PORT }}
+        run: |
+          DEPLOY_PORT="${RPI_DEPLOY_PORT:-22}"
+          ssh -p "${DEPLOY_PORT}" "${RPI_DEPLOY_USER}@${RPI_DEPLOY_HOST}" \
+            "curl --fail --silent --show-error http://127.0.0.1:8080/health"
+
+      - name: Remove temporary GHCR credentials
+        if: always()
+        continue-on-error: true
+        env:
+          RPI_DEPLOY_HOST: ${{ secrets.RPI_DEPLOY_HOST }}
+          RPI_DEPLOY_USER: ${{ secrets.RPI_DEPLOY_USER }}
+          RPI_DEPLOY_PORT: ${{ secrets.RPI_DEPLOY_PORT }}
+        run: |
+          DEPLOY_PORT="${RPI_DEPLOY_PORT:-22}"
+          ssh -p "${DEPLOY_PORT}" "${RPI_DEPLOY_USER}@${RPI_DEPLOY_HOST}" "docker logout ghcr.io"

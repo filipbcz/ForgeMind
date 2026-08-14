@@ -1560,4 +1560,6 @@ Samotnou platformu ForgeMind lze nasadit na OCI/Ubuntu server pomoci Docker Comp
 
 Kompletni priprava serveru, secrets a deployment workflow jsou popsane v `docs/deploy-oci.md`.
 
+Migrace existujici produkce na ARM64 Raspberry Pi pres Tailscale je popsana v `docs/deploy-raspberry.md`. Raspberry i OCI workflow jsou behem migrace zamerne pouze rucni a Raspberry pouziva samostatne ARM64 image tagy, aby neovlivnil OCI nasazeni.
+
 Toto nasazeni platformy nemeni approval pravidla pro produkcni deploy projektu spravovanych ForgeMindem.
