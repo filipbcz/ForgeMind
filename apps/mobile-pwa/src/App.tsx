@@ -109,6 +109,11 @@ import type {
 import { subscribeRealtime } from './realtime.js';
 import type { RealtimeConnectionMeta, RealtimeConnectionState } from './realtime.js';
 import { summarizeProjectProgress } from './project-progress.js';
+import {
+  currentExecutionEntries,
+  resolveCurrentActivity,
+  sanitizeProviderActivityDetail
+} from './activity-display.js';
 
 type View = 'tasks' | 'new-task' | 'approvals' | 'projects' | 'settings';
 type RealtimeUiState = 'connected' | 'reconnecting' | 'fallback';
@@ -1391,6 +1396,7 @@ function TaskButton(props: { task: TaskSummary; selected: boolean; onClick: () =
 interface TaskActivityEntry {
   id: string;
   createdAt: string;
+  runId?: string;
   phase: string;
   attempt: number;
   state: 'started' | 'progress' | 'completed' | 'failed';
@@ -1408,8 +1414,9 @@ function TaskActivityPanel(props: {
   realtimeState: RealtimeUiState;
 }) {
   const entries = useMemo(() => collectTaskActivityEntries(props.logs, props.taskId), [props.logs, props.taskId]);
-  const latest = entries.at(-1);
   const taskIsActive = activeStatuses.has(props.task.status);
+  const executionEntries = useMemo(() => currentExecutionEntries(entries), [entries]);
+  const latest = resolveCurrentActivity(executionEntries, props.task.updatedAt, taskIsActive);
   const [now, setNow] = useState(Date.now());
   useEffect(() => {
     if (!taskIsActive) return;
@@ -1437,6 +1444,7 @@ function TaskActivityPanel(props: {
         <div className="current-activity-content">
           <div className="current-activity-meta">
             <span>{formatPhase(latest?.phase ?? props.task.status)}</span>
+            {latest && latest.attempt > 0 ? <span>pokus {latest.attempt}</span> : null}
             <span>{formatRealtimeState(props.realtimeState)}</span>
           </div>
           <strong>{currentTitle}</strong>
@@ -1726,12 +1734,21 @@ function buildTaskWorkflow(task: TaskSummary, logs: AuditEventApi[]): TaskWorkfl
     completed: 5
   };
   const inferredStage = inferWorkflowStageFromLogs(logs);
-  const currentStage = statusStage[task.status] ?? inferredStage;
+  const statusCurrentStage = statusStage[task.status] ?? inferredStage;
   const failed = terminalStatuses.has(task.status)
     && task.status !== 'completed'
     && task.status !== 'cancelled'
     && task.status !== 'waiting_for_capability';
   const activities = collectTaskActivityEntries(logs, task.id);
+  const executionActivities = currentExecutionEntries(activities);
+  const latestExecutionActivity = executionActivities.at(-1);
+  const latestActivityAt = latestExecutionActivity ? Date.parse(latestExecutionActivity.createdAt) : Number.NaN;
+  const taskUpdatedAt = Date.parse(task.updatedAt);
+  const currentStage = activeStatuses.has(task.status)
+    && latestExecutionActivity
+    && (Number.isNaN(taskUpdatedAt) || !Number.isNaN(latestActivityAt) && latestActivityAt >= taskUpdatedAt)
+      ? activityWorkflowStage(latestExecutionActivity)
+      : statusCurrentStage;
 
   return stages.map((stage, index) => {
     let state: WorkflowStepState = index < currentStage ? 'completed' : index === currentStage ? 'active' : 'pending';
@@ -1739,13 +1756,20 @@ function buildTaskWorkflow(task: TaskSummary, logs: AuditEventApi[]): TaskWorkfl
     if (failed && index === currentStage) state = 'failed';
     if (task.status === 'cancelled' && index === currentStage) state = 'failed';
     const stageActivities = activities.filter((activity) => activityWorkflowStage(activity) === index);
-    const latestStageActivity = [...stageActivities].reverse().find((activity) => (
-      (activity.state === 'completed' || activity.state === 'failed') && activity.elapsedMs > 0
-    )) ?? stageActivities.at(-1);
+    const executionStageActivities = executionActivities.filter((activity) => activityWorkflowStage(activity) === index);
     const stageTiming = summarizeWorkflowStageTiming(activities, index);
+    const latestSuccessfulActivity = [...stageActivities].reverse().find((activity) => activity.state === 'completed');
+    const latestFailedExecution = [...executionStageActivities].reverse().find((activity) => activity.state === 'failed');
+    const latestStageActivity = index === currentStage
+      ? executionStageActivities.at(-1)
+      : index < currentStage
+        ? latestSuccessfulActivity ?? stageActivities.at(-1)
+        : undefined;
     const activityDetail = latestStageActivity
       ? formatWorkflowStageDetail(latestStageActivity, stageTiming, index)
-      : undefined;
+      : latestFailedExecution
+        ? formatPreviousAttemptFailure(latestFailedExecution, latestExecutionActivity)
+        : undefined;
 
     return {
       ...stage,
@@ -1768,18 +1792,18 @@ function summarizeWorkflowStageTiming(
   const recordedProviderAttempts = new Set(
     completedActivities
       .filter((activity) => activity.operation?.startsWith('provider_'))
-      .map((activity) => `${activity.phase}:${activity.attempt}`)
+      .map(activityAttemptIdentity)
   );
   const providerFallbacks = stageActivities.filter((activity) => (
     activity.kind === 'lifecycle'
     && (activity.state === 'completed' || activity.state === 'failed')
     && activity.elapsedMs > 0
-    && !recordedProviderAttempts.has(`${activity.phase}:${activity.attempt}`)
+    && !recordedProviderAttempts.has(activityAttemptIdentity(activity))
   ));
   const attempts = new Set(
     [...completedActivities, ...providerFallbacks]
       .filter((activity) => activity.attempt > 0 || activity.phase === 'planning')
-      .map((activity) => `${activity.phase}:${activity.attempt}`)
+      .map(activityAttemptIdentity)
   );
 
   return {
@@ -1789,19 +1813,35 @@ function summarizeWorkflowStageTiming(
   };
 }
 
+function activityAttemptIdentity(activity: TaskActivityEntry): string {
+  return `${activity.runId ?? 'legacy'}:${activity.phase}:${activity.attempt}`;
+}
+
 function formatWorkflowStageDetail(
   latestActivity: TaskActivityEntry,
   timing: WorkflowStageTiming,
   stageIndex: number
 ): string {
+  const attempt = latestActivity.attempt > 0 ? `Pokus ${latestActivity.attempt} · ` : '';
   if (timing.elapsedMs <= 0) {
-    return latestActivity.title;
+    return `${attempt}${latestActivity.title}`;
   }
 
   const attempts = stageIndex >= 2 && stageIndex <= 4 && timing.attemptCount > 1
     ? ` · ${timing.attemptCount} průchody`
     : '';
-  return `${latestActivity.title} · celkem ${formatElapsedTime(timing.elapsedMs)}${attempts}`;
+  return `${attempt}${latestActivity.title} · celkem ${formatElapsedTime(timing.elapsedMs)}${attempts}`;
+}
+
+function formatPreviousAttemptFailure(
+  failedActivity: TaskActivityEntry,
+  currentActivity: TaskActivityEntry | undefined
+): string {
+  const failedAttempt = failedActivity.attempt > 0 ? `Pokus ${failedActivity.attempt}` : 'Předchozí pokus';
+  const nextAttempt = currentActivity && currentActivity.attempt > failedActivity.attempt
+    ? `; čeká na pokus ${currentActivity.attempt}`
+    : '; čeká na nový průchod';
+  return `${failedAttempt} selhal${nextAttempt}`;
 }
 
 function activityWorkflowStage(activity: TaskActivityEntry): number {
@@ -2017,6 +2057,7 @@ function toTaskActivityEntry(event: AuditEventApi): TaskActivityEntry | undefine
     return {
       id: event.id,
       createdAt: event.createdAt,
+      runId: auditTaskRunId(event.payload),
       phase: 'completion',
       attempt: 0,
       state: 'failed',
@@ -2031,6 +2072,7 @@ function toTaskActivityEntry(event: AuditEventApi): TaskActivityEntry | undefine
     return {
       id: event.id,
       createdAt: event.createdAt,
+      runId: auditTaskRunId(event.payload),
       phase: 'workspace',
       attempt: 0,
       state: 'progress',
@@ -2053,6 +2095,7 @@ function toTaskActivityEntry(event: AuditEventApi): TaskActivityEntry | undefine
     return {
       id: event.id,
       createdAt: event.createdAt,
+      runId: auditTaskRunId(event.payload),
       phase: statusActivityPhase(status),
       attempt: typeof event.payload.attempt === 'number' ? event.payload.attempt : 0,
       state: failedStatus ? 'failed' : status === 'completed' || status === 'ready_for_user_review' ? 'completed' : 'progress',
@@ -2079,6 +2122,7 @@ function toTaskActivityEntry(event: AuditEventApi): TaskActivityEntry | undefine
     return {
       id: event.id,
       createdAt: event.createdAt,
+      runId: auditTaskRunId(event.payload),
       phase: typeof event.payload.phase === 'string' ? event.payload.phase : 'task',
       attempt: typeof event.payload.attempt === 'number' ? event.payload.attempt : 0,
       state,
@@ -2101,11 +2145,16 @@ function toTaskActivityEntry(event: AuditEventApi): TaskActivityEntry | undefine
   ) {
     return undefined;
   }
-  const summary = summarizeProviderActivity(kind, message);
+  const visibleMessage = sanitizeProviderActivityDetail(kind, message);
+  if (!visibleMessage) {
+    return undefined;
+  }
+  const summary = summarizeProviderActivity(kind, visibleMessage);
 
   return {
     id: event.id,
     createdAt: event.createdAt,
+    runId: auditTaskRunId(event.payload),
     phase: typeof event.payload.phase === 'string' ? event.payload.phase : 'provider',
     attempt: typeof event.payload.attempt === 'number' ? event.payload.attempt : 0,
     state: summary.state,
@@ -2114,6 +2163,12 @@ function toTaskActivityEntry(event: AuditEventApi): TaskActivityEntry | undefine
     kind,
     elapsedMs: typeof event.payload.elapsedMs === 'number' ? event.payload.elapsedMs : 0
   };
+}
+
+function auditTaskRunId(payload: Record<string, unknown>): string | undefined {
+  return typeof payload.taskRunId === 'string' && payload.taskRunId.trim()
+    ? payload.taskRunId
+    : undefined;
 }
 
 function statusActivityPhase(status: TaskSummary['status']): string {
