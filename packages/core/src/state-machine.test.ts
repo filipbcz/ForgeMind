@@ -26,4 +26,10 @@ describe('task state machine', () => {
     expect(TERMINAL_TASK_STATUSES.has('completed')).toBe(true);
     expect(canTransitionTask('completed', 'running_ai')).toBe(false);
   });
+
+  it('allows a cancelled task to close after its externally delivered pull request is verified as merged', () => {
+    expect(TERMINAL_TASK_STATUSES.has('cancelled')).toBe(true);
+    expect(canTransitionTask('cancelled', 'completed')).toBe(true);
+    expect(canTransitionTask('cancelled', 'running_ai')).toBe(false);
+  });
 });

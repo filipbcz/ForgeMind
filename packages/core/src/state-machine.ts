@@ -28,7 +28,7 @@ const transitions: Record<TaskStatus, TaskStatus[]> = {
   ready_for_user_review: ['completed', 'running_ai', 'cancelled'],
   completed: [],
   failed: [],
-  cancelled: [],
+  cancelled: ['completed'],
   budget_exceeded: [],
   iteration_limit_reached: [],
   repeated_error_detected: [],
