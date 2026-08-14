@@ -442,7 +442,10 @@ export function selectReleaseExecutionEvidence<T extends {
     return true;
   });
   return latestByCommand
-    .sort((left, right) => Number(right.commitSha === currentCommitSha) - Number(left.commitSha === currentCommitSha))
+    .sort((left, right) => (
+      Number(right.status === 'deferred') - Number(left.status === 'deferred')
+      || Number(right.commitSha === currentCommitSha) - Number(left.commitSha === currentCommitSha)
+    ))
     .slice(0, limit);
 }
 

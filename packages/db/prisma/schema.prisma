@@ -238,6 +238,7 @@ enum AcceptanceEvidenceStatus {
   passed
   failed
   blocked
+  deferred
 }
 
 model GitHubConnection {
@@ -321,6 +322,7 @@ model Task {
   mode                        TaskMode      @default(safe)
   status                      TaskStatus    @default(draft)
   waitingForCapabilities      Json          @default("[]") @map("waiting_for_capabilities")
+  deferredValidationCapabilities Json       @default("[]") @map("deferred_validation_capabilities")
   githubIssueNumber           Int?          @map("github_issue_number")
   githubIssueUrl              String?       @map("github_issue_url")
   branchName                  String?       @map("branch_name")

@@ -174,59 +174,6 @@ describe('roadmap task completion', () => {
     expect(result.nextTask?.id).toBe('task_2');
   });
 
-  it('starts a dependent step while its Windows validation is deferred', async () => {
-    const steps = [
-      { id: 'step_1', projectId: 'project_1', cycleId: 'cycle_1', sequenceNumber: 1, title: 'Win64 gate', description: 'Run Win64', acceptanceCriteria: ['Runs'], dependsOnStepTitles: [], status: 'waiting_for_capability', taskId: 'task_1' },
-      { id: 'step_2', projectId: 'project_1', cycleId: 'cycle_1', sequenceNumber: 2, title: 'Geodesy', description: 'Continue implementation', acceptanceCriteria: ['Implemented'], dependsOnStepTitles: ['Win64 gate'], status: 'pending' }
-    ];
-    const createAndStartRoadmapStepTask = vi.fn(async (_stepId: string, input: { prompt: string }) => ({ id: 'task_2', ...input }));
-    const repository = {
-      getProjectRoadmap: vi.fn(async () => ({
-        projectId: 'project_1',
-        cycles: [{ id: 'cycle_1', projectId: 'project_1', cycleNumber: 1, objective: 'Objective', status: 'active' }],
-        steps
-      })),
-      getProject: vi.fn(async () => ({ id: 'project_1', name: 'Project', defaultTaskMode: 'auto' })),
-      getTask: vi.fn(async () => ({ id: 'task_1', status: 'waiting_for_capability', waitingForCapabilities: ['windows'] })),
-      createAndStartRoadmapStepTask
-    };
-
-    const result = await import('./roadmap.js').then(({ startNextRoadmapStep }) => (
-      startNextRoadmapStep(repository as never, 'project_1', 'cycle_1')
-    ));
-
-    expect(result?.id).toBe('task_2');
-    expect(createAndStartRoadmapStepTask).toHaveBeenCalledTimes(1);
-    expect(createAndStartRoadmapStepTask.mock.calls[0]![1].prompt).toContain(
-      'Implemented predecessor steps with deferred environment validation:\n- Win64 gate'
-    );
-  });
-
-  it('keeps a dependent step blocked for a deferred non-Windows capability', async () => {
-    const steps = [
-      { id: 'step_1', projectId: 'project_1', cycleId: 'cycle_1', sequenceNumber: 1, title: 'Hardware gate', description: 'Run hardware test', acceptanceCriteria: ['Runs'], dependsOnStepTitles: [], status: 'waiting_for_capability', taskId: 'task_1' },
-      { id: 'step_2', projectId: 'project_1', cycleId: 'cycle_1', sequenceNumber: 2, title: 'Integration', description: 'Continue implementation', acceptanceCriteria: ['Implemented'], dependsOnStepTitles: ['Hardware gate'], status: 'pending' }
-    ];
-    const createAndStartRoadmapStepTask = vi.fn();
-    const repository = {
-      getProjectRoadmap: vi.fn(async () => ({
-        projectId: 'project_1',
-        cycles: [{ id: 'cycle_1', projectId: 'project_1', cycleNumber: 1, objective: 'Objective', status: 'active' }],
-        steps
-      })),
-      getProject: vi.fn(async () => ({ id: 'project_1', name: 'Project', defaultTaskMode: 'auto' })),
-      getTask: vi.fn(async () => ({ id: 'task_1', status: 'waiting_for_capability', waitingForCapabilities: ['flight-hardware'] })),
-      createAndStartRoadmapStepTask
-    };
-
-    const result = await import('./roadmap.js').then(({ startNextRoadmapStep }) => (
-      startNextRoadmapStep(repository as never, 'project_1', 'cycle_1')
-    ));
-
-    expect(result).toBeUndefined();
-    expect(createAndStartRoadmapStepTask).not.toHaveBeenCalled();
-  });
-
   it('does not audit a cycle while another step still waits for a capable worker', async () => {
     const completedTaskStep = { id: 'step_2', projectId: 'project_1', cycleId: 'cycle_1', sequenceNumber: 2, title: 'Docs', status: 'running', taskId: 'task_2' };
     const enqueueProjectAudit = vi.fn();

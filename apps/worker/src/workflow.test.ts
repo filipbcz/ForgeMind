@@ -1297,7 +1297,7 @@ describe('worker workflow', () => {
       }
     });
 
-    expect(result.status).toBe('waiting_for_capability');
+    expect(result.status).toBe('completed');
     expect(result.validation.command).toBe(`node --version && node -e "process.exit(0)"`);
     expect(result.validation.deferredChecks).toEqual([
       expect.objectContaining({
@@ -1307,6 +1307,7 @@ describe('worker workflow', () => {
       })
     ]);
     expect(result.requiredCapabilities).toContain('unreal-engine-5.8');
+    expect(result.summary).toContain('Windows-specific validation was deferred to the final project audit.');
     expect(mergePullRequest).toHaveBeenCalledOnce();
     expect(implement).toHaveBeenCalledOnce();
     expect(review).toHaveBeenCalledOnce();

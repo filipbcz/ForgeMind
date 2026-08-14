@@ -72,10 +72,11 @@ export async function runDatabaseWorkerOnce(options: { deferInterruptSignals?: b
   const recovery = await repository.recoverStuckQueueJobs(claimTimeoutMinutes);
   const workerCapabilities = resolveWorkerCapabilities();
   const requeuedCapabilityTasks = await repository.requeueTasksWaitingForCapabilities(workerCapabilities);
-  const deferredCapabilityTasks = await repository.listTasksWaitingForCapabilitiesWithPendingRoadmapSteps();
+  const deferredCapabilityTasks = await repository.listTasksWaitingForCapabilities();
   for (const task of deferredCapabilityTasks) {
     if (isNonBlockingDeferredValidation(task.waitingForCapabilities ?? [])) {
-      await advanceRoadmapAfterTaskCapabilityWait(repository, task.id);
+      const completed = await repository.completeTaskWithDeferredValidation(task.id);
+      if (completed) await advanceRoadmapAfterTaskCompletion(repository, task.id);
     }
   }
   const recoveredProjectAudits = await repository.recoverStuckProjectAudits(claimTimeoutMinutes);
@@ -564,7 +565,7 @@ export async function runDatabaseWorkerOnce(options: { deferInterruptSignals?: b
       await finalizeQueueJob('failed', result.summary, false);
     } else {
       if (result.requiredCapabilities?.length) {
-        await repository.setTaskWaitingCapabilities(claimed.task.id, result.requiredCapabilities);
+        await repository.setTaskDeferredValidationCapabilities(claimed.task.id, result.requiredCapabilities);
       }
       await repository.transitionTask(claimed.task.id, 'ready_for_user_review', {
         pullRequestUrl: result.pullRequestUrl ?? null,
@@ -2349,7 +2350,7 @@ export async function recordTaskAcceptanceEvidence(
         requirementIds: step.requirementIds,
         criterion: check.criterion,
         source: 'validation_command',
-        status: 'blocked',
+        status: isNonBlockingDeferredValidation(check.requiredCapabilities) ? 'deferred' : 'blocked',
         evidenceIdentity: `deferred:${check.command}`,
         contractVersion: contract.version,
         commitSha: input.result.commitSha,

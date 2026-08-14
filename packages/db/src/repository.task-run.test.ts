@@ -192,6 +192,9 @@ function createMockPrisma() {
     projectImplementationStep: {
       updateMany: vi.fn(async () => ({ count: 1 }))
     },
+    acceptanceEvidence: {
+      updateMany: vi.fn(async () => ({ count: 1 }))
+    },
     taskIteration: { create: vi.fn(), findMany: vi.fn() },
     taskCheckpoint: {
       findMany: vi.fn(async () => []),
@@ -623,6 +626,39 @@ describe('ForgeMindRepository task runs', () => {
     expect(prisma.projectImplementationStep.updateMany).toHaveBeenCalledWith({
       where: { taskId: 'task_1', status: { in: ['completed', 'waiting_for_capability'] } },
       data: { status: 'running', completedAt: null }
+    });
+  });
+
+  it('atomically completes a legacy Windows capability wait and defers its evidence', async () => {
+    const { prisma } = createMockPrisma();
+    const waitingTask = {
+      id: 'task_1', projectId: 'project_1', createdByUserId: 'user_local_owner', title: 'Task', prompt: 'Prompt',
+      mode: 'safe', status: 'waiting_for_capability', waitingForCapabilities: ['windows'],
+      githubIssueNumber: 1, githubIssueUrl: 'https://github.com/demo/repo/issues/1', branchName: 'ai/1-task',
+      pullRequestNumber: 1, pullRequestUrl: 'https://github.com/demo/repo/pull/1', maxIterations: 10, maxBudgetUsd: 2,
+      createdAt: new Date(), updatedAt: new Date(), startedAt: new Date(), finishedAt: new Date()
+    };
+    prisma.task.findUnique.mockResolvedValueOnce(waitingTask);
+    prisma.task.update.mockResolvedValueOnce({
+      ...waitingTask,
+      status: 'completed',
+      waitingForCapabilities: [],
+      deferredValidationCapabilities: ['windows']
+    });
+    const repository = new ForgeMindRepository(prisma);
+
+    const completed = await repository.completeTaskWithDeferredValidation('task_1');
+
+    expect(completed?.status).toBe('completed');
+    expect(completed?.waitingForCapabilities).toEqual([]);
+    expect(completed?.deferredValidationCapabilities).toEqual(['windows']);
+    expect(prisma.projectImplementationStep.updateMany).toHaveBeenCalledWith({
+      where: { taskId: 'task_1', status: 'waiting_for_capability' },
+      data: { status: 'completed', completedAt: expect.any(Date) }
+    });
+    expect(prisma.acceptanceEvidence.updateMany).toHaveBeenCalledWith({
+      where: { taskId: 'task_1', source: 'validation_command', status: 'blocked' },
+      data: { status: 'deferred' }
     });
   });
 

@@ -42,6 +42,7 @@ describe('capability audit contract', () => {
     expect(prompt).toContain('task validation and GitHub checks are supporting evidence');
     expect(prompt).toContain('Copy each acceptance criterion');
     expect(prompt).toContain('Do not rerun commands that already have passed trusted execution evidence');
+    expect(prompt).toContain('status deferred identifies a Windows-specific check');
   });
 
   it('accepts a fully evidenced satisfied verdict', () => {
@@ -163,6 +164,7 @@ describe('release audit contract', () => {
     expect(prompt).toContain('ForgeMind implementation-step evidence:');
     expect(prompt).toContain('Step 1: Build leaderboard [completed; initial_roadmap] task=task_1');
     expect(prompt).toContain('must address missing product behavior');
+    expect(prompt).toContain('status deferred identifies Windows-specific validation');
   });
 
   it('allows a focused release gap linked to an existing requirement', () => {

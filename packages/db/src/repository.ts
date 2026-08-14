@@ -1,6 +1,5 @@
 import {
   activeProjectContractRequirements,
-  isNonBlockingDeferredValidation,
   type AcceptanceEvidence,
   type AcceptanceEvidenceSource,
   type AcceptanceEvidenceStatus,
@@ -1704,32 +1703,16 @@ export class ForgeMindRepository {
       const dependencyTitles = Array.isArray(step.dependsOnStepTitles)
         ? step.dependsOnStepTitles.filter((value): value is string => typeof value === 'string')
         : [];
-      let deferredDependencyTitles: string[] = [];
       if (dependencyTitles.length > 0) {
-        const dependencies = await tx.projectImplementationStep.findMany({
+        const completedDependencies = await tx.projectImplementationStep.count({
           where: {
             projectId: input.projectId,
             cycleId: step.cycleId,
-            title: { in: dependencyTitles }
-          },
-          include: {
-            task: { select: { status: true, waitingForCapabilities: true } }
+            title: { in: dependencyTitles },
+            status: 'completed'
           }
         });
-        deferredDependencyTitles = dependencies
-          .filter((dependency) => (
-            dependency.status === 'waiting_for_capability'
-            && dependency.task?.status === 'waiting_for_capability'
-            && isNonBlockingDeferredValidation(jsonStringArray(dependency.task.waitingForCapabilities))
-          ))
-          .map((dependency) => dependency.title);
-        const satisfiedDependencies = new Set(dependencies
-          .filter((dependency) => (
-            dependency.status === 'completed'
-            || deferredDependencyTitles.includes(dependency.title)
-          ))
-          .map((dependency) => dependency.title));
-        if (dependencyTitles.some((title) => !satisfiedDependencies.has(title))) return undefined;
+        if (completedDependencies !== new Set(dependencyTitles).size) return undefined;
       }
 
       const project = await tx.project.findUnique({ where: { id: input.projectId } });
@@ -1801,12 +1784,6 @@ export class ForgeMindRepository {
         actorType: 'system', eventType: 'task_enqueued', projectId: project.id, taskId: task.id,
         payload: { reason: 'roadmap_step_started' }
       });
-      if (deferredDependencyTitles.length > 0) {
-        await this.writeAuditTx(tx, {
-          actorType: 'system', eventType: 'roadmap_dependency_validation_deferred', projectId: project.id, taskId: task.id,
-          payload: { stepId: step.id, deferredDependencyTitles, capability: 'windows' }
-        });
-      }
       return toTask(task);
     });
   }
@@ -3265,6 +3242,7 @@ export class ForgeMindRepository {
         data: {
           status: start ? 'submitted' : 'draft',
           waitingForCapabilities: [],
+          deferredValidationCapabilities: [],
           startedAt: start ? new Date() : null,
           finishedAt: null
         }
@@ -3336,28 +3314,56 @@ export class ForgeMindRepository {
     return toTask(updated);
   }
 
-  async setTaskWaitingCapabilities(taskId: string, capabilities: string[]): Promise<ForgeTask> {
+  async setTaskDeferredValidationCapabilities(taskId: string, capabilities: string[]): Promise<ForgeTask> {
     const normalized = Array.from(new Set(capabilities.map((item) => item.trim().toLowerCase()).filter(Boolean)));
     const updated = await this.prisma.task.update({
       where: { id: taskId },
-      data: { waitingForCapabilities: normalized }
+      data: { deferredValidationCapabilities: normalized }
     });
     return toTask(updated);
   }
 
-  async listTasksWaitingForCapabilitiesWithPendingRoadmapSteps(): Promise<ForgeTask[]> {
-    const tasks = await this.prisma.task.findMany({
-      where: {
-        status: 'waiting_for_capability',
-        roadmapSteps: {
-          some: {
-            cycle: {
-              status: 'active',
-              steps: { some: { status: 'pending', taskId: null } }
-            }
-          }
+  async completeTaskWithDeferredValidation(taskId: string): Promise<ForgeTask | undefined> {
+    return this.prisma.$transaction(async (tx) => {
+      await tx.$queryRawUnsafe(WORKER_QUEUE_ADVISORY_LOCK_SQL);
+      const task = await tx.task.findUnique({ where: { id: taskId } });
+      if (!task || task.status !== 'waiting_for_capability') return undefined;
+
+      const completedAt = new Date();
+      const updated = await tx.task.update({
+        where: { id: task.id },
+        data: {
+          status: 'completed',
+          waitingForCapabilities: [],
+          deferredValidationCapabilities: jsonStringArray(task.waitingForCapabilities),
+          finishedAt: completedAt
         }
-      },
+      });
+      await tx.projectImplementationStep.updateMany({
+        where: { taskId: task.id, status: 'waiting_for_capability' },
+        data: { status: 'completed', completedAt }
+      });
+      await tx.acceptanceEvidence.updateMany({
+        where: { taskId: task.id, source: 'validation_command', status: 'blocked' },
+        data: { status: 'deferred' }
+      });
+      await this.writeAuditTx(tx, {
+        actorType: 'system',
+        eventType: 'task_status_completed',
+        projectId: task.projectId,
+        taskId: task.id,
+        payload: {
+          deferredValidationCapabilities: jsonStringArray(task.waitingForCapabilities),
+          migratedFromCapabilityWait: true
+        }
+      });
+      return toTask(updated);
+    });
+  }
+
+  async listTasksWaitingForCapabilities(): Promise<ForgeTask[]> {
+    const tasks = await this.prisma.task.findMany({
+      where: { status: 'waiting_for_capability' },
       orderBy: { createdAt: 'asc' }
     });
     return tasks.map(toTask);

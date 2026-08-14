@@ -425,6 +425,7 @@ export function toTaskSummary(task: TaskApi): TaskSummary {
     issueUrl: task.githubIssueUrl,
     pullRequestUrl: task.pullRequestUrl,
     waitingForCapabilities: task.waitingForCapabilities,
+    deferredValidationCapabilities: task.deferredValidationCapabilities,
     plan: task.status === 'draft' ? [] : ['Create issue and branch', 'Run provider', 'Validate result', 'Prepare draft PR'],
     testResult: task.status === 'draft' ? 'Not started' : 'See worker log',
     diffSummary: task.status === 'draft' ? 'No changes' : 'See diff summary'

@@ -1574,6 +1574,19 @@ function TaskDetail(props: {
         </section>
       ) : null}
 
+      {props.task.status === 'completed' && (props.task.deferredValidationCapabilities ?? []).length > 0 ? (
+        <section className="task-deferred-validation" role="status">
+          <AlertTriangle size={20} />
+          <div>
+            <strong>Doporucena zaverecna validace</strong>
+            <p>
+              Task je dokoncen na zaklade dostupnych kontrol. Validace pro{' '}
+              {(props.task.deferredValidationCapabilities ?? []).join(', ')} byla odlozena a bude zohlednena v zaverecnem auditu projektu.
+            </p>
+          </div>
+        </section>
+      ) : null}
+
       <section className={`project-progress-panel ${projectProgress.tone}`} aria-label="Stav projektu">
         <span className="project-progress-icon"><ProjectProgressIcon size={20} /></span>
         <div className="project-progress-content">

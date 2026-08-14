@@ -259,7 +259,7 @@ export interface AcceptanceEvidenceApi {
   criterionKey: string;
   criterion: string;
   source: 'validation_command' | 'github_check' | 'repository_audit' | 'artifact';
-  status: 'passed' | 'failed' | 'blocked';
+  status: 'passed' | 'failed' | 'blocked' | 'deferred';
   evidenceKey: string;
   contractVersion: number;
   commitSha?: string;
@@ -289,6 +289,7 @@ export interface TaskApi {
   mode: 'safe' | 'auto' | 'full_auto';
   status: TaskStatus;
   waitingForCapabilities?: string[];
+  deferredValidationCapabilities?: string[];
   githubIssueNumber?: number;
   githubIssueUrl?: string;
   branchName?: string;
@@ -790,6 +791,7 @@ export interface TaskSummary {
   issueUrl?: string;
   pullRequestUrl?: string;
   waitingForCapabilities?: string[];
+  deferredValidationCapabilities?: string[];
   plan: string[];
   testResult: string;
   diffSummary: string;

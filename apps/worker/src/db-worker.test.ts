@@ -54,7 +54,7 @@ function createClaimedTask(queueReason = 'task_started') {
 const repositoryMock = {
   recoverStuckQueueJobs: vi.fn(async () => ({ recoveredCount: 0, queueJobIds: [] })),
   requeueTasksWaitingForCapabilities: vi.fn(async () => 0),
-  listTasksWaitingForCapabilitiesWithPendingRoadmapSteps: vi.fn(async () => []),
+  listTasksWaitingForCapabilities: vi.fn(async () => []),
   recoverStuckProjectAudits: vi.fn(async () => 0),
   getGitHubConnectionSecret: vi.fn(async () => undefined),
   getAIProviderConnectionSecret: vi.fn(async () => undefined),
@@ -74,7 +74,8 @@ const repositoryMock = {
   recordProviderUsage: vi.fn(async () => undefined),
   transitionTask: vi.fn(async () => undefined),
   waitTaskForCapabilities: vi.fn(async () => undefined),
-  setTaskWaitingCapabilities: vi.fn(async () => undefined),
+  setTaskDeferredValidationCapabilities: vi.fn(async () => undefined),
+  completeTaskWithDeferredValidation: vi.fn(async (): Promise<unknown> => ({ id: 'task_windows', status: 'completed' })),
   createApproval: vi.fn(async () => ({ id: 'approval_1' })),
   createIteration: vi.fn(async () => undefined),
   listTaskCheckpoints: vi.fn(async (): Promise<unknown[]> => []),
@@ -207,8 +208,8 @@ describe('db-worker policy enforcement', () => {
     }
   });
 
-  it('keeps an existing Windows capability wait from blocking the next roadmap task', async () => {
-    repositoryMock.listTasksWaitingForCapabilitiesWithPendingRoadmapSteps.mockResolvedValueOnce([{
+  it('completes an existing Windows capability wait and advances its roadmap', async () => {
+    repositoryMock.listTasksWaitingForCapabilities.mockResolvedValueOnce([{
       id: 'task_windows',
       waitingForCapabilities: ['windows']
     }] as never);
@@ -217,7 +218,8 @@ describe('db-worker policy enforcement', () => {
     const { runDatabaseWorkerOnce } = await import('./db-worker.js');
     const result = await runDatabaseWorkerOnce();
 
-    expect(advanceRoadmapAfterTaskCapabilityWaitMock).toHaveBeenCalledWith(repositoryMock, 'task_windows');
+    expect(repositoryMock.completeTaskWithDeferredValidation).toHaveBeenCalledWith('task_windows');
+    expect(advanceRoadmapAfterTaskCompletionMock).toHaveBeenCalledWith(repositoryMock, 'task_windows');
     expect(result).toEqual(expect.objectContaining({ claimed: false }));
   });
 
@@ -2385,10 +2387,10 @@ github:
     expect(advanceRoadmapAfterTaskCompletionMock).toHaveBeenCalledWith(repositoryMock, 'task_1');
   });
 
-  it('persists a capability wait without failing or retrying the queue job', async () => {
+  it('completes a task with deferred Windows validation evidence', async () => {
     runWorkerTaskMock.mockResolvedValueOnce({
       taskId: 'task_1',
-      status: 'waiting_for_capability',
+      status: 'completed',
       issueUrl: 'https://github.com/demo/repo/issues/1',
       branchName: 'ai/1-task',
       pullRequestUrl: 'https://github.com/demo/repo/pull/1',
@@ -2407,10 +2409,14 @@ github:
     const { runDatabaseWorkerOnce } = await import('./db-worker.js');
     await runDatabaseWorkerOnce();
 
-    expect(repositoryMock.waitTaskForCapabilities).toHaveBeenCalledWith(
-      'task_1', ['windows'], expect.objectContaining({ pullRequestUrl: 'https://github.com/demo/repo/pull/1' })
-    );
-    expect(advanceRoadmapAfterTaskCapabilityWaitMock).toHaveBeenCalledWith(repositoryMock, 'task_1');
+    expect(repositoryMock.setTaskDeferredValidationCapabilities).toHaveBeenCalledWith('task_1', ['windows']);
+    expect(repositoryMock.transitionTask).toHaveBeenNthCalledWith(1, 'task_1', 'ready_for_user_review', {
+      pullRequestUrl: 'https://github.com/demo/repo/pull/1',
+      branchName: 'ai/1-task'
+    });
+    expect(repositoryMock.transitionTask).toHaveBeenNthCalledWith(2, 'task_1', 'completed');
+    expect(repositoryMock.waitTaskForCapabilities).not.toHaveBeenCalled();
+    expect(advanceRoadmapAfterTaskCompletionMock).toHaveBeenCalledWith(repositoryMock, 'task_1');
     expect(repositoryMock.finalizeQueueJob).toHaveBeenCalledWith('queue_1', 'succeeded');
     expect(repositoryMock.failTask).not.toHaveBeenCalled();
   });

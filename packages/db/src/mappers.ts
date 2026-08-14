@@ -430,6 +430,7 @@ export function toTask(task: Task): ForgeTask {
     mode: task.mode,
     status: task.status,
     waitingForCapabilities: jsonStringArray(task.waitingForCapabilities),
+    deferredValidationCapabilities: jsonStringArray(task.deferredValidationCapabilities),
     githubIssueNumber: task.githubIssueNumber ?? undefined,
     githubIssueUrl: task.githubIssueUrl ?? undefined,
     branchName: task.branchName ?? undefined,

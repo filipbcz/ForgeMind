@@ -65,6 +65,19 @@ describe('worker acceptance evidence', () => {
           stderr: '',
           passed: true,
           criterion: 'Work item tests pass.'
+        }],
+        deferredChecks: [{
+          command: 'cmake --build --preset windows-release',
+          criterion: 'Windows build passes.',
+          rationale: 'Authoritative Windows compiler check.',
+          requiredCapabilities: ['windows'],
+          missingCapabilities: ['windows']
+        }, {
+          command: 'docker compose up --wait',
+          criterion: 'Container stack starts.',
+          rationale: 'Requires a Docker daemon.',
+          requiredCapabilities: ['docker'],
+          missingCapabilities: ['docker']
         }]
       },
       commitSha: 'abc123',
@@ -76,7 +89,7 @@ describe('worker acceptance evidence', () => {
 
     await recordTaskAcceptanceEvidence(repository as never, { project, taskId: 'task_1', taskRunId: 'run_1', result });
 
-    expect(recordAcceptanceEvidence).toHaveBeenCalledTimes(2);
+    expect(recordAcceptanceEvidence).toHaveBeenCalledTimes(4);
     expect(recordAcceptanceEvidence).toHaveBeenNthCalledWith(1, expect.objectContaining({
       requirementIds: ['REQ-API', 'REQ-UI'],
       source: 'validation_command',
@@ -85,6 +98,18 @@ describe('worker acceptance evidence', () => {
       commitSha: 'abc123'
     }));
     expect(recordAcceptanceEvidence).toHaveBeenNthCalledWith(2, expect.objectContaining({
+      source: 'validation_command',
+      status: 'deferred',
+      command: 'cmake --build --preset windows-release',
+      payload: expect.objectContaining({ missingCapabilities: ['windows'] })
+    }));
+    expect(recordAcceptanceEvidence).toHaveBeenNthCalledWith(3, expect.objectContaining({
+      source: 'validation_command',
+      status: 'blocked',
+      command: 'docker compose up --wait',
+      payload: expect.objectContaining({ missingCapabilities: ['docker'] })
+    }));
+    expect(recordAcceptanceEvidence).toHaveBeenNthCalledWith(4, expect.objectContaining({
       source: 'github_check',
       status: 'passed',
       evidenceIdentity: 'github-checks:abc123'

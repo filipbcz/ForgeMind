@@ -338,7 +338,7 @@ export interface ProjectContractSnapshot {
 }
 
 export type AcceptanceEvidenceSource = 'validation_command' | 'github_check' | 'repository_audit' | 'artifact';
-export type AcceptanceEvidenceStatus = 'passed' | 'failed' | 'blocked';
+export type AcceptanceEvidenceStatus = 'passed' | 'failed' | 'blocked' | 'deferred';
 
 export interface AcceptanceEvidence {
   id: string;
@@ -467,6 +467,7 @@ export interface ForgeTask {
   mode: TaskMode;
   status: TaskStatus;
   waitingForCapabilities?: string[];
+  deferredValidationCapabilities?: string[];
   githubIssueNumber?: number;
   githubIssueUrl?: string;
   branchName?: string;

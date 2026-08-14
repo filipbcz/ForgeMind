@@ -132,6 +132,16 @@ describe('selectReleaseExecutionEvidence', () => {
     expect(selected[0]?.commitSha).toBe('current');
   });
 
+  it('keeps deferred Windows checks visible within the bounded release evidence', () => {
+    const selected = selectReleaseExecutionEvidence([
+      { source: 'validation_command', status: 'passed', criterion: 'Portable check', command: 'npm test', commitSha: 'current' },
+      { source: 'validation_command', status: 'deferred', criterion: 'Win64 starts', command: 'Flying.exe --smoke', commitSha: 'ancestor' },
+      { source: 'validation_command', status: 'passed', criterion: 'Build', command: 'npm run build', commitSha: 'current' }
+    ], 'current', 2);
+
+    expect(selected.map((item) => item.command)).toEqual(['Flying.exe --smoke', 'npm run build']);
+  });
+
   it('rebinds trusted evidence when squash merge metadata changed but the Git tree is identical', async () => {
     const workspace = await mkdtemp(join(tmpdir(), 'forgemind-audit-tree-'));
     temporaryDirectories.push(workspace);

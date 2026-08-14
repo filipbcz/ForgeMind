@@ -16,6 +16,7 @@ import type {
   TaskMode,
   TaskStatus
 } from '@forgemind/core';
+import { isNonBlockingDeferredValidation } from '@forgemind/core';
 import {
   createAiBranchName,
   renderIssueBody,
@@ -1214,16 +1215,21 @@ export async function runWorkerTask(input: WorkerTaskInput): Promise<WorkerTaskR
             detail: summary,
             operation: 'finish_task'
           });
-          const requiredCapabilities = uniqueStrings((validation.deferredChecks ?? []).flatMap((check) => check.missingCapabilities));
+          const deferredChecks = validation.deferredChecks ?? [];
+          const { blockingCapabilities, deferredCapabilities } = partitionDeferredValidationCapabilities(deferredChecks);
+          const deferUntilProjectAudit = deferredCapabilities.length > 0 && blockingCapabilities.length === 0;
+          const requiredCapabilities = deferUntilProjectAudit ? deferredCapabilities : blockingCapabilities;
           return {
             taskId: input.task.id,
-            status: requiredCapabilities.length > 0 ? 'waiting_for_capability' : 'completed',
+            status: requiredCapabilities.length > 0 && !deferUntilProjectAudit ? 'waiting_for_capability' : 'completed',
             issueUrl: issue.issueUrl,
             branchName,
             workspacePath,
             validation,
             commitSha: await resolveHeadSha(git),
-            summary,
+            summary: deferUntilProjectAudit
+              ? `${summary}\n\nWindows-specific validation was deferred to the final project audit.`
+              : summary,
             approvals: [],
             requiredCapabilities: requiredCapabilities.length > 0 ? requiredCapabilities : undefined,
             completedAt: nowIso()
@@ -1273,9 +1279,11 @@ export async function runWorkerTask(input: WorkerTaskInput): Promise<WorkerTaskR
         });
 
         if (delivery.kind === 'completed') {
-          const requiredCapabilities = uniqueStrings((validation.deferredChecks ?? [])
-            .flatMap((check) => check.missingCapabilities));
-          if (requiredCapabilities.length > 0 && delivery.result.status === 'completed') {
+          const deferredChecks = validation.deferredChecks ?? [];
+          const { blockingCapabilities, deferredCapabilities } = partitionDeferredValidationCapabilities(deferredChecks);
+          const deferUntilProjectAudit = deferredCapabilities.length > 0 && blockingCapabilities.length === 0;
+          const requiredCapabilities = deferUntilProjectAudit ? deferredCapabilities : blockingCapabilities;
+          if (requiredCapabilities.length > 0 && delivery.result.status === 'completed' && !deferUntilProjectAudit) {
             return {
               ...delivery.result,
               status: 'waiting_for_capability',
@@ -1283,9 +1291,16 @@ export async function runWorkerTask(input: WorkerTaskInput): Promise<WorkerTaskR
               summary: `${delivery.result.summary}\n\nSource delivery completed. Authoritative validation is waiting for worker capabilities: ${requiredCapabilities.join(', ')}.`
             };
           }
-          return requiredCapabilities.length > 0
-            ? { ...delivery.result, requiredCapabilities }
-            : delivery.result;
+          if (requiredCapabilities.length > 0) {
+            return {
+              ...delivery.result,
+              requiredCapabilities,
+              summary: deferUntilProjectAudit
+                ? `${delivery.result.summary}\n\nWindows-specific validation was deferred to the final project audit.`
+                : delivery.result.summary
+            };
+          }
+          return delivery.result;
         }
 
         validation = delivery.validation;
@@ -2757,6 +2772,17 @@ function uniqueApprovals(values: ApprovalType[]): ApprovalType[] {
 
 function uniqueStrings(values: string[]): string[] {
   return Array.from(new Set(values));
+}
+
+function partitionDeferredValidationCapabilities(
+  checks: import('./validation.js').DeferredValidationCheck[]
+): { blockingCapabilities: string[]; deferredCapabilities: string[] } {
+  const deferredChecks = checks.filter((check) => isNonBlockingDeferredValidation(check.requiredCapabilities));
+  const blockingChecks = checks.filter((check) => !isNonBlockingDeferredValidation(check.requiredCapabilities));
+  return {
+    blockingCapabilities: uniqueStrings(blockingChecks.flatMap((check) => check.missingCapabilities)),
+    deferredCapabilities: uniqueStrings(deferredChecks.flatMap((check) => check.requiredCapabilities))
+  };
 }
 
 function normalizeRuntimeApprovals(values: readonly unknown[] | undefined): ApprovalType[] {

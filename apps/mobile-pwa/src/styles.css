@@ -1023,7 +1023,8 @@ a {
   overflow-wrap: anywhere;
 }
 
-.task-capability-wait {
+.task-capability-wait,
+.task-deferred-validation {
   display: flex;
   gap: 12px;
   align-items: flex-start;
@@ -1033,7 +1034,8 @@ a {
   color: #6f4d0c;
 }
 
-.task-capability-wait p {
+.task-capability-wait p,
+.task-deferred-validation p {
   margin: 4px 0 0;
 }
 
