@@ -55,6 +55,26 @@ describe('review prompt', () => {
     expect(prompt).toContain('100% tests passed, 0 tests failed out of 1');
   });
 
+  it('bounds very large changed-file lists without dropping the review diff', () => {
+    const changedFiles = Array.from({ length: 1_000 }, (_, index) =>
+      `build-validation/generated/path-${index.toString().padStart(4, '0')}/artifact.cpp`
+    );
+    const prompt = buildReviewPrompt({
+      taskId: 'task-large-file-list',
+      taskTitle: 'Review generated integration output',
+      taskPrompt: 'Review the implementation without exhausting provider context.',
+      repositoryPath: '/workspace',
+      changedFiles,
+      acceptanceCriteria: ['The implementation remains reviewable.'],
+      validation: { command: 'npm test', exitCode: 0, stdout: 'passed', stderr: '', passed: true },
+      diff: '+export const reviewed = true;'
+    });
+
+    expect(prompt).toContain('additional changed file paths omitted; inspect the bounded diff below');
+    expect(prompt).toContain('+export const reviewed = true;');
+    expect(prompt.length).toBeLessThan(30_000);
+  });
+
   it('limits follow-up review to the correction and previous blockers', () => {
     const prompt = buildReviewPrompt({
       taskId: 'task-2',

@@ -1,6 +1,8 @@
 import type { ReviewInput } from './provider.js';
 
 const MAX_VALIDATION_OUTPUT_CHARS = 2_000;
+const MAX_CHANGED_FILE_LIST_CHARS = 20_000;
+const MAX_CHANGED_FILE_COUNT = 250;
 
 export function buildReviewPrompt(input: ReviewInput): string {
   const existingStateReview = input.reviewMode === 'existing_state';
@@ -92,7 +94,7 @@ export function buildReviewPrompt(input: ReviewInput): string {
       : []),
     '',
     'Changed files:',
-    renderList(input.changedFiles, 'No changed files were reported.'),
+    renderChangedFiles(input.changedFiles),
     ...(existingStateReview
       ? [
           '',
@@ -108,6 +110,29 @@ export function buildReviewPrompt(input: ReviewInput): string {
 
 function renderList(items: string[], emptyMessage: string): string {
   return items.length > 0 ? items.map((item) => `- ${item}`).join('\n') : `- ${emptyMessage}`;
+}
+
+function renderChangedFiles(items: string[]): string {
+  if (items.length === 0) {
+    return '- No changed files were reported.';
+  }
+
+  const rendered: string[] = [];
+  let renderedChars = 0;
+  for (const item of items) {
+    const line = `- ${item}`;
+    if (rendered.length >= MAX_CHANGED_FILE_COUNT || renderedChars + line.length > MAX_CHANGED_FILE_LIST_CHARS) {
+      break;
+    }
+    rendered.push(line);
+    renderedChars += line.length + 1;
+  }
+
+  const omittedCount = items.length - rendered.length;
+  if (omittedCount > 0) {
+    rendered.push(`- [${omittedCount} additional changed file paths omitted; inspect the bounded diff below]`);
+  }
+  return rendered.join('\n');
 }
 
 function truncateValidationOutput(value: string): string {

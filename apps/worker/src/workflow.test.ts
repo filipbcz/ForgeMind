@@ -3056,6 +3056,9 @@ describe('worker workflow', () => {
       await writeFile(join(input.repositoryPath, 'node_modules', 'yaml', 'index.js'), 'generated\n', 'utf8');
       await mkdir(join(input.repositoryPath, 'out', 'build', 'test'), { recursive: true });
       await writeFile(join(input.repositoryPath, 'out', 'build', 'test', 'artifact.txt'), 'generated\n', 'utf8');
+      await mkdir(join(input.repositoryPath, 'build-jsbsim-acceptance', '_deps', 'jsbsim'), { recursive: true });
+      await writeFile(join(input.repositoryPath, 'build-jsbsim-acceptance', 'CMakeCache.txt'), 'generated\n', 'utf8');
+      await writeFile(join(input.repositoryPath, 'build-jsbsim-acceptance', '_deps', 'jsbsim', 'artifact.o'), 'generated\n', 'utf8');
       return {
         summary: 'Created one source file.',
         changedFiles: ['src/result.ts'],
@@ -3086,6 +3089,8 @@ describe('worker workflow', () => {
     }));
     const firstReviewInput = (review.mock.calls as unknown as Array<[ReviewInput]>)[0]?.[0];
     expect(firstReviewInput?.diff).not.toContain('out/build');
+    expect(firstReviewInput?.changedFiles).not.toContain('build-jsbsim-acceptance/CMakeCache.txt');
+    expect(firstReviewInput?.diff).not.toContain('build-jsbsim-acceptance');
     const committedFiles = (await simpleGit({ baseDir: join(workspaceRoot, task.id) }).show([
       '--name-only',
       '--format=',

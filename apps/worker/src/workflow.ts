@@ -3710,6 +3710,7 @@ function isSubstantiveImplementationPath(path: string): boolean {
 function isGeneratedWorkerPath(path: string): boolean {
   const normalized = normalizeRepoPath(path);
   const segments = normalized.split('/');
+  const rootSegment = segments[0] ?? '';
   return normalized === 'agents.md'
     || normalized === 'mock_implementation.md'
     || segments.includes('node_modules')
@@ -3717,8 +3718,16 @@ function isGeneratedWorkerPath(path: string): boolean {
     || normalized.startsWith('out/build/')
     || normalized === 'build'
     || normalized.startsWith('build/')
+    || (rootSegment.startsWith('build-') && !SOURCE_BUILD_ROOTS.has(rootSegment))
     || segments.some((segment) => segment.startsWith('cmake-build-'));
 }
+
+const SOURCE_BUILD_ROOTS = new Set([
+  'build-scripts',
+  'build-support',
+  'build-system',
+  'build-tools'
+]);
 
 function normalizeRepoPath(path: string): string {
   return toPortableRepoPath(path).toLowerCase();
