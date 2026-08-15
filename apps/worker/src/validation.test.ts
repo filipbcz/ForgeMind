@@ -242,6 +242,18 @@ describe('validation runner', () => {
     );
   });
 
+  it('returns a rejected validation command as a recoverable failed check', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'forgemind-validation-policy-'));
+    const command = 'python3 -m json.tool schema.json >/dev/null';
+
+    const result = await runValidationChecks([{ kind: 'command', command }], cwd);
+
+    expect(result.passed).toBe(false);
+    expect(result.failingCommand).toBe(command);
+    expect(result.exitCode).toBe(1);
+    expect(result.stderr).toBe(`Validation command is not allowed: ${command}`);
+  });
+
   it('rejects mutable operating-system package installation during validation', () => {
     expect(() => assertAllowedValidationCommand('apt-get install -y cmake')).toThrow(
       'Validation command is not allowed'

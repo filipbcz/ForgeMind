@@ -192,9 +192,9 @@ export async function runValidationCommand(
 ): Promise<ValidationResult> {
   throwIfAborted(signal);
   const effectiveCommand = normalizeValidationCommandForEnvironment(command);
-  assertAllowedValidationCommand(effectiveCommand);
 
   try {
+    assertAllowedValidationCommand(effectiveCommand);
     const subprocess = execaCommand(effectiveCommand, {
       cwd,
       env: createValidationEnvironment(),
