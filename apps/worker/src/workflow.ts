@@ -3393,6 +3393,7 @@ export function isReviewSummaryOnlyPath(path: string): boolean {
 }
 
 async function renderUntrackedFileDiff(workspacePath: string, path: string): Promise<string> {
+  const displayPath = toPortableRepoPath(path);
   try {
     const content = await readFile(join(workspacePath, path), 'utf8');
     const lines = content.length === 0 ? [] : content.replace(/\r\n/g, '\n').split('\n');
@@ -3400,10 +3401,10 @@ async function renderUntrackedFileDiff(workspacePath: string, path: string): Pro
       lines.pop();
     }
     const header = [
-      `diff --git a/${normalizeRepoPath(path)} b/${normalizeRepoPath(path)}`,
+      `diff --git a/${displayPath} b/${displayPath}`,
       'new file mode 100644',
       '--- /dev/null',
-      `+++ b/${normalizeRepoPath(path)}`
+      `+++ b/${displayPath}`
     ];
     if (lines.length === 0) {
       return header.join('\n');
@@ -3411,7 +3412,7 @@ async function renderUntrackedFileDiff(workspacePath: string, path: string): Pro
 
     return [...header, `@@ -0,0 +1,${lines.length} @@`, ...lines.map((line) => `+${line}`)].join('\n');
   } catch {
-    return `diff --git a/${normalizeRepoPath(path)} b/${normalizeRepoPath(path)}\n[unreadable or binary file]`;
+    return `diff --git a/${displayPath} b/${displayPath}\n[unreadable or binary file]`;
   }
 }
 
@@ -3720,5 +3721,9 @@ function isGeneratedWorkerPath(path: string): boolean {
 }
 
 function normalizeRepoPath(path: string): string {
-  return path.replace(/\\/g, '/').toLowerCase();
+  return toPortableRepoPath(path).toLowerCase();
+}
+
+function toPortableRepoPath(path: string): string {
+  return path.replace(/\\/g, '/');
 }

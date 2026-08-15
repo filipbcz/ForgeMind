@@ -23,12 +23,36 @@ describe('review prompt', () => {
     expect(prompt).toContain('Do not run shell commands, tests, builds, type checks, linters, Git commands, or other tools.');
     expect(prompt).toContain('Do not repeat the supplied validation commands.');
     expect(prompt).toContain('Treat exit code 0 as evidence that a command completed, not by itself as proof');
+    expect(prompt).toContain('exit code 0 establishes that every chained command exited successfully');
     expect(prompt).toContain('meaningfully verify the acceptance criteria');
     expect(prompt).toContain('Return one criterionResults entry for every explicit acceptance criterion');
     expect(prompt).toContain('Implement profile selection without changing authentication.');
     expect(prompt).toContain('A profile can be selected.');
     expect(prompt).toContain('Command: npm test && npm run build');
     expect(prompt).toContain('+export const selected = true;');
+  });
+
+  it('preserves the beginning and end of long validation output', () => {
+    const prompt = buildReviewPrompt({
+      taskId: 'task-long-output',
+      taskTitle: 'Build terrain runtime',
+      taskPrompt: 'Build and execute the terrain runtime test.',
+      repositoryPath: '/workspace',
+      changedFiles: ['Tests/TerrainRuntimeTests.cpp'],
+      acceptanceCriteria: ['Terrain runtime test passes.'],
+      validation: {
+        command: 'cmake --build --preset test && ctest --test-dir out/build/test',
+        exitCode: 0,
+        stdout: `CONFIGURATION_START\n${'x'.repeat(3_000)}\n100% tests passed, 0 tests failed out of 1`,
+        stderr: '',
+        passed: true
+      },
+      diff: '+int main() { return 0; }'
+    });
+
+    expect(prompt).toContain('CONFIGURATION_START');
+    expect(prompt).toContain('validation output truncated:');
+    expect(prompt).toContain('100% tests passed, 0 tests failed out of 1');
   });
 
   it('limits follow-up review to the correction and previous blockers', () => {

@@ -2962,6 +2962,7 @@ describe('worker workflow', () => {
   it('reports actual diff stats for newly created untracked files', async () => {
     const workspaceRoot = join(tmpdir(), `forgemind-worker-untracked-diff-${randomUUID()}`);
     const implementationDiffStats: Array<{ filesChanged?: number; insertions?: number; deletions?: number }> = [];
+    const reviewInputs: ReviewInput[] = [];
     const task = {
       ...demoTask,
       id: `task_${randomUUID()}`
@@ -2990,6 +2991,7 @@ describe('worker workflow', () => {
         };
       },
       async review(_input: ReviewInput): Promise<ReviewResult> {
+        reviewInputs.push(_input);
         return {
           summary: 'Review passed.',
           blockers: [],
@@ -3035,6 +3037,8 @@ describe('worker workflow', () => {
         deletions: 0
       })
     );
+    expect(reviewInputs[0]?.diff).toContain('diff --git a/src/App.tsx b/src/App.tsx');
+    expect(reviewInputs[0]?.diff).not.toContain('diff --git a/src/app.tsx b/src/app.tsx');
   }, 10000);
 
   it('excludes dependency and build output directories from diff metrics and review', async () => {

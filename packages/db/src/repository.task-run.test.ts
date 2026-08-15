@@ -245,6 +245,17 @@ function createMockPrisma() {
 }
 
 describe('ForgeMindRepository task runs', () => {
+  it('keeps the task list stable when older tasks receive later status updates', async () => {
+    const { prisma } = createMockPrisma();
+    const repository = new ForgeMindRepository(prisma);
+
+    await repository.listTasks();
+
+    expect(prisma.task.findMany).toHaveBeenCalledWith({
+      orderBy: { createdAt: 'desc' }
+    });
+  });
+
   it('sanitizes PostgreSQL-incompatible null bytes in task iteration evidence', async () => {
     const { prisma } = createMockPrisma();
     const repository = new ForgeMindRepository(prisma);

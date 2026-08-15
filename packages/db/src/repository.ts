@@ -2040,7 +2040,7 @@ export class ForgeMindRepository {
 
   async listTasks(): Promise<ForgeTask[]> {
     const tasks = await this.prisma.task.findMany({
-      orderBy: { updatedAt: 'desc' }
+      orderBy: { createdAt: 'desc' }
     });
     return tasks.map(toTask);
   }
