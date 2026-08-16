@@ -1,0 +1,65 @@
+name: Add Raspberry SSH Key
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  add-ssh-key:
+    runs-on: ubuntu-latest
+    environment: raspberry-production
+
+    steps:
+      - name: Connect runner to Tailscale
+        uses: tailscale/github-action@v4
+        with:
+          oauth-client-id: ${{ secrets.TS_OAUTH_CLIENT_ID }}
+          oauth-secret: ${{ secrets.TS_OAUTH_SECRET }}
+          tags: tag:ci
+          ping: ${{ secrets.RPI_DEPLOY_HOST }}
+
+      - name: Configure SSH
+        env:
+          RPI_DEPLOY_SSH_KEY_B64: ${{ secrets.RPI_DEPLOY_SSH_KEY_B64 }}
+          RPI_DEPLOY_HOST: ${{ secrets.RPI_DEPLOY_HOST }}
+          RPI_DEPLOY_PORT: ${{ secrets.RPI_DEPLOY_PORT }}
+        run: |
+          set -euo pipefail
+          DEPLOY_PORT="${RPI_DEPLOY_PORT:-22}"
+
+          mkdir -p ~/.ssh
+          chmod 700 ~/.ssh
+
+          printf '%s' "${RPI_DEPLOY_SSH_KEY_B64}" \
+            | base64 -d \
+            | tr -d '\r' \
+            > ~/.ssh/id_ed25519
+
+          chmod 600 ~/.ssh/id_ed25519
+
+          ssh-keyscan \
+            -p "${DEPLOY_PORT}" \
+            -H "${RPI_DEPLOY_HOST}" \
+            >> ~/.ssh/known_hosts
+
+      - name: Add Termius public key
+        env:
+          RPI_DEPLOY_HOST: ${{ secrets.RPI_DEPLOY_HOST }}
+          RPI_DEPLOY_USER: ${{ secrets.RPI_DEPLOY_USER }}
+          RPI_DEPLOY_PORT: ${{ secrets.RPI_DEPLOY_PORT }}
+          TERMIUS_PUBLIC_KEY: ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIGx1nTCr1JjmruhluMqJHXpX/86qjB2jN2eZGXMSZwom
+        run: |
+          set -euo pipefail
+          DEPLOY_PORT="${RPI_DEPLOY_PORT:-22}"
+
+          ssh \
+            -p "${DEPLOY_PORT}" \
+            "${RPI_DEPLOY_USER}@${RPI_DEPLOY_HOST}" \
+            "mkdir -p ~/.ssh &&
+             chmod 700 ~/.ssh &&
+             touch ~/.ssh/authorized_keys &&
+             chmod 600 ~/.ssh/authorized_keys &&
+             (grep -qxF '${TERMIUS_PUBLIC_KEY}' ~/.ssh/authorized_keys ||
+              printf '%s\n' '${TERMIUS_PUBLIC_KEY}' >> ~/.ssh/authorized_keys)"
