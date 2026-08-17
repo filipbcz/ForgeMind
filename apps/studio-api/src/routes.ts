@@ -107,7 +107,12 @@ const retrySchema = z.object({
 });
 
 const roadmapGenerateSchema = z.object({
-  objective: z.string().min(20).optional()
+  objective: z.string().min(20).optional(),
+  contractRecovery: z.object({
+    baseVersion: z.number().int().positive(),
+    reason: z.string().trim().min(20),
+    confirmation: z.string().trim()
+  }).optional()
 });
 
 const projectContractPlanSchema = z.object({
@@ -1212,14 +1217,35 @@ export function registerRoutes(app: FastifyInstance, repository: ForgeMindReposi
       const specifications = await repository.getProjectSpecifications(project.id);
       const currentSpecification = specifications?.current.fullSpecification ?? project.brief ?? objective;
       const contractHistory = await repository.getProjectContracts(project.id);
-      const previousContract = contractHistory?.current?.contract;
+      const latestContractVersion = contractHistory?.versions.at(-1);
+      const recovery = input.contractRecovery;
+      if (recovery && recovery.confirmation !== `RECOVER CONTRACT FROM V${recovery.baseVersion}`) {
+        return reply.code(400).send({
+          error: `Type "RECOVER CONTRACT FROM V${recovery.baseVersion}" to confirm contract recovery.`
+        });
+      }
+      const recoveryBaseVersion = recovery
+        ? contractHistory?.versions.find((version) => version.version === recovery.baseVersion)
+        : undefined;
+      if (recovery && !recoveryBaseVersion) {
+        return reply.code(400).send({
+          error: `Project contract version ${recovery.baseVersion} does not exist.`
+        });
+      }
+      if (recovery && latestContractVersion && recovery.baseVersion >= latestContractVersion.version) {
+        return reply.code(400).send({
+          error: 'Contract recovery must select a historical version older than the latest contract.'
+        });
+      }
+      const previousContract = recoveryBaseVersion?.contract ?? latestContractVersion?.contract;
       const planning = await generateRoadmapPlan(repository, project, objective, currentSpecification, previousContract);
       let plan = planning.plan;
       const regeneratedContract = resolveRegeneratedProjectContract(
         plan,
         currentSpecification,
         objective,
-        previousContract
+        previousContract,
+        latestContractVersion ? latestContractVersion.version + 1 : undefined
       );
       const { projectContract, contractDelta, touchedRequirementIds } = regeneratedContract;
       const architectureUpdate = toProjectArchitectureUpdate(plan, !previousContract);
@@ -1262,12 +1288,16 @@ export function registerRoutes(app: FastifyInstance, repository: ForgeMindReposi
         projectContract,
         contractDelta,
         contractChangeSummary: contractDelta?.summary ?? 'Initial generated project contract.',
+        contractRecovery: recovery ? {
+          baseVersion: recovery.baseVersion,
+          reason: recovery.reason
+        } : undefined,
         architectureUpdate,
         steps: stepBlueprints
       });
 
       const firstStep = findFirstPendingStepForLatestCycle(roadmap);
-      if (firstStep) {
+      if (firstStep && !recovery) {
         await startNextRoadmapStep(repository, project.id, firstStep.cycleId);
       }
 
@@ -2054,7 +2084,8 @@ export function resolveRegeneratedProjectContract(
   plan: PlanResult,
   currentSpecification: string,
   objective: string,
-  previousContract?: ProjectContract
+  previousContract?: ProjectContract,
+  outputVersion?: number
 ): {
   projectContract: ProjectContract;
   contractDelta?: ProjectContractDelta;
@@ -2072,7 +2103,10 @@ export function resolveRegeneratedProjectContract(
   const contractDelta = toProjectContractDelta(plan);
   const applied = applyProjectContractDelta(previousContract, contractDelta);
   return {
-    projectContract: withProjectContractSource(applied.contract, source),
+    projectContract: withProjectContractSource({
+      ...applied.contract,
+      version: outputVersion ?? applied.contract.version
+    }, source),
     contractDelta,
     touchedRequirementIds: applied.touchedRequirementIds
   };

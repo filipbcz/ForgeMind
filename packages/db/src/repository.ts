@@ -150,6 +150,10 @@ export interface CreateProjectRoadmapCycleInput {
   projectContract: ProjectContract;
   contractDelta?: ProjectContractDelta;
   contractChangeSummary?: string;
+  contractRecovery?: {
+    baseVersion: number;
+    reason: string;
+  };
   architectureUpdate?: ProjectArchitectureUpdate;
   approvedExtension?: {
     sourceCycleId: string;
@@ -1246,9 +1250,33 @@ export class ForgeMindRepository {
         if (currentContractVersion && !input.contractDelta) {
           throw new Error('An existing project contract can only be revised with an explicit contract delta.');
         }
+        const contractBaseVersion = currentContractVersion && input.contractRecovery
+          ? await tx.projectContractVersion.findUnique({
+              where: {
+                projectId_version: {
+                  projectId: input.projectId,
+                  version: input.contractRecovery.baseVersion
+                }
+              }
+            })
+          : currentContractVersion;
         if (currentContractVersion && input.contractDelta) {
-          const currentContract = toProjectContractVersion(currentContractVersion).contract;
-          const expectedContract = applyProjectContractDelta(currentContract, input.contractDelta).contract;
+          if (!contractBaseVersion) {
+            throw new Error(`Recovery base contract version ${input.contractRecovery?.baseVersion} does not exist.`);
+          }
+          if (input.contractRecovery && contractBaseVersion.version >= currentContractVersion.version) {
+            throw new Error('Contract recovery must use a historical version older than the latest contract.');
+          }
+          if (input.contractDelta.baseVersion !== contractBaseVersion.version) {
+            throw new Error(
+              `Contract delta base version ${input.contractDelta.baseVersion} does not match selected version ${contractBaseVersion.version}.`
+            );
+          }
+          const baseContract = toProjectContractVersion(contractBaseVersion).contract;
+          const expectedContract = {
+            ...applyProjectContractDelta(baseContract, input.contractDelta).contract,
+            version: expectedContractVersion
+          };
           if (!sameProjectContractSemantics(expectedContract, input.projectContract)) {
             throw new Error('The regenerated project contract does not match its explicit contract delta.');
           }
@@ -1269,7 +1297,7 @@ export class ForgeMindRepository {
               : currentContractVersion
                 ? 'manual_regeneration'
                 : 'initial_plan',
-            parentVersionId: currentContractVersion?.id
+            parentVersionId: contractBaseVersion?.id
           }
         });
 
@@ -1307,6 +1335,21 @@ export class ForgeMindRepository {
             currentArchitectureVersionId: architectureVersion?.id
           }
         });
+
+        if (input.contractRecovery) {
+          await this.writeAuditTx(tx, {
+            actorType: 'user',
+            actorId: LOCAL_USER_ID,
+            eventType: 'project_contract_recovered',
+            projectId: input.projectId,
+            payload: {
+              baseVersion: input.contractRecovery.baseVersion,
+              replacedLatestVersion: currentContractVersion?.version ?? null,
+              recoveredVersion: input.projectContract.version,
+              reason: input.contractRecovery.reason
+            }
+          });
+        }
 
         await tx.projectRoadmapCycle.updateMany({
           where: {

@@ -168,6 +168,16 @@ describe('project roadmap generation', () => {
       .toMatchObject(projectContract.requirements[1]!);
     expect(result.touchedRequirementIds).toEqual(['REQ-SCOPE']);
     expect(result.contractDelta?.baseVersion).toBe(1);
+
+    const recovered = resolveRegeneratedProjectContract(
+      plan,
+      'Revised complete project specification.',
+      'Revised complete project specification.',
+      projectContract,
+      3
+    );
+    expect(recovered.projectContract.version).toBe(3);
+    expect(recovered.projectContract.requirements).toEqual(result.projectContract.requirements);
   });
 
   it('preserves independent scope and acceptance criteria for every step', () => {
