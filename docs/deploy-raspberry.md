@@ -17,6 +17,11 @@ the protection rules and secrets for production deployment. The OCI workflow rem
 during and after the migration so that a regular push cannot restart the rollback host or deploy
 two production copies unintentionally.
 
+Before pulling a new release, the remote deploy script removes unused Docker build cache and
+images older than 24 hours. Images referenced by running containers, named volumes, database data,
+and the currently active release are not removed. This keeps enough extraction space on the
+Raspberry host while retaining the live image as the immediate rollback source during deployment.
+
 ## 1. Bootstrap Raspberry Pi
 
 Copy `infra/deploy/bootstrap-debian-13-raspberry.sh` to the target and run it interactively as `filip`. The script installs Docker Engine and Compose, grants the deploy user Docker access, creates the application directories, and allows `filip` to manage Tailscale Serve.
