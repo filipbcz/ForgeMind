@@ -1,6 +1,6 @@
 # README Parity Checklist
 
-Posledni aktualizace: 2026-07-03
+Posledni aktualizace: 2026-08-17
 
 Tento dokument mapuje hlavni pozadavky z README na implementaci v kodu nebo na vedome odlozeni mimo MVP scope.
 
@@ -19,16 +19,22 @@ Tento dokument mapuje hlavni pozadavky z README na implementaci v kodu nebo na v
 | Push notifications end-to-end (subscription + trigger events) | SPLNENO | `apps/mobile-pwa/src/pwa.ts`, `apps/mobile-pwa/public/sw.js`, `apps/studio-api/src/notifications.ts`, `apps/studio-api/src/server.ts` |
 | GitHub issue body README template parity | SPLNENO | `packages/github/src/index.ts`, `packages/github/src/index.test.ts` |
 | E2E representative pipeline (API -> worker -> GitHub -> mobile read model payload) | SPLNENO | `apps/studio-api/src/routes.test.ts` |
+| Verzovany project contract, capability evidence a release audit | SPLNENO | `packages/core`, `packages/db`, `apps/worker`, `docs/roadmap-quality-implementation-plan.md` |
+| ARM64 Raspberry Pi deployment platformy z `main` | SPLNENO | `.github/workflows/deploy-raspberry.yml`, `infra/docker-compose.raspberry.yml`, `docs/deploy-raspberry.md` |
 
 ## 2) Vedome odlozene mimo MVP
 
 Tyto body odpovidaji README sekci "Co neni cilem MVP" a zustavaji odlozene:
 
-- automaticky deploy do produkce
+- automaticky deploy projektu spravovanych ForgeMindem do jejich produkce
 - automaticky merge do `main`
 - plne autonomni rozhodovani bez schvalovani
 - vlastni trenovani modelu
 - komplexni multi-user enterprise sprava prav
+
+Automaticky deploy samotne platformy ForgeMind na Raspberry Pi je provozni CI/CD funkce a je
+implementovany. Neznamena to automaticky produkcni deploy projektu, nad kterymi ForgeMind pracuje;
+ten zustava mimo MVP a pod explicitnim approval workflow.
 
 ## 3) Acceptance zdroje pravdy
 

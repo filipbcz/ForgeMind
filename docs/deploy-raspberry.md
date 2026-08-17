@@ -11,9 +11,11 @@ This runbook moves the existing ForgeMind production stack from OCI to the ARM64
 - Local web upstream: `http://127.0.0.1:8080`
 - Tailnet HTTPS name: `https://forgemind.tail50677a.ts.net`
 
-The Raspberry workflow is manual-only. A push to `main` cannot switch production accidentally.
-The OCI workflow is also manual-only during and after the migration. This prevents a regular
-push from restarting the rollback host or deploying two production copies unintentionally.
+The Raspberry workflow runs automatically after every push to `main` and can also be started
+manually with `workflow_dispatch`. The `raspberry-production` GitHub environment therefore owns
+the protection rules and secrets for production deployment. The OCI workflow remains manual-only
+during and after the migration so that a regular push cannot restart the rollback host or deploy
+two production copies unintentionally.
 
 ## 1. Bootstrap Raspberry Pi
 
@@ -49,7 +51,8 @@ Create the `raspberry-production` GitHub environment with these secrets:
 
 The Tailscale OAuth client must be allowed to create ephemeral devices with the `tag:ci` tag. Tailnet ACLs must allow `tag:ci` to reach `forgemind:22`. The GitHub-hosted runner needs this connection because `100.98.107.4` is not publicly routable.
 
-The `Deploy to Raspberry Pi` workflow builds dedicated ARM64 images. It does not replace the existing AMD64 OCI tags.
+The `Deploy to Raspberry Pi` workflow builds dedicated ARM64 images and deploys them after a push
+to `main` or a manual dispatch. It does not replace the existing AMD64 OCI tags.
 
 ## 3. Preserve Production Configuration
 

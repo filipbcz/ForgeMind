@@ -3,17 +3,19 @@
 ## Aktivni plan kvality roadmapy
 
 Aktualni navazujici prace se ridi dokumentem `docs/roadmap-quality-implementation-plan.md`.
-Plan oddeluje dokonceni tasku, work itemu, kontraktni capability a celeho projektu. Etapy 1-6 a migracni kod etapy 7 jsou implementovane; zbyva aplikace migraci a rizeny produkcni rollout.
+Plan oddeluje dokonceni tasku, work itemu, kontraktni capability a celeho projektu. Etapy 1-6 a migracni kod etapy 7 jsou implementovane; zbyva potvrdit stav migraci a dokoncit rizene produkcni overeni.
 
-Posledni aktualizace: 2026-07-03
+Posledni aktualizace: 2026-08-17
 Zdroj pozadavku: README.md
 
 ## Kde jsme ted
 
 - Zaklad persistence a fronty je hotovy: PostgreSQL queue, claim/finalize, recovery zaseklych claimed jobu.
 - Mobil uz zobrazuje operativni stav (runs, queue, worker status/events).
-- Kroky 1-12 (README MVP jadro) jsou hotove vcetne root validace build/test.
-- Nejvetsi mezery proti README jsou ted: realny Codex provider, tvrde policy enforcement, plne webhook event flow, monitoring metriky a doplneni mobilnich/detailnich toku.
+- Kroky 1-22 (README MVP a parity vlna) jsou hotove vcetne drive provedene root validace build/test.
+- Verzovany project contract, acceptance evidence, capability/release audit a completion gate jsou implementovane a commitnute.
+- ARM64 Raspberry Pi deploy se spousti automaticky z `main`; OCI zustava rucni rollback cesta.
+- Otevrena prace je potvrzeni stavu migraci a rizene produkcni overeni etapy 7 vcetne jednoho celeho requirementu.
 
 ## Pravidla postupu (abychom se neztraceli)
 
@@ -86,7 +88,7 @@ Zdroj pozadavku: README.md
 
 ## Aktivni krok
 
-Aktivne resime: Zadny - roadmap kroky 13-22 jsou uzavrene.
+Aktivne resime: Etapu 7 planu kvality roadmapy - potvrzeni migraci a rizene produkcni overeni. Implementacni kroky 1-22 jsou uzavrene.
 
 ## Navazujici kroky (README delta) - dalsi vlna
 

@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from 'vitest';
 import type { AIProvider, ImplementationStepPlan, PlanResult } from '@forgemind/providers';
-import { buildImplementationStepBlueprintsWithRepairs, buildRoadmapPlanningPrompt, buildRoadmapStepTaskPrompt, createProjectPlanningSession, findFirstPendingStepForLatestCycle, repairRoadmapOnce, resolveTaskMode, toImplementationStepBlueprints, toProjectArchitectureUpdate, toProjectContract } from './routes.js';
+import { buildImplementationStepBlueprintsWithRepairs, buildRoadmapPlanningPrompt, buildRoadmapStepTaskPrompt, createProjectPlanningSession, findFirstPendingStepForLatestCycle, repairRoadmapOnce, resolveRegeneratedProjectContract, resolveTaskMode, toImplementationStepBlueprints, toProjectArchitectureUpdate, toProjectContract } from './routes.js';
 
 const projectContract = {
   version: 1,
@@ -121,7 +121,53 @@ describe('project roadmap generation', () => {
     expect(prompt).toContain('contractDelta with baseVersion 1');
     expect(prompt).toContain('REQ-SCOPE');
     expect(prompt).toContain('projectContract as null');
+    expect(prompt).toContain('Requirements omitted from the delta remain active and unchanged');
     expect(prompt).not.toContain('complete brief is intentionally not repeated');
+  });
+
+  it('applies brief revisions as a delta without dropping unchanged completed requirements', () => {
+    const plan: PlanResult = {
+      summary: 'Revise supported scope.',
+      steps: [],
+      acceptanceCriteria: [],
+      projectContract: null,
+      contractDelta: {
+        baseVersion: 1,
+        summary: 'Math practice application with revised documented scope.',
+        addRequirements: [],
+        updateRequirements: [{
+          id: 'REQ-SCOPE',
+          description: 'Supported grades, operations, and regional rules are explicit.',
+          briefReferences: ['revised supported grades and regional rules'],
+          rationale: 'The user revised the supported product scope.'
+        }],
+        supersedeRequirements: [],
+        removeRequirements: [],
+        invariantChanges: { add: [], remove: [] },
+        prohibitedSubstituteChanges: { add: [], remove: [] },
+        releaseCriteriaChanges: { add: [], remove: [] },
+        migrationImpacts: [],
+        compatibilityImpacts: []
+      },
+      implementationSteps: []
+    };
+
+    const result = resolveRegeneratedProjectContract(
+      plan,
+      'Revised complete project specification.',
+      'Revised complete project specification.',
+      projectContract
+    );
+
+    expect(result.projectContract.version).toBe(2);
+    expect(result.projectContract.requirements.map((requirement) => requirement.id)).toEqual([
+      'REQ-SCOPE',
+      'REQ-GENERATOR'
+    ]);
+    expect(result.projectContract.requirements.find((requirement) => requirement.id === 'REQ-GENERATOR'))
+      .toMatchObject(projectContract.requirements[1]!);
+    expect(result.touchedRequirementIds).toEqual(['REQ-SCOPE']);
+    expect(result.contractDelta?.baseVersion).toBe(1);
   });
 
   it('preserves independent scope and acceptance criteria for every step', () => {

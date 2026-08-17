@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from 'vitest';
-import { ForgeMindRepository, mergeProjectArchitecture } from './repository.js';
+import { ForgeMindRepository, mergeProjectArchitecture, sameProjectContractSemantics } from './repository.js';
 
 function createMockPrisma() {
   let queuePaused = false;
@@ -245,6 +245,29 @@ function createMockPrisma() {
 }
 
 describe('ForgeMindRepository task runs', () => {
+  it('compares regenerated contract semantics independently from source metadata', () => {
+    const contract = {
+      version: 2,
+      summary: 'Project',
+      invariants: ['Keep completed work.'],
+      prohibitedSubstitutes: [],
+      requirements: [{
+        id: 'REQ-CORE', title: 'Core', description: 'Core remains implemented.',
+        acceptanceCriteria: ['Core tests pass.'], status: 'active' as const,
+        introducedInVersion: 1, lastChangedInVersion: 1
+      }],
+      releaseCriteria: ['Build passes.'],
+      sourceBriefHash: 'old', sourceBriefSnapshot: 'Old brief'
+    };
+
+    expect(sameProjectContractSemantics(contract, {
+      ...contract, sourceBriefHash: 'new', sourceBriefSnapshot: 'New brief'
+    })).toBe(true);
+    expect(sameProjectContractSemantics(contract, {
+      ...contract, requirements: []
+    })).toBe(false);
+  });
+
   it('keeps the task list stable when older tasks receive later status updates', async () => {
     const { prisma } = createMockPrisma();
     const repository = new ForgeMindRepository(prisma);
@@ -620,6 +643,60 @@ describe('ForgeMindRepository task runs', () => {
         finishedAt: expect.any(Date)
       }
     });
+    expect(prisma.projectImplementationStep.updateMany).toHaveBeenCalledWith({
+      where: { taskId: 'task_1', status: 'running' },
+      data: { status: 'cancelled', completedAt: null }
+    });
+  });
+
+  it('closes a running roadmap step when validation terminally fails', async () => {
+    const { prisma } = createMockPrisma();
+    prisma.task.findUnique.mockResolvedValueOnce({
+      id: 'task_1', projectId: 'project_1', createdByUserId: 'user_local_owner', title: 'Task', prompt: 'Prompt',
+      mode: 'safe', status: 'validating', maxIterations: 10, maxBudgetUsd: 2,
+      createdAt: new Date(), updatedAt: new Date(), startedAt: new Date(), finishedAt: null
+    });
+    const repository = new ForgeMindRepository(prisma);
+
+    await repository.transitionTask('task_1', 'validation_failed', { validation: { exitCode: 1 } });
+
+    expect(prisma.task.update).toHaveBeenCalledWith({
+      where: { id: 'task_1' },
+      data: expect.objectContaining({
+        status: 'validation_failed',
+        finishedAt: expect.any(Date)
+      })
+    });
+    expect(prisma.projectImplementationStep.updateMany).toHaveBeenCalledWith({
+      where: { taskId: 'task_1', status: 'running' },
+      data: { status: 'cancelled', completedAt: null }
+    });
+    expect(prisma.auditLog.create).toHaveBeenCalledWith({
+      data: expect.objectContaining({
+        eventType: 'project_implementation_step_status_updated',
+        taskId: 'task_1',
+        payload: { status: 'cancelled', reason: 'task_validation_failed' }
+      })
+    });
+  });
+
+  it('closes a running roadmap step when worker execution fails', async () => {
+    const { prisma } = createMockPrisma();
+    const repository = new ForgeMindRepository(prisma);
+
+    await repository.failTask('task_1', 'Provider crashed.', 'provider_failed');
+
+    expect(prisma.projectImplementationStep.updateMany).toHaveBeenCalledWith({
+      where: { taskId: 'task_1', status: 'running' },
+      data: { status: 'cancelled', completedAt: null }
+    });
+    expect(prisma.auditLog.create).toHaveBeenCalledWith({
+      data: expect.objectContaining({
+        eventType: 'project_implementation_step_status_updated',
+        taskId: 'task_1',
+        payload: { status: 'cancelled', reason: 'task_provider_failed' }
+      })
+    });
   });
 
   it('reopens a completed roadmap step when its task is retried', async () => {
@@ -635,7 +712,24 @@ describe('ForgeMindRepository task runs', () => {
     await repository.retryTask('task_1', true);
 
     expect(prisma.projectImplementationStep.updateMany).toHaveBeenCalledWith({
-      where: { taskId: 'task_1', status: { in: ['completed', 'waiting_for_capability'] } },
+      where: { taskId: 'task_1', status: { in: ['completed', 'waiting_for_capability', 'cancelled'] } },
+      data: { status: 'running', completedAt: null }
+    });
+  });
+
+  it('reopens a cancelled roadmap step when its failed task is retried', async () => {
+    const { prisma } = createMockPrisma();
+    prisma.task.findUnique.mockResolvedValueOnce({
+      id: 'task_1', projectId: 'project_1', createdByUserId: 'user_local_owner', title: 'Task', prompt: 'Prompt',
+      mode: 'safe', status: 'validation_failed', maxIterations: 10, maxBudgetUsd: 2,
+      createdAt: new Date(), updatedAt: new Date(), startedAt: new Date(), finishedAt: new Date()
+    });
+    const repository = new ForgeMindRepository(prisma);
+
+    await repository.retryTask('task_1', true);
+
+    expect(prisma.projectImplementationStep.updateMany).toHaveBeenCalledWith({
+      where: { taskId: 'task_1', status: { in: ['completed', 'waiting_for_capability', 'cancelled'] } },
       data: { status: 'running', completedAt: null }
     });
   });

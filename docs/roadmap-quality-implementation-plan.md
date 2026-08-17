@@ -112,7 +112,7 @@ Overeni: scope znamy, zadne uzivatelske zmeny nebyly vraceny.
 
 ### Etapa 1 - Projektovy kontrakt a trasovatelne work itemy
 
-Stav: IMPLEMENTOVANO, CEKA NA COMMIT
+Stav: HOTOVO
 
 - [x] Pridat sdilene typy `ProjectContract` a requirementu do `packages/core`.
 - [x] Ulozit kontrakt do `projects.project_contract`.
@@ -132,7 +132,7 @@ Akceptace:
 
 ### Etapa 2 - Perzistentni evidence a capability read model
 
-Stav: IMPLEMENTOVANO, CEKA NA COMMIT
+Stav: HOTOVO
 
 - [x] Pridat tabulku `acceptance_evidence` a odpovidajici core typy.
 - [x] Ukladat jednotlive vysledky validacnich prikazu a GitHub checks s task/run/commit vazbou.
@@ -149,7 +149,7 @@ Akceptace:
 
 ### Etapa 3 - Nezavisly read-only audit capability
 
-Stav: IMPLEMENTOVANO, CEKA NA COMMIT
+Stav: HOTOVO
 
 - [x] Pridat do `AIProvider` metodu `auditCapability` s vlastnim schema outputu.
 - [x] Implementovat Codex audit v read-only sandboxu pro OAuth CLI; API key varianta vyzaduje cileny repository packet.
@@ -176,7 +176,7 @@ Akceptace:
 
 ### Etapa 4 - Gap work itemy a completion gate
 
-Stav: IMPLEMENTOVANO, CEKA NA COMMIT
+Stav: HOTOVO
 
 - [x] Zrusit prime `task completed -> roadmap cycle completed` pro kontraktni roadmapy.
 - [x] Po dokonceni work itemu spustit audit relevantnich requirements pred dalsim requirementem.
@@ -195,7 +195,7 @@ Akceptace:
 
 ### Etapa 5 - Release audit a rozsireni projektu
 
-Stav: IMPLEMENTOVANO, CEKA NA COMMIT
+Stav: HOTOVO
 
 - [x] Pred dokoncenim cyklu auditovat vsechny release criteria a global invariants.
 - [x] Kontrolovat vazby mezi capabilities a end-to-end funkcnost.
@@ -211,7 +211,7 @@ Akceptace:
 
 ### Etapa 6 - GUI a provozni prehled
 
-Stav: IMPLEMENTOVANO, CEKA NA COMMIT
+Stav: HOTOVO
 
 - [x] Zobrazit souhrn kontraktu a requirement IDs work itemu.
 - [x] Zobrazit requirements jako hlavni milestones vcetne odvozeneho stavu a poctu evidenci.
@@ -262,12 +262,14 @@ Tento plan je dokoncen pouze kdyz:
 
 ## 8. Poradi dalsi prace
 
-Bez zmeny tohoto planu se pokracuje v tomto poradi:
+Implementace etap 1-6 a migracni kod etapy 7 jsou hotove. Dalsi prace je provozni a pokracuje v tomto poradi:
 
-1. Dokoncit `sourceBriefHash` v etape 1.
-2. Implementovat etapu 2 jako samostatnou migraci a repository vrstvu.
-3. Implementovat etapu 3 vcetne provider testu.
-4. Zapnout completion gate z etapy 4 az po funkcni auditni metode.
-5. Dodelat release audit, GUI a migraci starych projektu.
+1. Potvrdit, ze automaticky deploy uspesne aplikoval pripravene databazove migrace; pokud ne, dokoncit je podle runbooku.
+2. Overit po deployi obnovu workeru, stav fronty a zachovani existujicich projektu bez falesne evidence.
+3. Spustit jeden testovaci projektovy requirement pres implementaci, validaci, merge a capability audit.
+4. Overit release audit a completion gate na celem testovacim roadmap cyklu.
+5. Teprve po uspesne akceptaci rozsirit rollout na produkcni roadmapy.
 
-Completion gate se nesmi zapnout v mezistavu bez funkcniho auditu, protoze by zablokoval vsechny roadmapy.
+Raspberry workflow se spousti automaticky po pushi do `main`; samotna aplikace migraci a obnoveni
+produkcnich roadmap vsak musi respektovat runbook a explicitni provozni kontrolu z
+`docs/deploy-raspberry.md`.

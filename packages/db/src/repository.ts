@@ -1,5 +1,6 @@
 import {
   activeProjectContractRequirements,
+  applyProjectContractDelta,
   type AcceptanceEvidence,
   type AcceptanceEvidenceSource,
   type AcceptanceEvidenceStatus,
@@ -384,6 +385,16 @@ const ACTIVE_TASK_STATUSES: ReadonlySet<TaskStatus> = new Set([
 ]);
 
 const ACTIVE_QUEUE_STATUSES = ['pending', 'claimed'] as const;
+const ROADMAP_STEP_CANCELLING_TASK_STATUSES: ReadonlySet<TaskStatus> = new Set([
+  'failed',
+  'cancelled',
+  'budget_exceeded',
+  'iteration_limit_reached',
+  'repeated_error_detected',
+  'approval_rejected',
+  'provider_failed',
+  'validation_failed'
+]);
 const DEFAULT_QUEUE_MAX_ATTEMPTS = 3;
 const DEFAULT_QUEUE_BACKOFF_SECONDS = 30;
 const DEFAULT_AUDIT_JOB_MAX_ATTEMPTS = 3;
@@ -886,8 +897,6 @@ export class ForgeMindRepository {
             : input.validationProfile ? toPrismaJson(input.validationProfile as unknown as JsonValue) : undefined,
           projectContract: invalidateProjectContext ? Prisma.DbNull : undefined,
           currentContractVersionId: invalidateProjectContext ? null : undefined,
-          projectMemory: invalidateProjectContext ? Prisma.DbNull : undefined,
-          projectArchitecture: invalidateProjectContext ? Prisma.DbNull : undefined,
           planningSessionId: invalidatePlanningSession ? null : undefined,
           planningSessionProvider: invalidatePlanningSession ? null : undefined,
           planningSessionModel: invalidatePlanningSession ? null : undefined,
@@ -1233,6 +1242,16 @@ export class ForgeMindRepository {
           throw new Error(
             `Project contract version ${input.projectContract.version} is invalid; expected ${expectedContractVersion}.`
           );
+        }
+        if (currentContractVersion && !input.contractDelta) {
+          throw new Error('An existing project contract can only be revised with an explicit contract delta.');
+        }
+        if (currentContractVersion && input.contractDelta) {
+          const currentContract = toProjectContractVersion(currentContractVersion).contract;
+          const expectedContract = applyProjectContractDelta(currentContract, input.contractDelta).contract;
+          if (!sameProjectContractSemantics(expectedContract, input.projectContract)) {
+            throw new Error('The regenerated project contract does not match its explicit contract delta.');
+          }
         }
         const contractVersion = await tx.projectContractVersion.create({
           data: {
@@ -3207,23 +3226,37 @@ export class ForgeMindRepository {
       }
     });
 
-    const updated = await this.prisma.task.update({
-      where: { id: taskId },
-      data: {
-        status: 'cancelled',
-        finishedAt: new Date()
+    const updated = await this.prisma.$transaction(async (tx) => {
+      const finishedAt = new Date();
+      const cancelledTask = await tx.task.update({
+        where: { id: taskId },
+        data: { status: 'cancelled', finishedAt }
+      });
+      const cancelledSteps = await tx.projectImplementationStep.updateMany({
+        where: { taskId, status: 'running' },
+        data: { status: 'cancelled', completedAt: null }
+      });
+      await this.writeAuditTx(tx, {
+        actorType: 'user',
+        actorId: LOCAL_USER_ID,
+        eventType: 'task_cancelled',
+        projectId: cancelledTask.projectId,
+        taskId: cancelledTask.id,
+        payload: {
+          cancelledQueueJobs: queueCancellation.count,
+          cancelledRoadmapSteps: cancelledSteps.count
+        }
+      });
+      if (cancelledSteps.count > 0) {
+        await this.writeAuditTx(tx, {
+          actorType: 'system',
+          eventType: 'project_implementation_step_status_updated',
+          projectId: cancelledTask.projectId,
+          taskId: cancelledTask.id,
+          payload: { status: 'cancelled', reason: 'task_cancelled' }
+        });
       }
-    });
-
-    await this.writeAudit({
-      actorType: 'user',
-      actorId: LOCAL_USER_ID,
-      eventType: 'task_cancelled',
-      projectId: updated.projectId,
-      taskId: updated.id,
-      payload: {
-        cancelledQueueJobs: queueCancellation.count
-      }
+      return cancelledTask;
     });
 
     return toTask(updated);
@@ -3248,7 +3281,7 @@ export class ForgeMindRepository {
         }
       });
       await tx.projectImplementationStep.updateMany({
-        where: { taskId, status: { in: ['completed', 'waiting_for_capability'] } },
+        where: { taskId, status: { in: ['completed', 'waiting_for_capability', 'cancelled'] } },
         data: { status: 'running', completedAt: null }
       });
       return retriedTask;
@@ -3271,21 +3304,40 @@ export class ForgeMindRepository {
     if (!current) throw new Error(`Task "${taskId}" not found`);
     assertTaskTransition(current.status, nextStatus);
 
-    const updated = await this.prisma.task.update({
-      where: { id: taskId },
-      data: {
-        status: nextStatus,
-        waitingForCapabilities: nextStatus === 'completed' ? [] : undefined,
-        finishedAt: nextStatus === 'completed' ? new Date() : undefined
+    const updated = await this.prisma.$transaction(async (tx) => {
+      const transitionedTask = await tx.task.update({
+        where: { id: taskId },
+        data: {
+          status: nextStatus,
+          waitingForCapabilities: nextStatus === 'completed' ? [] : undefined,
+          finishedAt: nextStatus === 'completed' || ROADMAP_STEP_CANCELLING_TASK_STATUSES.has(nextStatus)
+            ? new Date()
+            : undefined
+        }
+      });
+      const cancelledSteps = ROADMAP_STEP_CANCELLING_TASK_STATUSES.has(nextStatus)
+        ? await tx.projectImplementationStep.updateMany({
+            where: { taskId, status: 'running' },
+            data: { status: 'cancelled', completedAt: null }
+          })
+        : { count: 0 };
+      await this.writeAuditTx(tx, {
+        actorType: 'system',
+        eventType: `task_status_${nextStatus}`,
+        projectId: transitionedTask.projectId,
+        taskId: transitionedTask.id,
+        payload
+      });
+      if (cancelledSteps.count > 0) {
+        await this.writeAuditTx(tx, {
+          actorType: 'system',
+          eventType: 'project_implementation_step_status_updated',
+          projectId: transitionedTask.projectId,
+          taskId: transitionedTask.id,
+          payload: { status: 'cancelled', reason: `task_${nextStatus}` }
+        });
       }
-    });
-
-    await this.writeAudit({
-      actorType: 'system',
-      eventType: `task_status_${nextStatus}`,
-      projectId: updated.projectId,
-      taskId: updated.id,
-      payload
+      return transitionedTask;
     });
 
     return toTask(updated);
@@ -3790,20 +3842,33 @@ export class ForgeMindRepository {
   }
 
   async failTask(taskId: string, errorMessage: string, status: TaskStatus = 'failed'): Promise<void> {
-    const task = await this.prisma.task.update({
-      where: { id: taskId },
-      data: {
-        status,
-        finishedAt: new Date()
+    await this.prisma.$transaction(async (tx) => {
+      const task = await tx.task.update({
+        where: { id: taskId },
+        data: { status, finishedAt: new Date() }
+      });
+      const cancelledSteps = ROADMAP_STEP_CANCELLING_TASK_STATUSES.has(status)
+        ? await tx.projectImplementationStep.updateMany({
+            where: { taskId, status: 'running' },
+            data: { status: 'cancelled', completedAt: null }
+          })
+        : { count: 0 };
+      await this.writeAuditTx(tx, {
+        actorType: 'system',
+        eventType: 'task_failed',
+        projectId: task.projectId,
+        taskId: task.id,
+        payload: { errorMessage, status }
+      });
+      if (cancelledSteps.count > 0) {
+        await this.writeAuditTx(tx, {
+          actorType: 'system',
+          eventType: 'project_implementation_step_status_updated',
+          projectId: task.projectId,
+          taskId: task.id,
+          payload: { status: 'cancelled', reason: `task_${status}` }
+        });
       }
-    });
-
-    await this.writeAudit({
-      actorType: 'system',
-      eventType: 'task_failed',
-      projectId: task.projectId,
-      taskId: task.id,
-      payload: { errorMessage, status }
     });
   }
 
@@ -4370,6 +4435,18 @@ function implementationStepIdentity(input: { title: string; requirementIds: stri
     requirementIds: [...input.requirementIds].sort(),
     deliverables: input.deliverables.map((item) => item.replace(/\s+/g, ' ').trim().toLowerCase()).sort()
   })).digest('hex');
+}
+
+export function sameProjectContractSemantics(left: ProjectContract, right: ProjectContract): boolean {
+  const semanticView = (contract: ProjectContract) => ({
+    version: contract.version,
+    summary: contract.summary,
+    invariants: contract.invariants,
+    prohibitedSubstitutes: contract.prohibitedSubstitutes,
+    requirements: contract.requirements,
+    releaseCriteria: contract.releaseCriteria
+  });
+  return JSON.stringify(semanticView(left)) === JSON.stringify(semanticView(right));
 }
 
 function jsonStringArray(value: Prisma.JsonValue): string[] {

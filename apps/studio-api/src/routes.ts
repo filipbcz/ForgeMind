@@ -1212,14 +1212,25 @@ export function registerRoutes(app: FastifyInstance, repository: ForgeMindReposi
       const specifications = await repository.getProjectSpecifications(project.id);
       const currentSpecification = specifications?.current.fullSpecification ?? project.brief ?? objective;
       const contractHistory = await repository.getProjectContracts(project.id);
-      const planning = await generateRoadmapPlan(repository, project, objective, currentSpecification);
+      const previousContract = contractHistory?.current?.contract;
+      const planning = await generateRoadmapPlan(repository, project, objective, currentSpecification, previousContract);
       let plan = planning.plan;
-      const projectContract = toProjectContract(
+      const regeneratedContract = resolveRegeneratedProjectContract(
         plan,
-        buildContractSource(currentSpecification, objective),
-        (contractHistory?.current?.version ?? 0) + 1
+        currentSpecification,
+        objective,
+        previousContract
       );
-      const architectureUpdate = toProjectArchitectureUpdate(plan, true);
+      const { projectContract, contractDelta, touchedRequirementIds } = regeneratedContract;
+      const architectureUpdate = toProjectArchitectureUpdate(plan, !previousContract);
+      const roadmapValidationOptions = previousContract
+        ? {
+            completedStepTitles: planning.completedSteps,
+            migrationImpacts: contractDelta!.migrationImpacts,
+            compatibilityImpacts: contractDelta!.compatibilityImpacts,
+            extension: true
+          }
+        : { completedStepTitles: planning.completedSteps };
       const repairedRoadmap = await buildImplementationStepBlueprintsWithRepairs({
         provider: planning.provider,
         session: planning.session,
@@ -1227,14 +1238,17 @@ export function registerRoutes(app: FastifyInstance, repository: ForgeMindReposi
         repairInput: {
           taskId: project.id,
           objective,
-          allowedRequirementIds: activeProjectContractRequirements(projectContract).map((requirement) => requirement.id),
+          allowedRequirementIds: touchedRequirementIds,
           completedStepTitles: planning.completedSteps,
-          migrationImpacts: [],
-          compatibilityImpacts: []
+          migrationImpacts: contractDelta?.migrationImpacts ?? [],
+          compatibilityImpacts: contractDelta?.compatibilityImpacts ?? []
         },
-        validate: (candidate) => toImplementationStepBlueprints(candidate, projectContract, undefined, {
-          completedStepTitles: planning.completedSteps
-        })
+        validate: (candidate) => toImplementationStepBlueprints(
+          candidate,
+          projectContract,
+          touchedRequirementIds,
+          roadmapValidationOptions
+        )
       });
       plan = repairedRoadmap.plan;
       const stepBlueprints = repairedRoadmap.blueprints;
@@ -1246,6 +1260,8 @@ export function registerRoutes(app: FastifyInstance, repository: ForgeMindReposi
         projectId: project.id,
         objective,
         projectContract,
+        contractDelta,
+        contractChangeSummary: contractDelta?.summary ?? 'Initial generated project contract.',
         architectureUpdate,
         steps: stepBlueprints
       });
@@ -1927,14 +1943,15 @@ export function buildRoadmapPlanningPrompt(input: {
     return [
       input.continuation
         ? 'Continue the existing project planning session. The persisted contract below is authoritative even if session memory differs.'
-        : 'Extend the persisted project contract below. It is the authoritative base contract.',
-      `Generate an ordered implementation roadmap for this objective: ${input.objective}`,
+        : 'Revise the persisted project contract below against the complete current specification. It is the authoritative base contract and unchanged requirements must survive.',
+      `Generate an ordered implementation roadmap only for changes required by this objective: ${input.objective}`,
       `Current contract (compact JSON):\n${JSON.stringify(compactProjectContract(input.currentContract))}`,
       input.completedSteps.length > 0
         ? `Do not recreate these completed steps:\n${input.completedSteps.map((step) => `- ${step}`).join('\n')}`
         : undefined,
       `Return projectContract as null and contractDelta with baseVersion ${input.currentContract.version}.`,
       'The delta must list every requirement addition, update, supersession, or removal explicitly. Every update, supersession, and removal requires a concrete rationale.',
+      'Never replace the complete contract with a smaller topical contract. Requirements omitted from the delta remain active and unchanged.',
       'Preserve all unchanged active requirements. Include migrationImpacts and compatibilityImpacts, using empty arrays when there are none.',
       'Return only implementationSteps needed to realize the delta. Every added, updated, superseded, or removed requirement must be referenced by at least one returned step.',
       'Every step must include a concrete changeRationale, dependsOnStepTitles referencing only earlier returned steps, and validationFocus. Include regression validation and add migration or compatibility validation when those impacts are declared.',
@@ -2030,6 +2047,34 @@ export function toProjectContractDelta(plan: PlanResult): ProjectContractDelta {
       briefReferences: requirement.briefReferences ?? undefined,
       rationale: requirement.rationale
     }))
+  };
+}
+
+export function resolveRegeneratedProjectContract(
+  plan: PlanResult,
+  currentSpecification: string,
+  objective: string,
+  previousContract?: ProjectContract
+): {
+  projectContract: ProjectContract;
+  contractDelta?: ProjectContractDelta;
+  touchedRequirementIds: string[];
+} {
+  const source = buildContractSource(currentSpecification, objective);
+  if (!previousContract) {
+    const projectContract = toProjectContract(plan, source, 1);
+    return {
+      projectContract,
+      touchedRequirementIds: activeProjectContractRequirements(projectContract).map((requirement) => requirement.id)
+    };
+  }
+
+  const contractDelta = toProjectContractDelta(plan);
+  const applied = applyProjectContractDelta(previousContract, contractDelta);
+  return {
+    projectContract: withProjectContractSource(applied.contract, source),
+    contractDelta,
+    touchedRequirementIds: applied.touchedRequirementIds
   };
 }
 
