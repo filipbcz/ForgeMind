@@ -1274,6 +1274,22 @@ a {
   margin-top: 2px;
 }
 
+.capability-disclosure {
+  border: 1px solid #dbe3dc;
+  border-radius: 8px;
+  overflow: hidden;
+}
+
+.capability-disclosure > summary {
+  padding: 12px;
+  cursor: pointer;
+  font-weight: 700;
+}
+
+.capability-disclosure .capability-list {
+  border-top: 1px solid #dbe3dc;
+}
+
 .project-contract-summary {
   margin-bottom: 14px;
   padding: 10px 12px;

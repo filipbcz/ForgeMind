@@ -170,6 +170,11 @@ export async function generateProjectRoadmap(projectId: string, input: GenerateP
   });
 }
 
+export async function startNextProjectRoadmapStep(projectId: string): Promise<TaskSummary> {
+  const task = await request<TaskApi>(`/api/projects/${projectId}/implementation-steps/start-next`, { method: 'POST' });
+  return toTaskSummary(task);
+}
+
 export async function decideProjectRoadmapExtension(
   projectId: string,
   input: DecideProjectRoadmapExtensionRequest

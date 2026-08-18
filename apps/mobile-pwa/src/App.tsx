@@ -65,6 +65,7 @@ import {
   retryTask as retryTaskRequest,
   retryProjectAudit,
   setWorkerQueuePaused,
+  startNextProjectRoadmapStep,
   subscribeNotification,
   startTask as startTaskRequest,
   unsubscribeNotification,
@@ -590,6 +591,16 @@ export function App() {
     onSuccess: (roadmap) => invalidateProjectData(roadmap.projectId)
   });
 
+  const startNextProjectRoadmapStepMutation = useMutation({
+    mutationFn: startNextProjectRoadmapStep,
+    onSuccess: (task) => {
+      invalidateTaskData(task.id);
+      invalidateProjectData(task.projectId);
+      setSelectedTaskId(task.id);
+      setView('tasks');
+    }
+  });
+
   const startTaskMutation = useMutation({
     mutationFn: startTaskRequest,
     onSuccess: (task) => {
@@ -950,7 +961,9 @@ export function App() {
             architecturesLoading={projectArchitecturesQuery.isLoading}
             architecturesError={projectArchitecturesQuery.error ? formatUiError(projectArchitecturesQuery.error) : undefined}
             roadmapError={
-              generateProjectRoadmapMutation.error
+              startNextProjectRoadmapStepMutation.error
+                ? formatUiError(startNextProjectRoadmapStepMutation.error)
+                : generateProjectRoadmapMutation.error
                 ? formatUiError(generateProjectRoadmapMutation.error)
                 : projectRoadmapQuery.error
                   ? formatUiError(projectRoadmapQuery.error)
@@ -967,6 +980,7 @@ export function App() {
             generatingRoadmap={generateProjectRoadmapMutation.isPending}
             decidingExtension={decideProjectRoadmapExtensionMutation.isPending}
             retryingAudit={retryProjectAuditMutation.isPending}
+            startingRoadmapStep={startNextProjectRoadmapStepMutation.isPending}
             deletingProject={deleteProjectMutation.isPending}
             deleteProjectError={deleteProjectMutation.error ? formatUiError(deleteProjectMutation.error) : undefined}
             onCreateProject={createProject}
@@ -979,6 +993,7 @@ export function App() {
             onGenerateRoadmap={(projectId, input) => generateProjectRoadmapMutation.mutate({ projectId, input })}
             onDecideExtension={(projectId, input) => decideProjectRoadmapExtensionMutation.mutate({ projectId, input })}
             onRetryAudit={(projectId) => retryProjectAuditMutation.mutate(projectId)}
+            onStartNextRoadmapStep={(projectId) => startNextProjectRoadmapStepMutation.mutate(projectId)}
             onDeleteProject={(projectId, input) => {
               deleteProjectMutation.reset();
               deleteProjectMutation.mutate({ projectId, input });
@@ -2507,6 +2522,7 @@ function ProjectsPanel(props: {
   generatingRoadmap: boolean;
   decidingExtension: boolean;
   retryingAudit: boolean;
+  startingRoadmapStep: boolean;
   deletingProject: boolean;
   deleteProjectError?: string;
   onCreateProject: (formData: FormData) => void;
@@ -2516,6 +2532,7 @@ function ProjectsPanel(props: {
   onGenerateRoadmap: (projectId: string, input?: GenerateProjectRoadmapRequest) => void;
   onDecideExtension: (projectId: string, input: DecideProjectRoadmapExtensionRequest) => void;
   onRetryAudit: (projectId: string) => void;
+  onStartNextRoadmapStep: (projectId: string) => void;
   onDeleteProject: (projectId: string, input: DeleteProjectRequest) => void;
   githubRepositories: GitHubRepositoryApi[];
   githubRepositoriesLoading: boolean;
@@ -2548,6 +2565,11 @@ function ProjectsPanel(props: {
   const latestCycle = roadmapCycles[0];
   const currentContract = props.contracts?.current?.contract ?? selectedProject?.projectContract;
   const cycleSteps = latestCycle ? props.roadmap?.steps.filter((step) => step.cycleId === latestCycle.id) ?? [] : [];
+  const canStartNextRoadmapStep = Boolean(
+    latestCycle?.status === 'active'
+    && cycleSteps.some((step) => step.status === 'pending' && !step.taskId)
+    && !cycleSteps.some((step) => step.status === 'running' || step.status === 'waiting_for_capability')
+  );
   const roadmapUsesOlderBrief = Boolean(
     latestCycle?.cycleNumber === 1
     && selectedProject?.brief?.trim()
@@ -2919,7 +2941,23 @@ function ProjectsPanel(props: {
             </form>
           </section>
           <section className="plain-section">
-            <h3>Roadmap</h3>
+            <div className="section-heading">
+              <div>
+                <h3>Roadmap</h3>
+                {latestCycle ? <p>Cyklus {latestCycle.cycleNumber} | {cycleSteps.length} kroku</p> : null}
+              </div>
+              {canStartNextRoadmapStep ? (
+                <button
+                  className="primary-action"
+                  type="button"
+                  disabled={props.startingRoadmapStep}
+                  onClick={() => props.onStartNextRoadmapStep(selectedProject.id)}
+                >
+                  <Play size={16} />
+                  {props.startingRoadmapStep ? 'Spoustim...' : 'Spustit dalsi krok'}
+                </button>
+              ) : null}
+            </div>
             {props.roadmapLoading ? <p>Nacitam roadmapu...</p> : null}
             {props.roadmapError ? <div className="error-banner">{props.roadmapError}</div> : null}
             {!props.roadmapLoading && !latestCycle ? <p>Zatim bez roadmap cyklu.</p> : null}
@@ -2988,7 +3026,7 @@ function ProjectsPanel(props: {
                   <div className="contract-history">
                     <h4>Historie architektury</h4>
                     {[...(props.architectures?.versions ?? [])].reverse().map((version) => (
-                      <details key={version.id} open={version.id === props.architectures?.current?.id ? true : undefined}>
+                      <details key={version.id}>
                         <summary>
                           <span>
                             <strong>Architektura v{version.version}</strong>
@@ -3025,7 +3063,11 @@ function ProjectsPanel(props: {
                   </div>
                 ) : null}
                 {(props.roadmap?.capabilities ?? []).length > 0 ? (
-                  <div className="capability-list">
+                  <details className="capability-disclosure">
+                    <summary>
+                      Pozadavky kontraktu a jejich dukazy ({props.roadmap?.capabilities.length ?? 0})
+                    </summary>
+                    <div className="capability-list">
                     {(props.roadmap?.capabilities ?? []).map((capability) => (
                       <div className="capability-row" key={capability.requirement.id}>
                         <div>
@@ -3059,7 +3101,8 @@ function ProjectsPanel(props: {
                         ) : null}
                       </div>
                     ))}
-                  </div>
+                    </div>
+                  </details>
                 ) : null}
                 <div className="roadmap-cycle-list">
                   {roadmapCycles.map((cycle) => {
@@ -3077,7 +3120,7 @@ function ProjectsPanel(props: {
                         ? ` | kontrakt v${cycleContractVersion.version}`
                         : '';
                     return (
-                      <details className="roadmap-cycle" open={isLatest ? true : undefined} key={cycle.id}>
+                      <details className="roadmap-cycle" key={cycle.id}>
                         <summary>
                           <span className="roadmap-cycle-title">
                             <small>{isLatest ? 'Aktuální cyklus' : 'Historie'}</small>
