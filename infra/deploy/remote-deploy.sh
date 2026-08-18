@@ -41,9 +41,9 @@ docker network inspect shared-edge >/dev/null 2>&1 || docker network create shar
 echo "Docker storage before deployment:"
 docker system df
 
-echo "Reclaiming unused Docker build cache and images older than 24 hours before pulling the release."
+echo "Reclaiming unused Docker build cache and images before pulling the release."
 docker builder prune --all --force
-docker image prune --all --force --filter "until=24h"
+docker image prune --all --force
 
 echo "Docker storage after pre-deployment cleanup:"
 docker system df

@@ -157,7 +157,7 @@ docker run --rm \
   alpine sh -c 'find /data -mindepth 1 -maxdepth 1 -exec rm -rf {} + && tar -C /data -xzf /backup/worker-workspaces.tar.gz'
 ```
 
-Run `infra/deploy/remote-deploy.sh` through the Raspberry workflow again. It applies any newer Prisma migrations before starting API, worker, OAuth relay, and web.
+Run `infra/deploy/remote-deploy.sh` through the Raspberry workflow again. Before downloading a release it removes all Docker build cache and images not referenced by running containers, so multiple recent multi-gigabyte runtime images cannot exhaust the Raspberry Pi disk. Active images, containers, volumes, database data, and worker workspaces are preserved. The script then applies any newer Prisma migrations before starting API, worker, OAuth relay, and web.
 
 ## 6. Acceptance And Cutover
 
