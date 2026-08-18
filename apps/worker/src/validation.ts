@@ -1,4 +1,6 @@
 import { execaCommand } from 'execa';
+import { existsSync } from 'node:fs';
+import { delimiter, join } from 'node:path';
 import type { ValidationCheck } from '@forgemind/providers';
 import { createWorkspaceEnvironment } from '@forgemind/shared';
 import { missingValidationCapabilities, requiredValidationCapabilities, resolveWorkerCapabilities } from './worker-capabilities.js';
@@ -81,8 +83,21 @@ export interface ValidationActivity {
 
 export type ValidationActivityHandler = (activity: ValidationActivity) => Promise<void> | void;
 
-export function createValidationEnvironment(source: NodeJS.ProcessEnv = process.env): NodeJS.ProcessEnv {
-  return createWorkspaceEnvironment(source);
+export function createValidationEnvironment(
+  source: NodeJS.ProcessEnv = process.env,
+  workspacePath?: string
+): NodeJS.ProcessEnv {
+  const environment = createWorkspaceEnvironment(source);
+  if (!workspacePath) return environment;
+  const virtualEnvironmentBin = process.platform === 'win32'
+    ? join(workspacePath, '.venv', 'Scripts')
+    : join(workspacePath, '.venv', 'bin');
+  if (!existsSync(virtualEnvironmentBin)) return environment;
+  return {
+    ...environment,
+    VIRTUAL_ENV: join(workspacePath, '.venv'),
+    PATH: [virtualEnvironmentBin, environment.PATH].filter(Boolean).join(delimiter)
+  };
 }
 
 export function normalizeValidationCommandForEnvironment(command: string): string {
@@ -197,7 +212,7 @@ export async function runValidationCommand(
     assertAllowedValidationCommand(effectiveCommand);
     const subprocess = execaCommand(effectiveCommand, {
       cwd,
-      env: createValidationEnvironment(),
+      env: createValidationEnvironment(process.env, cwd),
       shell: shouldUsePowerShell(effectiveCommand) ? 'powershell.exe' : true,
       timeout: Math.max(1, Math.min(60, timeoutMinutes)) * 60 * 1000,
       cancelSignal: signal,

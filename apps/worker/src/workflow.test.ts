@@ -195,6 +195,19 @@ describe('worker workflow', () => {
     await expect(inferRepositoryInstallCommand(workspacePath)).resolves.toBeUndefined();
   });
 
+  it('creates a persistent workspace virtual environment for declared Python validation dependencies', async () => {
+    const workspacePath = join(tmpdir(), `forgemind-worker-python-install-${randomUUID()}`);
+    await mkdir(workspacePath, { recursive: true });
+    await writeFile(join(workspacePath, 'requirements-dev.txt'), 'pytest==8.4.1\njsonschema==4.25.0\n', 'utf8');
+
+    await expect(inferRepositoryInstallCommand(workspacePath)).resolves.toBe(
+      'python3 -m venv .venv && .venv/bin/python -m pip install --disable-pip-version-check -r requirements-dev.txt'
+    );
+
+    await mkdir(join(workspacePath, '.venv'));
+    await expect(inferRepositoryInstallCommand(workspacePath)).resolves.toContain('requirements-dev.txt');
+  });
+
   it('runs the local provider workflow end-to-end without GitHub operations', async () => {
     const workspaceRoot = join(tmpdir(), `forgemind-worker-test-${randomUUID()}`);
     let capturedReviewInput: ReviewInput | undefined;
@@ -2348,6 +2361,80 @@ describe('worker workflow', () => {
       stderr: '/bin/sh: 1: cmake: not found'
     }));
   }, 10000);
+
+  it('defers an artifact consumer when its platform-specific producer was deferred', async () => {
+    const workspaceRoot = join(tmpdir(), `forgemind-worker-deferred-artifact-${randomUUID()}`);
+    const projectWithoutVerify = {
+      ...demoProject,
+      configYaml: noGitProjectConfig.replace('commands:\n  verify: "node --version"\n', 'commands: {}\n')
+    };
+    const reportCheck = `node -e "require('node:fs').readFileSync('shipping-report.json')"`;
+    const plan = vi.fn(async (input: PlanInput): Promise<PlanResult> => input.validationFailure
+      ? {
+          summary: 'The report check depends on the deferred Windows benchmark.',
+          steps: [],
+          acceptanceCriteria: [],
+          validationChecks: [],
+          validationRecovery: {
+            action: 'blocked',
+            rationale: 'The missing Windows benchmark report artifact cannot be validated until the Windows benchmark runs.'
+          }
+        }
+      : {
+          summary: 'Produce and validate the benchmark report.',
+          steps: ['Implement benchmark gate'],
+          acceptanceCriteria: ['Benchmark report is valid'],
+          validationChecks: [
+            {
+              kind: 'command',
+              command: 'Flying-Win64-Shipping.exe --write-report shipping-report.json',
+              criterion: 'Produce the benchmark report.',
+              requiredCapabilities: ['windows', 'unreal-engine-5.8']
+            },
+            {
+              kind: 'command',
+              command: reportCheck,
+              criterion: 'Validate the generated benchmark report.'
+            },
+            { kind: 'command', command: 'node --version', criterion: 'Portable repository validation passes.' }
+          ]
+        });
+    const provider: AIProvider = {
+      ...createProviderStub(),
+      plan,
+      async implement(input: ImplementInput): Promise<ImplementResult> {
+        return {
+          summary: 'Implemented benchmark gate.',
+          changedFiles: ['status.txt'],
+          diffStat: { filesChanged: 1, insertions: 1, deletions: 0 },
+          requestedApprovals: [],
+          validationChecks: input.plan.validationChecks,
+          fileUpdates: [{ path: 'status.txt', content: 'ok\n' }]
+        };
+      }
+    };
+
+    const result = await runWorkerTask({
+      project: projectWithoutVerify,
+      task: { ...demoTask, id: `task_${randomUUID()}` },
+      provider,
+      workspaceRoot
+    });
+
+    expect(result.status).toBe('ready_for_user_review');
+    expect(result.validation.passed).toBe(true);
+    expect(result.validation.deferredChecks).toEqual([
+      expect.objectContaining({ command: 'Flying-Win64-Shipping.exe --write-report shipping-report.json' }),
+      expect.objectContaining({
+        command: reportCheck,
+        requiredCapabilities: ['windows', 'unreal-engine-5.8']
+      })
+    ]);
+    expect(result.validation.checkResults).toEqual([
+      expect.objectContaining({ command: 'node --version', passed: true })
+    ]);
+    expect(plan).toHaveBeenCalledTimes(2);
+  }, 15000);
 
   it('keeps only the current roadmap step in provider execution context', () => {
     expect(compactTaskExecutionPrompt([

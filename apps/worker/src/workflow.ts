@@ -925,6 +925,10 @@ export async function runWorkerTask(input: WorkerTaskInput): Promise<WorkerTaskR
 
       if (recoveryDecision.action === 'blocked') {
         invalidValidationRecoveryResponseCount = 0;
+        const deferredPrerequisites = deferredChecksMatchingBlocker(
+          recoveryDecision.rationale,
+          validation.deferredChecks ?? []
+        );
         await input.hooks?.onIteration?.({
           phase: 'planning',
           prompt: validationRevisionContext,
@@ -939,6 +943,17 @@ export async function runWorkerTask(input: WorkerTaskInput): Promise<WorkerTaskR
             validationPlanRevision: validationPlanRevisionCount
           }
         });
+        if (deferredPrerequisites.length > 0) {
+          const inheritedCapabilities = uniqueStrings(deferredPrerequisites.flatMap((check) => check.requiredCapabilities));
+          validationChecks = validationChecks.map((check) => (
+            normalizeValidationCommandForEnvironment(check.command)
+              === normalizeValidationCommandForEnvironment(failedValidationCheck.command)
+              ? { ...check, requiredCapabilities: uniqueStrings([...(check.requiredCapabilities ?? []), ...inheritedCapabilities]) }
+              : check
+          ));
+          resumeValidationPlanRevision = false;
+          continue;
+        }
         return {
           taskId: input.task.id,
           status: 'validation_failed',
@@ -2382,35 +2397,50 @@ function hashCheckpointValue(value: string): string {
 }
 
 export async function inferRepositoryInstallCommand(workspacePath: string): Promise<string | undefined> {
-  if (!await pathExists(join(workspacePath, 'package.json')) || await pathExists(join(workspacePath, 'node_modules'))) {
-    return undefined;
+  const commands: string[] = [];
+  if (await pathExists(join(workspacePath, 'package.json')) && !await pathExists(join(workspacePath, 'node_modules'))) {
+    if (
+      await pathExists(join(workspacePath, 'package-lock.json'))
+      || await pathExists(join(workspacePath, 'npm-shrinkwrap.json'))
+    ) {
+      commands.push('npm ci');
+    } else if (await pathExists(join(workspacePath, 'pnpm-lock.yaml'))) {
+      commands.push('corepack pnpm install --frozen-lockfile');
+    } else if (await pathExists(join(workspacePath, 'yarn.lock'))) {
+      const packageManager = await readPackageManager(workspacePath);
+      commands.push(packageManager?.startsWith('yarn@1.')
+        ? 'corepack yarn install --frozen-lockfile'
+        : 'corepack yarn install --immutable');
+    } else if (
+      await pathExists(join(workspacePath, 'bun.lock'))
+      || await pathExists(join(workspacePath, 'bun.lockb'))
+    ) {
+      commands.push('bun install --frozen-lockfile');
+    }
   }
 
-  if (
-    await pathExists(join(workspacePath, 'package-lock.json'))
-    || await pathExists(join(workspacePath, 'npm-shrinkwrap.json'))
-  ) {
-    return 'npm ci';
+  const pythonRequirements = await firstExistingPath(workspacePath, [
+    'requirements-dev.lock',
+    'requirements.lock',
+    'requirements-dev.txt',
+    'requirements.txt'
+  ]);
+  if (pythonRequirements) {
+    const virtualEnvironmentPython = process.platform === 'win32'
+      ? '.venv\\Scripts\\python.exe'
+      : '.venv/bin/python';
+    commands.push(
+      `python3 -m venv .venv && ${virtualEnvironmentPython} -m pip install --disable-pip-version-check -r ${pythonRequirements}`
+    );
   }
 
-  if (await pathExists(join(workspacePath, 'pnpm-lock.yaml'))) {
-    return 'corepack pnpm install --frozen-lockfile';
-  }
+  return commands.length > 0 ? commands.join(' && ') : undefined;
+}
 
-  if (await pathExists(join(workspacePath, 'yarn.lock'))) {
-    const packageManager = await readPackageManager(workspacePath);
-    return packageManager?.startsWith('yarn@1.')
-      ? 'corepack yarn install --frozen-lockfile'
-      : 'corepack yarn install --immutable';
+async function firstExistingPath(workspacePath: string, candidates: string[]): Promise<string | undefined> {
+  for (const candidate of candidates) {
+    if (await pathExists(join(workspacePath, candidate))) return candidate;
   }
-
-  if (
-    await pathExists(join(workspacePath, 'bun.lock'))
-    || await pathExists(join(workspacePath, 'bun.lockb'))
-  ) {
-    return 'bun install --frozen-lockfile';
-  }
-
   return undefined;
 }
 
@@ -3009,15 +3039,22 @@ function isDeferredValidationOnlyBlocker(
   blocker: string,
   deferredChecks: import('./validation.js').DeferredValidationCheck[]
 ): boolean {
-  if (deferredChecks.length === 0) return false;
+  return deferredChecksMatchingBlocker(blocker, deferredChecks).length > 0;
+}
+
+function deferredChecksMatchingBlocker(
+  blocker: string,
+  deferredChecks: import('./validation.js').DeferredValidationCheck[]
+): import('./validation.js').DeferredValidationCheck[] {
+  if (deferredChecks.length === 0) return [];
   const normalized = blocker.toLowerCase();
   const describesMissingEvidence = (
     /\b(?:cannot|can't|could not|unable to)\b.*\b(?:verify|validate|run|execute|access)\b/.test(normalized)
     || /\b(?:unavailable|not available|not verified|not run|blocked)\b/.test(normalized)
     || /\bmissing\b.*\b(?:evidence|artifact|runtime|capabilit(?:y|ies)|worker|environment)\b/.test(normalized)
   );
-  if (!describesMissingEvidence) return false;
-  return deferredChecks.some((check) => [
+  if (!describesMissingEvidence) return [];
+  return deferredChecks.filter((check) => [
     check.criterion,
     ...check.requiredCapabilities,
     ...check.missingCapabilities
@@ -3714,6 +3751,7 @@ function isGeneratedWorkerPath(path: string): boolean {
   return normalized === 'agents.md'
     || normalized === 'mock_implementation.md'
     || segments.includes('node_modules')
+    || segments.includes('.venv')
     || normalized === 'out/build'
     || normalized.startsWith('out/build/')
     || normalized === 'build'

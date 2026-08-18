@@ -43,7 +43,11 @@ Projektova konfigurace se nacita z agent.config.yaml pres packages/config (parse
 
 ### commands
 
-`commands.install` instaluje pouze zavislosti deklarovane repozitarem a bezi pred validacnimi prikazy. Systemove build nastroje se neinstaluji za behu tasku; musi byt soucasti verzovaneho ForgeMind runtime image. Zakladni produkcni image obsahuje Node.js, Git, CMake/CTest, Ninja, GNU C/C++ toolchain, pkg-config a ripgrep.
+`commands.install` instaluje pouze zavislosti deklarovane repozitarem a bezi pred validacnimi prikazy. Systemove build nastroje se neinstaluji za behu tasku; musi byt soucasti verzovaneho ForgeMind runtime image. Zakladni produkcni image obsahuje Node.js, Git, Python 3 vcetne `pip` a `venv`, CMake/CTest, Ninja, GNU C/C++ toolchain, pkg-config a ripgrep.
+
+Bez explicitniho `commands.install` worker automaticky rozpozna Node lockfile a Python `requirements-dev.lock`, `requirements.lock`, `requirements-dev.txt` nebo `requirements.txt`. Python zavislosti instaluje do `.venv` uvnitr persistentniho task workspace a nasledujici validacni prikazy spousti s timto prostredim v `PATH`. Virtualni prostredi proto prezije vymenu worker kontejneru pri deployi, ale nezasahuje do hostitele ani do globalni vrstvy runtime image.
+
+Validacni kontrola, ktera spotrebovava artefakt vytvoreny platformnim prikazem, musi deklarovat stejne `requiredCapabilities` jako jeho producent. Pokud starsi plan tuto vazbu nema a AI potvrdi, ze chybejici artefakt zavisi pouze na jiz odlozene platformni validaci, worker capabilities zdedi a oba prikazy odlozi spolecne misto ukonceni tasku chybou.
 
 - install (optional)
 - lint (optional)

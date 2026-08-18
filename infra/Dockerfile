@@ -45,6 +45,8 @@ RUN apt-get update \
     pkg-config \
     python-is-python3 \
     python3 \
+    python3-pip \
+    python3-venv \
     ripgrep \
   && npm install --global "@openai/codex@${CODEX_VERSION}" \
   && rm -rf /var/lib/apt/lists/*

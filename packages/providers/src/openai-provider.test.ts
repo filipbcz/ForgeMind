@@ -117,6 +117,7 @@ describe('OpenAI provider', () => {
     expect(prompt).toContain('"exitCode": 1');
     expect(prompt).toContain('complete stdout');
     expect(prompt).toContain('complete stderr');
+    expect(prompt).toContain('persistent workspace environment');
   });
 
   it('emits the actual token breakdown returned by the API', async () => {

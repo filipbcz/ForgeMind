@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from 'vitest';
-import { mkdtemp, readFile, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import {
@@ -62,6 +62,17 @@ describe('validation runner', () => {
     });
     expect(environment).not.toHaveProperty('GITHUB_TOKEN');
     expect(environment).not.toHaveProperty('FORGEMIND_ENCRYPTION_KEY');
+  });
+
+  it('uses a persistent workspace virtual environment for subsequent validation commands', async () => {
+    const workspacePath = await mkdtemp(join(tmpdir(), 'forgemind-validation-venv-'));
+    const binPath = join(workspacePath, '.venv', process.platform === 'win32' ? 'Scripts' : 'bin');
+    await mkdir(binPath, { recursive: true });
+
+    const environment = createValidationEnvironment({ PATH: 'system-path' }, workspacePath);
+
+    expect(environment.VIRTUAL_ENV).toBe(join(workspacePath, '.venv'));
+    expect(environment.PATH?.split(process.platform === 'win32' ? ';' : ':')[0]).toBe(binPath);
   });
 
   it('treats stderr warnings as diagnostic output when the command exits successfully', async () => {
