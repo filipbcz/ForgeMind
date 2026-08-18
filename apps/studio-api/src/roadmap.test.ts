@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from 'vitest';
 import type { AIProvider, ImplementationStepPlan, PlanResult } from '@forgemind/providers';
-import { buildImplementationStepBlueprintsWithRepairs, buildRoadmapPlanningPrompt, buildRoadmapStepTaskPrompt, createProjectPlanningSession, findFirstPendingStepForLatestCycle, repairRoadmapOnce, resolveRegeneratedProjectContract, resolveTaskMode, toImplementationStepBlueprints, toProjectArchitectureUpdate, toProjectContract } from './routes.js';
+import { buildImplementationStepBlueprintsWithRepairs, buildRoadmapPlanningPrompt, buildRoadmapStepTaskPrompt, collectRegeneratedRoadmapRequirementIds, createProjectPlanningSession, findFirstPendingStepForLatestCycle, repairRoadmapOnce, resolveRegeneratedProjectContract, resolveTaskMode, selectUnfinishedRoadmapSteps, toImplementationStepBlueprints, toProjectArchitectureUpdate, toProjectContract } from './routes.js';
 
 const projectContract = {
   version: 1,
@@ -123,6 +123,60 @@ describe('project roadmap generation', () => {
     expect(prompt).toContain('projectContract as null');
     expect(prompt).toContain('Requirements omitted from the delta remain active and unchanged');
     expect(prompt).not.toContain('complete brief is intentionally not repeated');
+  });
+
+  it('requires unfinished roadmap work to survive contract regeneration', () => {
+    const prompt = buildRoadmapPlanningPrompt({
+      project: { name: 'Demo', brief: 'Complete brief.' },
+      objective: 'Revise regional scope',
+      completedSteps: ['Build core'],
+      unfinishedSteps: [
+        { title: 'Ship installer', requirementIds: ['REQ-INSTALLER', 'REQ-RELEASE'] },
+        { title: 'Run stability QA', requirementIds: ['REQ-STABILITY'] }
+      ],
+      continuation: true,
+      currentContract: projectContract
+    });
+
+    expect(prompt).toContain('Carry forward every unfinished work item');
+    expect(prompt).toContain('Ship installer [REQ-INSTALLER, REQ-RELEASE]');
+    expect(prompt).toContain('Run stability QA [REQ-STABILITY]');
+    expect(prompt).toContain('finish all carried-forward work');
+  });
+
+  it('validates regenerated roadmaps against changed and unfinished active requirements', () => {
+    const contract = {
+      ...projectContract,
+      requirements: [
+        ...projectContract.requirements.map((requirement) => ({ ...requirement, status: 'active' as const })),
+        {
+          id: 'REQ-REMOVED', title: 'Removed capability', description: 'No longer required.',
+          acceptanceCriteria: ['Not applicable.'], briefReferences: ['removed'], status: 'removed' as const
+        }
+      ]
+    };
+
+    expect(collectRegeneratedRoadmapRequirementIds(
+      contract,
+      ['REQ-SCOPE'],
+      [{ requirementIds: ['REQ-GENERATOR', 'REQ-REMOVED'] }]
+    )).toEqual(['REQ-SCOPE', 'REQ-GENERATOR']);
+  });
+
+  it('carries unfinished steps only from the selected recovery contract', () => {
+    const unfinished = selectUnfinishedRoadmapSteps({
+      cycles: [
+        { id: 'cycle_v1', contractVersionId: 'contract_v1' },
+        { id: 'cycle_v2', contractVersionId: 'contract_v2' }
+      ],
+      steps: [
+        { cycleId: 'cycle_v1', title: 'Completed foundation', status: 'completed', requirementIds: ['REQ-SCOPE'] },
+        { cycleId: 'cycle_v1', title: 'Ship installer', status: 'pending', requirementIds: ['REQ-GENERATOR'] },
+        { cycleId: 'cycle_v2', title: 'Bad replacement work', status: 'pending', requirementIds: ['REQ-REMOVED'] }
+      ]
+    }, 'contract_v1');
+
+    expect(unfinished).toEqual([{ title: 'Ship installer', requirementIds: ['REQ-GENERATOR'] }]);
   });
 
   it('applies brief revisions as a delta without dropping unchanged completed requirements', () => {

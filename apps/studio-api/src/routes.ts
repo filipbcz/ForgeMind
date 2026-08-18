@@ -1238,7 +1238,14 @@ export function registerRoutes(app: FastifyInstance, repository: ForgeMindReposi
         });
       }
       const previousContract = recoveryBaseVersion?.contract ?? latestContractVersion?.contract;
-      const planning = await generateRoadmapPlan(repository, project, objective, currentSpecification, previousContract);
+      const planning = await generateRoadmapPlan(
+        repository,
+        project,
+        objective,
+        currentSpecification,
+        previousContract,
+        recoveryBaseVersion?.id ?? latestContractVersion?.id
+      );
       let plan = planning.plan;
       const regeneratedContract = resolveRegeneratedProjectContract(
         plan,
@@ -1249,6 +1256,11 @@ export function registerRoutes(app: FastifyInstance, repository: ForgeMindReposi
       );
       const { projectContract, contractDelta, touchedRequirementIds } = regeneratedContract;
       const architectureUpdate = toProjectArchitectureUpdate(plan, !previousContract);
+      const requiredRequirementIds = collectRegeneratedRoadmapRequirementIds(
+        projectContract,
+        touchedRequirementIds,
+        planning.unfinishedSteps
+      );
       const roadmapValidationOptions = previousContract
         ? {
             completedStepTitles: planning.completedSteps,
@@ -1264,7 +1276,7 @@ export function registerRoutes(app: FastifyInstance, repository: ForgeMindReposi
         repairInput: {
           taskId: project.id,
           objective,
-          allowedRequirementIds: touchedRequirementIds,
+          allowedRequirementIds: requiredRequirementIds,
           completedStepTitles: planning.completedSteps,
           migrationImpacts: contractDelta?.migrationImpacts ?? [],
           compatibilityImpacts: contractDelta?.compatibilityImpacts ?? []
@@ -1272,7 +1284,7 @@ export function registerRoutes(app: FastifyInstance, repository: ForgeMindReposi
         validate: (candidate) => toImplementationStepBlueprints(
           candidate,
           projectContract,
-          touchedRequirementIds,
+          requiredRequirementIds,
           roadmapValidationOptions
         )
       });
@@ -1836,8 +1848,15 @@ async function generateRoadmapPlan(
   project: Project,
   objective: string,
   currentSpecification?: string,
-  currentContract?: ProjectContract
-): Promise<{ plan: PlanResult; provider: AIProvider; session: ProviderSessionContext; completedSteps: string[] }> {
+  currentContract?: ProjectContract,
+  sourceContractVersionId?: string
+): Promise<{
+  plan: PlanResult;
+  provider: AIProvider;
+  session: ProviderSessionContext;
+  completedSteps: string[];
+  unfinishedSteps: Array<{ title: string; requirementIds: string[] }>;
+}> {
   const connection = project.aiProviderConnectionId
     ? await readAIProviderConnectionSecretById(repository, project.aiProviderConnectionId)
     : await readAIProviderConnectionSecret(repository);
@@ -1854,6 +1873,7 @@ async function generateRoadmapPlan(
   let session = createProjectPlanningSession(repository, project, connection);
   const existingRoadmap = await repository.getProjectRoadmap(project.id);
   const completedSteps = existingRoadmap?.steps.filter((step) => step.status === 'completed').map((step) => step.title) ?? [];
+  const unfinishedSteps = selectUnfinishedRoadmapSteps(existingRoadmap, sourceContractVersionId);
   const planInput = {
     taskId: project.id,
     title: `Project roadmap for ${project.name}`,
@@ -1861,6 +1881,7 @@ async function generateRoadmapPlan(
       project: currentSpecification ? { ...project, brief: currentSpecification } : project,
       objective,
       completedSteps,
+      unfinishedSteps,
       continuation: Boolean(session.id),
       currentContract
     }),
@@ -1874,7 +1895,7 @@ async function generateRoadmapPlan(
     session = createProjectPlanningSession(repository, project, connection, true);
     plan = await provider.plan({ ...planInput, session });
   }
-  return { plan, provider, session, completedSteps };
+  return { plan, provider, session, completedSteps, unfinishedSteps };
 }
 
 function roadmapPlanningMaxRuntimeMs(): number {
@@ -1966,6 +1987,7 @@ export function buildRoadmapPlanningPrompt(input: {
   project: Pick<Project, 'name' | 'brief'>;
   objective: string;
   completedSteps: string[];
+  unfinishedSteps?: Array<{ title: string; requirementIds: string[] }>;
   continuation: boolean;
   currentContract?: ProjectContract;
 }): string {
@@ -1979,11 +2001,14 @@ export function buildRoadmapPlanningPrompt(input: {
       input.completedSteps.length > 0
         ? `Do not recreate these completed steps:\n${input.completedSteps.map((step) => `- ${step}`).join('\n')}`
         : undefined,
+      input.unfinishedSteps?.length
+        ? `Carry forward every unfinished work item below. It may be adapted or explicitly merged with another returned step, but all of its still-active requirement ids must remain covered:\n${input.unfinishedSteps.map((step) => `- ${step.title} [${step.requirementIds.join(', ')}]`).join('\n')}`
+        : undefined,
       `Return projectContract as null and contractDelta with baseVersion ${input.currentContract.version}.`,
       'The delta must list every requirement addition, update, supersession, or removal explicitly. Every update, supersession, and removal requires a concrete rationale.',
       'Never replace the complete contract with a smaller topical contract. Requirements omitted from the delta remain active and unchanged.',
       'Preserve all unchanged active requirements. Include migrationImpacts and compatibilityImpacts, using empty arrays when there are none.',
-      'Return only implementationSteps needed to realize the delta. Every added, updated, superseded, or removed requirement must be referenced by at least one returned step.',
+      'Return implementationSteps needed to realize the delta and to finish all carried-forward work. Every added, updated, superseded, removed, or carried-forward active requirement must be referenced by at least one returned step.',
       'Every step must include a concrete changeRationale, dependsOnStepTitles referencing only earlier returned steps, and validationFocus. Include regression validation and add migration or compatibility validation when those impacts are declared.',
       'Keep each implementation step focused: at most 3 requirementIds, 3 deliverables, 5 acceptanceCriteria, and 5 inScope items. Split broader work into additional ordered steps.',
       'Return a compact architectureUpdate containing only architecture changes caused by this extension.'
@@ -2001,6 +2026,9 @@ export function buildRoadmapPlanningPrompt(input: {
         ? `Existing brief context: ${input.project.brief.trim()}`
         : undefined,
       input.completedSteps.length > 0 ? `Already completed implementation steps:\n${input.completedSteps.map((step) => `- ${step}`).join('\n')}` : undefined,
+      input.unfinishedSteps?.length
+        ? `Unfinished implementation steps that must remain covered:\n${input.unfinishedSteps.map((step) => `- ${step.title} [${step.requirementIds.join(', ')}]`).join('\n')}`
+        : undefined,
       '',
       'Return concrete implementation steps that can be executed one by one as individual engineering tasks in implementationSteps.',
       'Also return projectContract with version 1, summary, global invariants, prohibited substitutes, atomic requirements, and release criteria.',
@@ -2110,6 +2138,34 @@ export function resolveRegeneratedProjectContract(
     contractDelta,
     touchedRequirementIds: applied.touchedRequirementIds
   };
+}
+
+export function collectRegeneratedRoadmapRequirementIds(
+  projectContract: ProjectContract,
+  touchedRequirementIds: string[],
+  unfinishedSteps: Array<{ requirementIds: string[] }>
+): string[] {
+  const activeRequirementIds = new Set(activeProjectContractRequirements(projectContract).map((requirement) => requirement.id));
+  return Array.from(new Set([
+    ...touchedRequirementIds,
+    ...unfinishedSteps.flatMap((step) => step.requirementIds).filter((requirementId) => activeRequirementIds.has(requirementId))
+  ]));
+}
+
+export function selectUnfinishedRoadmapSteps(
+  roadmap: {
+    cycles: Array<{ id: string; contractVersionId?: string }>;
+    steps: Array<{ cycleId: string; title: string; status: string; requirementIds: string[] }>;
+  } | undefined,
+  sourceContractVersionId?: string
+): Array<{ title: string; requirementIds: string[] }> {
+  if (!roadmap) return [];
+  const sourceCycleIds = new Set(roadmap.cycles
+    .filter((cycle) => !sourceContractVersionId || cycle.contractVersionId === sourceContractVersionId)
+    .map((cycle) => cycle.id));
+  return roadmap.steps
+    .filter((step) => sourceCycleIds.has(step.cycleId) && step.status !== 'completed')
+    .map((step) => ({ title: step.title, requirementIds: step.requirementIds }));
 }
 
 function withProjectContractSource(contract: ProjectContract, source: string): ProjectContract {
