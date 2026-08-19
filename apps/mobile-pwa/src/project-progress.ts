@@ -114,6 +114,15 @@ export function summarizeProjectProgress(
     };
   }
 
+  if (steps.length > 0 && completedSteps === steps.length && latestCycle.status === 'active') {
+    return {
+      ...base,
+      tone: 'attention',
+      headline: 'Implementace je hotová, audit čeká',
+      detail: 'Závěrečný projektový audit spusťte ručně v detailu projektu.'
+    };
+  }
+
   return {
     ...base,
     tone: 'completed',

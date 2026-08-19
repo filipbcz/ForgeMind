@@ -46,6 +46,21 @@ describe('summarizeProjectProgress', () => {
     });
   });
 
+  it('shows that a completed implementation is waiting for a manual audit', () => {
+    const source = roadmap({
+      steps: [{
+        id: 'step_1', projectId: 'project_1', cycleId: 'cycle_1', sequenceNumber: 1,
+        title: 'Only step', description: 'Done', acceptanceCriteria: ['Done'], requirementIds: ['REQ-1'],
+        deliverables: ['Feature'], dependsOnStepTitles: [], validationFocus: [], status: 'completed', taskId: 'task_1'
+      }]
+    });
+
+    expect(summarizeProjectProgress(source, 'task_1')).toMatchObject({
+      tone: 'attention',
+      headline: 'Implementace je hotová, audit čeká'
+    });
+  });
+
   it('prioritizes a running project audit over roadmap steps', () => {
     const summary = summarizeProjectProgress(roadmap({
       auditJobs: [{

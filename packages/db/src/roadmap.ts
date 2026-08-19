@@ -1,4 +1,3 @@
-import { activeProjectContractRequirements } from '@forgemind/core';
 import type { ForgeTask, Project, ProjectImplementationStep, ProjectRoadmapCycle } from '@forgemind/core';
 import type { ForgeMindRepository } from './repository.js';
 
@@ -71,13 +70,9 @@ export async function advanceRoadmapAfterTaskCompletion(
   if (cycle.status === 'completed' || cycle.status === 'awaiting_extension_approval') {
     return { advanced: linkedStep.status !== 'completed', completedStep, completedCycle: cycle, project };
   }
-  const audit = await repository.enqueueProjectAudit({
-    projectId: project.id,
-    cycleId: cycle.id,
-    triggerTaskId: taskId,
-    requirementIds: activeProjectContractRequirements(project.projectContract).map((requirement) => requirement.id)
-  });
-  return { advanced: true, completedStep, auditQueued: audit.enqueued, project };
+  // Contract-backed cycles stay active after their final implementation step.
+  // A user explicitly starts the completion audit from the project UI.
+  return { advanced: true, completedStep, auditQueued: false, project };
 }
 
 export async function startNextRoadmapStep(

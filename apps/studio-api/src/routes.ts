@@ -1165,6 +1165,45 @@ export function registerRoutes(app: FastifyInstance, repository: ForgeMindReposi
     }
   });
 
+  app.post('/api/projects/:id/audit/start', async (request, reply) => {
+    try {
+      const { id } = idParamsSchema.parse(request.params);
+      const [project, roadmap] = await Promise.all([
+        repository.getProject(id),
+        repository.getProjectRoadmap(id)
+      ]);
+      if (!project) return sendNotFound(reply, `Project "${id}" not found`);
+      if (!roadmap) return sendNotFound(reply, `Project "${id}" does not have a roadmap`);
+      if (!project.projectContract) {
+        return reply.code(409).send({ error: 'A project contract is required before the final audit can start.' });
+      }
+      const cycle = [...roadmap.cycles].sort((left, right) => right.cycleNumber - left.cycleNumber)[0];
+      if (!cycle) return reply.code(409).send({ error: 'The project does not have a roadmap cycle to audit.' });
+      if (cycle.status === 'completed' || cycle.status === 'awaiting_extension_approval') {
+        return reply.code(409).send({ error: 'The latest roadmap cycle is already completed and audited.' });
+      }
+      const cycleSteps = roadmap.steps.filter((step) => step.cycleId === cycle.id);
+      if (cycleSteps.length === 0 || cycleSteps.some((step) => step.status !== 'completed')) {
+        return reply.code(409).send({ error: 'All implementation steps must be completed before the final audit can start.' });
+      }
+      const latestCompletedStep = [...cycleSteps]
+        .filter((step) => step.taskId)
+        .sort((left, right) => right.sequenceNumber - left.sequenceNumber)[0];
+      const audit = await repository.enqueueProjectAudit({
+        projectId: id,
+        cycleId: cycle.id,
+        triggerTaskId: latestCompletedStep?.taskId,
+        requirementIds: activeProjectContractRequirements(project.projectContract).map((requirement) => requirement.id)
+      });
+      if (!audit.enqueued) {
+        return reply.code(409).send({ error: 'The final project audit is already queued or no newer completed work is available to audit.' });
+      }
+      return (await repository.getProjectRoadmap(id))!;
+    } catch (error) {
+      return sendBadRequest(reply, error);
+    }
+  });
+
   app.post('/api/projects/:id/implementation-steps/start-next', async (request, reply) => {
     try {
       const { id } = idParamsSchema.parse(request.params);

@@ -48,7 +48,7 @@ describe('roadmap task completion', () => {
     expect(second.nextTask).toBeUndefined();
   });
 
-  it('queues one completion audit instead of completing the cycle after the final step', async () => {
+  it('leaves a contract cycle ready for a manually started audit after the final step', async () => {
     const step = {
       id: 'step_1', projectId: 'project_1', cycleId: 'cycle_1', sequenceNumber: 1,
       title: 'Only step', description: 'Done', acceptanceCriteria: ['Done'], requirementIds: ['REQ-1'], deliverables: ['Feature'],
@@ -77,11 +77,9 @@ describe('roadmap task completion', () => {
 
     const result = await advanceRoadmapAfterTaskCompletion(repository as never, 'task_1');
 
-    expect(result.auditQueued).toBe(true);
+    expect(result.auditQueued).toBe(false);
     expect(result.completedCycle).toBeUndefined();
-    expect(enqueueProjectAudit).toHaveBeenCalledWith({
-      projectId: 'project_1', cycleId: 'cycle_1', triggerTaskId: 'task_1', requirementIds: ['REQ-1']
-    });
+    expect(enqueueProjectAudit).not.toHaveBeenCalled();
     expect(repository.updateProjectRoadmapCycleStatus).not.toHaveBeenCalled();
   });
 

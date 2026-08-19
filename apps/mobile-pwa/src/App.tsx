@@ -64,6 +64,7 @@ import {
   resolveApproval as resolveApprovalRequest,
   retryTask as retryTaskRequest,
   retryProjectAudit,
+  startProjectAudit,
   setWorkerQueuePaused,
   startNextProjectRoadmapStep,
   subscribeNotification,
@@ -591,6 +592,11 @@ export function App() {
     onSuccess: (roadmap) => invalidateProjectData(roadmap.projectId)
   });
 
+  const startProjectAuditMutation = useMutation({
+    mutationFn: startProjectAudit,
+    onSuccess: (roadmap) => invalidateProjectData(roadmap.projectId)
+  });
+
   const startNextProjectRoadmapStepMutation = useMutation({
     mutationFn: startNextProjectRoadmapStep,
     onSuccess: (task) => {
@@ -961,7 +967,9 @@ export function App() {
             architecturesLoading={projectArchitecturesQuery.isLoading}
             architecturesError={projectArchitecturesQuery.error ? formatUiError(projectArchitecturesQuery.error) : undefined}
             roadmapError={
-              startNextProjectRoadmapStepMutation.error
+              startProjectAuditMutation.error
+                ? formatUiError(startProjectAuditMutation.error)
+                : startNextProjectRoadmapStepMutation.error
                 ? formatUiError(startNextProjectRoadmapStepMutation.error)
                 : generateProjectRoadmapMutation.error
                 ? formatUiError(generateProjectRoadmapMutation.error)
@@ -980,6 +988,7 @@ export function App() {
             generatingRoadmap={generateProjectRoadmapMutation.isPending}
             decidingExtension={decideProjectRoadmapExtensionMutation.isPending}
             retryingAudit={retryProjectAuditMutation.isPending}
+            startingAudit={startProjectAuditMutation.isPending}
             startingRoadmapStep={startNextProjectRoadmapStepMutation.isPending}
             deletingProject={deleteProjectMutation.isPending}
             deleteProjectError={deleteProjectMutation.error ? formatUiError(deleteProjectMutation.error) : undefined}
@@ -993,6 +1002,7 @@ export function App() {
             onGenerateRoadmap={(projectId, input) => generateProjectRoadmapMutation.mutate({ projectId, input })}
             onDecideExtension={(projectId, input) => decideProjectRoadmapExtensionMutation.mutate({ projectId, input })}
             onRetryAudit={(projectId) => retryProjectAuditMutation.mutate(projectId)}
+            onStartAudit={(projectId) => startProjectAuditMutation.mutate(projectId)}
             onStartNextRoadmapStep={(projectId) => startNextProjectRoadmapStepMutation.mutate(projectId)}
             onDeleteProject={(projectId, input) => {
               deleteProjectMutation.reset();
@@ -2522,6 +2532,7 @@ function ProjectsPanel(props: {
   generatingRoadmap: boolean;
   decidingExtension: boolean;
   retryingAudit: boolean;
+  startingAudit: boolean;
   startingRoadmapStep: boolean;
   deletingProject: boolean;
   deleteProjectError?: string;
@@ -2532,6 +2543,7 @@ function ProjectsPanel(props: {
   onGenerateRoadmap: (projectId: string, input?: GenerateProjectRoadmapRequest) => void;
   onDecideExtension: (projectId: string, input: DecideProjectRoadmapExtensionRequest) => void;
   onRetryAudit: (projectId: string) => void;
+  onStartAudit: (projectId: string) => void;
   onStartNextRoadmapStep: (projectId: string) => void;
   onDeleteProject: (projectId: string, input: DeleteProjectRequest) => void;
   githubRepositories: GitHubRepositoryApi[];
@@ -3112,6 +3124,11 @@ function ProjectsPanel(props: {
                       .sort((left, right) => left.sequenceNumber - right.sequenceNumber);
                     const completedStepCount = steps.filter((step) => step.status === 'completed').length;
                     const auditJob = props.roadmap?.auditJobs.find((job) => job.cycleId === cycle.id);
+                    const canStartAudit = isLatest
+                      && cycle.status === 'active'
+                      && steps.length > 0
+                      && steps.every((step) => step.status === 'completed')
+                      && (!auditJob || auditJob.status === 'succeeded');
                     const cycleContractVersion = props.contracts?.versions.find((version) => version.id === cycle.contractVersionId);
                     const cycleContractLabel = cycleContractVersion?.changeSummary.startsWith('Imported legacy')
                       && cycle.cycleNumber !== cycleContractVersion.version
@@ -3149,6 +3166,19 @@ function ProjectsPanel(props: {
                                   </button>
                                 </div>
                               ) : null}
+                            </div>
+                          ) : null}
+                          {canStartAudit ? (
+                            <div className="actions">
+                              <button
+                                className="primary-action"
+                                type="button"
+                                disabled={props.startingAudit}
+                                onClick={() => props.onStartAudit(selectedProject.id)}
+                              >
+                                <ClipboardCheck size={16} />
+                                Spustit závěrečný audit
+                              </button>
                             </div>
                           ) : null}
                           <div className="timeline">

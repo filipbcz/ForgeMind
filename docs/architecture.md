@@ -71,7 +71,7 @@ Trvale checkpointy a idempotence:
 1. `task_checkpoints` uklada stav `started/completed/failed`, fazi, stabilni klic operace, otisk vstupu a omezeny vystup pro validaci a externi efekty.
 2. Commit, push, vytvoreni PR, GitHub checks a merge se pri phase retry obnovuji pouze od prvni nedokoncene operace.
 3. GitHub adapter pred vytvorenim PR vyhleda otevreny PR pro stejnou head/base branch a merge jiz slouceneho PR vraci jako uspesny. Opakovani po vypadku proto nevytvari duplicitni PR ani merge.
-4. Migrace validacniho prostredi pouzivaji stejne checkpointy jako ostatni prikazy. Project audit ma unikatni job na roadmap cyklus a uspesny audit se znovu nezaqueueuje.
+4. Migrace validacniho prostredi pouzivaji stejne checkpointy jako ostatni prikazy. Project audit ma unikatni job na roadmap cyklus. Dokonceni posledniho implementacniho kroku audit automaticky nespousti; uzivatel jej spusti rucne az po kontrole rozsahu. Pokud audit prida opravne kroky, jejich dokonceni opet ceka na dalsi rucni audit.
 
 Project architecture lifecycle:
 

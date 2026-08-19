@@ -133,6 +133,66 @@ describe('Studio API routes', () => {
     await app.close();
   });
 
+  it('starts the final project audit only when all implementation steps are completed', async () => {
+    const roadmap = {
+      projectId: 'project_1',
+      cycles: [{ id: 'cycle_1', projectId: 'project_1', cycleNumber: 1, objective: 'Demo', status: 'active' }],
+      steps: [{
+        id: 'step_1', projectId: 'project_1', cycleId: 'cycle_1', sequenceNumber: 1,
+        title: 'Demo', description: 'Done', acceptanceCriteria: ['Done'], requirementIds: ['REQ-DEMO'],
+        deliverables: ['Demo'], dependsOnStepTitles: [], validationFocus: [], status: 'completed', taskId: 'task_1'
+      }],
+      evidence: [], capabilities: [], auditJobs: []
+    };
+    const repository = {
+      getProject: vi.fn(async () => ({
+        id: 'project_1', name: 'Project',
+        projectContract: {
+          version: 1, summary: 'Demo', invariants: [], prohibitedSubstitutes: [], releaseCriteria: ['Ready'],
+          requirements: [{ id: 'REQ-DEMO', title: 'Demo', description: 'Demo works.', acceptanceCriteria: ['Done'], status: 'active' }]
+        }
+      })),
+      getProjectRoadmap: vi.fn(async () => roadmap),
+      enqueueProjectAudit: vi.fn(async () => ({ enqueued: true, job: { id: 'audit_1' } }))
+    };
+    const app = Fastify();
+    registerRoutes(app, repository as never);
+
+    const response = await app.inject({ method: 'POST', url: '/api/projects/project_1/audit/start' });
+
+    expect(response.statusCode).toBe(200);
+    expect(repository.enqueueProjectAudit).toHaveBeenCalledWith({
+      projectId: 'project_1', cycleId: 'cycle_1', triggerTaskId: 'task_1', requirementIds: ['REQ-DEMO']
+    });
+    await app.close();
+  });
+
+  it('rejects a manual final audit while an implementation step is unfinished', async () => {
+    const repository = {
+      getProject: vi.fn(async () => ({
+        id: 'project_1',
+        projectContract: {
+          version: 1, summary: 'Demo', invariants: [], prohibitedSubstitutes: [], releaseCriteria: ['Ready'],
+          requirements: [{ id: 'REQ-DEMO', title: 'Demo', description: 'Demo works.', acceptanceCriteria: ['Done'], status: 'active' }]
+        }
+      })),
+      getProjectRoadmap: vi.fn(async () => ({
+        projectId: 'project_1',
+        cycles: [{ id: 'cycle_1', projectId: 'project_1', cycleNumber: 1, objective: 'Demo', status: 'active' }],
+        steps: [{ id: 'step_1', cycleId: 'cycle_1', status: 'pending' }], evidence: [], capabilities: [], auditJobs: []
+      })),
+      enqueueProjectAudit: vi.fn()
+    };
+    const app = Fastify();
+    registerRoutes(app, repository as never);
+
+    const response = await app.inject({ method: 'POST', url: '/api/projects/project_1/audit/start' });
+
+    expect(response.statusCode).toBe(409);
+    expect(repository.enqueueProjectAudit).not.toHaveBeenCalled();
+    await app.close();
+  });
+
   it('blocks roadmap regeneration before invoking AI while project work is active', async () => {
     const repository = {
       getProject: vi.fn(async () => ({
