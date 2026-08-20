@@ -1,6 +1,48 @@
 import { describe, expect, it, vi } from 'vitest';
 import { advanceRoadmapAfterTaskCapabilityWait, advanceRoadmapAfterTaskCompletion } from './roadmap.js';
 
+const configuredProjectYaml = `
+project:
+  id: project_1
+  name: Project
+  repo: demo/repo
+  default_branch: main
+  type: node
+  runtime: node
+workflow:
+  default_mode: safe
+  create_issue: true
+  create_branch: true
+  create_draft_pr: true
+  auto_push: true
+  auto_merge: false
+  allow_ai_auto_improvements: false
+ai:
+  primary_provider: codex
+  reviewer_provider: codex
+  model_profile: balanced
+limits:
+  max_iterations: 4
+  max_runtime_minutes: 60
+  max_changed_files: 20
+  max_diff_lines: 1000
+  max_repeated_error_count: 2
+commands: {}
+approval:
+  required_for: []
+  auto_allowed: []
+sandbox:
+  allow_network: false
+  allow_sudo: false
+  writable_paths: [/workspace]
+  forbidden_paths: [/etc]
+github:
+  issue_label: ai-task
+  branch_prefix: ai/
+  pr_draft: true
+  require_ci_green: true
+`;
+
 describe('roadmap task completion', () => {
   it('completes the linked step and starts the next pending step exactly once', async () => {
     const steps = [
@@ -28,6 +70,7 @@ describe('roadmap task completion', () => {
       })),
       getProject: vi.fn(async () => ({
         id: 'project_1', name: 'Project', defaultTaskMode: 'auto',
+        configYaml: configuredProjectYaml,
         projectContract: {
           version: 1, summary: 'Project', invariants: [], prohibitedSubstitutes: [],
           requirements: [{ id: 'REQ-1', title: 'Feature', description: 'Feature works.', acceptanceCriteria: ['Done'] }],
@@ -45,6 +88,7 @@ describe('roadmap task completion', () => {
     expect(first.nextTask?.id).toBe('task_2');
     expect(steps.map((step) => step.status)).toEqual(['completed', 'running']);
     expect(createAndStartRoadmapStepTask).toHaveBeenCalledTimes(1);
+    expect(createAndStartRoadmapStepTask).toHaveBeenCalledWith('step_2', expect.objectContaining({ maxIterations: 4 }));
     expect(second.nextTask).toBeUndefined();
   });
 

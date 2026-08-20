@@ -1330,6 +1330,19 @@ github:
       };
     }) => {
       await input.hooks?.onProviderActivity?.({
+        phase: 'implementation',
+        attempt: 1,
+        kind: 'lifecycle',
+        message: 'Provider usage captured.',
+        elapsedMs: 0,
+        usage: {
+          provider: 'codex',
+          model: 'gpt-5.5',
+          totalTokens: 100000,
+          source: 'actual_total'
+        }
+      });
+      await input.hooks?.onProviderActivity?.({
         phase: 'review',
         attempt: 2,
         kind: 'lifecycle',
@@ -1339,6 +1352,19 @@ github:
           provider: 'codex',
           model: 'gpt-5.5',
           totalTokens: 124947,
+          source: 'actual_total'
+        }
+      });
+      await input.hooks?.onProviderActivity?.({
+        phase: 'implementation',
+        attempt: 2,
+        kind: 'lifecycle',
+        message: 'Provider usage captured.',
+        elapsedMs: 0,
+        usage: {
+          provider: 'codex',
+          model: 'gpt-5.5',
+          totalTokens: 160000,
           source: 'actual_total'
         }
       });
@@ -1359,7 +1385,12 @@ github:
     const { runDatabaseWorkerOnce } = await import('./db-worker.js');
     await runDatabaseWorkerOnce();
 
-    expect(repositoryMock.recordProviderUsage).toHaveBeenCalledWith(expect.objectContaining({
+    expect(repositoryMock.recordProviderUsage).toHaveBeenNthCalledWith(1, expect.objectContaining({
+      phase: 'implementation',
+      totalTokens: 100000,
+      usageSource: 'actual_total'
+    }));
+    expect(repositoryMock.recordProviderUsage).toHaveBeenNthCalledWith(2, expect.objectContaining({
       provider: 'codex',
       model: 'gpt-5.5',
       phase: 'review',
@@ -1368,8 +1399,13 @@ github:
       usageSource: 'actual_total',
       estimatedCostUsd: 0
     }));
+    expect(repositoryMock.recordProviderUsage).toHaveBeenNthCalledWith(3, expect.objectContaining({
+      phase: 'implementation',
+      totalTokens: 60000,
+      usageSource: 'actual_total'
+    }));
     expect(repositoryMock.finishTaskRun).toHaveBeenCalledWith(expect.objectContaining({
-      totalTokens: 124947,
+      totalTokens: 284947,
       usageSource: 'actual_total',
       actualCostUsd: null
     }));
@@ -2237,7 +2273,7 @@ github:
     });
 
     runWorkerTaskMock.mockImplementationOnce(async (input: { hooks?: { onIteration?: (iteration: { phase: 'validation'; prompt: string; resultSummary: string; diffStat: { filesChanged: number; insertions: number; deletions: number }; validationResult: { passed: boolean; exitCode: number; stderr: string; stdout: string } }) => Promise<void> } }) => {
-      const iteration = {
+      const iteration = (buildDuration: number) => ({
         phase: 'validation' as const,
         prompt: 'npm test',
         resultSummary: 'Validation failed',
@@ -2245,14 +2281,14 @@ github:
         validationResult: {
           passed: false,
           exitCode: 1,
-          stderr: 'TypeError: same failure',
-          stdout: ''
+          stderr: '',
+          stdout: `Build success in ${buildDuration}ms\nTypeError: same failure`
         }
-      };
+      });
 
-      await input.hooks?.onIteration?.(iteration);
-      await input.hooks?.onIteration?.(iteration);
-      await input.hooks?.onIteration?.(iteration);
+      await input.hooks?.onIteration?.(iteration(100));
+      await input.hooks?.onIteration?.(iteration(250));
+      await input.hooks?.onIteration?.(iteration(900));
 
       return {
         taskId: 'task_1',

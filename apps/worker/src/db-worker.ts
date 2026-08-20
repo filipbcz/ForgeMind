@@ -4,7 +4,7 @@ import { parseAgentConfigYaml, toCoreLimits, type AgentConfig } from '@forgemind
 import { activeProjectContractRequirements, DEFAULT_LIMITS, evaluateLimits, isNonBlockingDeferredValidation, requiresApproval, type Limits, type LimitUsage } from '@forgemind/core';
 import { advanceRoadmapAfterTaskCapabilityWait, advanceRoadmapAfterTaskCompletion, createRepository, getPrismaClient, startNextRoadmapStep, type AIProviderConnectionSecret, type ForgeMindRepository } from '@forgemind/db';
 import { GitHubAppAdapter, createGitHubAdapterFromEnv, type GitHubChecksResult } from '@forgemind/github';
-import { buildProjectExtensionProposalPrompt, createProvider, formatProjectExtensionProposal, type AIProvider, type ProviderSessionContext, type ReviewResult, type ValidationCheck } from '@forgemind/providers';
+import { buildProjectExtensionProposalPrompt, createProvider, formatProjectExtensionProposal, type AIProvider, type ProviderSessionContext, type ProviderUsageMeasurement, type ReviewResult, type ValidationCheck } from '@forgemind/providers';
 import type { AcceptanceEvidence, ApprovalType, Project, ProjectArchitectureUpdate, ProjectContract, ProviderKind, TaskStatus } from '@forgemind/core';
 import { toErrorMessage, type JsonValue } from '@forgemind/shared';
 import { formatProjectArchitectureContext, runWorkerTask, type WorkerTaskResult, type WorkerTaskResume } from './workflow.js';
@@ -134,6 +134,7 @@ export async function runDatabaseWorkerOnce(options: { deferInterruptSignals?: b
   let diffLines = 0;
   let repeatedErrorCount = 0;
   let lastErrorFingerprint: string | undefined;
+  const cumulativeProviderTotals = new Map<string, ProviderUsageMeasurement>();
   let lastProviderActivityAuditAt = 0;
   const measuredUsage = {
     measurements: 0,
@@ -361,36 +362,39 @@ export async function runDatabaseWorkerOnce(options: { deferInterruptSignals?: b
           });
         },
         onProviderActivity: async (activity) => {
+          let normalizedUsage: ProviderUsageMeasurement | undefined;
           if (activity.usage) {
+            const usage = normalizeProviderUsageMeasurement(activity.phase, activity.usage, cumulativeProviderTotals);
+            normalizedUsage = usage;
             measuredUsage.measurements += 1;
-            measuredUsage.totalTokens += activity.usage.totalTokens;
-            if (activity.usage.inputTokens === undefined || activity.usage.outputTokens === undefined) {
+            measuredUsage.totalTokens += usage.totalTokens;
+            if (usage.inputTokens === undefined || usage.outputTokens === undefined) {
               measuredUsage.completeBreakdown = false;
             } else {
-              measuredUsage.inputTokens += activity.usage.inputTokens;
-              measuredUsage.outputTokens += activity.usage.outputTokens;
-              measuredUsage.cachedTokens += activity.usage.cachedTokens ?? 0;
+              measuredUsage.inputTokens += usage.inputTokens;
+              measuredUsage.outputTokens += usage.outputTokens;
+              measuredUsage.cachedTokens += usage.cachedTokens ?? 0;
             }
-            if (activity.usage.actualCostUsd === undefined) {
+            if (usage.actualCostUsd === undefined) {
               measuredUsage.completeCost = false;
             } else {
-              measuredUsage.actualCostUsd += activity.usage.actualCostUsd;
+              measuredUsage.actualCostUsd += usage.actualCostUsd;
             }
 
             await repository.recordProviderUsage({
               taskId: claimed.task.id,
               taskRunId: claimed.taskRun.id,
-              provider: activity.usage.provider,
-              model: activity.usage.model,
+              provider: usage.provider,
+              model: usage.model,
               phase: activity.phase,
               attempt: activity.attempt,
-              inputTokens: activity.usage.inputTokens ?? 0,
-              outputTokens: activity.usage.outputTokens ?? 0,
-              cachedTokens: activity.usage.cachedTokens ?? 0,
-              totalTokens: activity.usage.totalTokens,
-              usageSource: activity.usage.source,
+              inputTokens: usage.inputTokens ?? 0,
+              outputTokens: usage.outputTokens ?? 0,
+              cachedTokens: usage.cachedTokens ?? 0,
+              totalTokens: usage.totalTokens,
+              usageSource: usage.source,
               estimatedCostUsd: 0,
-              actualCostUsd: activity.usage.actualCostUsd
+              actualCostUsd: usage.actualCostUsd
             });
           }
           const now = Date.now();
@@ -412,16 +416,16 @@ export async function runDatabaseWorkerOnce(options: { deferInterruptSignals?: b
               message: activity.message,
               elapsedMs: activity.elapsedMs,
               provider: activity.usage?.provider ?? (activity.phase === 'review' ? reviewerSelection.kind : getLastProviderKind()),
-              usage: activity.usage
+              usage: normalizedUsage
                 ? {
-                    provider: activity.usage.provider,
-                    model: activity.usage.model,
-                    totalTokens: activity.usage.totalTokens,
-                    inputTokens: activity.usage.inputTokens ?? null,
-                    outputTokens: activity.usage.outputTokens ?? null,
-                    cachedTokens: activity.usage.cachedTokens ?? null,
-                    source: activity.usage.source,
-                    actualCostUsd: activity.usage.actualCostUsd ?? null
+                    provider: normalizedUsage.provider,
+                    model: normalizedUsage.model,
+                    totalTokens: normalizedUsage.totalTokens,
+                    inputTokens: normalizedUsage.inputTokens ?? null,
+                    outputTokens: normalizedUsage.outputTokens ?? null,
+                    cachedTokens: normalizedUsage.cachedTokens ?? null,
+                    source: normalizedUsage.source,
+                    actualCostUsd: normalizedUsage.actualCostUsd ?? null
                   }
                 : null
             }
@@ -2408,10 +2412,12 @@ function buildIterationErrorFingerprint(phase: string, validationResult: unknown
     if (passed) return undefined;
 
     const exitCode = typeof payload.exitCode === 'number' ? payload.exitCode : 'unknown';
-    const stderr = typeof payload.stderr === 'string' && payload.stderr.trim().length > 0 ? payload.stderr.trim() : '';
-    const stdout = typeof payload.stdout === 'string' && payload.stdout.trim().length > 0 ? payload.stdout.trim() : '';
-    const signature = stderr || stdout || String(exitCode);
-    return `validation:${signature}`;
+    const command = typeof payload.failingCommand === 'string'
+      ? payload.failingCommand
+      : (typeof payload.command === 'string' ? payload.command : 'unknown');
+    const stderr = typeof payload.stderr === 'string' ? payload.stderr : '';
+    const stdout = typeof payload.stdout === 'string' ? payload.stdout : '';
+    return `validation:${command}:${exitCode}:${stableValidationFailureSignature(stderr || stdout)}`;
   }
 
   if (normalizedPhase === 'review') {
@@ -2421,6 +2427,48 @@ function buildIterationErrorFingerprint(phase: string, validationResult: unknown
   }
 
   return undefined;
+}
+
+function normalizeProviderUsageMeasurement(
+  phase: string,
+  usage: ProviderUsageMeasurement,
+  cumulativeTotals: Map<string, ProviderUsageMeasurement>
+): ProviderUsageMeasurement {
+  if (usage.source !== 'actual_total') return usage;
+
+  const stream = phase === 'review' ? 'review' : 'implementation';
+  const key = `${usage.provider}:${usage.model}:${stream}`;
+  const previous = cumulativeTotals.get(key);
+  cumulativeTotals.set(key, usage);
+  if (!previous || usage.totalTokens < previous.totalTokens) return usage;
+
+  return {
+    ...usage,
+    totalTokens: usage.totalTokens - previous.totalTokens,
+    inputTokens: subtractCumulativeValue(usage.inputTokens, previous.inputTokens),
+    outputTokens: subtractCumulativeValue(usage.outputTokens, previous.outputTokens),
+    cachedTokens: subtractCumulativeValue(usage.cachedTokens, previous.cachedTokens),
+    actualCostUsd: subtractCumulativeValue(usage.actualCostUsd, previous.actualCostUsd)
+  };
+}
+
+function subtractCumulativeValue(current: number | undefined, previous: number | undefined): number | undefined {
+  if (current === undefined || previous === undefined) return current;
+  return Math.max(0, current - previous);
+}
+
+function stableValidationFailureSignature(output: string): string {
+  const normalizedLines = output
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter(Boolean);
+  const errorLines = normalizedLines.filter((line) => /(?:error|failed|failure|exception|not assignable|missing)/i.test(line));
+  const selected = (errorLines.length > 0 ? errorLines : normalizedLines.slice(-20))
+    .slice(-20)
+    .map((line) => line
+      .replace(/\b\d+(?:\.\d+)?m?s\b/gi, '<duration>')
+      .replace(/\b[0-9a-f]{8,}\b/gi, '<id>'));
+  return selected.join('|') || 'no-output';
 }
 
 function stopSignalToTaskStatus(signal: string): TaskStatus {

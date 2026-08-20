@@ -18,6 +18,7 @@
     "test": "vitest run"
   },
   "dependencies": {
+    "@forgemind/config": "0.1.0",
     "@forgemind/core": "0.1.0",
     "@forgemind/shared": "0.1.0",
     "@prisma/client": "^6.9.0"

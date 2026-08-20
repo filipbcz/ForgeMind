@@ -184,7 +184,7 @@ describe('project roadmap generation', () => {
       summary: 'Revise supported scope.',
       steps: [],
       acceptanceCriteria: [],
-      projectContract: null,
+      projectContract: undefined,
       contractDelta: {
         baseVersion: 1,
         summary: 'Math practice application with revised documented scope.',
