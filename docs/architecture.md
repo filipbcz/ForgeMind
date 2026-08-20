@@ -2,6 +2,8 @@
 
 Aktualni architektura je PostgreSQL-backed orchestrator s worker polling modelem.
 
+Statusy v tomto dokumentu maji stejny vyznam jako v `docs/readme-parity.md`: `implemented`, `tested`, `production-verified` a `deferred`.
+
 ## 1) Monorepo komponenty
 
 - apps/studio-api: REST orchestrator pro projekty, tasky, approvals, worker status/events, webhooky.
@@ -119,9 +121,20 @@ Aktivne vynucene policy vetve:
 
 1. Single-worker model (queue-ready, ale bez multi-worker koordinace).
 2. Runtime command sandbox je zatim konzervativni, ale vyzaduje dalsi hardening allowlistu.
-3. End-to-end scenar od task creation po draft PR je funkcni po castich, formalni E2E test je dalsi krok.
+3. Representative pipeline coverage je `tested` v `apps/worker/src/mvp-scenario.test.ts` a `apps/studio-api/src/routes.test.ts`. Produkcni E2E overeni realneho GitHubu, realneho providera a nasazene PWA zustava `deferred`.
 
-## 8) Monitoring metriky
+## 8) Evidence map
+
+| Oblast | Status | Evidence |
+| --- | --- | --- |
+| REST orchestrator, task lifecycle, webhooky, approvals, notifications | `implemented`, `tested` | `apps/studio-api/src/routes.ts`; `apps/studio-api/src/routes.test.ts`; `apps/studio-api/src/webhook.test.ts`; `apps/studio-api/src/notifications.test.ts` |
+| Worker runtime, retry, validation, review, delivery checkpoints | `implemented`, `tested` | `apps/worker/src/workflow.ts`; `apps/worker/src/db-worker.ts`; `apps/worker/src/workflow.test.ts`; `apps/worker/src/db-worker.test.ts`; `apps/worker/src/mvp-scenario.test.ts` |
+| PostgreSQL queue, project contract, acceptance evidence, architecture versions | `implemented`, `tested` | `packages/db/prisma/schema.prisma`; `packages/db/src/repository.ts`; `packages/db/src/repository.task-run.test.ts`; `packages/core/src` |
+| GitHub adapter boundary | `implemented`, `tested` | `packages/github/src/index.ts`; `packages/github/src/index.test.ts` |
+| Provider adapter boundary | `implemented`, `tested` | `packages/providers/src/provider.ts`; `packages/providers/src/codex-provider.ts`; `packages/providers/src/openai-provider.test.ts`; `apps/worker/src/db-worker.test.ts` |
+| Production verification of full platform behavior | `deferred` | `docs/roadmap-quality-implementation-plan.md`; `docs/deploy-raspberry.md` |
+
+## 9) Monitoring metriky
 
 Aktualni endpoint `/api/metrics` publikuje agregovane metriky z DB snapshotu:
 
@@ -131,7 +144,7 @@ Aktualni endpoint `/api/metrics` publikuje agregovane metriky z DB snapshotu:
 - run metriky (`forgemind_runs_*`, `forgemind_run_duration_seconds_*`).
 - cas generovani snapshotu (`forgemind_metrics_generated_at_unix`).
 
-## 9) Push notifikace
+## 10) Push notifikace
 
 - Mobile PWA registruje Service Worker a vytvari PushManager subscription pres VAPID public key (`/api/notifications/vapid-public-key`).
 - Subscription metadata se uklada do `notification_subscriptions`, user preference do `notification_settings`.

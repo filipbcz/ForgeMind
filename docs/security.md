@@ -2,6 +2,8 @@
 
 Tento dokument je provozni baseline pro ForgeMind MVP. Cilem je mit jasne hranice bezpecnosti pro worker, API a jejich integrace.
 
+Statusy v tomto dokumentu maji stejny vyznam jako v `docs/readme-parity.md`: `implemented`, `tested`, `production-verified` a `deferred`.
+
 ## 1) Security baseline (plati vzdy)
 
 1. Worker nesmi bezet jako root a nesmi pouzivat sudo.
@@ -11,17 +13,17 @@ Tento dokument je provozni baseline pro ForgeMind MVP. Cilem je mit jasne hranic
 5. Kazdy task musi mit provozni limity: iterace, runtime, diff, pocet souboru a opakovane chyby.
 6. Worker smi zapisovat pouze do vyhrazenych workspace cest.
 
-## 2) Co je implementovane ted
+## 2) Security status a evidence
 
-1. Worker bezi v oddelene service identite (systemd user/group forgemind-agent).
-2. Queue je persistovana v PostgreSQL a ma claim/recovery/retry semantiku.
-3. Worker policy enforcement je aktivni:
-- tokeny a cena se zaznamenavaji pro reporting, ale nezastavuji beh
-- opakovane stejne chyby zastavi beh (repeated_error_detected)
-- max iterace zastavi beh (iteration_limit_reached)
-- provider selhani je mapovano na provider_failed
-4. GitHub webhook endpoint overuje podpis pomoci x-hub-signature-256.
-5. Risky outcome vytvari approval a beh se zastavi ve stavu needs_approval.
+| Oblast | Status | Evidence |
+| --- | --- | --- |
+| Worker service identity and systemd sandboxing profile | `implemented` | `infra/systemd/forgemind-worker.service`; `docs/deploy-oci.md`; `docs/deploy-raspberry.md` |
+| PostgreSQL queue claim/recovery/retry semantika | `implemented`, `tested` | `packages/db/src/repository.ts`; `packages/db/src/repository.task-run.test.ts`; `apps/worker/src/db-worker.test.ts` |
+| Worker policy: repeated error, max iterations, provider failure, approval stop | `implemented`, `tested` | `apps/worker/src/db-worker.ts`; `apps/worker/src/workflow.ts`; `apps/worker/src/db-worker.test.ts`; `apps/worker/src/workflow.test.ts` |
+| GitHub webhook `x-hub-signature-256` verification | `implemented`, `tested` | `apps/studio-api/src/webhook.ts`; `apps/studio-api/src/webhook.test.ts`; `apps/studio-api/src/routes.test.ts` |
+| Persistent GitHub credential encryption | `implemented`, `tested` | `packages/db/src/credentials.ts`; `packages/db/src/repository.ts`; `apps/studio-api/src/routes.ts`; `apps/studio-api/src/routes.test.ts` |
+| Central secret redaction across all provider output and logs | `deferred` | Future roadmap step "Redact Secrets From Logs Audits And Provider Output" |
+| Production verification of these controls | `deferred` | Future controlled production verification in `docs/roadmap-quality-implementation-plan.md` |
 
 ## 3) Secrets handling standard
 
@@ -55,7 +57,7 @@ Tento dokument je provozni baseline pro ForgeMind MVP. Cilem je mit jasne hranic
 ## 5) Validation command sandbox
 
 1. Validation command nesmi byt libovolny shell text bez kontroly.
-2. Pred produkci musi byt zavedena allowlist politika prikazu z projektove konfigurace.
+2. Allowlist politika prikazu z projektove konfigurace je `deferred`; aktualni implementace ma konzervativni guard pro vybrane zakazane patterns a workspace scope.
 3. Zakazane command patterns:
 - sudo
 - rm -rf /
@@ -102,5 +104,5 @@ Doporucene doplneni pred produkci:
 
 Krok je povazovan za hotovy, pokud:
 1. Tento dokument odpovida aktualnimu runtime chovani API a workeru.
-2. Je zde jasne oddeleno co je implementovane a co je povinne pred produkci.
+2. Je zde jasne oddeleno co je `implemented`, `tested`, `production-verified` a `deferred`.
 3. Systemd, secrets, sandbox a retention maji konkretni provozni pravidla.

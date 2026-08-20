@@ -1549,9 +1549,23 @@ Aktualni parity status mezi README pozadavky a implementaci je veden v:
 - `docs/readme-parity.md` (mapovani pozadavek -> implementace/odlozeni)
 - `docs/implementation-tracker.md` (krokovy stav + prubezne overeni)
 
-Finalni acceptance validace pro MVP delta:
+Statusy v dokumentaci jsou:
+
+- `implemented`: existuje runtime implementace nebo dokumentovana konfigurace v repozitari.
+- `tested`: existuje executable test reference nebo validacni prikaz.
+- `production-verified`: existuje explicitni produkcni overeni.
+- `deferred`: oblast je vedome mimo aktualni scope nebo ceka na rucni/produkci schopne overeni.
+
+Aktualni stav tohoto repozitare:
+
+- README MVP runtime parity je `implemented` a reprezentativni pipeline coverage je `tested`; evidence je v `docs/readme-parity.md`, `apps/worker/src/mvp-scenario.test.ts` a `apps/studio-api/src/routes.test.ts`.
+- Produkcni overeni realneho GitHubu, realneho providera a nasazene PWA je `deferred`.
+- Automaticky merge do `main` a automaticky produkcni deploy projektu spravovanych ForgeMindem zustavaji `deferred` a mimo MVP scope.
+
+Autoritativni release validace pro MVP delta:
 
 - `npm run build`
+- `npm run typecheck`
 - `npm test`
 
 ## 31. Produkcni provoz ForgeMind
