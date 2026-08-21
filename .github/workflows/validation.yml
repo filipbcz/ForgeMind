@@ -12,6 +12,22 @@ permissions:
 jobs:
   validate:
     runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_DB: forgemind_validation
+          POSTGRES_USER: forgemind
+          POSTGRES_PASSWORD: forgemind
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U forgemind -d forgemind_validation"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    env:
+      MIGRATION_DATABASE_URL: postgresql://forgemind:forgemind@127.0.0.1:5432/forgemind_validation
 
     steps:
       - uses: actions/checkout@v4
