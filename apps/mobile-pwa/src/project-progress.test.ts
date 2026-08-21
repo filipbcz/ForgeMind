@@ -51,8 +51,9 @@ describe('summarizeProjectProgress', () => {
       steps: [{
         id: 'step_1', projectId: 'project_1', cycleId: 'cycle_1', sequenceNumber: 1,
         title: 'Only step', description: 'Done', acceptanceCriteria: ['Done'], requirementIds: ['REQ-1'],
-        deliverables: ['Feature'], changeRationale: 'Finish the only step.', dependsOnStepTitles: [], validationFocus: [],
-        status: 'completed', taskId: 'task_1', createdAt: '2026-08-10T00:00:00.000Z', updatedAt: '2026-08-10T00:00:00.000Z'
+        deliverables: ['Feature'], changeRationale: 'Complete the only planned capability.',
+        dependsOnStepTitles: [], validationFocus: [], status: 'completed', taskId: 'task_1',
+        createdAt: '', updatedAt: ''
       }]
     });
 

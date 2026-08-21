@@ -25,9 +25,6 @@
     "db:seed": "tsx packages/db/prisma/seed.ts",
     "qualify:reference": "node qualification/reference-project/run.mjs"
   },
-  "prisma": {
-    "schema": "packages/db/prisma/schema.prisma"
-  },
   "devDependencies": {
     "@types/node": "^22.15.29",
     "prisma": "^6.9.0",

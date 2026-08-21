@@ -1,4 +1,5 @@
 import type { ForgeTask, Project, ProjectImplementationStep, ProjectRoadmapCycle } from '@forgemind/core';
+import { parseAgentConfigYaml } from '@forgemind/config';
 import type { ForgeMindRepository } from './repository.js';
 
 export interface RoadmapAdvanceResult {
@@ -123,10 +124,19 @@ export async function startNextRoadmapStep(
         futureSteps
       }),
       mode: project.defaultTaskMode ?? 'safe',
-      maxIterations: 10,
+      maxIterations: resolveProjectMaxIterations(project.configYaml),
       maxBudgetUsd: 5,
       architectureVersionId: project.currentArchitectureVersionId ?? cycle.architectureVersionId
   });
+}
+
+function resolveProjectMaxIterations(configYaml: string | undefined): number {
+  if (!configYaml) return 10;
+  try {
+    return parseAgentConfigYaml(configYaml).limits.max_iterations;
+  } catch {
+    return 10;
+  }
 }
 
 export function buildRoadmapStepTaskPrompt(input: {
