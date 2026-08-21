@@ -18,7 +18,8 @@
     "dev:api": "npm run dev -w @forgemind/studio-api",
     "dev:mobile": "npm run dev -w @forgemind/mobile-pwa --",
     "dev:worker": "npm run dev -w @forgemind/worker",
-    "test": "npm run guard:workspace-tests && npm run test:workspaces",
+    "test": "npm run guard:workspace-tests && npm run test:migrations && npm run test:workspaces",
+    "test:migrations": "node scripts/validate-migrations.mjs",
     "test:workspaces": "node scripts/run-workspace-tests.mjs",
     "guard:workspace-tests": "node scripts/guard-workspace-tests.mjs",
     "typecheck": "tsc -b",
@@ -29,6 +30,7 @@
   },
   "devDependencies": {
     "@types/node": "^22.15.29",
+    "pg": "^8.16.3",
     "prisma": "^6.9.0",
     "playwright-core": "^1.54.2",
     "tsup": "^8.5.0",
