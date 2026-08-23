@@ -61,8 +61,11 @@ export function buildWebSocketUrl(taskId?: string): string {
 
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
   const hasBody = init?.body !== undefined && init?.body !== null;
+  const method = init?.method?.toUpperCase() ?? 'GET';
+  const isMutation = ['POST', 'PUT', 'PATCH', 'DELETE'].includes(method);
   const headers: HeadersInit = {
     ...(hasBody ? { 'Content-Type': 'application/json' } : {}),
+    ...(isMutation ? { 'X-ForgeMind-CSRF': '1' } : {}),
     ...init?.headers
   };
 

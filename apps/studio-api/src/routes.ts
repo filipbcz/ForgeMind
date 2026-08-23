@@ -1907,7 +1907,8 @@ function readSessionId(request: FastifyRequest): string | undefined {
 }
 
 function serializeSessionCookie(sessionId: string): string {
-  return `forgemind_session=${encodeURIComponent(sessionId)}; HttpOnly; SameSite=Lax; Path=/`;
+  const secure = process.env.FORGEMIND_SESSION_COOKIE_SECURE === 'true' ? '; Secure' : '';
+  return `forgemind_session=${encodeURIComponent(sessionId)}; HttpOnly; SameSite=Lax; Path=/${secure}`;
 }
 
 function requiresOwnerRole(request: FastifyRequest): boolean {
