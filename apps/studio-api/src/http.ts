@@ -1,4 +1,5 @@
 import type { FastifyReply } from 'fastify';
+import { redactError, redactSecrets } from '@forgemind/core';
 import { ZodError } from 'zod';
 
 export function sendNotFound(reply: FastifyReply, message = 'Not found') {
@@ -9,12 +10,11 @@ export function sendBadRequest(reply: FastifyReply, error: unknown) {
   if (error instanceof ZodError) {
     return reply.code(400).send({
       error: 'Validation failed',
-      issues: error.issues
+      issues: redactSecrets(error.issues)
     });
   }
 
   return reply.code(400).send({
-    error: error instanceof Error ? error.message : String(error)
+    error: redactError(error)
   });
 }
-

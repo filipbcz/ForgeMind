@@ -1,5 +1,6 @@
 import cors from '@fastify/cors';
 import { createRepository, getPrismaClient } from '@forgemind/db';
+import { redactError } from '@forgemind/core';
 import type { AuditEvent } from '@forgemind/core';
 import Fastify from 'fastify';
 import type { FastifyInstance, FastifyReply, FastifyRequest } from 'fastify';
@@ -46,11 +47,25 @@ export async function createApp() {
 
   const app = Fastify({
     logger: {
-      level: process.env.LOG_LEVEL ?? 'info'
+      level: process.env.LOG_LEVEL ?? 'info',
+      redact: [
+        'req.headers.authorization',
+        'req.headers.cookie',
+        'headers.authorization',
+        'headers.cookie',
+        '*.apiKey',
+        '*.api_key',
+        '*.token',
+        '*.accessToken',
+        '*.access_token',
+        '*.password',
+        '*.secret'
+      ]
     },
     bodyLimit: requestBodyLimit
   });
 
+  registerErrorRedaction(app);
   await registerHttpGuardrails(app, allowedCorsOrigins);
   await app.register(rawBody, {
     field: 'rawBody',
@@ -68,6 +83,20 @@ export async function createApp() {
   startTaskNotificationBridge(app, repository, notificationService, realtime);
 
   return app;
+}
+
+export function registerErrorRedaction(app: FastifyInstance) {
+  app.setErrorHandler((error, request, reply) => {
+    const redactedMessage = redactError(error);
+    const statusCode = typeof error === 'object'
+      && error !== null
+      && 'statusCode' in error
+      && typeof error.statusCode === 'number'
+      ? error.statusCode
+      : 500;
+    request.log.error({ error: redactedMessage }, 'request failed');
+    return reply.code(statusCode >= 400 ? statusCode : 500).send({ error: redactedMessage });
+  });
 }
 
 export async function registerHttpGuardrails(app: FastifyInstance, allowedCorsOrigins = resolveAllowedCorsOrigins()) {
