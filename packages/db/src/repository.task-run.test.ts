@@ -213,7 +213,7 @@ function createMockPrisma() {
         updatedAt: new Date()
       }))
     },
-    approval: { create: vi.fn(), findMany: vi.fn(), findUnique: vi.fn(), update: vi.fn() },
+    approval: { create: vi.fn(), findMany: vi.fn(), findUnique: vi.fn(), update: vi.fn(), updateMany: vi.fn() },
     providerUsage: { create: vi.fn(), findMany: vi.fn() },
     auditLog: { create: vi.fn(async () => ({ id: 'audit_1', createdAt: new Date() })), findMany: vi.fn() },
     notificationSettings: { findUnique: vi.fn(), upsert: vi.fn() },
@@ -893,6 +893,35 @@ describe('ForgeMindRepository task runs', () => {
       key: 'external:merge_pr',
       status: 'completed',
       inputHash: 'input-sha'
+    }));
+  });
+
+  it('atomically consumes an approved risk approval once', async () => {
+    const { prisma } = createMockPrisma();
+    prisma.approval.updateMany
+      .mockResolvedValueOnce({ count: 1 })
+      .mockResolvedValueOnce({ count: 0 });
+    const repository = new ForgeMindRepository(prisma);
+
+    await expect(repository.consumeRiskApproval('approval_1')).resolves.toBe(true);
+    await expect(repository.consumeRiskApproval('approval_1')).resolves.toBe(false);
+
+    expect(prisma.approval.updateMany).toHaveBeenCalledWith({
+      where: {
+        id: 'approval_1',
+        status: 'approved'
+      },
+      data: {
+        status: 'cancelled',
+        resolvedAt: expect.any(Date)
+      }
+    });
+    expect(prisma.auditLog.create).toHaveBeenCalledWith(expect.objectContaining({
+      data: expect.objectContaining({
+        actorType: 'system',
+        eventType: 'approval_consumed',
+        payload: { approvalId: 'approval_1' }
+      })
     }));
   });
 });

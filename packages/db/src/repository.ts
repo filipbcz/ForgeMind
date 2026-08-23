@@ -3985,6 +3985,31 @@ export class ForgeMindRepository {
     return toApproval(updated);
   }
 
+  async consumeRiskApproval(approvalId: string): Promise<boolean> {
+    const result = await this.prisma.approval.updateMany({
+      where: {
+        id: approvalId,
+        status: 'approved'
+      },
+      data: {
+        status: 'cancelled',
+        resolvedAt: new Date()
+      }
+    });
+
+    if (result.count === 0) {
+      return false;
+    }
+
+    await this.writeAudit({
+      actorType: 'system',
+      eventType: 'approval_consumed',
+      payload: { approvalId }
+    });
+
+    return true;
+  }
+
   async listTaskAudit(taskId: string): Promise<AuditEvent[]> {
     const events = await this.prisma.auditLog.findMany({
       where: { taskId },

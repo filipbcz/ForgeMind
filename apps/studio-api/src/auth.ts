@@ -31,6 +31,7 @@ interface PendingAuthState {
 export class AuthService {
   private readonly pendingStates = new Map<string, PendingAuthState>();
   private readonly sessionsByUser = new Map<string, AuthSession>();
+  private readonly sessionsById = new Map<string, AuthSession>();
 
   startGitHubLogin(): AuthStartResult {
     if (!process.env.GITHUB_CLIENT_ID || !process.env.GITHUB_CALLBACK_URL) {
@@ -82,7 +83,12 @@ export class AuthService {
       providerAccess: 'pending_token_exchange'
     };
 
+    const previousSession = this.sessionsByUser.get(user.id);
+    if (previousSession) {
+      this.sessionsById.delete(previousSession.id);
+    }
     this.sessionsByUser.set(user.id, session);
+    this.sessionsById.set(session.id, session);
 
     return {
       session,
@@ -91,7 +97,11 @@ export class AuthService {
   }
 
   logout(userId: string) {
+    const session = this.sessionsByUser.get(userId);
     const hadSession = this.sessionsByUser.delete(userId);
+    if (session) {
+      this.sessionsById.delete(session.id);
+    }
     return {
       userId,
       loggedOut: hadSession
@@ -100,6 +110,10 @@ export class AuthService {
 
   getSession(userId: string) {
     return this.sessionsByUser.get(userId) ?? null;
+  }
+
+  getSessionById(sessionId: string) {
+    return this.sessionsById.get(sessionId) ?? null;
   }
 }
 

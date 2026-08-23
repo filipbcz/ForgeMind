@@ -20,6 +20,13 @@ const TERMINAL_FAILURE_STATUSES = new Set([
   'approval_rejected'
 ]);
 
+const DEFAULT_CORS_ORIGINS = [
+  'http://localhost:5173',
+  'http://127.0.0.1:5173',
+  'http://localhost:4000',
+  'http://127.0.0.1:4000'
+];
+
 export async function createApp() {
   const app = Fastify({
     logger: {
@@ -28,7 +35,14 @@ export async function createApp() {
   });
 
   await app.register(cors, {
-    origin: true,
+    origin: (origin, callback) => {
+      if (!origin || resolveAllowedCorsOrigins().has(origin)) {
+        callback(null, true);
+        return;
+      }
+      callback(null, false);
+    },
+    credentials: true,
     methods: ['GET', 'HEAD', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS']
   });
   await app.register(rawBody, {
@@ -47,6 +61,14 @@ export async function createApp() {
   startTaskNotificationBridge(app, repository, notificationService, realtime);
 
   return app;
+}
+
+function resolveAllowedCorsOrigins(): Set<string> {
+  const configured = process.env.FORGEMIND_CORS_ORIGINS
+    ?.split(',')
+    .map((origin) => origin.trim())
+    .filter(Boolean);
+  return new Set(configured?.length ? configured : DEFAULT_CORS_ORIGINS);
 }
 
 function startTaskNotificationBridge(
