@@ -28,6 +28,23 @@ describe('Studio API server', () => {
     expect(response.headers['access-control-allow-methods']).toContain(method);
   });
 
+  it('does not allow credentialed API requests from arbitrary origins', async () => {
+    app = await createApp();
+
+    const response = await app.inject({
+      method: 'OPTIONS',
+      url: '/api/projects/project_1',
+      headers: {
+        origin: 'https://attacker.example',
+        'access-control-request-method': 'PATCH',
+        'access-control-request-headers': 'content-type'
+      }
+    });
+
+    expect(response.statusCode).toBe(404);
+    expect(response.headers['access-control-allow-origin']).toBeUndefined();
+  });
+
   it('does not overlap notification polling while a database query is still running', async () => {
     vi.useFakeTimers();
     let finishPoll: (() => void) | undefined;

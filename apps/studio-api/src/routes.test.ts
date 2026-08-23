@@ -1,12 +1,13 @@
 import Fastify from 'fastify';
 import rawBody from 'fastify-raw-body';
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, expect, it, vi } from 'vitest';
 import type { AIProvider, CostEstimateResult, ImplementInput, ImplementResult, PlanInput, PlanResult, ReviewInput, ReviewResult } from '@forgemind/providers';
 import type { GitHubAdapter } from '@forgemind/github';
 import { createAuthService } from './auth.js';
+import type { AuthService, AuthUser } from './auth.js';
 import { createNotificationService } from './notifications.js';
 import { registerRoutes } from './routes.js';
 import { signGitHubWebhookPayload } from './webhook.js';
@@ -28,7 +29,347 @@ async function loadRunWorkerTask() {
   return module.runWorkerTask;
 }
 
+function createAuthenticatedHeaders(auth: AuthService, user: AuthUser): Record<string, string> {
+  const previousClientId = process.env.GITHUB_CLIENT_ID;
+  const previousCallbackUrl = process.env.GITHUB_CALLBACK_URL;
+  process.env.GITHUB_CLIENT_ID = 'github-client-id';
+  process.env.GITHUB_CALLBACK_URL = 'http://localhost:4000/api/auth/github/callback';
+
+  try {
+    const login = auth.startGitHubLogin();
+    const { session } = auth.completeGitHubCallback({ code: 'test-github-code', state: login.state }, user);
+    return { authorization: `Bearer ${session.id}` };
+  } finally {
+    restoreEnv('GITHUB_CLIENT_ID', previousClientId);
+    restoreEnv('GITHUB_CALLBACK_URL', previousCallbackUrl);
+  }
+}
+
+const ownerUser: AuthUser = { id: 'user_1', email: 'owner@example.com', name: 'Owner', role: 'owner' };
+
+function createOwnerAuthenticatedHeaders(auth: AuthService): Record<string, string> {
+  return createAuthenticatedHeaders(auth, ownerUser);
+}
+
+function withRiskApproval(headers: Record<string, string>, approvalId = 'approval_risk_1'): Record<string, string> {
+  return { ...headers, 'x-forgemind-approval-id': approvalId };
+}
+
+function requireSetCookieHeader(header: string | string[] | undefined): string {
+  const value = Array.isArray(header) ? header[0] : header;
+  if (!value) {
+    throw new Error('Expected Set-Cookie header.');
+  }
+  return value;
+}
+
+function approvedRiskApproval(
+  type: string,
+  id = 'approval_risk_1',
+  mutation?: { method: string; path: string; body?: unknown; actorId?: string }
+) {
+  return {
+    id,
+    taskId: 'task_1',
+    type,
+    status: 'approved',
+    requestedBy: 'agent',
+    title: 'Approved risky operation',
+    description: 'The requested risky mutation was approved explicitly.',
+    riskLevel: 'high',
+    payload: mutation
+      ? {
+          apiMutation: {
+            method: mutation.method,
+            path: mutation.path,
+            actorId: mutation.actorId ?? ownerUser.id,
+            bodyHash: hashApiMutationBody(mutation.body ?? null)
+          }
+        }
+      : {},
+    createdAt: new Date().toISOString(),
+    resolvedAt: new Date().toISOString()
+  };
+}
+
+function hashApiMutationBody(body: unknown): string {
+  return createHash('sha256').update(stableJson(body)).digest('hex');
+}
+
+function stableJson(value: unknown): string {
+  if (value === null || typeof value !== 'object') {
+    return JSON.stringify(value);
+  }
+  if (Array.isArray(value)) {
+    return `[${value.map(stableJson).join(',')}]`;
+  }
+  const entries = Object.entries(value as Record<string, unknown>)
+    .filter(([, item]) => item !== undefined)
+    .sort(([left], [right]) => left.localeCompare(right));
+  return `{${entries.map(([key, item]) => `${JSON.stringify(key)}:${stableJson(item)}`).join(',')}}`;
+}
+
+const mutatingEndpointInventory = [
+  ['PUT', '/api/worker/queue'],
+  ['POST', '/api/auth/logout'],
+  ['POST', '/api/providers/models'],
+  ['POST', '/api/providers/codex/oauth/start'],
+  ['POST', '/api/github/connect'],
+  ['POST', '/api/github/disconnect'],
+  ['POST', '/api/providers/codex/oauth/complete'],
+  ['POST', '/api/providers/connect'],
+  ['DELETE', '/api/providers/connections/connection_1'],
+  ['POST', '/api/projects'],
+  ['PATCH', '/api/projects/project_1'],
+  ['DELETE', '/api/projects/project_1'],
+  ['POST', '/api/projects/project_1/github-repository'],
+  ['PUT', '/api/projects/project_1/config'],
+  ['POST', '/api/projects/project_1/audit/retry'],
+  ['POST', '/api/projects/project_1/audit/start'],
+  ['POST', '/api/projects/project_1/implementation-steps/start-next'],
+  ['POST', '/api/projects/project_1/implementation-steps/generate'],
+  ['POST', '/api/projects/project_1/extension/decision'],
+  ['POST', '/api/tasks'],
+  ['POST', '/api/tasks/task_1/start'],
+  ['POST', '/api/tasks/task_1/cancel'],
+  ['POST', '/api/tasks/task_1/retry'],
+  ['POST', '/api/tasks/task_1/complete'],
+  ['POST', '/api/approvals/approval_1/approve'],
+  ['POST', '/api/approvals/approval_1/reject'],
+  ['POST', '/api/approvals/approval_1/comment'],
+  ['POST', '/api/notifications/subscribe'],
+  ['POST', '/api/notifications/unsubscribe'],
+  ['PUT', '/api/notifications/settings']
+] as const;
+
 describe('Studio API routes', () => {
+  it('rejects mutating API requests when auth service is not configured', async () => {
+    const repository = {
+      createTask: vi.fn(),
+      getCurrentUser: vi.fn()
+    };
+    const app = Fastify();
+    registerRoutes(app, repository as never);
+
+    const response = await app.inject({
+      method: 'POST',
+      url: '/api/tasks',
+      payload: {}
+    });
+
+    expect(response.statusCode).toBe(503);
+    expect(response.json()).toEqual({ error: 'Auth service is not configured for mutating API requests.' });
+    expect(repository.getCurrentUser).not.toHaveBeenCalled();
+    expect(repository.createTask).not.toHaveBeenCalled();
+    await app.close();
+  });
+
+  it.each(mutatingEndpointInventory)('rejects anonymous %s %s before route handlers execute', async (method, url) => {
+    const repository = {
+      createTask: vi.fn(),
+      getCurrentUser: vi.fn()
+    };
+    const app = Fastify();
+    registerRoutes(app, repository as never, undefined, createAuthService());
+
+    const response = await app.inject({
+      method,
+      url,
+      payload: {}
+    });
+
+    expect(response.statusCode).toBe(401);
+    expect(response.json()).toEqual({ error: 'Authentication required for mutating API requests.' });
+    expect(repository.getCurrentUser).not.toHaveBeenCalled();
+    expect(repository.createTask).not.toHaveBeenCalled();
+    await app.close();
+  });
+
+  it('requires explicit approved approval before risky mutations execute', async () => {
+    const auth = createAuthService();
+    const repository = {
+      getCurrentUser: vi.fn(async () => ownerUser),
+      getApproval: vi.fn(),
+      setWorkerQueuePaused: vi.fn()
+    };
+    const app = Fastify();
+    registerRoutes(app, repository as never, undefined, auth);
+
+    const response = await app.inject({
+      method: 'PUT',
+      url: '/api/worker/queue',
+      headers: createOwnerAuthenticatedHeaders(auth),
+      payload: { paused: true }
+    });
+
+    expect(response.statusCode).toBe(403);
+    expect(response.json()).toEqual({ error: 'Approved config_change approval required for this mutation.' });
+    expect(repository.setWorkerQueuePaused).not.toHaveBeenCalled();
+    await app.close();
+  });
+
+  it('rejects risky approvals that are not bound to the exact mutation', async () => {
+    const auth = createAuthService();
+    const repository = {
+      getCurrentUser: vi.fn(async () => ownerUser),
+      getApproval: vi.fn(async (id: string) => {
+        if (id === 'approval_wrong_body') return approvedRiskApproval('config_change', id, {
+          method: 'PUT',
+          path: '/api/worker/queue',
+          body: { paused: false }
+        });
+        if (id === 'approval_wrong_actor') return approvedRiskApproval('config_change', id, {
+          method: 'PUT',
+          path: '/api/worker/queue',
+          body: { paused: true },
+          actorId: 'user_2'
+        });
+        return undefined;
+      }),
+      consumeRiskApproval: vi.fn(),
+      setWorkerQueuePaused: vi.fn()
+    };
+    const app = Fastify();
+    const headers = createOwnerAuthenticatedHeaders(auth);
+    registerRoutes(app, repository as never, undefined, auth);
+
+    const wrongBodyResponse = await app.inject({
+      method: 'PUT',
+      url: '/api/worker/queue',
+      headers: withRiskApproval(headers, 'approval_wrong_body'),
+      payload: { paused: true }
+    });
+    const wrongActorResponse = await app.inject({
+      method: 'PUT',
+      url: '/api/worker/queue',
+      headers: withRiskApproval(headers, 'approval_wrong_actor'),
+      payload: { paused: true }
+    });
+
+    expect(wrongBodyResponse.statusCode).toBe(403);
+    expect(wrongActorResponse.statusCode).toBe(403);
+    expect(repository.setWorkerQueuePaused).not.toHaveBeenCalled();
+    await app.close();
+  });
+
+  it('rejects reused risky approval ids after successful execution', async () => {
+    const auth = createAuthService();
+    const repository = {
+      getCurrentUser: vi.fn(async () => ownerUser),
+      getApproval: vi.fn(async (id: string) => id === 'approval_queue_pause'
+        ? approvedRiskApproval('config_change', id, {
+            method: 'PUT',
+            path: '/api/worker/queue',
+            body: { paused: true }
+          })
+        : undefined),
+      consumeRiskApproval: vi.fn()
+        .mockResolvedValueOnce(true)
+        .mockResolvedValueOnce(false),
+      setWorkerQueuePaused: vi.fn(async (paused: boolean) => ({
+        queuePaused: paused,
+        pausedAt: paused ? new Date().toISOString() : undefined,
+        updatedAt: new Date().toISOString()
+      })),
+      getWorkerStatus: vi.fn(async () => ({
+        state: 'idle',
+        queuePaused: true,
+        queuedTaskCount: 0,
+        activeTaskCount: 0,
+        updatedAt: new Date().toISOString()
+      }))
+    };
+    const app = Fastify();
+    const headers = createOwnerAuthenticatedHeaders(auth);
+    registerRoutes(app, repository as never, undefined, auth);
+
+    const firstResponse = await app.inject({
+      method: 'PUT',
+      url: '/api/worker/queue',
+      headers: withRiskApproval(headers, 'approval_queue_pause'),
+      payload: { paused: true }
+    });
+    const secondResponse = await app.inject({
+      method: 'PUT',
+      url: '/api/worker/queue',
+      headers: withRiskApproval(headers, 'approval_queue_pause'),
+      payload: { paused: true }
+    });
+
+    expect(firstResponse.statusCode).toBe(200);
+    expect(secondResponse.statusCode).toBe(403);
+    expect(repository.setWorkerQueuePaused).toHaveBeenCalledOnce();
+    await app.close();
+  });
+
+  it('rejects non-owner principals for approval mutations before resolving approvals', async () => {
+    const operator = { id: 'user_1', email: 'operator@example.com', name: 'Operator', role: 'operator' as const };
+    const auth = createAuthService();
+    const repository = {
+      getCurrentUser: vi.fn(async () => operator),
+      getApproval: vi.fn(async () => ({
+        id: 'approval_1',
+        taskId: 'task_1',
+        type: 'new_dependency',
+        status: 'pending',
+        requestedBy: 'agent',
+        title: 'Approval required',
+        description: 'Approve dependency update',
+        riskLevel: 'medium',
+        payload: {},
+        createdAt: new Date().toISOString()
+      })),
+      resolveApproval: vi.fn()
+    };
+    const app = Fastify();
+    registerRoutes(app, repository as never, undefined, auth);
+
+    const response = await app.inject({
+      method: 'POST',
+      url: '/api/approvals/approval_1/approve',
+      headers: createAuthenticatedHeaders(auth, operator)
+    });
+
+    expect(response.statusCode).toBe(403);
+    expect(response.json()).toEqual({ error: 'Owner role required for this mutation.' });
+    expect(repository.getApproval).not.toHaveBeenCalled();
+    expect(repository.resolveApproval).not.toHaveBeenCalled();
+    await app.close();
+  });
+
+  it('requires pending approval state before approval execution', async () => {
+    const owner = { id: 'user_1', email: 'owner@example.com', name: 'Owner', role: 'owner' as const };
+    const auth = createAuthService();
+    const repository = {
+      getCurrentUser: vi.fn(async () => owner),
+      getApproval: vi.fn(async () => ({
+        id: 'approval_1',
+        taskId: 'task_1',
+        type: 'risky_refactor',
+        status: 'approved',
+        requestedBy: 'agent',
+        title: 'Approval required',
+        description: 'Already approved.',
+        riskLevel: 'high',
+        createdAt: new Date().toISOString()
+      })),
+      resolveApproval: vi.fn()
+    };
+    const app = Fastify();
+    registerRoutes(app, repository as never, undefined, auth);
+
+    const response = await app.inject({
+      method: 'POST',
+      url: '/api/approvals/approval_1/approve',
+      headers: createAuthenticatedHeaders(auth, owner)
+    });
+
+    expect(response.statusCode).toBe(409);
+    expect(response.json()).toEqual({ error: 'Only a pending approval can be approved.' });
+    expect(repository.resolveApproval).not.toHaveBeenCalled();
+    await app.close();
+  });
+
   it('returns the current project specification and its version history', async () => {
     const current = {
       id: 'spec_2', projectId: 'project_1', version: 2,
@@ -78,6 +419,7 @@ describe('Studio API routes', () => {
       steps: [], evidence: [], capabilities: [], auditJobs: []
     };
     const repository = {
+      getCurrentUser: vi.fn(async () => ownerUser),
       getProject: vi.fn(async () => ({
         id: 'project_1', name: 'Project', slug: 'project', defaultBranch: 'main',
         brief: 'Initial project brief long enough.', isActive: true, createdAt: '', updatedAt: ''
@@ -91,11 +433,14 @@ describe('Studio API routes', () => {
       createProjectRoadmapCycle: vi.fn()
     };
     const app = Fastify();
-    registerRoutes(app, repository as never);
+    const auth = createAuthService();
+    const headers = createOwnerAuthenticatedHeaders(auth);
+    registerRoutes(app, repository as never, undefined, auth);
 
     const response = await app.inject({
       method: 'POST',
       url: '/api/projects/project_1/extension/decision',
+      headers,
       payload: { approved: true, cycleId: 'cycle_1' }
     });
 
@@ -118,13 +463,16 @@ describe('Studio API routes', () => {
       }]
     };
     const repository = {
+      getCurrentUser: vi.fn(async () => ownerUser),
       getProjectRoadmap: vi.fn(async () => roadmap),
       enqueueProjectAudit: vi.fn(async () => ({ enqueued: true, job: roadmap.auditJobs[0] }))
     };
     const app = Fastify();
-    registerRoutes(app, repository as never);
+    const auth = createAuthService();
+    const headers = createOwnerAuthenticatedHeaders(auth);
+    registerRoutes(app, repository as never, undefined, auth);
 
-    const response = await app.inject({ method: 'POST', url: '/api/projects/project_1/audit/retry' });
+    const response = await app.inject({ method: 'POST', url: '/api/projects/project_1/audit/retry', headers });
 
     expect(response.statusCode).toBe(200);
     expect(repository.enqueueProjectAudit).toHaveBeenCalledWith({
@@ -145,6 +493,7 @@ describe('Studio API routes', () => {
       evidence: [], capabilities: [], auditJobs: []
     };
     const repository = {
+      getCurrentUser: vi.fn(async () => ownerUser),
       getProject: vi.fn(async () => ({
         id: 'project_1', name: 'Project',
         projectContract: {
@@ -156,9 +505,11 @@ describe('Studio API routes', () => {
       enqueueProjectAudit: vi.fn(async () => ({ enqueued: true, job: { id: 'audit_1' } }))
     };
     const app = Fastify();
-    registerRoutes(app, repository as never);
+    const auth = createAuthService();
+    const headers = createOwnerAuthenticatedHeaders(auth);
+    registerRoutes(app, repository as never, undefined, auth);
 
-    const response = await app.inject({ method: 'POST', url: '/api/projects/project_1/audit/start' });
+    const response = await app.inject({ method: 'POST', url: '/api/projects/project_1/audit/start', headers });
 
     expect(response.statusCode).toBe(200);
     expect(repository.enqueueProjectAudit).toHaveBeenCalledWith({
@@ -169,6 +520,7 @@ describe('Studio API routes', () => {
 
   it('rejects a manual final audit while an implementation step is unfinished', async () => {
     const repository = {
+      getCurrentUser: vi.fn(async () => ownerUser),
       getProject: vi.fn(async () => ({
         id: 'project_1',
         projectContract: {
@@ -184,9 +536,11 @@ describe('Studio API routes', () => {
       enqueueProjectAudit: vi.fn()
     };
     const app = Fastify();
-    registerRoutes(app, repository as never);
+    const auth = createAuthService();
+    const headers = createOwnerAuthenticatedHeaders(auth);
+    registerRoutes(app, repository as never, undefined, auth);
 
-    const response = await app.inject({ method: 'POST', url: '/api/projects/project_1/audit/start' });
+    const response = await app.inject({ method: 'POST', url: '/api/projects/project_1/audit/start', headers });
 
     expect(response.statusCode).toBe(409);
     expect(repository.enqueueProjectAudit).not.toHaveBeenCalled();
@@ -195,6 +549,7 @@ describe('Studio API routes', () => {
 
   it('blocks roadmap regeneration before invoking AI while project work is active', async () => {
     const repository = {
+      getCurrentUser: vi.fn(async () => ownerUser),
       getProject: vi.fn(async () => ({
         id: 'project_1', name: 'Project', slug: 'project', defaultBranch: 'main',
         brief: 'A sufficiently detailed project objective.', isActive: true, createdAt: '', updatedAt: ''
@@ -205,11 +560,14 @@ describe('Studio API routes', () => {
       getProjectSpecifications: vi.fn()
     };
     const app = Fastify();
-    registerRoutes(app, repository as never);
+    const auth = createAuthService();
+    const headers = createOwnerAuthenticatedHeaders(auth);
+    registerRoutes(app, repository as never, undefined, auth);
 
     const response = await app.inject({
       method: 'POST',
       url: '/api/projects/project_1/implementation-steps/generate',
+      headers,
       payload: {}
     });
 
@@ -222,6 +580,7 @@ describe('Studio API routes', () => {
   it('exposes worker status endpoint', async () => {
     let queuePaused = false;
     const repository = {
+      getCurrentUser: vi.fn(async () => ownerUser),
       getWorkerStatus: vi.fn(async () => ({
         state: 'idle',
         queuePaused,
@@ -238,6 +597,15 @@ describe('Studio API routes', () => {
         },
         updatedAt: new Date().toISOString()
       })),
+      getApproval: vi.fn(async (id: string) => {
+        if (id === 'approval_risk_1') return approvedRiskApproval('config_change', id, {
+          method: 'PUT',
+          path: '/api/worker/queue',
+          body: { paused: true }
+        });
+        return undefined;
+      }),
+      consumeRiskApproval: vi.fn(async () => true),
       setWorkerQueuePaused: vi.fn(async (paused: boolean) => {
         queuePaused = paused;
         return {
@@ -290,7 +658,9 @@ describe('Studio API routes', () => {
     };
 
     const app = Fastify();
-    registerRoutes(app, repository as never);
+    const auth = createAuthService();
+    const headers = createOwnerAuthenticatedHeaders(auth);
+    registerRoutes(app, repository as never, undefined, auth);
 
     const response = await app.inject({
       method: 'GET',
@@ -312,6 +682,7 @@ describe('Studio API routes', () => {
     const pauseResponse = await app.inject({
       method: 'PUT',
       url: '/api/worker/queue',
+      headers: withRiskApproval(headers),
       payload: { paused: true }
     });
 
@@ -444,14 +815,48 @@ describe('Studio API routes', () => {
       getTaskDiff: vi.fn(),
       getTaskUsage: vi.fn(),
       listApprovals: vi.fn(async () => []),
-      getApproval: vi.fn(),
+      getApproval: vi.fn(async (id: string) => {
+        if (id === 'approval_delete_invalid_1') return approvedRiskApproval('delete_files', id, {
+          method: 'DELETE',
+          path: '/api/projects/project_1',
+          body: {
+            confirmation: 'Wrong name',
+            deleteGitHubRepository: false
+          }
+        });
+        if (id === 'approval_delete_1') return approvedRiskApproval('delete_files', id, {
+          method: 'DELETE',
+          path: '/api/projects/project_1',
+          body: {
+            confirmation: 'Demo',
+            deleteGitHubRepository: false
+          }
+        });
+        if (id === 'approval_delete_github_1') return approvedRiskApproval('delete_files', id, {
+          method: 'DELETE',
+          path: '/api/projects/project_1',
+          body: {
+            confirmation: 'Demo',
+            deleteGitHubRepository: true
+          }
+        });
+        if (id === 'approval_task_1' || id === 'approval_task_complete_1') return approvedRiskApproval('risky_refactor', id, {
+          method: 'POST',
+          path: '/api/tasks/task_1/complete',
+          body: {}
+        });
+        return undefined;
+      }),
+      consumeRiskApproval: vi.fn(async () => true),
       resolveApproval: vi.fn(),
       getImplementationStepByTaskId: vi.fn(async () => undefined),
       writeAudit: vi.fn(async () => ({ id: 'audit_1' }))
     };
 
     const app = Fastify();
-    registerRoutes(app, repository as never);
+    const auth = createAuthService();
+    const headers = createOwnerAuthenticatedHeaders(auth);
+    registerRoutes(app, repository as never, undefined, auth);
 
     const getProjectResponse = await app.inject({
       method: 'GET',
@@ -463,6 +868,7 @@ describe('Studio API routes', () => {
     const patchProjectResponse = await app.inject({
       method: 'PATCH',
       url: '/api/projects/project_1',
+      headers,
       payload: {
         name: 'Updated demo',
         defaultBranch: 'develop',
@@ -479,6 +885,7 @@ describe('Studio API routes', () => {
     const clearProjectBriefResponse = await app.inject({
       method: 'PATCH',
       url: '/api/projects/project_1',
+      headers,
       payload: { brief: null }
     });
     expect(clearProjectBriefResponse.statusCode).toBe(200);
@@ -497,6 +904,7 @@ describe('Studio API routes', () => {
     const validationProfileResponse = await app.inject({
       method: 'PATCH',
       url: '/api/projects/project_1',
+      headers,
       payload: { validationProfile }
     });
     expect(validationProfileResponse.statusCode).toBe(200);
@@ -505,6 +913,7 @@ describe('Studio API routes', () => {
     const shortProjectBriefResponse = await app.inject({
       method: 'PATCH',
       url: '/api/projects/project_1',
+      headers,
       payload: { brief: 'Too short' }
     });
     expect(shortProjectBriefResponse.statusCode).toBe(400);
@@ -512,6 +921,7 @@ describe('Studio API routes', () => {
     const invalidDeleteResponse = await app.inject({
       method: 'DELETE',
       url: '/api/projects/project_1',
+      headers: withRiskApproval(headers, 'approval_delete_invalid_1'),
       payload: {
         confirmation: 'Wrong name',
         deleteGitHubRepository: false
@@ -523,6 +933,7 @@ describe('Studio API routes', () => {
     const deleteProjectResponse = await app.inject({
       method: 'DELETE',
       url: '/api/projects/project_1',
+      headers: withRiskApproval(headers, 'approval_delete_1'),
       payload: {
         confirmation: 'Demo',
         deleteGitHubRepository: false
@@ -545,6 +956,7 @@ describe('Studio API routes', () => {
     const deleteProjectWithRepositoryResponse = await app.inject({
       method: 'DELETE',
       url: '/api/projects/project_1',
+      headers: withRiskApproval(headers, 'approval_delete_github_1'),
       payload: {
         confirmation: 'Demo',
         deleteGitHubRepository: true
@@ -574,6 +986,7 @@ describe('Studio API routes', () => {
     const putConfigResponse = await app.inject({
       method: 'PUT',
       url: '/api/projects/project_1/config',
+      headers,
       payload: { configYaml: 'project:\n  id: updated-demo' }
     });
     expect(putConfigResponse.statusCode).toBe(200);
@@ -594,6 +1007,7 @@ describe('Studio API routes', () => {
     const prematureCompletionResponse = await app.inject({
       method: 'POST',
       url: '/api/tasks/task_1/complete',
+      headers: withRiskApproval(headers, 'approval_task_1'),
       payload: {}
     });
     expect(prematureCompletionResponse.statusCode).toBe(409);
@@ -609,6 +1023,7 @@ describe('Studio API routes', () => {
     const completeTaskResponse = await app.inject({
       method: 'POST',
       url: '/api/tasks/task_1/complete',
+      headers: withRiskApproval(headers, 'approval_task_complete_1'),
       payload: {}
     });
     expect(completeTaskResponse.statusCode).toBe(200);
@@ -686,17 +1101,41 @@ describe('Studio API routes', () => {
       getTaskDiff: vi.fn(),
       getTaskUsage: vi.fn(),
       listApprovals: vi.fn(async () => []),
-      getApproval: vi.fn(),
+      getApproval: vi.fn(async (id: string) => {
+        if (id === 'approval_provider_frozen_1') return approvedRiskApproval('config_change', id, {
+          method: 'POST',
+          path: '/api/providers/connect',
+          body: {
+            provider: 'github_copilot',
+            apiKey: 'github-token',
+            model: 'copilot-model'
+          }
+        });
+        if (id === 'approval_provider_connect_1') return approvedRiskApproval('config_change', id, {
+          method: 'POST',
+          path: '/api/providers/connect',
+          body: {
+            provider: 'openai',
+            apiKey: 'sk-test',
+            model: 'gpt-4o-mini'
+          }
+        });
+        return undefined;
+      }),
+      consumeRiskApproval: vi.fn(async () => true),
       resolveApproval: vi.fn(),
       writeAudit: vi.fn(async () => ({ id: 'audit_1' }))
     };
 
     const app = Fastify();
-    registerRoutes(app, repository as never);
+    const auth = createAuthService();
+    const headers = createOwnerAuthenticatedHeaders(auth);
+    registerRoutes(app, repository as never, undefined, auth);
 
     const response = await app.inject({
       method: 'POST',
       url: '/api/tasks',
+      headers,
       payload: {
         projectId: 'project_1',
         title: 'Rich task payload',
@@ -776,7 +1215,8 @@ describe('Studio API routes', () => {
     const app = Fastify();
 
     try {
-      registerRoutes(app, repository as never, createNotificationService(), createAuthService());
+      const auth = createAuthService();
+      registerRoutes(app, repository as never, createNotificationService(), auth);
 
       const loginResponse = await app.inject({
         method: 'POST',
@@ -793,10 +1233,12 @@ describe('Studio API routes', () => {
       });
       expect(callbackResponse.statusCode).toBe(200);
       expect(callbackResponse.json().session.provider).toBe('github');
+      const sessionCookie = callbackResponse.headers['set-cookie'];
 
       const logoutResponse = await app.inject({
         method: 'POST',
-        url: '/api/auth/logout'
+        url: '/api/auth/logout',
+        headers: { cookie: requireSetCookieHeader(sessionCookie) }
       });
       expect(logoutResponse.statusCode).toBe(200);
       expect(logoutResponse.json().userId).toBe('user_1');
@@ -834,7 +1276,28 @@ describe('Studio API routes', () => {
       getTaskDiff: vi.fn(),
       getTaskUsage: vi.fn(),
       listApprovals: vi.fn(async () => []),
-      getApproval: vi.fn(),
+      getApproval: vi.fn(async (id: string) => {
+        if (id === 'approval_provider_frozen_1') return approvedRiskApproval('config_change', id, {
+          method: 'POST',
+          path: '/api/providers/connect',
+          body: {
+            provider: 'github_copilot',
+            apiKey: 'github-token',
+            model: 'copilot-model'
+          }
+        });
+        if (id === 'approval_provider_connect_1') return approvedRiskApproval('config_change', id, {
+          method: 'POST',
+          path: '/api/providers/connect',
+          body: {
+            provider: 'openai',
+            apiKey: 'sk-test',
+            model: 'gpt-4o-mini'
+          }
+        });
+        return undefined;
+      }),
+      consumeRiskApproval: vi.fn(async () => true),
       resolveApproval: vi.fn(),
       getAIProviderConnection: vi.fn(async () => undefined),
       upsertAIProviderConnection: vi.fn(async (input: { provider: 'openai' | 'codex'; authMode?: 'api_key' | 'codex_oauth'; model: string }) => ({
@@ -863,7 +1326,8 @@ describe('Studio API routes', () => {
     const app = Fastify();
 
     try {
-      registerRoutes(app, repository as never, createNotificationService(), createAuthService());
+      const auth = createAuthService();
+      registerRoutes(app, repository as never, createNotificationService(), auth);
 
       const sessionBefore = await app.inject({
         method: 'GET',
@@ -884,6 +1348,10 @@ describe('Studio API routes', () => {
         url: `/api/auth/github/callback?code=test-github-code&state=${encodeURIComponent(loginPayload.state)}`
       });
       expect(callbackResponse.statusCode).toBe(200);
+      const sessionCookie = callbackResponse.headers['set-cookie'];
+      const sessionHeaders = { cookie: requireSetCookieHeader(sessionCookie) };
+      const frozenCopilotRiskHeaders = withRiskApproval(sessionHeaders, 'approval_provider_frozen_1');
+      const providerConnectRiskHeaders = withRiskApproval(sessionHeaders, 'approval_provider_connect_1');
 
       const sessionAfter = await app.inject({
         method: 'GET',
@@ -903,6 +1371,7 @@ describe('Studio API routes', () => {
       const frozenCopilotResponse = await app.inject({
         method: 'POST',
         url: '/api/providers/connect',
+        headers: frozenCopilotRiskHeaders,
         payload: {
           provider: 'github_copilot',
           apiKey: 'github-token',
@@ -915,6 +1384,7 @@ describe('Studio API routes', () => {
       const connectResponse = await app.inject({
         method: 'POST',
         url: '/api/providers/connect',
+        headers: providerConnectRiskHeaders,
         payload: {
           provider: 'openai',
           apiKey: 'sk-test',
@@ -977,7 +1447,21 @@ describe('Studio API routes', () => {
       getTaskDiff: vi.fn(),
       getTaskUsage: vi.fn(),
       listApprovals: vi.fn(async () => []),
-      getApproval: vi.fn(),
+      getApproval: vi.fn(async (id: string) => {
+        if (id === 'approval_github_connect_1') return approvedRiskApproval('config_change', id, {
+          method: 'POST',
+          path: '/api/github/connect',
+          body: {
+            token: 'Bearer github-token'
+          }
+        });
+        if (id === 'approval_github_disconnect_1') return approvedRiskApproval('config_change', id, {
+          method: 'POST',
+          path: '/api/github/disconnect'
+        });
+        return undefined;
+      }),
+      consumeRiskApproval: vi.fn(async () => true),
       resolveApproval: vi.fn(),
       getGitHubConnection: vi.fn(async () => undefined),
       getGitHubConnectionSecret: vi.fn(async () => ({
@@ -1021,7 +1505,12 @@ describe('Studio API routes', () => {
     } as Response);
 
     const app = Fastify();
-    registerRoutes(app, repository as never, createNotificationService(), createAuthService());
+    const auth = createAuthService();
+    const user = { id: 'user_1', email: 'owner@example.com', name: 'Owner', role: 'owner' as const };
+    const sessionHeaders = createAuthenticatedHeaders(auth, user);
+    const githubConnectRiskHeaders = withRiskApproval(sessionHeaders, 'approval_github_connect_1');
+    const githubDisconnectRiskHeaders = withRiskApproval(sessionHeaders, 'approval_github_disconnect_1');
+    registerRoutes(app, repository as never, createNotificationService(), auth);
 
     const statusBefore = await app.inject({
       method: 'GET',
@@ -1033,6 +1522,7 @@ describe('Studio API routes', () => {
     const connectResponse = await app.inject({
       method: 'POST',
       url: '/api/github/connect',
+      headers: githubConnectRiskHeaders,
       payload: {
         token: 'Bearer github-token'
       }
@@ -1182,7 +1672,8 @@ describe('Studio API routes', () => {
 
     const disconnectResponse = await app.inject({
       method: 'POST',
-      url: '/api/github/disconnect'
+      url: '/api/github/disconnect',
+      headers: githubDisconnectRiskHeaders
     });
     expect(disconnectResponse.statusCode).toBe(200);
     expect(disconnectResponse.json().status.adapter).toBe('none');
@@ -1230,7 +1721,9 @@ describe('Studio API routes', () => {
     };
 
     const app = Fastify();
-    registerRoutes(app, repository as never, createNotificationService());
+    const auth = createAuthService();
+    const headers = createOwnerAuthenticatedHeaders(auth);
+    registerRoutes(app, repository as never, createNotificationService(), auth);
 
     const previousVapid = process.env.VAPID_PUBLIC_KEY;
     process.env.VAPID_PUBLIC_KEY = 'BMOCK_PUBLIC_VAPID_KEY';
@@ -1238,6 +1731,7 @@ describe('Studio API routes', () => {
     const subscribeResponse = await app.inject({
       method: 'POST',
       url: '/api/notifications/subscribe',
+      headers,
       payload: {
         endpoint: 'https://push.example.com/subscription/1',
         deviceName: 'Test phone'
@@ -1262,6 +1756,7 @@ describe('Studio API routes', () => {
     const putSettingsResponse = await app.inject({
       method: 'PUT',
       url: '/api/notifications/settings',
+      headers,
       payload: {
         approvalRequests: false,
         budgetAlerts: true
@@ -1273,6 +1768,7 @@ describe('Studio API routes', () => {
     const unsubscribeResponse = await app.inject({
       method: 'POST',
       url: '/api/notifications/unsubscribe',
+      headers,
       payload: {
         endpoint: 'https://push.example.com/subscription/1'
       }
@@ -1328,7 +1824,8 @@ describe('Studio API routes', () => {
       encoding: false,
       runFirst: true
     });
-    registerRoutes(app, repository as never);
+    const auth = createAuthService();
+    registerRoutes(app, repository as never, undefined, auth);
 
     const payload = JSON.stringify({ action: 'opened', repository: { full_name: 'owner/repo' } });
     const secret = 'webhook-secret';
@@ -1474,7 +1971,18 @@ describe('Studio API routes', () => {
           resolvedAt: new Date().toISOString()
         }
       ]),
-      getApproval: vi.fn(),
+      getApproval: vi.fn(async () => ({
+        id: 'approval_1',
+        taskId: 'task_1',
+        type: 'new_dependency',
+        status: 'pending',
+        requestedBy: 'agent',
+        title: 'Approval required',
+        description: 'Approve dependency update',
+        riskLevel: 'medium',
+        payload: {},
+        createdAt: new Date().toISOString()
+      })),
       resolveApproval: vi.fn(async () => ({
         id: 'approval_1',
         taskId: 'task_1',
@@ -1492,11 +2000,14 @@ describe('Studio API routes', () => {
     };
 
     const app = Fastify();
-    registerRoutes(app, repository as never);
+    const auth = createAuthService();
+    const headers = createOwnerAuthenticatedHeaders(auth);
+    registerRoutes(app, repository as never, undefined, auth);
 
     const response = await app.inject({
       method: 'POST',
-      url: '/api/approvals/approval_1/approve'
+      url: '/api/approvals/approval_1/approve',
+      headers
     });
 
     expect(response.statusCode).toBe(200);
@@ -1675,7 +2186,20 @@ describe('Studio API routes', () => {
         records: []
       })),
       listApprovals: vi.fn(async () => []),
-      getApproval: vi.fn(),
+      getApproval: vi.fn(async (id: string) => {
+        if (id === 'approval_pipeline_task_start_1') {
+          const taskId = Array.from(tasks.keys())[0];
+          return taskId
+            ? approvedRiskApproval('risky_refactor', id, {
+                method: 'POST',
+                path: `/api/tasks/${taskId}/start`,
+                body: {}
+              })
+            : undefined;
+        }
+        return undefined;
+      }),
+      consumeRiskApproval: vi.fn(async () => true),
       resolveApproval: vi.fn(),
       writeAudit: vi.fn(async (entry) => {
         const item = { id: `audit_${randomUUID()}`, createdAt: now(), ...entry };
@@ -1706,11 +2230,14 @@ describe('Studio API routes', () => {
     };
 
     const app = Fastify();
-    registerRoutes(app, repository as never);
+    const auth = createAuthService();
+    const headers = createOwnerAuthenticatedHeaders(auth);
+    registerRoutes(app, repository as never, undefined, auth);
 
     const projectResponse = await app.inject({
       method: 'POST',
       url: '/api/projects',
+      headers,
       payload: {
         name: 'Pipeline project',
         slug: 'pipeline-project',
@@ -1725,6 +2252,7 @@ describe('Studio API routes', () => {
     const createTaskResponse = await app.inject({
       method: 'POST',
       url: '/api/tasks',
+      headers,
       payload: {
         projectId: createdProject.id,
         title: 'Pipeline test task',
@@ -1745,6 +2273,7 @@ describe('Studio API routes', () => {
     const startResponse = await app.inject({
       method: 'POST',
       url: `/api/tasks/${createdTask.id}/start`,
+      headers: withRiskApproval(headers, 'approval_pipeline_task_start_1'),
       payload: {}
     });
     expect(startResponse.statusCode).toBe(200);

@@ -1,4 +1,4 @@
-import type { FastifyInstance } from 'fastify';
+import type { FastifyInstance, FastifyReply, FastifyRequest } from 'fastify';
 import { createHash } from 'node:crypto';
 import { z } from 'zod';
 import { buildProjectExtensionProposalPrompt, CodexExecutionTimeoutError, createProvider, formatProjectExtensionProposal, GitHubCopilotProvider, listCodexModels, listOpenAIModels } from '@forgemind/providers';
@@ -25,6 +25,7 @@ import type { AIProviderConnectionKind, AIProviderConnectionSecret, ForgeMindRep
 import { parseGitHubWebhookPayload, projectGitHubWebhookEvent, verifyGitHubWebhookSignature } from './webhook.js';
 import type { NotificationService } from './notifications.js';
 import { activeProjectContractRequirements, applyProjectContractDelta } from '@forgemind/core';
+import type { ApprovalType } from '@forgemind/core';
 import type { Project, ProjectArchitectureUpdate, ProjectContract, ProjectContractDelta, TaskMode } from '@forgemind/core';
 import { resolveRuntimeEnvVar } from './runtime-env.js';
 
@@ -324,6 +325,8 @@ export function registerRoutes(app: FastifyInstance, repository: ForgeMindReposi
   const dispatcher = createTaskDispatchService(repository);
   const processedWebhookDeliveries = new Set<string>();
 
+  app.addHook('preHandler', async (request, reply) => requireAuthorizedMutation(request, reply, repository, auth));
+
   app.post('/api/auth/github/login', async (_request, reply) => {
     try {
       if (!auth) {
@@ -353,6 +356,7 @@ export function registerRoutes(app: FastifyInstance, repository: ForgeMindReposi
       const input = githubCallbackQuerySchema.parse(request.query);
       const currentUser = await repository.getCurrentUser();
       const session = auth.completeGitHubCallback(input, currentUser);
+      reply.header('Set-Cookie', serializeSessionCookie(session.session.id));
       await repository.writeAudit({
         actorType: 'user',
         actorId: currentUser.id,
@@ -377,6 +381,7 @@ export function registerRoutes(app: FastifyInstance, repository: ForgeMindReposi
 
       const currentUser = await repository.getCurrentUser();
       const result = auth.logout(currentUser.id);
+      reply.header('Set-Cookie', 'forgemind_session=; HttpOnly; SameSite=Lax; Path=/; Max-Age=0');
       await repository.writeAudit({
         actorType: 'user',
         actorId: currentUser.id,
@@ -1622,6 +1627,13 @@ export function registerRoutes(app: FastifyInstance, repository: ForgeMindReposi
   app.post('/api/approvals/:id/approve', async (request, reply) => {
     try {
       const { id } = idParamsSchema.parse(request.params);
+      const existingApproval = await repository.getApproval(id);
+      if (!existingApproval) {
+        return sendNotFound(reply, `Approval "${id}" not found`);
+      }
+      if (existingApproval.status !== 'pending') {
+        return reply.code(409).send({ error: 'Only a pending approval can be approved.' });
+      }
       const approval = await repository.resolveApproval(id, 'approved');
       if (!approval) {
         return sendNotFound(reply, `Approval "${id}" not found`);
@@ -1650,6 +1662,13 @@ export function registerRoutes(app: FastifyInstance, repository: ForgeMindReposi
   app.post('/api/approvals/:id/reject', async (request, reply) => {
     try {
       const { id } = idParamsSchema.parse(request.params);
+      const existingApproval = await repository.getApproval(id);
+      if (!existingApproval) {
+        return sendNotFound(reply, `Approval "${id}" not found`);
+      }
+      if (existingApproval.status !== 'pending') {
+        return reply.code(409).send({ error: 'Only a pending approval can be rejected.' });
+      }
       const approval = await repository.resolveApproval(id, 'rejected');
       return approval ? approval : sendNotFound(reply, `Approval "${id}" not found`);
     } catch (error) {
@@ -1805,6 +1824,156 @@ export function registerRoutes(app: FastifyInstance, repository: ForgeMindReposi
       return sendBadRequest(reply, error);
     }
   });
+}
+
+async function requireAuthorizedMutation(
+  request: FastifyRequest,
+  reply: FastifyReply,
+  repository: ForgeMindRepository,
+  auth: AuthService | undefined
+) {
+  if (!isProtectedMutationRequest(request)) {
+    return;
+  }
+
+  if (!auth) {
+    return reply.code(503).send({ error: 'Auth service is not configured for mutating API requests.' });
+  }
+
+  const sessionId = readSessionId(request);
+  if (!sessionId) {
+    return reply.code(401).send({ error: 'Authentication required for mutating API requests.' });
+  }
+
+  const session = auth.getSessionById(sessionId);
+  if (!session) {
+    return reply.code(401).send({ error: 'Authentication required for mutating API requests.' });
+  }
+
+  const currentUser = await repository.getCurrentUser();
+  if (session.userId !== currentUser.id) {
+    return reply.code(403).send({ error: 'Authenticated principal is not authorized for this mutation.' });
+  }
+
+  if (requiresOwnerRole(request) && currentUser.role !== 'owner') {
+    return reply.code(403).send({ error: 'Owner role required for this mutation.' });
+  }
+
+  const approvalType = requiredRiskApprovalType(request);
+  if (approvalType) {
+    const approvalId = readSingleHeader(request.headers['x-forgemind-approval-id']);
+    if (!approvalId) {
+      return reply.code(403).send({ error: `Approved ${approvalType} approval required for this mutation.` });
+    }
+    const approval = await repository.getApproval(approvalId);
+    if (!approval || approval.type !== approvalType || approval.status !== 'approved' || !approvalMatchesMutation(approval.payload, request, currentUser.id)) {
+      return reply.code(403).send({ error: `Approved ${approvalType} approval required for this mutation.` });
+    }
+    const consumed = await repository.consumeRiskApproval(approvalId);
+    if (!consumed) {
+      return reply.code(403).send({ error: `Approved ${approvalType} approval required for this mutation.` });
+    }
+  }
+}
+
+function isProtectedMutationRequest(request: FastifyRequest): boolean {
+  if (!['POST', 'PUT', 'PATCH', 'DELETE'].includes(request.method)) {
+    return false;
+  }
+  const path = request.url.split('?')[0] ?? request.url;
+  if (!path.startsWith('/api/')) {
+    return false;
+  }
+  return path !== '/api/auth/github/login' && path !== '/api/webhooks/github';
+}
+
+function readSessionId(request: FastifyRequest): string | undefined {
+  const authorization = request.headers.authorization;
+  if (authorization?.startsWith('Bearer ')) {
+    return authorization.slice('Bearer '.length).trim() || undefined;
+  }
+
+  const cookie = Array.isArray(request.headers.cookie) ? request.headers.cookie.join(';') : request.headers.cookie;
+  const sessionCookie = cookie
+    ?.split(';')
+    .map((item) => item.trim())
+    .find((item) => item.startsWith('forgemind_session='));
+  const encodedSessionId = sessionCookie?.slice('forgemind_session='.length);
+  try {
+    return encodedSessionId ? decodeURIComponent(encodedSessionId) : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+function serializeSessionCookie(sessionId: string): string {
+  return `forgemind_session=${encodeURIComponent(sessionId)}; HttpOnly; SameSite=Lax; Path=/`;
+}
+
+function requiresOwnerRole(request: FastifyRequest): boolean {
+  const path = request.url.split('?')[0] ?? request.url;
+  return path === '/api/worker/queue'
+    || path.startsWith('/api/github/')
+    || path === '/api/providers/models'
+    || path.startsWith('/api/providers/connect')
+    || path.startsWith('/api/providers/connections/')
+    || path.startsWith('/api/providers/codex/oauth/')
+    || path.startsWith('/api/approvals/')
+    || (request.method === 'DELETE' && path.startsWith('/api/projects/'));
+}
+
+function requiredRiskApprovalType(request: FastifyRequest): ApprovalType | undefined {
+  const path = request.url.split('?')[0] ?? request.url;
+  if (path === '/api/worker/queue') return 'config_change';
+  if (path.startsWith('/api/github/')) return 'config_change';
+  if (path.startsWith('/api/providers/connect') || path.startsWith('/api/providers/connections/') || path === '/api/providers/codex/oauth/complete') {
+    return 'config_change';
+  }
+  if (request.method === 'DELETE' && path.startsWith('/api/projects/')) return 'delete_files';
+  if (path.startsWith('/api/tasks/') && request.method === 'POST') return 'risky_refactor';
+  return undefined;
+}
+
+function readSingleHeader(value: string | string[] | undefined): string | undefined {
+  return Array.isArray(value) ? value[0] : value;
+}
+
+function approvalMatchesMutation(payload: unknown, request: FastifyRequest, actorId: string): boolean {
+  if (!payload || typeof payload !== 'object' || Array.isArray(payload)) {
+    return false;
+  }
+  const apiMutation = (payload as { apiMutation?: unknown }).apiMutation;
+  if (!apiMutation || typeof apiMutation !== 'object' || Array.isArray(apiMutation)) {
+    return false;
+  }
+  const expected = {
+    method: request.method,
+    path: request.url.split('?')[0] ?? request.url,
+    actorId,
+    bodyHash: hashApiMutationBody(request.body ?? null)
+  };
+  const actual = apiMutation as Partial<typeof expected>;
+  return actual.method === expected.method
+    && actual.path === expected.path
+    && actual.actorId === expected.actorId
+    && actual.bodyHash === expected.bodyHash;
+}
+
+function hashApiMutationBody(body: unknown): string {
+  return createHash('sha256').update(stableJson(body)).digest('hex');
+}
+
+function stableJson(value: unknown): string {
+  if (value === null || typeof value !== 'object') {
+    return JSON.stringify(value);
+  }
+  if (Array.isArray(value)) {
+    return `[${value.map(stableJson).join(',')}]`;
+  }
+  const entries = Object.entries(value as Record<string, unknown>)
+    .filter(([, item]) => item !== undefined)
+    .sort(([left], [right]) => left.localeCompare(right));
+  return `{${entries.map(([key, item]) => `${JSON.stringify(key)}:${stableJson(item)}`).join(',')}}`;
 }
 
 function formatMetrics(snapshot: Awaited<ReturnType<ForgeMindRepository['getOperationalMetrics']>>): string {
