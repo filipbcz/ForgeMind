@@ -1,6 +1,7 @@
 import {
   activeProjectContractRequirements,
   applyProjectContractDelta,
+  redactSecrets,
   type AcceptanceEvidence,
   type AcceptanceEvidenceSource,
   type AcceptanceEvidenceStatus,
@@ -3672,6 +3673,7 @@ export class ForgeMindRepository {
     retryable = true
   ): Promise<void> {
     if (!queueJobId) return;
+    const redactedErrorMessage = errorMessage === undefined ? undefined : redactSecrets(errorMessage);
 
     const queueJob = await this.prisma.taskQueueJob.findUnique({
       where: { id: queueJobId },
@@ -3701,7 +3703,7 @@ export class ForgeMindRepository {
               reason: 'phase_retry',
               claimedAt: null,
               nextAttemptAt,
-              errorMessage
+              errorMessage: redactedErrorMessage
             }
           });
           await tx.task.updateMany({
@@ -3714,17 +3716,15 @@ export class ForgeMindRepository {
               finishedAt: null
             }
           });
-          await tx.auditLog.create({
-            data: {
-              actorType: 'system',
-              eventType: 'task_queue_retry_scheduled',
-              taskId: queueJob.taskId,
-              payload: {
-                queueJobId,
-                nextAttemptAt: nextAttemptAt.toISOString(),
-                errorMessage: errorMessage ?? null,
-                resumeFromCheckpoint: true
-              }
+          await this.writeAuditTx(tx, {
+            actorType: 'system',
+            eventType: 'task_queue_retry_scheduled',
+            taskId: queueJob.taskId,
+            payload: {
+              queueJobId,
+              nextAttemptAt: nextAttemptAt.toISOString(),
+              errorMessage: redactedErrorMessage ?? null,
+              resumeFromCheckpoint: true
             }
           });
         });
@@ -3738,7 +3738,7 @@ export class ForgeMindRepository {
         status,
         claimedAt: null,
         nextAttemptAt: null,
-        errorMessage,
+        errorMessage: redactedErrorMessage,
         finishedAt: new Date()
       }
     });
@@ -3761,11 +3761,11 @@ export class ForgeMindRepository {
         iterationNumber: input.iterationNumber,
         phase: input.phase,
         prompt: sanitizePostgresText(input.prompt),
-        resultSummary: sanitizePostgresText(input.resultSummary),
-        providerPrompt: input.providerPrompt === undefined ? undefined : sanitizePostgresText(input.providerPrompt),
-        providerResponse: input.providerResponse === undefined ? undefined : sanitizePostgresText(input.providerResponse),
-        diffStatJson: toPrismaJson(input.diffStat),
-        validationResultJson: toPrismaJson(input.validationResult)
+        resultSummary: sanitizePostgresText(redactSecrets(input.resultSummary)),
+        providerPrompt: input.providerPrompt === undefined ? undefined : sanitizePostgresText(redactSecrets(input.providerPrompt)),
+        providerResponse: input.providerResponse === undefined ? undefined : sanitizePostgresText(redactSecrets(input.providerResponse)),
+        diffStatJson: toPrismaJson(redactSecrets(input.diffStat)),
+        validationResultJson: toPrismaJson(redactSecrets(input.validationResult))
       }
     });
   }
@@ -3885,6 +3885,7 @@ export class ForgeMindRepository {
   }
 
   async failTask(taskId: string, errorMessage: string, status: TaskStatus = 'failed'): Promise<void> {
+    const redactedErrorMessage = redactSecrets(errorMessage);
     await this.prisma.$transaction(async (tx) => {
       const task = await tx.task.update({
         where: { id: taskId },
@@ -3901,7 +3902,7 @@ export class ForgeMindRepository {
         eventType: 'task_failed',
         projectId: task.projectId,
         taskId: task.id,
-        payload: { errorMessage, status }
+        payload: { errorMessage: redactedErrorMessage, status }
       });
       if (cancelledSteps.count > 0) {
         await this.writeAuditTx(tx, {
@@ -4142,7 +4143,7 @@ export class ForgeMindRepository {
         eventType: input.eventType,
         projectId: input.projectId,
         taskId: input.taskId,
-        payload: toPrismaJson(input.payload)
+        payload: toPrismaJson(redactSecrets(input.payload))
       }
     });
     return toAuditEvent(event);
@@ -4159,7 +4160,7 @@ export class ForgeMindRepository {
         eventType: input.eventType,
         projectId: input.projectId,
         taskId: input.taskId,
-        payload: toPrismaJson(input.payload)
+        payload: toPrismaJson(redactSecrets(input.payload))
       }
     });
     return toAuditEvent(event);

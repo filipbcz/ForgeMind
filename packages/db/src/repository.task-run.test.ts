@@ -307,6 +307,62 @@ describe('ForgeMindRepository task runs', () => {
     });
   });
 
+  it('redacts provider output before persisting task iteration evidence', async () => {
+    const { prisma } = createMockPrisma();
+    const repository = new ForgeMindRepository(prisma);
+
+    await repository.createIteration({
+      taskRunId: 'run_1',
+      iterationNumber: 1,
+      phase: 'implementation',
+      prompt: 'Implement the task',
+      resultSummary: 'Provider summary copied CODEX_API_KEY=sk-summary_1234567890abcdef',
+      providerPrompt: 'Use OPENAI_API_KEY=sk-prompt_1234567890abcdef',
+      providerResponse: 'Saved token github_pat_1234567890abcdefghijklmnopqr in output',
+      diffStat: { filesChanged: 1 },
+      validationResult: { stderr: 'Authorization: Bearer sk-validation_1234567890abcdef' }
+    });
+
+    const persisted = prisma.taskIteration.create.mock.calls[0][0].data;
+    expect(JSON.stringify(persisted)).toContain('[secret-redacted]');
+    expect(JSON.stringify(persisted)).not.toContain('sk-summary_1234567890abcdef');
+    expect(JSON.stringify(persisted)).not.toContain('sk-prompt_1234567890abcdef');
+    expect(JSON.stringify(persisted)).not.toContain('github_pat_1234567890abcdefghijklmnopqr');
+    expect(JSON.stringify(persisted)).not.toContain('sk-validation_1234567890abcdef');
+  });
+
+  it('redacts audit payloads before persistence', async () => {
+    const { prisma } = createMockPrisma();
+    const repository = new ForgeMindRepository(prisma);
+
+    await repository.writeAudit({
+      actorType: 'system',
+      eventType: 'task_provider_activity',
+      taskId: 'task_1',
+      payload: {
+        message: 'Provider printed Authorization: Bearer sk-audit_1234567890abcdef',
+        apiKey: 'sk-object_1234567890abcdef'
+      }
+    });
+
+    const persisted = prisma.auditLog.create.mock.calls[0][0].data.payload;
+    expect(JSON.stringify(persisted)).toContain('[secret-redacted]');
+    expect(JSON.stringify(persisted)).not.toContain('sk-audit_1234567890abcdef');
+    expect(JSON.stringify(persisted)).not.toContain('sk-object_1234567890abcdef');
+  });
+
+  it('redacts queue and task failure errors before persistence', async () => {
+    const { prisma } = createMockPrisma();
+    const repository = new ForgeMindRepository(prisma);
+
+    await repository.finalizeQueueJob('queue_1', 'failed', 'Queue failed with GITHUB_TOKEN=ghp_1234567890abcdefghijklmnop', false);
+    await repository.failTask('task_1', 'Provider failed with sk-failure_1234567890abcdef', 'provider_failed');
+
+    expect(JSON.stringify(prisma.taskQueueJob.update.mock.calls[0][0])).not.toContain('ghp_1234567890abcdefghijklmnop');
+    expect(JSON.stringify(prisma.auditLog.create.mock.calls)).not.toContain('sk-failure_1234567890abcdef');
+    expect(JSON.stringify(prisma.auditLog.create.mock.calls)).toContain('[secret-redacted]');
+  });
+
   it('merges architecture deltas without duplicates and resolves recorded debt', () => {
     const architecture = mergeProjectArchitecture({
       version: 1,

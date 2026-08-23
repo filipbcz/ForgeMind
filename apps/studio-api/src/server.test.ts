@@ -3,6 +3,7 @@ import Fastify from 'fastify';
 import type { FastifyInstance } from 'fastify';
 import {
   createApp,
+  registerErrorRedaction,
   registerHttpGuardrails,
   startNonOverlappingPolling,
   validateProductionHttpSecurityConfig
@@ -77,6 +78,20 @@ describe('Studio API server', () => {
 
     expect(response.statusCode).toBe(404);
     expect(response.headers['access-control-allow-origin']).toBeUndefined();
+  });
+
+  it('redacts credentials from uncaught application errors', async () => {
+    app = Fastify({ logger: false });
+    registerErrorRedaction(app);
+    app.get('/failure', async () => {
+      throw new Error('Provider failed with Authorization: Bearer sk-server_1234567890abcdef');
+    });
+
+    const response = await app.inject({ method: 'GET', url: '/failure' });
+
+    expect(response.statusCode).toBe(500);
+    expect(response.body).toContain('[secret-redacted]');
+    expect(response.body).not.toContain('sk-server_1234567890abcdef');
   });
 
   it('fails production startup when required HTTP security config is missing or unsafe', () => {
