@@ -6,6 +6,7 @@ import { isAbsolute, relative, resolve } from 'node:path';
 import type { ValidationCheck } from '@forgemind/providers';
 import { createWorkspaceEnvironment } from '@forgemind/shared';
 import { missingValidationCapabilities, requiredValidationCapabilities, resolveWorkerCapabilities } from './worker-capabilities.js';
+import { prepareResourcePolicyCommand, type WorkerResourcePolicy } from './resource-policy.js';
 
 const VALIDATION_OUTPUT_FLUSH_MS = 350;
 const MAX_ACTIVITY_CHUNK_CHARS = 8_000;
@@ -239,23 +240,26 @@ export async function runValidationCommand(
   timeoutMinutes = 10,
   signal?: AbortSignal,
   filesystemPolicy?: WorkspaceFilesystemPolicy,
-  onTermination?: ProcessTreeTerminationHandler
+  onTermination?: ProcessTreeTerminationHandler,
+  resourcePolicy?: WorkerResourcePolicy
 ): Promise<ValidationResult> {
   throwIfAborted(signal);
-  const effectiveCommand = normalizeValidationCommandForEnvironment(command);
+  const normalizedCommand = normalizeValidationCommandForEnvironment(command);
+  let effectiveCommand = normalizedCommand;
 
   try {
-    assertAllowedValidationCommand(effectiveCommand);
-    const denial = await evaluateCommandFilesystemIsolation(effectiveCommand, cwd, filesystemPolicy);
+    assertAllowedValidationCommand(normalizedCommand);
+    const denial = await evaluateCommandFilesystemIsolation(normalizedCommand, cwd, filesystemPolicy);
     if (denial) {
       return {
-        command: effectiveCommand,
+        command: normalizedCommand,
         exitCode: 1,
         stdout: '',
         stderr: formatFilesystemIsolationDenial(denial),
         passed: false
       };
     }
+    effectiveCommand = prepareResourcePolicyCommand(normalizedCommand, resourcePolicy);
     const subprocess = execaCommand(effectiveCommand, {
       cwd,
       env: createValidationEnvironment(process.env, cwd),
@@ -381,7 +385,8 @@ export async function runValidationChecks(
   inputHash?: string,
   signal?: AbortSignal,
   availableCapabilities: ReadonlySet<string> = resolveWorkerCapabilities(),
-  filesystemPolicy?: WorkspaceFilesystemPolicy
+  filesystemPolicy?: WorkspaceFilesystemPolicy,
+  resourcePolicy?: WorkerResourcePolicy
 ): Promise<ValidationResult> {
   throwIfAborted(signal);
   if (checks.length === 0) {
@@ -406,7 +411,45 @@ export async function runValidationChecks(
 
   for (const [index, check] of checks.entries()) {
     throwIfAborted(signal);
-    const effectiveCommand = normalizeValidationCommandForEnvironment(check.command);
+    const normalizedCommand = normalizeValidationCommandForEnvironment(check.command);
+    let effectiveCommand = normalizedCommand;
+    try {
+      effectiveCommand = prepareResourcePolicyCommand(normalizedCommand, resourcePolicy);
+    } catch (error) {
+      const result: ValidationResult = {
+        command: normalizedCommand,
+        exitCode: 1,
+        stdout: '',
+        stderr: error instanceof Error ? error.message : String(error),
+        passed: false
+      };
+      await onActivity?.({
+        state: 'denied',
+        command: normalizedCommand,
+        checkIndex: index + 1,
+        checkCount: checks.length,
+        elapsedMs: 0,
+        inputHash,
+        category: check.category,
+        stdout: result.stdout,
+        stderr: result.stderr,
+        exitCode: result.exitCode,
+        criterion: check.criterion,
+        rationale: check.rationale,
+        requiredCapabilities: check.requiredCapabilities
+      });
+      outputs.push(`[command] ${normalizedCommand}`);
+      outputs.push(result.stderr);
+      checkResults.push({
+        ...result,
+        inputHash,
+        criterion: check.criterion,
+        rationale: check.rationale,
+        requiredCapabilities: check.requiredCapabilities
+      });
+      failingResult = result;
+      break;
+    }
     const missingCapabilities = missingValidationCapabilities(check, availableCapabilities);
     if (missingCapabilities.length > 0) {
       const deferredCheck: DeferredValidationCheck = {
@@ -481,10 +524,10 @@ export async function runValidationChecks(
 
     executedCheckCount += 1;
     try {
-      assertAllowedValidationCommand(effectiveCommand);
+      assertAllowedValidationCommand(normalizedCommand);
     } catch (error) {
       const result: ValidationResult = {
-        command: effectiveCommand,
+        command: normalizedCommand,
         exitCode: 1,
         stdout: '',
         stderr: error instanceof Error ? error.message : String(error),
@@ -492,7 +535,7 @@ export async function runValidationChecks(
       };
       await onActivity?.({
         state: 'completed',
-        command: effectiveCommand,
+        command: normalizedCommand,
         checkIndex: index + 1,
         checkCount: checks.length,
         elapsedMs: 0,
@@ -505,7 +548,7 @@ export async function runValidationChecks(
         rationale: check.rationale,
         requiredCapabilities: check.requiredCapabilities
       });
-      outputs.push(`[command] ${effectiveCommand}`);
+      outputs.push(`[command] ${normalizedCommand}`);
       if (check.criterion) {
         outputs.push(`[criterion] ${check.criterion}`);
       }
@@ -523,10 +566,10 @@ export async function runValidationChecks(
       failingResult = result;
       break;
     }
-    const denial = await evaluateCommandFilesystemIsolation(effectiveCommand, cwd, filesystemPolicy);
+    const denial = await evaluateCommandFilesystemIsolation(normalizedCommand, cwd, filesystemPolicy);
     if (denial) {
       const result: ValidationResult = {
-        command: effectiveCommand,
+        command: normalizedCommand,
         exitCode: 1,
         stdout: '',
         stderr: formatFilesystemIsolationDenial(denial),
@@ -535,7 +578,7 @@ export async function runValidationChecks(
       };
       await onActivity?.({
         state: 'denied',
-        command: effectiveCommand,
+        command: normalizedCommand,
         checkIndex: index + 1,
         checkCount: checks.length,
         elapsedMs: 0,
@@ -549,7 +592,7 @@ export async function runValidationChecks(
         requiredCapabilities: check.requiredCapabilities,
         denial
       });
-      outputs.push(`[command] ${effectiveCommand}`);
+      outputs.push(`[command] ${normalizedCommand}`);
       if (check.criterion) {
         outputs.push(`[criterion] ${check.criterion}`);
       }
@@ -577,7 +620,7 @@ export async function runValidationChecks(
       inputHash,
       category: check.category
     });
-    const result = await runValidationCommand(effectiveCommand, cwd, async (stream, message) => {
+    const result = await runValidationCommand(normalizedCommand, cwd, async (stream, message) => {
       await onActivity?.({
         state: 'output',
         command: effectiveCommand,
@@ -601,7 +644,7 @@ export async function runValidationChecks(
         termination,
         message: `Validation command process tree terminated after ${termination.reason}.`
       });
-    });
+    }, resourcePolicy);
     await onActivity?.({
       state: 'completed',
       command: effectiveCommand,

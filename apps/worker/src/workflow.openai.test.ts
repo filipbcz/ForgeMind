@@ -53,7 +53,8 @@ ai: {}
 limits: {}
 commands: {}
 approval: {}
-sandbox: {}
+sandbox:
+  allow_network: true
 github: {}`,
   isActive: true,
   createdAt: new Date().toISOString(),

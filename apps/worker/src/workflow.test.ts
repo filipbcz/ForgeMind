@@ -52,7 +52,7 @@ approval:
   required_for: []
   auto_allowed: []
 sandbox:
-  allow_network: false
+  allow_network: true
   allow_sudo: false
   writable_paths:
     - /workspace

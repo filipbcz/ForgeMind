@@ -54,6 +54,13 @@ export const agentConfigSchema = z.object({
     writable_paths: z.array(z.string()).default(['/workspace']),
     forbidden_paths: z.array(z.string()).default(['/etc', '/root', '/home/*/.ssh', '/var/run/docker.sock'])
   }),
+  resources: z.object({
+    cpu_limit_seconds: z.number().int().positive().optional(),
+    memory_limit_mb: z.number().int().positive().optional(),
+    disk_limit_mb: z.number().int().positive().optional(),
+    min_free_space_mb: z.number().int().nonnegative().default(0),
+    retention_days: z.number().int().nonnegative().default(14)
+  }).default({}),
   github: z.object({
     issue_label: z.string().default('ai-task'),
     branch_prefix: z.string().default('ai/'),
