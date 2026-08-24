@@ -1,7 +1,9 @@
 import { describe, expect, it, vi } from 'vitest';
+import { existsSync, readFileSync } from 'node:fs';
 import { mkdir, mkdtemp, readFile, symlink, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
+import { setTimeout as delay } from 'node:timers/promises';
 import {
   assertAllowedValidationCommand,
   collectPassedValidationCheckResults,
@@ -43,6 +45,68 @@ describe('validation runner', () => {
 
     expect(result.passed).toBe(true);
     expect(result.stdout).toContain('v');
+  });
+
+  it.skipIf(process.platform === 'win32')('terminates child and grandchild processes when a command times out', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'forgemind-validation-timeout-tree-'));
+    const { parentScript } = await writeProcessTreeScripts(cwd);
+
+    const result = await runValidationCommand(`node ${JSON.stringify(parentScript)}`, cwd, undefined, 0.02);
+
+    expect(result.passed).toBe(false);
+    expect(result.termination).toMatchObject({ reason: 'timeout', processGroupTerminated: true });
+    expect(result.stderr).toContain('terminated process tree');
+    const childPid = Number(await readFile(join(cwd, 'child.pid'), 'utf8'));
+    const grandchildPid = Number(await readFile(join(cwd, 'grandchild.pid'), 'utf8'));
+    await expectProcessToExit(childPid);
+    await expectProcessToExit(grandchildPid);
+  }, 10_000);
+
+  it.skipIf(process.platform === 'win32')('terminates child and grandchild processes when a command is cancelled', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'forgemind-validation-cancel-tree-'));
+    const { parentScript } = await writeProcessTreeScripts(cwd);
+    const controller = new AbortController();
+    const terminations: unknown[] = [];
+
+    const command = runValidationCommand(
+      `node ${JSON.stringify(parentScript)}`,
+      cwd,
+      undefined,
+      10,
+      controller.signal,
+      undefined,
+      (termination) => {
+        terminations.push(termination);
+      }
+    );
+    await waitForFile(join(cwd, 'grandchild.pid'));
+    controller.abort(new Error('cancel validation'));
+
+    await expect(command).rejects.toThrow('cancel validation');
+    expect(terminations).toEqual([expect.objectContaining({ reason: 'cancelled', processGroupTerminated: true })]);
+    const childPid = Number(await readFile(join(cwd, 'child.pid'), 'utf8'));
+    const grandchildPid = Number(await readFile(join(cwd, 'grandchild.pid'), 'utf8'));
+    await expectProcessToExit(childPid);
+    await expectProcessToExit(grandchildPid);
+  }, 10_000);
+
+  it.skipIf(process.platform === 'win32')('emits an auditable termination activity for timed out command trees', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'forgemind-validation-audit-tree-'));
+    const { parentScript } = await writeProcessTreeScripts(cwd);
+    const activities: Array<{ state: string; termination?: unknown }> = [];
+
+    await runValidationChecks(
+      [{ kind: 'command', command: `node ${JSON.stringify(parentScript)}`, timeoutMinutes: 0.02 }],
+      cwd,
+      (activity) => {
+        activities.push({ state: activity.state, termination: activity.termination });
+      }
+    );
+
+    expect(activities).toContainEqual(expect.objectContaining({
+      state: 'terminated',
+      termination: expect.objectContaining({ reason: 'timeout', processGroupTerminated: true })
+    }));
   });
 
   it('rejects validation command paths that traverse workspace symlinks outside the workspace', async () => {
@@ -401,3 +465,71 @@ describe('validation runner', () => {
     expect(result.stdout).toContain('2');
   });
 });
+
+async function writeProcessTreeScripts(cwd: string): Promise<{ parentScript: string }> {
+  const parentScript = join(cwd, 'parent.js');
+  const childScript = join(cwd, 'child.js');
+  const grandchildScript = join(cwd, 'grandchild.js');
+  await writeFile(grandchildScript, [
+    'const fs = require("node:fs");',
+    `fs.writeFileSync(${JSON.stringify(join(cwd, 'grandchild.ready'))}, "ready");`,
+    'setInterval(() => {}, 1000);'
+  ].join('\n'), 'utf8');
+  await writeFile(childScript, [
+    'const fs = require("node:fs");',
+    'const { spawn } = require("node:child_process");',
+    `const grandchild = spawn(process.execPath, [${JSON.stringify(grandchildScript)}], { stdio: "ignore" });`,
+    `fs.writeFileSync(${JSON.stringify(join(cwd, 'grandchild.pid'))}, String(grandchild.pid));`,
+    `fs.writeFileSync(${JSON.stringify(join(cwd, 'child.ready'))}, "ready");`,
+    'setInterval(() => {}, 1000);'
+  ].join('\n'), 'utf8');
+  await writeFile(parentScript, [
+    'const fs = require("node:fs");',
+    'const { spawn } = require("node:child_process");',
+    `const child = spawn(process.execPath, [${JSON.stringify(childScript)}], { stdio: "ignore" });`,
+    `fs.writeFileSync(${JSON.stringify(join(cwd, 'child.pid'))}, String(child.pid));`,
+    'setInterval(() => {}, 1000);'
+  ].join('\n'), 'utf8');
+  return { parentScript };
+}
+
+async function waitForFile(path: string): Promise<void> {
+  for (let attempt = 0; attempt < 100; attempt += 1) {
+    try {
+      await readFile(path, 'utf8');
+      return;
+    } catch {
+      await delay(50);
+    }
+  }
+  throw new Error(`Timed out waiting for ${path}`);
+}
+
+async function expectProcessToExit(pid: number): Promise<void> {
+  for (let attempt = 0; attempt < 100; attempt += 1) {
+    if (!isProcessRunning(pid)) return;
+    await delay(50);
+  }
+  throw new Error(`Process ${pid} survived termination`);
+}
+
+function isProcessRunning(pid: number): boolean {
+  if (process.platform === 'linux') {
+    try {
+      const status = existsSync(`/proc/${pid}/status`) ? readFileSync(`/proc/${pid}/status`, 'utf8') : '';
+      if (/^State:\s+Z\b/m.test(status)) return false;
+    } catch {
+      return false;
+    }
+  }
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    return !(
+      error instanceof Error
+      && 'code' in error
+      && (error as NodeJS.ErrnoException).code === 'ESRCH'
+    );
+  }
+}

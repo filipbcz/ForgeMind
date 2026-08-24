@@ -26,6 +26,7 @@ export interface ValidationResult {
   stderr: string;
   passed: boolean;
   denied?: FilesystemIsolationDenial;
+  termination?: ProcessTreeTermination;
   checkResults?: ValidationCheckExecutionResult[];
   executedCheckCount?: number;
   reusedCheckCount?: number;
@@ -65,8 +66,16 @@ export interface ValidationCheckExecutionResult {
   requiredCapabilities?: string[];
 }
 
+export interface ProcessTreeTermination {
+  reason: 'timeout' | 'cancelled';
+  pid?: number;
+  signal: 'SIGTERM';
+  processGroupTerminated: boolean;
+  errorMessage?: string;
+}
+
 export interface ValidationActivity {
-  state: 'started' | 'output' | 'completed' | 'deferred' | 'denied';
+  state: 'started' | 'output' | 'completed' | 'deferred' | 'denied' | 'terminated';
   command: string;
   checkIndex: number;
   checkCount: number;
@@ -83,9 +92,11 @@ export interface ValidationActivity {
   rationale?: string;
   requiredCapabilities?: string[];
   denial?: FilesystemIsolationDenial;
+  termination?: ProcessTreeTermination;
 }
 
 export type ValidationActivityHandler = (activity: ValidationActivity) => Promise<void> | void;
+type ProcessTreeTerminationHandler = (termination: ProcessTreeTermination) => Promise<void> | void;
 
 export interface WorkspaceFilesystemPolicy {
   workspacePath: string;
@@ -227,7 +238,8 @@ export async function runValidationCommand(
   onOutput?: (stream: 'stdout' | 'stderr', message: string) => Promise<void> | void,
   timeoutMinutes = 10,
   signal?: AbortSignal,
-  filesystemPolicy?: WorkspaceFilesystemPolicy
+  filesystemPolicy?: WorkspaceFilesystemPolicy,
+  onTermination?: ProcessTreeTerminationHandler
 ): Promise<ValidationResult> {
   throwIfAborted(signal);
   const effectiveCommand = normalizeValidationCommandForEnvironment(command);
@@ -248,10 +260,47 @@ export async function runValidationCommand(
       cwd,
       env: createValidationEnvironment(process.env, cwd),
       shell: shouldUsePowerShell(effectiveCommand) ? 'powershell.exe' : true,
-      timeout: Math.max(1, Math.min(60, timeoutMinutes)) * 60 * 1000,
-      cancelSignal: signal,
+      detached: process.platform !== 'win32',
       reject: false
     });
+    let termination: ProcessTreeTermination | undefined;
+    let forceKillTimer: NodeJS.Timeout | undefined;
+    const terminateProcessTree = (reason: ProcessTreeTermination['reason']) => {
+      if (termination) return;
+      const pid = subprocess.pid;
+      const processGroupTerminated = Boolean(pid && process.platform !== 'win32');
+      let errorMessage: string | undefined;
+      try {
+        if (processGroupTerminated) {
+          process.kill(-pid!, 'SIGTERM');
+          forceKillTimer = setTimeout(() => {
+            try {
+              process.kill(-pid!, 'SIGKILL');
+            } catch {
+              // The process group already exited.
+            }
+          }, 5_000);
+          forceKillTimer.unref();
+        } else {
+          subprocess.kill('SIGTERM');
+        }
+      } catch (error) {
+        errorMessage = error instanceof Error ? error.message : String(error);
+      }
+      termination = {
+        reason,
+        pid,
+        signal: 'SIGTERM',
+        processGroupTerminated,
+        errorMessage
+      };
+    };
+    const abortListener = () => terminateProcessTree('cancelled');
+    signal?.addEventListener('abort', abortListener, { once: true });
+    if (signal?.aborted) {
+      terminateProcessTree('cancelled');
+    }
+    const timeout = setTimeout(() => terminateProcessTree('timeout'), resolveValidationTimeoutMs(timeoutMinutes));
     const pendingOutput: Record<'stdout' | 'stderr', string> = { stdout: '', stderr: '' };
     let flushTimer: NodeJS.Timeout | undefined;
     let outputQueue = Promise.resolve();
@@ -283,15 +332,27 @@ export async function runValidationCommand(
     subprocess.stderr?.on('data', (chunk: Buffer | string) => enqueueOutput('stderr', String(chunk)));
 
     const result = await subprocess;
+    clearTimeout(timeout);
+    if (forceKillTimer) clearTimeout(forceKillTimer);
+    signal?.removeEventListener('abort', abortListener);
     flushOutput();
     await outputQueue;
+    if (termination) {
+      await onTermination?.(termination);
+    }
+    if (termination?.reason === 'cancelled') {
+      throw signal?.reason instanceof Error ? signal.reason : new Error('Validation was cancelled.');
+    }
 
     return {
       command: effectiveCommand,
-      exitCode: result.exitCode ?? 0,
+      exitCode: termination ? 1 : (result.exitCode ?? 0),
       stdout: sanitizeValidationOutput(result.stdout),
-      stderr: sanitizeValidationOutput(result.stderr),
-      passed: result.exitCode === 0
+      stderr: sanitizeValidationOutput(termination?.reason === 'timeout'
+        ? `${result.stderr ? `${result.stderr}\n` : ''}Validation command timed out; terminated process tree.`
+        : result.stderr),
+      passed: !termination && result.exitCode === 0,
+      termination
     };
   } catch (error) {
     if (signal?.aborted) {
@@ -305,6 +366,11 @@ export async function runValidationCommand(
       passed: false
     };
   }
+}
+
+function resolveValidationTimeoutMs(timeoutMinutes: number): number {
+  const minutes = Number.isFinite(timeoutMinutes) ? timeoutMinutes : 10;
+  return Math.max(1_000, Math.min(60 * 60_000, minutes * 60_000));
 }
 
 export async function runValidationChecks(
@@ -523,7 +589,19 @@ export async function runValidationChecks(
         inputHash,
         category: check.category
       });
-    }, check.timeoutMinutes, signal, filesystemPolicy);
+    }, check.timeoutMinutes, signal, filesystemPolicy, async (termination) => {
+      await onActivity?.({
+        state: 'terminated',
+        command: effectiveCommand,
+        checkIndex: index + 1,
+        checkCount: checks.length,
+        elapsedMs: Date.now() - startedAt,
+        inputHash,
+        category: check.category,
+        termination,
+        message: `Validation command process tree terminated after ${termination.reason}.`
+      });
+    });
     await onActivity?.({
       state: 'completed',
       command: effectiveCommand,
