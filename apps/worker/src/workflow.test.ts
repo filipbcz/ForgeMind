@@ -2,7 +2,7 @@ import { describe, expect, it, vi } from 'vitest';
 import { join } from 'node:path';
 import { createHash, randomUUID } from 'node:crypto';
 import { tmpdir } from 'node:os';
-import { access, mkdir, readFile, writeFile } from 'node:fs/promises';
+import { access, mkdir, readFile, symlink, writeFile } from 'node:fs/promises';
 import { simpleGit } from 'simple-git';
 import {
   buildTaskExecutionPrompt,
@@ -1192,6 +1192,83 @@ describe('worker workflow', () => {
     )).toEqual([
       { kind: 'command', command: 'node tools/forge_validate.js architecture' }
     ]);
+  });
+
+  it('emits a structured audit activity when validation command access is denied by filesystem isolation', async () => {
+    const workspaceRoot = join(tmpdir(), `forgemind-worker-denied-command-${randomUUID()}`);
+    const activities: TaskActivity[] = [];
+    const project: Project = {
+      ...demoProject,
+      configYaml: noGitProjectConfig.replace('verify: "node --version"', 'verify: "cat /var/run/docker.sock"')
+    };
+    const task: ForgeTask = {
+      ...demoTask,
+      id: `task_${randomUUID()}`,
+      projectId: project.id,
+      maxIterations: 1
+    };
+
+    const result = await runWorkerTask({
+      project,
+      task,
+      provider: createProviderStub(),
+      reviewProvider: createProviderStub(),
+      workspaceRoot,
+      hooks: {
+        onActivity: async (activity) => {
+          activities.push(activity);
+        }
+      }
+    });
+
+    expect(result.status).toBe('validation_failed');
+    expect(result.validation.stderr).toContain('filesystem isolation policy');
+    expect(activities).toContainEqual(expect.objectContaining({
+      phase: 'validation',
+      state: 'failed',
+      operation: 'command_denied',
+      metadata: expect.objectContaining({
+        policy: 'filesystem_isolation',
+        reason: 'forbidden_path',
+        command: 'cat /var/run/docker.sock',
+        path: '/var/run/docker.sock'
+      })
+    }));
+  });
+
+  it('rejects provider file updates that traverse workspace symlinks outside the workspace', async () => {
+    const workspaceRoot = join(tmpdir(), `forgemind-worker-symlink-write-${randomUUID()}`);
+    const outsidePath = join(tmpdir(), `forgemind-worker-outside-${randomUUID()}`);
+    await mkdir(outsidePath, { recursive: true });
+    const task: ForgeTask = {
+      ...demoTask,
+      id: `task_${randomUUID()}`,
+      maxIterations: 1
+    };
+    const provider = createProviderStub({
+      implement: vi.fn(async (input): Promise<ImplementResult> => {
+        await symlink(outsidePath, join(input.repositoryPath, 'outside-link'), 'dir');
+        return {
+          summary: 'Attempted symlink traversal write',
+          changedFiles: ['outside-link/secret.txt'],
+          diffStat: { filesChanged: 1, insertions: 1, deletions: 0 },
+          requestedApprovals: [],
+          fileUpdates: [{ path: 'outside-link/secret.txt', content: 'leak\n' }]
+        };
+      })
+    });
+
+    const result = await runWorkerTask({
+      project: demoProject,
+      task,
+      provider,
+      reviewProvider: createProviderStub(),
+      workspaceRoot
+    });
+
+    expect(result.status).toBe('needs_approval');
+    expect(result.approvals).toContain('write_outside_repo');
+    await expect(access(join(outsidePath, 'secret.txt'))).rejects.toThrow();
   });
 
   it('does not re-add persisted architecture checks to an authoritative resume plan', async () => {

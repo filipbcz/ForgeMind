@@ -289,7 +289,7 @@ export async function runDatabaseWorkerOnce(options: { deferInterruptSignals?: b
         onActivity: async (activity) => {
           await repository.writeAudit({
             actorType: activity.phase === 'github' ? 'github' : 'agent',
-            eventType: 'task_activity',
+            eventType: activity.operation === 'command_denied' ? 'command_denied' : 'task_activity',
             taskId: claimed.task.id,
             payload: {
               taskRunId: claimed.taskRun.id,
@@ -300,7 +300,8 @@ export async function runDatabaseWorkerOnce(options: { deferInterruptSignals?: b
               operation: activity.operation ?? null,
               attempt: activity.attempt ?? null,
               elapsedMs: activity.elapsedMs ?? null,
-              exitCode: activity.exitCode ?? null
+              exitCode: activity.exitCode ?? null,
+              metadata: activity.metadata ?? null
             }
           });
         },
