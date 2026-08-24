@@ -15,6 +15,18 @@ function createProject(): Project {
     githubOwner: 'demo',
     githubRepo: 'mvp-scenario-project',
     defaultBranch: 'main',
+    configYaml: `project:
+  id: mvp-scenario-project
+  name: MVP Scenario Project
+  repo: github.com/demo/mvp-scenario-project
+workflow: {}
+ai: {}
+limits: {}
+commands: {}
+approval: {}
+sandbox:
+  allow_network: true
+github: {}`,
     isActive: true,
     createdAt: new Date().toISOString(),
     updatedAt: new Date().toISOString()

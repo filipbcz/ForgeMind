@@ -2356,6 +2356,7 @@ describe('Studio API routes', () => {
       provider: workerProvider,
       github: workerGitHub,
       verifyCommand: 'node --version',
+      resourcePolicy: { allowNetwork: true, minFreeSpaceMb: 0, retentionDays: 14 },
       workspaceRoot: join(tmpdir(), `forgemind-step21-${randomUUID()}`),
       hooks: {
         onStatus: async (status: string, payload: unknown) => {

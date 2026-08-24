@@ -39,6 +39,11 @@ import {
   type ValidationCheckExecutionResult,
   type ValidationResult
 } from './validation.js';
+import {
+  assertFreeSpaceForWorker,
+  resolveWorkerResourcePolicy,
+  type WorkerResourcePolicy
+} from './resource-policy.js';
 
 export interface WorkerTaskInput {
   project: Project;
@@ -55,6 +60,7 @@ export interface WorkerTaskInput {
   reviewProviderSession?: ProviderSessionContext;
   hooks?: WorkerTaskHooks;
   signal?: AbortSignal;
+  resourcePolicy?: WorkerResourcePolicy;
 }
 
 type GitHubOperation = 'create_issue' | 'create_branch' | 'commit_and_push' | 'create_draft_pr' | 'create_pull_request' | 'wait_for_checks' | 'merge_pr' | 'comment_on_issue';
@@ -161,6 +167,7 @@ export interface WorkerTaskResult {
 export async function runWorkerTask(input: WorkerTaskInput): Promise<WorkerTaskResult> {
   throwIfTaskAborted(input.signal);
   const config = resolveWorkerConfig(input.project, input);
+  const resourcePolicy = input.resourcePolicy ?? resolveWorkerResourcePolicy(input.project.configYaml);
   const provider = input.provider ?? createProvider(config.providerKind);
   const reviewProvider = input.reviewProvider ?? provider;
   const taskPrompt = compactTaskExecutionPrompt(input.task.prompt);
@@ -180,6 +187,7 @@ export async function runWorkerTask(input: WorkerTaskInput): Promise<WorkerTaskR
     operation: 'prepare_workspace'
   });
   await mkdir(workspacePath, { recursive: true });
+  await assertFreeSpaceForWorker(workspacePath, resourcePolicy);
 
   const usageSummary = input.usageSummary ?? formatUsageSummary(await provider.estimateCost({ prompt: executionPrompt, repositorySizeHint: 'small' }));
 
@@ -881,7 +889,7 @@ export async function runWorkerTask(input: WorkerTaskInput): Promise<WorkerTaskR
         }, passedValidationCheckResults, validationInputHash, input.signal, undefined, {
           workspacePath,
           forbiddenPaths: config.sandbox.forbiddenPaths
-        });
+        }, resourcePolicy);
         collectPassedValidationCheckResults(validation, passedValidationCheckResults);
         await input.hooks?.onIteration?.({
           phase: 'validation',

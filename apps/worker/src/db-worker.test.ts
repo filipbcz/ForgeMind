@@ -1,5 +1,8 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
-import { resolve } from 'node:path';
+import { join, resolve } from 'node:path';
+import { access, mkdir, utimes, writeFile } from 'node:fs/promises';
+import { randomUUID } from 'node:crypto';
+import { tmpdir } from 'node:os';
 
 const createProviderMock = vi.fn();
 const runWorkerTaskMock = vi.fn();
@@ -61,6 +64,7 @@ const repositoryMock = {
   getAIProviderConnectionSecretById: vi.fn(async (_connectionId: string): Promise<unknown> => undefined),
   claimNextSubmittedTask: vi.fn(async (): Promise<unknown> => createClaimedTask()),
   claimNextProjectAudit: vi.fn(async (): Promise<unknown> => undefined),
+  listTasks: vi.fn(async (): Promise<unknown[]> => []),
   getTask: vi.fn(async (): Promise<unknown> => undefined),
   getProjectRoadmap: vi.fn(async (): Promise<unknown> => undefined),
   finalizeProjectAudit: vi.fn(async () => ({ retryScheduled: false })),
@@ -156,6 +160,8 @@ describe('db-worker policy enforcement', () => {
     repositoryMock.getGitHubConnectionSecret.mockResolvedValue(undefined);
     repositoryMock.getTask.mockReset();
     repositoryMock.getTask.mockResolvedValue(undefined);
+    repositoryMock.listTasks.mockReset();
+    repositoryMock.listTasks.mockResolvedValue([]);
     repositoryMock.getTaskUsage.mockResolvedValue({
       taskId: 'task_1',
       inputTokens: 0,
@@ -199,6 +205,112 @@ describe('db-worker policy enforcement', () => {
     try {
       const { resolveWorkerWorkspaceRoot } = await import('./db-worker.js');
       expect(resolveWorkerWorkspaceRoot()).toBe(resolve('/data/workspaces'));
+    } finally {
+      if (previousWorkspaceRoot === undefined) {
+        delete process.env.FORGEMIND_WORKSPACE_ROOT;
+      } else {
+        process.env.FORGEMIND_WORKSPACE_ROOT = previousWorkspaceRoot;
+      }
+    }
+  });
+
+  it('fails a claimed task before execution when free disk space is below policy', async () => {
+    const claimed = createClaimedTask();
+    claimed.project.configYaml = `project:
+  id: demo
+  name: Demo
+  repo: github.com/demo/demo
+workflow:
+  create_issue: false
+  create_branch: false
+  create_draft_pr: false
+  auto_push: false
+ai: {}
+limits: {}
+commands: {}
+approval: {}
+sandbox:
+  allow_network: true
+resources:
+  min_free_space_mb: ${Number.MAX_SAFE_INTEGER}
+github: {}`;
+    repositoryMock.claimNextSubmittedTask.mockResolvedValueOnce(claimed);
+
+    const { runDatabaseWorkerOnce } = await import('./db-worker.js');
+    const result = await runDatabaseWorkerOnce();
+
+    expect(result).toEqual(expect.objectContaining({
+      claimed: true,
+      taskId: 'task_1',
+      status: 'failed'
+    }));
+    expect(runWorkerTaskMock).not.toHaveBeenCalled();
+    expect(repositoryMock.failTask).toHaveBeenCalledWith(
+      'task_1',
+      expect.stringContaining('free disk space is below policy'),
+      'failed'
+    );
+    expect(repositoryMock.finalizeQueueJob).toHaveBeenCalledWith(
+      'queue_1',
+      'failed',
+      expect.stringContaining('free disk space is below policy'),
+      false
+    );
+  }, 10000);
+
+  it('uses configured retention days when cleaning expired workspace artifacts', async () => {
+    const previousWorkspaceRoot = process.env.FORGEMIND_WORKSPACE_ROOT;
+    const workspaceRoot = join(tmpdir(), `forgemind-db-worker-retention-${randomUUID()}`);
+    const oldInactiveWorkspace = join(workspaceRoot, 'task_old');
+    const oldActiveWorkspace = join(workspaceRoot, 'task_active');
+    await mkdir(oldInactiveWorkspace, { recursive: true });
+    await mkdir(oldActiveWorkspace, { recursive: true });
+    await writeFile(join(oldInactiveWorkspace, 'artifact.txt'), 'old\n');
+    await writeFile(join(oldActiveWorkspace, 'artifact.txt'), 'active\n');
+    const oldDate = new Date(Date.now() - 2 * 24 * 60 * 60 * 1000);
+    await utimes(oldInactiveWorkspace, oldDate, oldDate);
+    await utimes(oldActiveWorkspace, oldDate, oldDate);
+    process.env.FORGEMIND_WORKSPACE_ROOT = workspaceRoot;
+
+    try {
+      const claimed = createClaimedTask();
+      claimed.project.configYaml = `project:
+  id: demo
+  name: Demo
+  repo: github.com/demo/demo
+workflow:
+  create_issue: false
+  create_branch: false
+  create_draft_pr: false
+  auto_push: false
+ai: {}
+limits: {}
+commands: {}
+approval: {}
+sandbox:
+  allow_network: true
+resources:
+  retention_days: 1
+github: {}`;
+      repositoryMock.claimNextSubmittedTask.mockResolvedValueOnce(claimed);
+      repositoryMock.listTasks.mockResolvedValue([{ id: 'task_active', status: 'running' }]);
+      runWorkerTaskMock.mockResolvedValueOnce({
+        taskId: 'task_1',
+        status: 'ready_for_user_review',
+        issueUrl: '',
+        branchName: 'main',
+        workspacePath: join(workspaceRoot, 'task_1'),
+        validation: { command: 'true', exitCode: 0, stdout: '', stderr: '', passed: true },
+        summary: 'Local workflow completed.',
+        approvals: [],
+        completedAt: new Date().toISOString()
+      });
+
+      const { runDatabaseWorkerOnce } = await import('./db-worker.js');
+      await runDatabaseWorkerOnce();
+
+      await expect(access(oldInactiveWorkspace)).rejects.toThrow();
+      await expect(access(oldActiveWorkspace)).resolves.toBeUndefined();
     } finally {
       if (previousWorkspaceRoot === undefined) {
         delete process.env.FORGEMIND_WORKSPACE_ROOT;

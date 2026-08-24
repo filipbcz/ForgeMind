@@ -11,6 +11,12 @@ import { formatProjectArchitectureContext, runWorkerTask, type WorkerTaskResult,
 import { buildTargetedRepositoryContext, prepareCapabilityAuditWorkspace, runCapabilityAudit, runReleaseAudit } from './capability-audit.js';
 import { formatValidationFailure } from './validation.js';
 import { resolveWorkerCapabilities } from './worker-capabilities.js';
+import {
+  assertFreeSpaceForWorker,
+  cleanupExpiredWorkerArtifacts,
+  resolveWorkerResourcePolicy,
+  type WorkerResourcePolicy
+} from './resource-policy.js';
 
 type ApprovedLimitSignal = 'diff_lines_limit_reached' | 'changed_files_limit_reached';
 
@@ -162,6 +168,33 @@ export async function runDatabaseWorkerOnce(options: { deferInterruptSignals?: b
         : await createGitHubAdapterFromEnv())
     : undefined;
   const limits = resolveLimits(claimed.project.configYaml, claimed.task.maxIterations);
+  let resourcePolicy: WorkerResourcePolicy;
+  try {
+    resourcePolicy = resolveWorkerResourcePolicy(claimed.project.configYaml);
+    await runWorkspaceRetentionCleanup(repository, workspaceRoot, claimed.task.id, resourcePolicy);
+    await assertFreeSpaceForWorker(workspaceRoot, resourcePolicy);
+  } catch (error) {
+    const message = sanitizeAuditErrorMessage(toErrorMessage(error));
+    await repository.failTask(claimed.task.id, message, 'failed');
+    await repository.finishTaskRun({
+      taskRunId: claimed.taskRun.id,
+      status: 'failed',
+      errorMessage: message,
+      iterationCount: 0,
+      inputTokens: 0,
+      outputTokens: 0,
+      totalTokens: 0,
+      usageSource: 'unavailable',
+      estimatedCostUsd: 0,
+      actualCostUsd: null
+    });
+    await finalizeQueueJob('failed', message, false);
+    return {
+      claimed: true,
+      taskId: claimed.task.id,
+      status: 'failed'
+    };
+  }
   const selection = await resolveProviderSelection({
     repository,
     projectConfig,
@@ -276,6 +309,7 @@ export async function runDatabaseWorkerOnce(options: { deferInterruptSignals?: b
       reviewProvider,
       verifyCommand,
       workspaceRoot,
+      resourcePolicy,
       usageSummary: `Pre-run estimate: ${costEstimate.inputTokens} input tokens, ${costEstimate.outputTokens} output tokens, ${costEstimate.estimatedCostUsd.toFixed(4)} USD`,
       resume: resumeContext?.workflowResume,
       providerSession,
@@ -650,6 +684,26 @@ export async function runDatabaseWorkerOnce(options: { deferInterruptSignals?: b
       status
     };
   }
+}
+
+async function runWorkspaceRetentionCleanup(
+  repository: ForgeMindRepository,
+  workspaceRoot: string,
+  currentTaskId: string,
+  resourcePolicy: WorkerResourcePolicy
+): Promise<void> {
+  const tasks = await repository.listTasks();
+  const activeTaskIds = new Set(
+    tasks
+      .filter((task) => !['completed', 'cancelled', 'failed', 'ready_for_user_review'].includes(task.status))
+      .map((task) => task.id)
+  );
+  activeTaskIds.add(currentTaskId);
+  await cleanupExpiredWorkerArtifacts({
+    workspaceRoot,
+    activeTaskIds,
+    policy: resourcePolicy
+  });
 }
 
 function startTaskCancellationWatcher(
