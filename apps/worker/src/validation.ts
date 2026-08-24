@@ -1,6 +1,8 @@
 import { execaCommand } from 'execa';
 import { existsSync } from 'node:fs';
+import { lstat, realpath } from 'node:fs/promises';
 import { delimiter, join } from 'node:path';
+import { isAbsolute, relative, resolve } from 'node:path';
 import type { ValidationCheck } from '@forgemind/providers';
 import { createWorkspaceEnvironment } from '@forgemind/shared';
 import { missingValidationCapabilities, requiredValidationCapabilities, resolveWorkerCapabilities } from './worker-capabilities.js';
@@ -23,6 +25,7 @@ export interface ValidationResult {
   stdout: string;
   stderr: string;
   passed: boolean;
+  denied?: FilesystemIsolationDenial;
   checkResults?: ValidationCheckExecutionResult[];
   executedCheckCount?: number;
   reusedCheckCount?: number;
@@ -63,7 +66,7 @@ export interface ValidationCheckExecutionResult {
 }
 
 export interface ValidationActivity {
-  state: 'started' | 'output' | 'completed' | 'deferred';
+  state: 'started' | 'output' | 'completed' | 'deferred' | 'denied';
   command: string;
   checkIndex: number;
   checkCount: number;
@@ -79,9 +82,29 @@ export interface ValidationActivity {
   criterion?: string;
   rationale?: string;
   requiredCapabilities?: string[];
+  denial?: FilesystemIsolationDenial;
 }
 
 export type ValidationActivityHandler = (activity: ValidationActivity) => Promise<void> | void;
+
+export interface WorkspaceFilesystemPolicy {
+  workspacePath: string;
+  forbiddenPaths?: string[];
+}
+
+export interface FilesystemIsolationDenial {
+  policy: 'filesystem_isolation';
+  reason: 'outside_workspace' | 'forbidden_path';
+  path: string;
+  resolvedPath: string;
+  workspacePath: string;
+  command: string;
+}
+
+interface CanonicalForbiddenPath {
+  resolvedPath?: string;
+  pattern?: RegExp;
+}
 
 export function createValidationEnvironment(
   source: NodeJS.ProcessEnv = process.env,
@@ -203,13 +226,24 @@ export async function runValidationCommand(
   cwd: string,
   onOutput?: (stream: 'stdout' | 'stderr', message: string) => Promise<void> | void,
   timeoutMinutes = 10,
-  signal?: AbortSignal
+  signal?: AbortSignal,
+  filesystemPolicy?: WorkspaceFilesystemPolicy
 ): Promise<ValidationResult> {
   throwIfAborted(signal);
   const effectiveCommand = normalizeValidationCommandForEnvironment(command);
 
   try {
     assertAllowedValidationCommand(effectiveCommand);
+    const denial = await evaluateCommandFilesystemIsolation(effectiveCommand, cwd, filesystemPolicy);
+    if (denial) {
+      return {
+        command: effectiveCommand,
+        exitCode: 1,
+        stdout: '',
+        stderr: formatFilesystemIsolationDenial(denial),
+        passed: false
+      };
+    }
     const subprocess = execaCommand(effectiveCommand, {
       cwd,
       env: createValidationEnvironment(process.env, cwd),
@@ -280,7 +314,8 @@ export async function runValidationChecks(
   passedCheckResults: ReadonlyMap<string, ValidationCheckExecutionResult> = new Map(),
   inputHash?: string,
   signal?: AbortSignal,
-  availableCapabilities: ReadonlySet<string> = resolveWorkerCapabilities()
+  availableCapabilities: ReadonlySet<string> = resolveWorkerCapabilities(),
+  filesystemPolicy?: WorkspaceFilesystemPolicy
 ): Promise<ValidationResult> {
   throwIfAborted(signal);
   if (checks.length === 0) {
@@ -379,6 +414,93 @@ export async function runValidationChecks(
     }
 
     executedCheckCount += 1;
+    try {
+      assertAllowedValidationCommand(effectiveCommand);
+    } catch (error) {
+      const result: ValidationResult = {
+        command: effectiveCommand,
+        exitCode: 1,
+        stdout: '',
+        stderr: error instanceof Error ? error.message : String(error),
+        passed: false
+      };
+      await onActivity?.({
+        state: 'completed',
+        command: effectiveCommand,
+        checkIndex: index + 1,
+        checkCount: checks.length,
+        elapsedMs: 0,
+        inputHash,
+        category: check.category,
+        stdout: result.stdout,
+        stderr: result.stderr,
+        exitCode: result.exitCode,
+        criterion: check.criterion,
+        rationale: check.rationale,
+        requiredCapabilities: check.requiredCapabilities
+      });
+      outputs.push(`[command] ${effectiveCommand}`);
+      if (check.criterion) {
+        outputs.push(`[criterion] ${check.criterion}`);
+      }
+      if (check.rationale) {
+        outputs.push(`[rationale] ${check.rationale}`);
+      }
+      outputs.push(result.stderr);
+      checkResults.push({
+        ...result,
+        inputHash,
+        criterion: check.criterion,
+        rationale: check.rationale,
+        requiredCapabilities: check.requiredCapabilities
+      });
+      failingResult = result;
+      break;
+    }
+    const denial = await evaluateCommandFilesystemIsolation(effectiveCommand, cwd, filesystemPolicy);
+    if (denial) {
+      const result: ValidationResult = {
+        command: effectiveCommand,
+        exitCode: 1,
+        stdout: '',
+        stderr: formatFilesystemIsolationDenial(denial),
+        passed: false,
+        denied: denial
+      };
+      await onActivity?.({
+        state: 'denied',
+        command: effectiveCommand,
+        checkIndex: index + 1,
+        checkCount: checks.length,
+        elapsedMs: 0,
+        inputHash,
+        category: check.category,
+        stdout: result.stdout,
+        stderr: result.stderr,
+        exitCode: result.exitCode,
+        criterion: check.criterion,
+        rationale: check.rationale,
+        requiredCapabilities: check.requiredCapabilities,
+        denial
+      });
+      outputs.push(`[command] ${effectiveCommand}`);
+      if (check.criterion) {
+        outputs.push(`[criterion] ${check.criterion}`);
+      }
+      if (check.rationale) {
+        outputs.push(`[rationale] ${check.rationale}`);
+      }
+      outputs.push(result.stderr);
+      checkResults.push({
+        ...result,
+        inputHash,
+        criterion: check.criterion,
+        rationale: check.rationale,
+        requiredCapabilities: check.requiredCapabilities
+      });
+      failingResult = result;
+      break;
+    }
     const startedAt = Date.now();
     await onActivity?.({
       state: 'started',
@@ -401,7 +523,7 @@ export async function runValidationChecks(
         inputHash,
         category: check.category
       });
-    }, check.timeoutMinutes, signal);
+    }, check.timeoutMinutes, signal, filesystemPolicy);
     await onActivity?.({
       state: 'completed',
       command: effectiveCommand,
@@ -454,8 +576,147 @@ export async function runValidationChecks(
     executedCheckCount,
     reusedCheckCount,
     failingCommand: failingResult?.command,
+    denied: failingResult?.denied,
     deferredChecks
   };
+}
+
+export async function evaluateCommandFilesystemIsolation(
+  command: string,
+  cwd: string,
+  policy?: WorkspaceFilesystemPolicy
+): Promise<FilesystemIsolationDenial | undefined> {
+  const workspacePath = await canonicalizePath(policy?.workspacePath ?? cwd);
+  if (!isPathInside(workspacePath, await canonicalizePath(cwd))) {
+    return {
+      policy: 'filesystem_isolation',
+      reason: 'outside_workspace',
+      path: cwd,
+      resolvedPath: await canonicalizePath(cwd),
+      workspacePath,
+      command
+    };
+  }
+
+  const forbiddenPaths = await Promise.all(
+    uniqueStrings(['/var/run/docker.sock', ...(policy?.forbiddenPaths ?? [])])
+      .map((item) => canonicalizePolicyPath(item, workspacePath))
+  );
+  const candidates = extractCommandPathCandidates(command, policy?.forbiddenPaths ?? []);
+  for (const candidate of candidates) {
+    const resolvedPath = await canonicalizePath(isAbsolute(candidate) ? candidate : resolve(workspacePath, candidate));
+    if (forbiddenPaths.some((forbiddenPath) => matchesForbiddenPath(forbiddenPath, resolvedPath))) {
+      return {
+        policy: 'filesystem_isolation',
+        reason: 'forbidden_path',
+        path: candidate,
+        resolvedPath,
+        workspacePath,
+        command
+      };
+    }
+    if (!isPathInside(workspacePath, resolvedPath)) {
+      return {
+        policy: 'filesystem_isolation',
+        reason: 'outside_workspace',
+        path: candidate,
+        resolvedPath,
+        workspacePath,
+        command
+      };
+    }
+  }
+
+  return undefined;
+}
+
+async function canonicalizePolicyPath(path: string, workspacePath: string): Promise<CanonicalForbiddenPath> {
+  const normalized = path.replace(/\\/g, '/');
+  if (normalized.includes('*')) {
+    const absolutePattern = isAbsolute(path) ? normalized : resolve(workspacePath, normalized).replace(/\\/g, '/');
+    return { pattern: wildcardPathPattern(absolutePattern) };
+  }
+  return { resolvedPath: await canonicalizePath(isAbsolute(path) ? path : resolve(workspacePath, path)) };
+}
+
+async function canonicalizePath(path: string): Promise<string> {
+  try {
+    return await realpath(path);
+  } catch {
+    const parent = await nearestExistingParent(path);
+    const relativeTail = relative(parent.originalPath, resolve(path));
+    return resolve(parent.realPath, relativeTail);
+  }
+}
+
+async function nearestExistingParent(path: string): Promise<{ originalPath: string; realPath: string }> {
+  let current = resolve(path);
+  while (true) {
+    try {
+      await lstat(current);
+      return { originalPath: current, realPath: await realpath(current) };
+    } catch {
+      const parent = resolve(current, '..');
+      if (parent === current) return { originalPath: current, realPath: current };
+      current = parent;
+    }
+  }
+}
+
+function extractCommandPathCandidates(command: string, forbiddenPaths: string[] = []): string[] {
+  const candidates: string[] = [];
+  const bareForbiddenPaths = new Set(forbiddenPaths.flatMap((item) => {
+    const normalized = item.replace(/\\/g, '/');
+    if (isAbsolute(normalized) || normalized.includes('*') || normalized.includes('/')) return [];
+    return [normalized];
+  }));
+  for (const token of command.matchAll(/(?:"([^"]+)"|'([^']+)'|([^\s;&|()<>]+))/g)) {
+    const value = (token[1] ?? token[2] ?? token[3] ?? '').trim();
+    const cleaned = value.replace(/[,.]+$/g, '');
+    if (!cleaned || cleaned.includes('://') || cleaned.startsWith('-')) continue;
+    if (
+      isAbsolute(cleaned)
+      || cleaned.startsWith('./')
+      || cleaned.startsWith('../')
+      || cleaned.includes('/')
+      || cleaned.includes('\\')
+      || bareForbiddenPaths.has(cleaned.replace(/\\/g, '/'))
+    ) {
+      candidates.push(cleaned);
+    }
+  }
+  return uniqueStrings(candidates);
+}
+
+function isPathInside(parent: string, child: string): boolean {
+  const relativePath = relative(parent, child);
+  return relativePath === '' || (!relativePath.startsWith('..') && !isAbsolute(relativePath));
+}
+
+function isSameOrDescendant(parent: string, child: string): boolean {
+  return isPathInside(parent, child) || isPathInside(child, parent);
+}
+
+function matchesForbiddenPath(forbiddenPath: CanonicalForbiddenPath, resolvedPath: string): boolean {
+  const normalizedPath = resolvedPath.replace(/\\/g, '/');
+  if (forbiddenPath.pattern?.test(normalizedPath)) return true;
+  return Boolean(forbiddenPath.resolvedPath && isSameOrDescendant(forbiddenPath.resolvedPath, resolvedPath));
+}
+
+function wildcardPathPattern(path: string): RegExp {
+  const escaped = path
+    .split('*')
+    .map((part) => part.replace(/[.+?^${}()|[\]\\]/g, '\\$&'))
+    .join('[^/]+');
+  return new RegExp(`^${escaped}(?:/|$)`);
+}
+
+function formatFilesystemIsolationDenial(denial: FilesystemIsolationDenial): string {
+  return `Validation command denied by filesystem isolation policy: ${denial.reason} (${denial.path} -> ${denial.resolvedPath})`;
+}
+
+function uniqueStrings(values: string[]): string[] {
+  return [...new Set(values.filter(Boolean))];
 }
 
 function throwIfAborted(signal?: AbortSignal): void {

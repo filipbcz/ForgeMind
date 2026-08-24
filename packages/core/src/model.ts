@@ -60,6 +60,7 @@ export interface TaskActivity {
   attempt?: number;
   elapsedMs?: number;
   exitCode?: number;
+  metadata?: JsonValue;
 }
 
 export type ApprovalType =

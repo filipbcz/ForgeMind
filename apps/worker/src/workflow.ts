@@ -1,4 +1,4 @@
-import { access, mkdir, readFile, readdir, unlink, writeFile } from 'node:fs/promises';
+import { access, lstat, mkdir, readFile, readdir, realpath, unlink, writeFile } from 'node:fs/promises';
 import { createHash } from 'node:crypto';
 import { dirname, isAbsolute, join, relative, resolve } from 'node:path';
 import { simpleGit, type SimpleGit, type StatusResult } from 'simple-git';
@@ -499,7 +499,7 @@ export async function runWorkerTask(input: WorkerTaskInput): Promise<WorkerTaskR
       });
     resumedImplementation = undefined;
 
-    implementation = applyImplementationPolicy(implementation, workspacePath, config.sandbox);
+    implementation = await applyImplementationPolicy(implementation, workspacePath, config.sandbox);
     await emitTaskActivity(input.hooks, {
       phase: 'implementation',
       state: 'completed',
@@ -716,6 +716,44 @@ export async function runWorkerTask(input: WorkerTaskInput): Promise<WorkerTaskR
         validation = await runValidationChecks(validationChecks, workspacePath, async (activity) => {
           const checkLabel = `${activity.checkIndex}/${activity.checkCount}`;
           const checkpointKey = `validation:${hashCheckpointValue(activity.command)}`;
+          if (activity.state === 'denied') {
+            const denialPayload: JsonValue = {
+              policy: activity.denial?.policy ?? 'filesystem_isolation',
+              reason: activity.denial?.reason ?? 'unknown',
+              command: activity.command,
+              path: activity.denial?.path ?? null,
+              resolvedPath: activity.denial?.resolvedPath ?? null,
+              workspacePath: activity.denial?.workspacePath ?? workspacePath
+            };
+            await emitTaskActivity(input.hooks, {
+              phase: 'validation',
+              state: 'failed',
+              title: `Validace ${checkLabel} byla zamitnuta sandboxem`,
+              detail: activity.stderr,
+              operation: 'command_denied',
+              attempt,
+              elapsedMs: activity.elapsedMs,
+              exitCode: activity.exitCode,
+              metadata: denialPayload
+            });
+            await input.hooks?.onCheckpoint?.({
+              key: checkpointKey,
+              phase: 'validation',
+              status: 'failed',
+              inputHash: activity.inputHash ?? validationInputHash,
+              output: {
+                evidenceVersion: 1,
+                command: activity.command,
+                denied: true,
+                denial: denialPayload,
+                category: activity.category ?? null,
+                criterion: activity.criterion ?? null,
+                rationale: activity.rationale ?? null
+              },
+              errorMessage: activity.stderr
+            });
+            return;
+          }
           if (activity.state === 'deferred') {
             await emitTaskActivity(input.hooks, {
               phase: 'validation',
@@ -805,7 +843,10 @@ export async function runWorkerTask(input: WorkerTaskInput): Promise<WorkerTaskR
             },
             errorMessage: activity.exitCode === 0 ? undefined : `Validation command exited with ${activity.exitCode ?? 1}.`
           });
-        }, passedValidationCheckResults, validationInputHash, input.signal);
+        }, passedValidationCheckResults, validationInputHash, input.signal, undefined, {
+          workspacePath,
+          forbiddenPaths: config.sandbox.forbiddenPaths
+        });
         collectPassedValidationCheckResults(validation, passedValidationCheckResults);
         await input.hooks?.onIteration?.({
           phase: 'validation',
@@ -855,6 +896,20 @@ export async function runWorkerTask(input: WorkerTaskInput): Promise<WorkerTaskR
 
       if (validation.passed) {
         break;
+      }
+
+      if (validation.denied) {
+        return {
+          taskId: input.task.id,
+          status: 'validation_failed',
+          issueUrl: issue.issueUrl,
+          branchName,
+          workspacePath,
+          validation,
+          summary: validation.stderr,
+          approvals: [],
+          completedAt: nowIso()
+        };
       }
 
       validationPlanRevisionCount += 1;
@@ -2732,6 +2787,11 @@ interface WorkerConfig {
   };
 }
 
+interface CanonicalForbiddenPath {
+  resolvedPath?: string;
+  pattern?: RegExp;
+}
+
 function resolveWorkerConfig(project: Project, input: WorkerTaskInput): WorkerConfig {
   let config;
   try {
@@ -2898,13 +2958,13 @@ function computeVerifyCommandApprovals(
   return uniqueApprovals(approvals);
 }
 
-function applyImplementationPolicy(
+async function applyImplementationPolicy(
   implementation: ImplementResult,
   workspacePath: string,
   sandbox: {
     forbiddenPaths: string[];
   }
-): ImplementResult {
+): Promise<ImplementResult> {
   const normalizedApprovals = normalizeRuntimeApprovals(implementation.requestedApprovals);
   if (!implementation.fileUpdates?.length) {
     return {
@@ -2913,18 +2973,23 @@ function applyImplementationPolicy(
     };
   }
 
-  const workspaceRoot = resolve(workspacePath);
+  const workspaceRoot = await canonicalizeWorkerPath(workspacePath);
   const approvals: ApprovalType[] = [...normalizedApprovals];
-  const filteredUpdates = implementation.fileUpdates.filter((file) => {
+  const forbiddenPaths = await Promise.all(
+    uniqueStrings(['/var/run/docker.sock', ...sandbox.forbiddenPaths])
+      .map((item) => canonicalizeForbiddenPolicyPath(item, workspaceRoot))
+  );
+  const filteredUpdates: NonNullable<ImplementResult['fileUpdates']> = [];
+  for (const file of implementation.fileUpdates) {
     if (isAbsolute(file.path)) {
       approvals.push('write_outside_repo');
-      return false;
+      continue;
     }
 
-    const target = resolve(workspaceRoot, file.path);
-    if (!target.startsWith(workspaceRoot)) {
+    const target = await canonicalizeWorkerPath(resolve(workspaceRoot, file.path));
+    if (!isWorkerPathInside(workspaceRoot, target)) {
       approvals.push('write_outside_repo');
-      return false;
+      continue;
     }
 
     const normalized = file.path.replace(/\\/g, '/').toLowerCase();
@@ -2933,20 +2998,76 @@ function applyImplementationPolicy(
       approvals.push('github_workflow_change');
     }
 
-    const forbiddenMatch = sandbox.forbiddenPaths.some((item) => normalized.includes(item.toLowerCase().replace(/\\/g, '/')));
+    const forbiddenMatch = forbiddenPaths.some((forbiddenPath) => matchesWorkerForbiddenPath(forbiddenPath, target));
     if (forbiddenMatch) {
       approvals.push('write_outside_repo');
-      return false;
+      continue;
     }
 
-    return true;
-  });
+    filteredUpdates.push(file);
+  }
 
   return {
     ...implementation,
     fileUpdates: filteredUpdates,
     requestedApprovals: uniqueApprovals(approvals)
   };
+}
+
+async function canonicalizeForbiddenPolicyPath(path: string, workspaceRoot: string): Promise<CanonicalForbiddenPath> {
+  const normalized = path.replace(/\\/g, '/');
+  if (normalized.includes('*')) {
+    const absolutePattern = isAbsolute(path) ? normalized : resolve(workspaceRoot, normalized).replace(/\\/g, '/');
+    return { pattern: workerWildcardPathPattern(absolutePattern) };
+  }
+  return { resolvedPath: await canonicalizeWorkerPath(isAbsolute(path) ? path : resolve(workspaceRoot, path)) };
+}
+
+async function canonicalizeWorkerPath(path: string): Promise<string> {
+  try {
+    return await realpath(path);
+  } catch {
+    const parent = await nearestExistingWorkerParent(path);
+    const relativeTail = relative(parent.originalPath, resolve(path));
+    return resolve(parent.realPath, relativeTail);
+  }
+}
+
+async function nearestExistingWorkerParent(path: string): Promise<{ originalPath: string; realPath: string }> {
+  let current = resolve(path);
+  while (true) {
+    try {
+      await lstat(current);
+      return { originalPath: current, realPath: await realpath(current) };
+    } catch {
+      const parent = resolve(current, '..');
+      if (parent === current) return { originalPath: current, realPath: current };
+      current = parent;
+    }
+  }
+}
+
+function isWorkerPathInside(parent: string, child: string): boolean {
+  const relativePath = relative(parent, child);
+  return relativePath === '' || (!relativePath.startsWith('..') && !isAbsolute(relativePath));
+}
+
+function isWorkerPathSameOrDescendant(parent: string, child: string): boolean {
+  return isWorkerPathInside(parent, child) || isWorkerPathInside(child, parent);
+}
+
+function matchesWorkerForbiddenPath(forbiddenPath: CanonicalForbiddenPath, resolvedPath: string): boolean {
+  const normalizedPath = resolvedPath.replace(/\\/g, '/');
+  if (forbiddenPath.pattern?.test(normalizedPath)) return true;
+  return Boolean(forbiddenPath.resolvedPath && isWorkerPathSameOrDescendant(forbiddenPath.resolvedPath, resolvedPath));
+}
+
+function workerWildcardPathPattern(path: string): RegExp {
+  const escaped = path
+    .split('*')
+    .map((part) => part.replace(/[.+?^${}()|[\]\\]/g, '\\$&'))
+    .join('[^/]+');
+  return new RegExp(`^${escaped}(?:/|$)`);
 }
 
 function computeChangedPathApprovals(

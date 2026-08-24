@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from 'vitest';
-import { mkdir, mkdtemp, readFile, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, symlink, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import {
@@ -43,6 +43,102 @@ describe('validation runner', () => {
 
     expect(result.passed).toBe(true);
     expect(result.stdout).toContain('v');
+  });
+
+  it('rejects validation command paths that traverse workspace symlinks outside the workspace', async () => {
+    const workspacePath = await mkdtemp(join(tmpdir(), 'forgemind-validation-workspace-'));
+    const outsidePath = await mkdtemp(join(tmpdir(), 'forgemind-validation-outside-'));
+    await writeFile(join(outsidePath, 'secret.txt'), 'secret\n', 'utf8');
+    await symlink(outsidePath, join(workspacePath, 'outside-link'), 'dir');
+
+    const result = await runValidationChecks(
+      [{ kind: 'command', command: 'cat outside-link/secret.txt' }],
+      workspacePath,
+      undefined,
+      new Map(),
+      undefined,
+      undefined,
+      undefined,
+      { workspacePath, forbiddenPaths: [] }
+    );
+
+    expect(result.passed).toBe(false);
+    expect(result.stderr).toContain('filesystem isolation policy');
+    expect(result.stderr).toContain('outside_workspace');
+  });
+
+  it('rejects validation command access to the Docker socket', async () => {
+    const workspacePath = await mkdtemp(join(tmpdir(), 'forgemind-validation-docker-'));
+
+    const result = await runValidationChecks(
+      [{ kind: 'command', command: 'cat /var/run/docker.sock' }],
+      workspacePath,
+      undefined,
+      new Map(),
+      undefined,
+      undefined,
+      undefined,
+      { workspacePath, forbiddenPaths: [] }
+    );
+
+    expect(result.passed).toBe(false);
+    expect(result.stderr).toContain('filesystem isolation policy');
+    expect(result.stderr).toContain('/var/run/docker.sock');
+  });
+
+  it('rejects validation command access to configured secret paths', async () => {
+    const workspacePath = await mkdtemp(join(tmpdir(), 'forgemind-validation-secret-'));
+    await mkdir(join(workspacePath, '.secrets'));
+    await writeFile(join(workspacePath, '.secrets', 'token'), 'secret\n', 'utf8');
+    await writeFile(join(workspacePath, '.env'), 'TOKEN=secret\n', 'utf8');
+
+    const result = await runValidationChecks(
+      [
+        { kind: 'command', command: 'cat .secrets/token' },
+        { kind: 'command', command: 'cat .env' }
+      ],
+      workspacePath,
+      undefined,
+      new Map(),
+      undefined,
+      undefined,
+      undefined,
+      { workspacePath, forbiddenPaths: ['.secrets'] }
+    );
+
+    expect(result.passed).toBe(false);
+    expect(result.stderr).toContain('filesystem isolation policy');
+    expect(result.stderr).toContain('forbidden_path');
+
+    const bareSecretsResult = await runValidationChecks(
+      [{ kind: 'command', command: 'ls .secrets' }],
+      workspacePath,
+      undefined,
+      new Map(),
+      undefined,
+      undefined,
+      undefined,
+      { workspacePath, forbiddenPaths: ['.secrets'] }
+    );
+
+    expect(bareSecretsResult.passed).toBe(false);
+    expect(bareSecretsResult.stderr).toContain('filesystem isolation policy');
+    expect(bareSecretsResult.stderr).toContain('forbidden_path');
+
+    const dotEnvResult = await runValidationChecks(
+      [{ kind: 'command', command: 'cat .env' }],
+      workspacePath,
+      undefined,
+      new Map(),
+      undefined,
+      undefined,
+      undefined,
+      { workspacePath, forbiddenPaths: ['.env'] }
+    );
+
+    expect(dotEnvResult.passed).toBe(false);
+    expect(dotEnvResult.stderr).toContain('filesystem isolation policy');
+    expect(dotEnvResult.stderr).toContain('forbidden_path');
   });
 
   it('isolates validation from control-plane secrets and permits explicit workspace overrides', async () => {
