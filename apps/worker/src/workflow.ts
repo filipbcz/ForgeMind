@@ -812,6 +812,41 @@ export async function runWorkerTask(input: WorkerTaskInput): Promise<WorkerTaskR
             });
             return;
           }
+          if (activity.state === 'terminated') {
+            const terminationPayload: JsonValue = {
+              reason: activity.termination?.reason ?? 'unknown',
+              pid: activity.termination?.pid ?? null,
+              signal: activity.termination?.signal ?? null,
+              processGroupTerminated: activity.termination?.processGroupTerminated ?? false,
+              errorMessage: activity.termination?.errorMessage ?? null
+            };
+            await emitTaskActivity(input.hooks, {
+              phase: 'validation',
+              state: 'failed',
+              title: `Validace ${checkLabel} ukoncila strom procesu`,
+              detail: activity.message ?? activity.command,
+              operation: 'validation_command',
+              attempt,
+              elapsedMs: activity.elapsedMs,
+              metadata: terminationPayload
+            });
+            await input.hooks?.onCheckpoint?.({
+              key: checkpointKey,
+              phase: 'validation',
+              status: 'failed',
+              inputHash: activity.inputHash ?? validationInputHash,
+              output: {
+                evidenceVersion: 1,
+                command: activity.command,
+                category: activity.category ?? null,
+                termination: terminationPayload,
+                criterion: activity.criterion ?? null,
+                rationale: activity.rationale ?? null
+              },
+              errorMessage: activity.message ?? 'Validation command process tree was terminated.'
+            });
+            return;
+          }
           await emitTaskActivity(input.hooks, {
             phase: 'validation',
             state: activity.exitCode === 0 ? 'completed' : 'failed',
