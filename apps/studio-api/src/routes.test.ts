@@ -814,6 +814,44 @@ describe('Studio API routes', () => {
       listTaskAudit: vi.fn(),
       getTaskDiff: vi.fn(),
       getTaskUsage: vi.fn(),
+      exportTaskDiagnostics: vi.fn(async (taskId: string) => ({
+        version: 1,
+        generatedAt: new Date().toISOString(),
+        task: {
+          id: taskId,
+          projectId: 'project_1',
+          createdByUserId: 'user_1',
+          title: 'Demo task',
+          prompt: 'Do the thing',
+          mode: 'safe',
+          status: 'waiting_for_capability',
+          maxIterations: 10,
+          maxBudgetUsd: 2,
+          createdAt: new Date().toISOString(),
+          updatedAt: new Date().toISOString()
+        },
+        correlation: { task: `task:${taskId}` },
+        runs: [{
+          id: 'run_1',
+          taskId,
+          correlationId: `task:${taskId}:run:run_1`,
+          provider: 'codex',
+          model: 'codex-latest',
+          status: 'running',
+          state: { version: 1, status: 'waiting', reason: 'unavailable_capability', requiredCapabilities: ['windows'] },
+          iterationCount: 1,
+          inputTokens: 1,
+          outputTokens: 1,
+          totalTokens: 2,
+          usageSource: 'actual_total',
+          estimatedCostUsd: 0.01,
+          summary: 'Provider printed CODEX_API_KEY=sk-route_1234567890abcdef'
+        }],
+        queueJobs: [],
+        providerUsage: [],
+        auditEvents: [],
+        waitingOrBlockedState: { version: 1, status: 'waiting', reason: 'unavailable_capability', requiredCapabilities: ['windows'] }
+      })),
       listApprovals: vi.fn(async () => []),
       getApproval: vi.fn(async (id: string) => {
         if (id === 'approval_delete_invalid_1') return approvedRiskApproval('delete_files', id, {
@@ -998,6 +1036,20 @@ describe('Studio API routes', () => {
     });
     expect(getRunsResponse.statusCode).toBe(200);
     expect(repository.getTaskUsage).toHaveBeenCalledWith('task_1');
+
+    const getDiagnosticsResponse = await app.inject({
+      method: 'GET',
+      url: '/api/tasks/task_1/diagnostics'
+    });
+    expect(getDiagnosticsResponse.statusCode).toBe(200);
+    expect(repository.exportTaskDiagnostics).toHaveBeenCalledWith('task_1');
+    expect(getDiagnosticsResponse.json()).toEqual(expect.objectContaining({
+      correlation: { task: 'task:task_1' },
+      runs: [expect.objectContaining({ correlationId: 'task:task_1:run:run_1' })],
+      waitingOrBlockedState: expect.objectContaining({ status: 'waiting', reason: 'unavailable_capability' })
+    }));
+    expect(JSON.stringify(getDiagnosticsResponse.json())).toContain('[secret-redacted]');
+    expect(JSON.stringify(getDiagnosticsResponse.json())).not.toContain('sk-route_1234567890abcdef');
 
     const unmergedPullRequestSpy = vi.spyOn(globalThis, 'fetch').mockResolvedValueOnce({
       ok: true,

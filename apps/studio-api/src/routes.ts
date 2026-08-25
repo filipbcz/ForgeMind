@@ -24,7 +24,7 @@ import { advanceRoadmapAfterTaskCapabilityWait, advanceRoadmapAfterTaskCompletio
 import type { AIProviderConnectionKind, AIProviderConnectionSecret, ForgeMindRepository } from '@forgemind/db';
 import { parseGitHubWebhookPayload, projectGitHubWebhookEvent, verifyGitHubWebhookSignature } from './webhook.js';
 import type { NotificationService } from './notifications.js';
-import { activeProjectContractRequirements, applyProjectContractDelta } from '@forgemind/core';
+import { activeProjectContractRequirements, applyProjectContractDelta, redactSecrets } from '@forgemind/core';
 import type { ApprovalType } from '@forgemind/core';
 import type { Project, ProjectArchitectureUpdate, ProjectContract, ProjectContractDelta, TaskMode } from '@forgemind/core';
 import { resolveRuntimeEnvVar } from './runtime-env.js';
@@ -1600,6 +1600,13 @@ export function registerRoutes(app: FastifyInstance, repository: ForgeMindReposi
     const task = await repository.getTask(id);
     if (!task) return sendNotFound(reply, `Task "${id}" not found`);
     return repository.getTaskUsage(id);
+  });
+
+  app.get('/api/tasks/:id/diagnostics', async (request, reply) => {
+    const { id } = idParamsSchema.parse(request.params);
+    const diagnostics = await repository.exportTaskDiagnostics(id);
+    if (!diagnostics) return sendNotFound(reply, `Task "${id}" not found`);
+    return redactSecrets(diagnostics);
   });
 
   app.get('/api/tasks/:id/diff', async (request, reply) => {
