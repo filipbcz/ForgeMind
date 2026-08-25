@@ -39,6 +39,7 @@ import {
   type ProviderKind,
   type RiskLevel,
   type RunStatus,
+  type TaskDiagnosticExport,
   type TaskStatus,
   type TaskCheckpoint,
   type TaskRunState
@@ -4214,6 +4215,89 @@ export class ForgeMindRepository {
     };
   }
 
+  async exportTaskDiagnostics(taskId: string): Promise<TaskDiagnosticExport | undefined> {
+    const [taskRecord, runs, queueJobs, providerUsage, auditEvents] = await Promise.all([
+      this.prisma.task.findUnique({ where: { id: taskId } }),
+      this.prisma.taskRun.findMany({
+        where: { taskId },
+        orderBy: { startedAt: 'asc' }
+      }),
+      this.prisma.taskQueueJob.findMany({
+        where: { taskId },
+        orderBy: [{ createdAt: 'asc' }]
+      }),
+      this.prisma.providerUsage.findMany({
+        where: { taskId },
+        orderBy: { createdAt: 'asc' }
+      }),
+      this.prisma.auditLog.findMany({
+        where: { taskId },
+        orderBy: { createdAt: 'asc' }
+      })
+    ]);
+
+    if (!taskRecord) return undefined;
+
+    const task = toTask(taskRecord);
+    const taskCorrelationId = taskCorrelation(task.id);
+    const mappedRuns = runs.map((run) => ({
+      ...toTaskRun(run),
+      correlationId: runCorrelation(task.id, run.id)
+    }));
+    const latestDiagnosticState = [...mappedRuns]
+      .reverse()
+      .find((run) => run.state.status === 'waiting' || run.state.status === 'blocked' || run.state.status === 'retry_scheduled')
+      ?.state ?? resolveDiagnosticTaskState(task, queueJobs.at(-1)?.nextAttemptAt?.toISOString());
+
+    return redactSecrets({
+      version: 1,
+      generatedAt: new Date().toISOString(),
+      task,
+      correlation: {
+        task: taskCorrelationId,
+        ...(mappedRuns.at(-1) ? { run: runCorrelation(task.id, mappedRuns.at(-1)!.id) } : {}),
+        ...(queueJobs.at(-1) ? { queue: queueCorrelation(task.id, queueJobs.at(-1)!.id) } : {}),
+        ...(providerUsage.at(-1) ? { provider: providerCorrelation(task.id, providerUsage.at(-1)!.taskRunId, providerUsage.at(-1)!.id) } : {}),
+        ...(hasGitHubOperation(task, auditEvents.map(toAuditEvent)) ? { github: githubCorrelation(task.id) } : {})
+      },
+      runs: mappedRuns,
+      queueJobs: queueJobs.map((job) => ({
+        id: job.id,
+        correlationId: queueCorrelation(task.id, job.id),
+        status: job.status,
+        reason: job.reason,
+        attemptCount: job.attemptCount,
+        nextAttemptAt: job.nextAttemptAt?.toISOString(),
+        errorMessage: job.errorMessage ?? undefined,
+        createdAt: job.createdAt.toISOString(),
+        claimedAt: job.claimedAt?.toISOString(),
+        finishedAt: job.finishedAt?.toISOString()
+      })),
+      providerUsage: providerUsage.map((usage) => ({
+        id: usage.id,
+        correlationId: providerCorrelation(task.id, usage.taskRunId, usage.id),
+        taskRunId: usage.taskRunId,
+        provider: usage.provider,
+        model: usage.model,
+        phase: usage.phase ?? undefined,
+        attempt: usage.attempt ?? undefined,
+        totalTokens: usage.totalTokens,
+        usageSource: usage.usageSource,
+        estimatedCostUsd: Number(usage.estimatedCostUsd),
+        actualCostUsd: usage.actualCostUsd === null ? undefined : Number(usage.actualCostUsd),
+        createdAt: usage.createdAt.toISOString()
+      })),
+      auditEvents: auditEvents.map((event) => {
+        const mapped = toAuditEvent(event);
+        return {
+          ...mapped,
+          correlation: deriveAuditCorrelation(task.id, mapped)
+        };
+      }),
+      waitingOrBlockedState: latestDiagnosticState
+    });
+  }
+
   async writeAudit(input: Omit<AuditEvent, 'id' | 'createdAt'>): Promise<AuditEvent> {
     const event = await this.prisma.auditLog.create({
       data: {
@@ -4337,6 +4421,76 @@ function parseActiveIterationAudit(event: AuditLog | null):
     providerPrompt: typeof payload.providerPrompt === 'string' && payload.providerPrompt.length > 0 ? payload.providerPrompt : undefined,
     startedAt: event.createdAt.toISOString()
   };
+}
+
+function taskCorrelation(taskId: string): string {
+  return `task:${taskId}`;
+}
+
+function runCorrelation(taskId: string, runId: string): string {
+  return `${taskCorrelation(taskId)}:run:${runId}`;
+}
+
+function queueCorrelation(taskId: string, queueJobId: string): string {
+  return `${taskCorrelation(taskId)}:queue:${queueJobId}`;
+}
+
+function providerCorrelation(taskId: string, taskRunId: string, usageId: string): string {
+  return `${runCorrelation(taskId, taskRunId)}:provider:${usageId}`;
+}
+
+function githubCorrelation(taskId: string): string {
+  return `${taskCorrelation(taskId)}:github`;
+}
+
+function deriveAuditCorrelation(taskId: string, event: AuditEvent) {
+  const payload = event.payload && typeof event.payload === 'object' && !Array.isArray(event.payload)
+    ? event.payload as Record<string, JsonValue>
+    : {};
+  const taskRunId = typeof payload.taskRunId === 'string' ? payload.taskRunId : undefined;
+  const queueJobId = typeof payload.queueJobId === 'string' ? payload.queueJobId : undefined;
+  const providerUsageId = typeof payload.providerUsageId === 'string' ? payload.providerUsageId : undefined;
+  return {
+    task: taskCorrelation(taskId),
+    ...(taskRunId ? { run: runCorrelation(taskId, taskRunId) } : {}),
+    ...(queueJobId ? { queue: queueCorrelation(taskId, queueJobId) } : {}),
+    ...(taskRunId && providerUsageId ? { provider: providerCorrelation(taskId, taskRunId, providerUsageId) } : {}),
+    ...(isGitHubEvent(event) ? { github: githubCorrelation(taskId) } : {})
+  };
+}
+
+function hasGitHubOperation(task: ForgeTask, events: AuditEvent[]): boolean {
+  return Boolean(task.githubIssueUrl || task.pullRequestUrl || task.githubIssueNumber || task.pullRequestNumber)
+    || events.some(isGitHubEvent);
+}
+
+function isGitHubEvent(event: AuditEvent): boolean {
+  return event.actorType === 'github' || event.eventType.startsWith('task_github_') || event.eventType.startsWith('github_');
+}
+
+function resolveDiagnosticTaskState(task: ForgeTask, nextAttemptAt?: string): TaskRunState | undefined {
+  if (task.status === 'waiting_for_capability') {
+    return createWaitingRunState('unavailable_capability', {
+      detail: 'Task is waiting for a worker with the required capability.',
+      requiredCapabilities: task.waitingForCapabilities ?? []
+    });
+  }
+  if (task.status === 'needs_approval' || task.status === 'waiting_for_plan_approval') {
+    return createWaitingRunState('approval_required', { detail: 'Task is waiting for approval.' });
+  }
+  if (nextAttemptAt) {
+    return createRetryScheduledRunState({
+      detail: 'Task queue job is waiting for retry backoff.',
+      nextAttemptAt
+    });
+  }
+  if (task.status === 'validation_failed') return createBlockedRunState('validation_failed');
+  if (task.status === 'provider_failed') return createBlockedRunState('provider_failed');
+  if (task.status === 'approval_rejected') return createBlockedRunState('approval_rejected');
+  if (task.status === 'budget_exceeded') return createBlockedRunState('budget_exceeded');
+  if (task.status === 'iteration_limit_reached') return createBlockedRunState('iteration_limit_reached');
+  if (task.status === 'repeated_error_detected') return createBlockedRunState('repeated_error_detected');
+  return undefined;
 }
 
 function toGitHubConnectionSnapshot(connection: GitHubConnection): GitHubConnectionSnapshot {

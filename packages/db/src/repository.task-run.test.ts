@@ -356,6 +356,161 @@ describe('ForgeMindRepository task runs', () => {
     expect(JSON.stringify(persisted)).not.toContain('sk-object_1234567890abcdef');
   });
 
+  it('exports correlated diagnostics without representative secrets', async () => {
+    const { prisma } = createMockPrisma();
+    const createdAt = new Date('2026-08-25T10:00:00.000Z');
+    prisma.task.findUnique.mockResolvedValueOnce({
+      id: 'task_1',
+      projectId: 'project_1',
+      createdByUserId: 'user_local_owner',
+      title: 'Waiting task',
+      prompt: 'Investigate the waiting validation',
+      mode: 'safe',
+      status: 'waiting_for_capability',
+      waitingForCapabilities: ['windows'],
+      deferredValidationCapabilities: [],
+      githubIssueNumber: 42,
+      githubIssueUrl: 'https://github.com/demo/repo/issues/42',
+      branchName: 'ai/task-1',
+      architectureVersionId: null,
+      pullRequestNumber: null,
+      pullRequestUrl: null,
+      providerSessionId: null,
+      providerSessionProvider: null,
+      providerSessionModel: null,
+      providerSessionConnectionId: null,
+      providerSessionUpdatedAt: null,
+      maxIterations: 10,
+      maxBudgetUsd: 2,
+      createdAt,
+      updatedAt: createdAt,
+      startedAt: createdAt,
+      finishedAt: null
+    });
+    prisma.taskRun.findMany.mockResolvedValueOnce([{
+      id: 'run_0',
+      taskId: 'task_1',
+      provider: 'codex',
+      model: 'codex-latest',
+      status: 'failed',
+      iterationCount: 1,
+      inputTokens: 4,
+      outputTokens: 2,
+      totalTokens: 6,
+      usageSource: 'actual_total',
+      estimatedCostUsd: 0.01,
+      actualCostUsd: null,
+      startedAt: new Date('2026-08-25T09:00:00.000Z'),
+      finishedAt: new Date('2026-08-25T09:05:00.000Z'),
+      summary: null,
+      errorMessage: 'Superseded run',
+      runStateJson: { version: 1, status: 'failed', reason: 'unknown' }
+    }, {
+      id: 'run_1',
+      taskId: 'task_1',
+      provider: 'codex',
+      model: 'codex-latest',
+      status: 'running',
+      iterationCount: 1,
+      inputTokens: 10,
+      outputTokens: 5,
+      totalTokens: 15,
+      usageSource: 'actual_total',
+      estimatedCostUsd: 0.01,
+      actualCostUsd: null,
+      startedAt: createdAt,
+      finishedAt: null,
+      summary: 'Waiting for capability',
+      errorMessage: null,
+      runStateJson: { version: 1, status: 'waiting', reason: 'unavailable_capability', requiredCapabilities: ['windows'] }
+    }]);
+    prisma.taskQueueJob.findMany.mockResolvedValueOnce([{
+      id: 'queue_1',
+      taskId: 'task_1',
+      status: 'pending',
+      reason: 'task_started',
+      attemptCount: 2,
+      nextAttemptAt: createdAt,
+      errorMessage: 'retry with GITHUB_TOKEN=ghp_1234567890abcdefghijklmnop',
+      createdAt,
+      claimedAt: null,
+      finishedAt: null
+    }]);
+    prisma.providerUsage.findMany.mockResolvedValueOnce([{
+      id: 'usage_1',
+      taskId: 'task_1',
+      taskRunId: 'run_1',
+      provider: 'codex',
+      model: 'codex-latest',
+      phase: 'implementation',
+      attempt: 1,
+      inputTokens: 10,
+      outputTokens: 5,
+      cachedTokens: 0,
+      totalTokens: 15,
+      usageSource: 'actual_total',
+      credits: 0,
+      estimatedCostUsd: 0.01,
+      actualCostUsd: null,
+      createdAt
+    }]);
+    prisma.auditLog.findMany.mockResolvedValueOnce([{
+      id: 'audit_1',
+      actorType: 'agent',
+      actorId: null,
+      eventType: 'task_provider_activity',
+      projectId: 'project_1',
+      taskId: 'task_1',
+      payload: {
+        taskRunId: 'run_1',
+        providerUsageId: 'usage_1',
+        message: 'Provider returned Authorization: Bearer sk-diagnostic_1234567890abcdef'
+      },
+      createdAt
+    }, {
+      id: 'audit_2',
+      actorType: 'system',
+      actorId: null,
+      eventType: 'task_github_issue_created',
+      projectId: 'project_1',
+      taskId: 'task_1',
+      payload: { issueUrl: 'https://github.com/demo/repo/issues/42' },
+      createdAt
+    }]);
+    const repository = new ForgeMindRepository(prisma);
+
+    const diagnostics = await repository.exportTaskDiagnostics('task_1');
+
+    expect(diagnostics).toEqual(expect.objectContaining({
+      version: 1,
+      correlation: expect.objectContaining({
+        task: 'task:task_1',
+        run: 'task:task_1:run:run_1',
+        queue: 'task:task_1:queue:queue_1',
+        provider: 'task:task_1:run:run_1:provider:usage_1',
+        github: 'task:task_1:github'
+      }),
+      waitingOrBlockedState: expect.objectContaining({
+        status: 'waiting',
+        reason: 'unavailable_capability',
+        requiredCapabilities: ['windows']
+      })
+    }));
+    expect(diagnostics?.runs.map((run) => [run.id, run.correlationId])).toEqual([
+      ['run_0', 'task:task_1:run:run_0'],
+      ['run_1', 'task:task_1:run:run_1']
+    ]);
+    expect(diagnostics?.auditEvents[0]?.correlation).toEqual(expect.objectContaining({
+      task: 'task:task_1',
+      run: 'task:task_1:run:run_1',
+      provider: 'task:task_1:run:run_1:provider:usage_1'
+    }));
+    const serialized = JSON.stringify(diagnostics);
+    expect(serialized).toContain('[secret-redacted]');
+    expect(serialized).not.toContain('sk-diagnostic_1234567890abcdef');
+    expect(serialized).not.toContain('ghp_1234567890abcdefghijklmnop');
+  });
+
   it('redacts queue and task failure errors before persistence', async () => {
     const { prisma } = createMockPrisma();
     const repository = new ForgeMindRepository(prisma);

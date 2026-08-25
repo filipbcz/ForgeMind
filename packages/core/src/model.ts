@@ -773,3 +773,59 @@ export interface AuditEvent {
   payload: JsonValue;
   createdAt: IsoDateString;
 }
+
+export interface DiagnosticCorrelation {
+  task: string;
+  run?: string;
+  queue?: string;
+  provider?: string;
+  github?: string;
+}
+
+export interface DiagnosticQueueJob {
+  id: string;
+  correlationId: string;
+  status: string;
+  reason: string;
+  attemptCount: number;
+  nextAttemptAt?: IsoDateString;
+  errorMessage?: string;
+  createdAt: IsoDateString;
+  claimedAt?: IsoDateString;
+  finishedAt?: IsoDateString;
+}
+
+export interface DiagnosticTaskRun extends TaskRun {
+  correlationId: string;
+}
+
+export interface DiagnosticProviderUsage {
+  id: string;
+  correlationId: string;
+  taskRunId: string;
+  provider: ProviderKind;
+  model: string;
+  phase?: string;
+  attempt?: number;
+  totalTokens: number;
+  usageSource: string;
+  estimatedCostUsd: number;
+  actualCostUsd?: number;
+  createdAt: IsoDateString;
+}
+
+export interface DiagnosticAuditEvent extends AuditEvent {
+  correlation: DiagnosticCorrelation;
+}
+
+export interface TaskDiagnosticExport {
+  version: 1;
+  generatedAt: IsoDateString;
+  task: ForgeTask;
+  correlation: DiagnosticCorrelation;
+  runs: DiagnosticTaskRun[];
+  queueJobs: DiagnosticQueueJob[];
+  providerUsage: DiagnosticProviderUsage[];
+  auditEvents: DiagnosticAuditEvent[];
+  waitingOrBlockedState?: TaskRunState;
+}
