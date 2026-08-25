@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
-import type { ProjectRoadmapApi } from './types.js';
-import { summarizeProjectProgress } from './project-progress.js';
+import type { ProjectRoadmapApi, TaskSummary } from './types.js';
+import { summarizeProjectOperationalOverview, summarizeProjectProgress } from './project-progress.js';
 
 function roadmap(overrides: Partial<ProjectRoadmapApi> = {}): ProjectRoadmapApi {
   return {
@@ -31,6 +31,26 @@ function roadmap(overrides: Partial<ProjectRoadmapApi> = {}): ProjectRoadmapApi 
     evidence: [],
     capabilities: [],
     auditJobs: [],
+    ...overrides
+  };
+}
+
+function task(overrides: Partial<TaskSummary> = {}): TaskSummary {
+  return {
+    id: 'task_2',
+    projectId: 'project_1',
+    title: 'Windows validation',
+    prompt: '',
+    status: 'waiting_for_capability',
+    currentStep: '',
+    mode: 'safe',
+    iterations: 0,
+    maxIterations: 1,
+    updatedAt: '',
+    waitingForCapabilities: ['windows'],
+    plan: [],
+    testResult: '',
+    diffSummary: '',
     ...overrides
   };
 }
@@ -99,6 +119,88 @@ describe('summarizeProjectProgress', () => {
       tone: 'attention',
       headline: 'Čeká se na rozhodnutí o rozšíření',
       completedSteps: 2
+    });
+  });
+});
+
+describe('summarizeProjectOperationalOverview', () => {
+  it('puts the next active step and start action first', () => {
+    expect(summarizeProjectOperationalOverview(roadmap())).toMatchObject({
+      tone: 'active',
+      state: 'Připraven další krok',
+      activeStep: 'Krok 2: User flow',
+      blockers: [],
+      primaryAction: 'start_next_step',
+      primaryActionLabel: 'Spustit další krok'
+    });
+  });
+
+  it('maps completed implementation to the manual audit action', () => {
+    const source = roadmap();
+    source.steps[1]!.status = 'completed';
+
+    expect(summarizeProjectOperationalOverview(source)).toMatchObject({
+      tone: 'attention',
+      state: 'Audit čeká na spuštění',
+      activeStep: '2/2 kroků dokončeno.',
+      primaryAction: 'start_audit'
+    });
+  });
+
+  it('surfaces capability waits as blockers without a primary shell action', () => {
+    const source = roadmap();
+    source.steps[1]!.status = 'waiting_for_capability';
+    source.steps[1]!.taskId = 'task_2';
+
+    expect(summarizeProjectOperationalOverview(source, [task()])).toMatchObject({
+      tone: 'attention',
+      state: 'Čeká na capability',
+      activeStep: 'Krok 2: User flow',
+      primaryAction: 'none'
+    });
+    expect(summarizeProjectOperationalOverview(source, [task()]).blockers).toEqual([
+      'Krok 2 čeká na validační prostředí.',
+      'Windows validation: čeká na windows.'
+    ]);
+  });
+
+  it('maps blocked audit state to a retry audit action with the audit blocker first', () => {
+    const source = roadmap({
+      auditJobs: [{
+        id: 'audit_1', projectId: 'project_1', cycleId: 'cycle_1', requirementIds: [],
+        status: 'blocked', attemptCount: 2, errorMessage: 'Manual evidence missing', createdAt: '', updatedAt: ''
+      }]
+    });
+
+    expect(summarizeProjectOperationalOverview(source)).toMatchObject({
+      tone: 'attention',
+      state: 'Audit vyžaduje pozornost',
+      blockers: ['Manual evidence missing'],
+      primaryAction: 'retry_audit',
+      primaryActionLabel: 'Opakovat pouze audit'
+    });
+  });
+
+  it('maps extension approval wait to the extension decision action', () => {
+    const source = roadmap();
+    source.cycles[0]!.status = 'awaiting_extension_approval';
+
+    expect(summarizeProjectOperationalOverview(source)).toMatchObject({
+      tone: 'attention',
+      state: 'Čeká rozhodnutí',
+      primaryAction: 'review_extension',
+      primaryActionLabel: 'Zobrazit rozhodnutí'
+    });
+  });
+
+  it('does not offer to start a pending roadmap step that already has a task', () => {
+    const source = roadmap();
+    source.steps[1]!.taskId = 'task_2';
+
+    expect(summarizeProjectOperationalOverview(source)).toMatchObject({
+      tone: 'completed',
+      state: 'Cyklus dokončen',
+      primaryAction: 'none'
     });
   });
 });

@@ -1174,6 +1174,80 @@ a {
   accent-color: #0f766e;
 }
 
+.project-operational-overview {
+  display: grid;
+  grid-template-columns: minmax(0, 1.2fr) minmax(220px, 0.9fr) auto;
+  gap: 14px;
+  align-items: stretch;
+  padding: 14px;
+  margin-bottom: 18px;
+  border: 1px solid #d9e2dc;
+  border-left: 4px solid #68736c;
+  border-radius: 8px;
+  background: #f8faf8;
+}
+
+.project-operational-overview.active {
+  border-left-color: #0f766e;
+  background: #f1f9f7;
+}
+
+.project-operational-overview.attention {
+  border-left-color: #a76516;
+  background: #fff8ed;
+}
+
+.project-operational-overview.completed {
+  border-left-color: #197544;
+  background: #f1f8f3;
+}
+
+.operational-state,
+.operational-blockers {
+  min-width: 0;
+  display: grid;
+  align-content: start;
+  gap: 5px;
+}
+
+.operational-state span,
+.operational-blockers > span,
+.operational-action-status {
+  color: #69736c;
+  font-size: 0.78rem;
+  font-weight: 700;
+}
+
+.operational-state strong,
+.operational-blockers strong,
+.operational-state p,
+.operational-blockers li {
+  overflow-wrap: anywhere;
+}
+
+.operational-state p {
+  margin: 0;
+  color: #4c5750;
+  line-height: 1.45;
+}
+
+.operational-blockers ul {
+  margin: 0;
+  padding-left: 18px;
+  color: #5b4630;
+  line-height: 1.45;
+}
+
+.operational-action-bar {
+  display: flex;
+  justify-content: flex-end;
+  align-items: center;
+}
+
+.operational-action-bar .primary-action {
+  min-width: 180px;
+}
+
 .technical-details h4 {
   margin: 8px 0 0;
 }
@@ -2014,6 +2088,15 @@ a {
 
   .branch {
     max-width: 100%;
+  }
+
+  .project-operational-overview {
+    grid-template-columns: 1fr;
+  }
+
+  .operational-action-bar,
+  .operational-action-bar .primary-action {
+    width: 100%;
   }
 
   .task-overview-grid {

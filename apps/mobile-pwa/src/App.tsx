@@ -111,7 +111,8 @@ import type {
 } from './types.js';
 import { subscribeRealtime } from './realtime.js';
 import type { RealtimeConnectionMeta, RealtimeConnectionState } from './realtime.js';
-import { summarizeProjectProgress } from './project-progress.js';
+import { summarizeProjectOperationalOverview, summarizeProjectProgress } from './project-progress.js';
+import type { ProjectOperationalAction } from './project-progress.js';
 import {
   currentExecutionEntries,
   resolveCurrentActivity,
@@ -2504,7 +2505,35 @@ function ApprovalPanel(props: {
   );
 }
 
-function ProjectsPanel(props: {
+function ProjectOperationalActionButton(props: {
+  action: ProjectOperationalAction;
+  label?: string;
+  disabled: boolean;
+  onClick: () => void;
+}) {
+  if (props.action === 'none') {
+    return <span className="operational-action-status">Žádná ruční akce</span>;
+  }
+
+  const Icon = props.action === 'start_audit'
+    ? ClipboardCheck
+    : props.action === 'retry_audit'
+      ? RotateCcw
+      : props.action === 'review_extension'
+        ? ShieldCheck
+        : props.action === 'generate_roadmap'
+          ? LayoutList
+          : Play;
+
+  return (
+    <button className="primary-action" type="button" disabled={props.disabled} onClick={props.onClick}>
+      <Icon size={16} />
+      {props.label ?? 'Pokračovat'}
+    </button>
+  );
+}
+
+export function ProjectsPanel(props: {
   projects: ProjectSummary[];
   tasks: TaskSummary[];
   selectedProjectId?: string;
@@ -2578,6 +2607,7 @@ function ProjectsPanel(props: {
   const latestCycle = roadmapCycles[0];
   const currentContract = props.contracts?.current?.contract ?? selectedProject?.projectContract;
   const cycleSteps = latestCycle ? props.roadmap?.steps.filter((step) => step.cycleId === latestCycle.id) ?? [] : [];
+  const operationalOverview = summarizeProjectOperationalOverview(props.roadmap, props.tasks);
   const canStartNextRoadmapStep = Boolean(
     latestCycle?.status === 'active'
     && cycleSteps.some((step) => step.status === 'pending' && !step.taskId)
@@ -2693,6 +2723,56 @@ function ProjectsPanel(props: {
               <span>{selectedProject.defaultBranch}</span>
             </div>
           </div>
+          <section className={`project-operational-overview ${operationalOverview.tone}`} aria-label="Aktuální operace projektu">
+            <div className="operational-state">
+              <span>Aktuální stav</span>
+              <strong>{props.roadmapLoading ? 'Načítám stav projektu...' : operationalOverview.state}</strong>
+              <p>{props.roadmapLoading ? 'Získávám roadmapu a navazující operace.' : operationalOverview.activeStep}</p>
+            </div>
+            <div className="operational-blockers" aria-label="Blokery">
+              <span>Blokery</span>
+              {props.roadmapLoading ? (
+                <strong>Kontroluji</strong>
+              ) : operationalOverview.blockers.length > 0 ? (
+                <ul>
+                  {operationalOverview.blockers.map((blocker) => <li key={blocker}>{blocker}</li>)}
+                </ul>
+              ) : (
+                <strong>Žádné aktivní blokery</strong>
+              )}
+            </div>
+            <div className="operational-action-bar">
+              <ProjectOperationalActionButton
+                action={operationalOverview.primaryAction}
+                label={operationalOverview.primaryActionLabel}
+                disabled={
+                  props.roadmapLoading
+                  || props.generatingRoadmap
+                  || props.startingRoadmapStep
+                  || props.startingAudit
+                  || props.retryingAudit
+                  || (operationalOverview.primaryAction === 'generate_roadmap' && !selectedProject.brief?.trim())
+                }
+                onClick={() => {
+                  if (operationalOverview.primaryAction === 'generate_roadmap') {
+                    props.onGenerateRoadmap(selectedProject.id);
+                  }
+                  if (operationalOverview.primaryAction === 'start_next_step') {
+                    props.onStartNextRoadmapStep(selectedProject.id);
+                  }
+                  if (operationalOverview.primaryAction === 'start_audit') {
+                    props.onStartAudit(selectedProject.id);
+                  }
+                  if (operationalOverview.primaryAction === 'retry_audit') {
+                    props.onRetryAudit(selectedProject.id);
+                  }
+                  if (operationalOverview.primaryAction === 'review_extension') {
+                    document.querySelector('.roadmap-extension')?.scrollIntoView({ block: 'center' });
+                  }
+                }}
+              />
+            </div>
+          </section>
           <div className="detail-grid">
             <MetricBlock label="Open PR" value={String(selectedProject.openPullRequests)} />
             <MetricBlock label="Cykly" value={String(props.roadmap?.cycles.length ?? 0)} />
