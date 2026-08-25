@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
+import { getRunStateDetail, getRunStateLabel } from '@forgemind/core';
 import {
   AlertTriangle,
   Activity,
@@ -842,7 +843,7 @@ export function App() {
             <p>{projects.length} projekty</p>
             <h1>{viewTitle(view)}</h1>
             <p>
-              Worker: {workerStatusQuery.data?.state ?? 'unknown'} · queue {workerStatusQuery.data?.queuedTaskCount ?? 0} · active {workerStatusQuery.data?.activeTaskCount ?? 0} · {workerStatusQuery.data?.queuePaused ? 'fronta pozastavena' : 'fronta aktivní'}
+              Worker: {workerStatusQuery.data ? getRunStateLabel(workerStatusQuery.data.runState) : 'unknown'} · queue {workerStatusQuery.data?.queuedTaskCount ?? 0} · active {workerStatusQuery.data?.activeTaskCount ?? 0} · {workerStatusQuery.data?.queuePaused ? 'fronta pozastavena' : 'fronta aktivní'}
             </p>
             <div className="connection-indicators" aria-label="Realtime status">
               <RealtimeStatusBadge label="Global feed" state={globalRealtimeState} meta={globalRealtimeMeta} />
@@ -1675,7 +1676,7 @@ function TaskDetail(props: {
         </summary>
         <div className="task-disclosure-body technical-details">
           <dl className="technical-summary">
-            <div><dt>Worker</dt><dd>{props.workerStatus ? `${props.workerStatus.state} | queue ${props.workerStatus.queuedTaskCount} | active ${props.workerStatus.activeTaskCount}` : 'unknown'}</dd></div>
+            <div><dt>Worker</dt><dd>{props.workerStatus ? `${getRunStateLabel(props.workerStatus.runState)} | queue ${props.workerStatus.queuedTaskCount} | active ${props.workerStatus.activeTaskCount}` : 'unknown'}</dd></div>
             <div><dt>Realtime</dt><dd>{formatRealtimeState(props.realtimeState)} | {formatHeartbeatStatus(props.realtimeMeta)}</dd></div>
             <div><dt>Tokeny</dt><dd>{formatTokenUsage(props.usage)}</dd></div>
           </dl>
@@ -1925,7 +1926,7 @@ function formatQueueLabel(task: TaskSummary, queue?: TaskQueueApi): string {
 }
 
 function formatRunTitle(run: TaskRunApi): string {
-  return `${run.provider}/${run.model} | ${run.status} | iterace ${run.iterationCount}`;
+  return `${run.provider}/${run.model} | ${getRunStateLabel(run.state)} | iterace ${run.iterationCount}`;
 }
 
 function resolveLatestTaskError(
@@ -2011,7 +2012,7 @@ function formatTokenUsage(usage: TaskUsageApi | undefined): string {
 }
 
 function formatRunDetail(run: TaskRunApi, maxLength = 260): string {
-  return truncateText(run.errorMessage ?? run.summary ?? 'Bez detailu.', maxLength);
+  return truncateText(getRunStateDetail(run.state) ?? run.errorMessage ?? run.summary ?? 'Bez detailu.', maxLength);
 }
 
 function formatAuditPayload(payload: unknown, maxLength = 260): string {

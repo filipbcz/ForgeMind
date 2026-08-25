@@ -1,6 +1,13 @@
 import {
   activeProjectContractRequirements,
   applyProjectContractDelta,
+  createBlockedRunState,
+  createFailedRunState,
+  createRunningRunState,
+  createRetryScheduledRunState,
+  createWaitingRunState,
+  normalizeRunState,
+  parseTaskRunState,
   redactSecrets,
   type AcceptanceEvidence,
   type AcceptanceEvidenceSource,
@@ -31,8 +38,10 @@ import {
   type ProjectCapability,
   type ProviderKind,
   type RiskLevel,
+  type RunStatus,
   type TaskStatus,
-  type TaskCheckpoint
+  type TaskCheckpoint,
+  type TaskRunState
 } from '@forgemind/core';
 import { createHash } from 'node:crypto';
 import { parseAgentConfigYaml } from '@forgemind/config';
@@ -288,6 +297,7 @@ export interface QueueRecoveryResult {
 
 export interface WorkerStatusSnapshot {
   state: 'idle' | 'running';
+  runState: TaskRunState;
   queuePaused: boolean;
   queuePausedAt?: string;
   queuedTaskCount: number;
@@ -1815,7 +1825,8 @@ export class ForgeMindRepository {
           taskId: task.id,
           provider: resolveProjectProvider(project.configYaml ?? undefined),
           model: 'queued',
-          status: 'queued'
+          status: 'queued',
+          runStateJson: toTaskRunStateJson(normalizeRunState('queued'))
         }
       });
       await tx.taskQueueJob.create({
@@ -2618,7 +2629,8 @@ export class ForgeMindRepository {
           data: {
             status: 'failed',
             finishedAt: interruptedAt,
-            errorMessage: interruptionMessage
+            errorMessage: interruptionMessage,
+            runStateJson: toTaskRunStateJson(createFailedRunState('unknown', interruptionMessage))
           }
         });
         await tx.task.update({
@@ -2720,7 +2732,8 @@ export class ForgeMindRepository {
           data: {
             status: 'failed',
             finishedAt: recoveredAt,
-            errorMessage: interruptionMessage
+            errorMessage: interruptionMessage,
+            runStateJson: toTaskRunStateJson(createFailedRunState('unknown', interruptionMessage))
           }
         });
         await tx.task.update({
@@ -2836,7 +2849,8 @@ export class ForgeMindRepository {
         data: {
           status: 'failed',
           finishedAt: interruptedAt,
-          errorMessage
+          errorMessage,
+          runStateJson: toTaskRunStateJson(createFailedRunState('unknown', errorMessage))
         }
       });
       await tx.task.update({
@@ -2925,6 +2939,13 @@ export class ForgeMindRepository {
 
     return {
       state: runningRun || activeAuditCount > 0 ? 'running' : 'idle',
+      runState: runningRun || activeAuditCount > 0
+        ? normalizeRunState('running')
+        : queueControl.queuePaused
+          ? createWaitingRunState('paused_queue', { detail: 'Worker queue is paused.' })
+          : queuedTaskCount + queuedAuditCount > 0
+            ? createWaitingRunState('inactive_worker', { detail: 'Queued work is waiting for a worker.' })
+            : normalizeRunState('queued', { detail: 'No active worker run.' }),
       queuePaused: queueControl.queuePaused,
       queuePausedAt: queueControl.pausedAt,
       queuedTaskCount: queuedTaskCount + queuedAuditCount,
@@ -3220,7 +3241,8 @@ export class ForgeMindRepository {
           taskId: updated.id,
           provider: resolveProjectProvider(project?.configYaml ?? undefined),
           model: 'queued',
-          status: 'queued'
+          status: 'queued',
+          runStateJson: toTaskRunStateJson(normalizeRunState('queued'))
         }
       });
     }
@@ -3266,7 +3288,8 @@ export class ForgeMindRepository {
       data: {
         status: 'cancelled',
         errorMessage: 'Task cancelled by user.',
-        finishedAt: new Date()
+        finishedAt: new Date(),
+        runStateJson: toTaskRunStateJson(normalizeRunState('cancelled', { detail: 'Task cancelled by user.' }))
       }
     });
 
@@ -3392,6 +3415,10 @@ export class ForgeMindRepository {
     if (!current) throw new Error(`Task "${taskId}" not found`);
     assertTaskTransition(current.status, 'waiting_for_capability');
     const normalized = Array.from(new Set(capabilities.map((item) => item.trim().toLowerCase()).filter(Boolean)));
+    const runState = createWaitingRunState('unavailable_capability', {
+      requiredCapabilities: normalized,
+      detail: 'Authoritative validation is waiting for a worker with the required capability.'
+    });
     const updated = await this.prisma.task.update({
       where: { id: taskId },
       data: {
@@ -3400,12 +3427,20 @@ export class ForgeMindRepository {
         finishedAt: new Date()
       }
     });
+    await this.prisma.taskRun.updateMany({
+      where: { taskId, status: 'running' },
+      data: { runStateJson: toTaskRunStateJson(runState) }
+    });
     await this.writeAudit({
       actorType: 'system',
       eventType: 'task_waiting_for_capability',
       projectId: updated.projectId,
       taskId: updated.id,
-      payload: { ...payload as Record<string, JsonValue>, requiredCapabilities: normalized }
+      payload: {
+        ...payload as Record<string, JsonValue>,
+        requiredCapabilities: normalized,
+        runState: runState as unknown as JsonValue
+      }
     });
     return toTask(updated);
   }
@@ -3503,7 +3538,13 @@ export class ForgeMindRepository {
           });
         }
         await tx.taskRun.create({
-          data: { taskId: task.id, provider: resolveProjectProvider((await tx.project.findUnique({ where: { id: task.projectId } }))?.configYaml ?? undefined), model: 'queued', status: 'queued' }
+          data: {
+            taskId: task.id,
+            provider: resolveProjectProvider((await tx.project.findUnique({ where: { id: task.projectId } }))?.configYaml ?? undefined),
+            model: 'queued',
+            status: 'queued',
+            runStateJson: toTaskRunStateJson(normalizeRunState('queued'))
+          }
         });
         await tx.taskQueueJob.create({
           data: { taskId: task.id, reason: 'capability_available', status: 'pending', nextAttemptAt: now }
@@ -3617,7 +3658,8 @@ export class ForgeMindRepository {
         data: {
           status: 'failed',
           finishedAt: new Date(),
-          errorMessage: 'Worker run was superseded by a later queue claim.'
+          errorMessage: 'Worker run was superseded by a later queue claim.',
+          runStateJson: toTaskRunStateJson(createFailedRunState('unknown', 'Worker run was superseded by a later queue claim.'))
         }
       });
 
@@ -3629,7 +3671,8 @@ export class ForgeMindRepository {
               provider,
               model,
               status: 'running',
-              startedAt: new Date()
+              startedAt: new Date(),
+              runStateJson: toTaskRunStateJson(createRunningRunState())
             }
           })
         : await tx.taskRun.create({
@@ -3638,7 +3681,8 @@ export class ForgeMindRepository {
               provider,
               model,
               status: 'running',
-              startedAt: new Date()
+              startedAt: new Date(),
+              runStateJson: toTaskRunStateJson(createRunningRunState())
             }
           });
 
@@ -3724,7 +3768,11 @@ export class ForgeMindRepository {
               queueJobId,
               nextAttemptAt: nextAttemptAt.toISOString(),
               errorMessage: redactedErrorMessage ?? null,
-              resumeFromCheckpoint: true
+              resumeFromCheckpoint: true,
+              runState: createRetryScheduledRunState({
+                detail: redactedErrorMessage,
+                nextAttemptAt: nextAttemptAt.toISOString()
+              }) as unknown as JsonValue
             }
           });
         });
@@ -3855,7 +3903,9 @@ export class ForgeMindRepository {
     usageSource?: string;
     estimatedCostUsd?: number;
     actualCostUsd?: number | null;
+    runState?: TaskRunState;
   }): Promise<void> {
+    const detail = input.errorMessage ?? input.summary;
     await this.prisma.taskRun.update({
       where: { id: input.taskRunId },
       data: {
@@ -3869,6 +3919,7 @@ export class ForgeMindRepository {
         usageSource: input.usageSource,
         estimatedCostUsd: input.estimatedCostUsd,
         actualCostUsd: input.actualCostUsd,
+        runStateJson: toTaskRunStateJson(input.runState ?? normalizeRunState(input.status, { detail })),
         finishedAt: new Date()
       }
     });
@@ -4057,7 +4108,7 @@ export class ForgeMindRepository {
   }
 
   async getTaskUsage(taskId: string) {
-    const [runs, usage] = await Promise.all([
+    const [runs, usage, task, queuedJob] = await Promise.all([
       this.prisma.taskRun.findMany({
         where: { taskId },
         orderBy: { startedAt: 'asc' }
@@ -4065,6 +4116,18 @@ export class ForgeMindRepository {
       this.prisma.providerUsage.findMany({
         where: { taskId },
         orderBy: { createdAt: 'asc' }
+      }),
+      this.prisma.task.findUnique({
+        where: { id: taskId },
+        select: { status: true, waitingForCapabilities: true }
+      }),
+      this.prisma.taskQueueJob.findFirst({
+        where: {
+          taskId,
+          status: 'pending',
+          nextAttemptAt: { not: null }
+        },
+        orderBy: { nextAttemptAt: 'asc' }
       })
     ]);
 
@@ -4100,23 +4163,39 @@ export class ForgeMindRepository {
       cachedTokens: hasCompleteBreakdown ? totals.cachedTokens : 0,
       usageSource,
       actualCostUsd,
-      runs: runs.map((run) => ({
-        id: run.id,
-        provider: run.provider,
-        model: run.model,
-        status: run.status,
-        iterationCount: run.iterationCount,
-        inputTokens: run.inputTokens,
-        outputTokens: run.outputTokens,
-        totalTokens: run.totalTokens,
-        usageSource: run.usageSource,
-        estimatedCostUsd: Number(run.estimatedCostUsd),
-        actualCostUsd: run.actualCostUsd === null ? null : Number(run.actualCostUsd),
-        startedAt: run.startedAt?.toISOString(),
-        finishedAt: run.finishedAt?.toISOString(),
-        summary: run.summary,
-        errorMessage: run.errorMessage
-      })),
+      runs: runs.map((run, index) => {
+        const isLatestRun = index === runs.length - 1;
+        const detail = run.errorMessage ?? run.summary ?? undefined;
+        const waitingForCapabilities = task ? jsonStringArray(task.waitingForCapabilities) : [];
+        const fallbackState = isLatestRun
+          ? resolveTaskRunState({
+              persistedStatus: run.status,
+              taskStatus: task?.status,
+              waitingForCapabilities,
+              nextAttemptAt: queuedJob?.nextAttemptAt?.toISOString(),
+              detail
+            })
+          : normalizeRunState(run.status, { detail });
+        const state = parseTaskRunState(run.runStateJson as JsonValue, fallbackState);
+        return {
+          id: run.id,
+          provider: run.provider,
+          model: run.model,
+          status: run.status,
+          state,
+          iterationCount: run.iterationCount,
+          inputTokens: run.inputTokens,
+          outputTokens: run.outputTokens,
+          totalTokens: run.totalTokens,
+          usageSource: run.usageSource,
+          estimatedCostUsd: Number(run.estimatedCostUsd),
+          actualCostUsd: run.actualCostUsd === null ? null : Number(run.actualCostUsd),
+          startedAt: run.startedAt?.toISOString(),
+          finishedAt: run.finishedAt?.toISOString(),
+          summary: run.summary,
+          errorMessage: run.errorMessage
+        };
+      }),
       records: usage.map((item) => ({
         id: item.id,
         provider: item.provider,
@@ -4520,6 +4599,42 @@ export function sameProjectContractSemantics(left: ProjectContract, right: Proje
 
 function jsonStringArray(value: Prisma.JsonValue): string[] {
   return Array.isArray(value) ? value.filter((item): item is string => typeof item === 'string') : [];
+}
+
+function toTaskRunStateJson(state: TaskRunState): Prisma.InputJsonValue {
+  return toPrismaJson(state as unknown as JsonValue);
+}
+
+function resolveTaskRunState(input: {
+  persistedStatus: RunStatus;
+  taskStatus?: TaskStatus;
+  waitingForCapabilities: string[];
+  nextAttemptAt?: string;
+  detail?: string;
+}): TaskRunState {
+  if (input.taskStatus === 'waiting_for_capability') {
+    return createWaitingRunState('unavailable_capability', {
+      detail: input.detail,
+      requiredCapabilities: input.waitingForCapabilities
+    });
+  }
+  if (input.taskStatus === 'needs_approval') {
+    return createWaitingRunState('approval_required', { detail: input.detail });
+  }
+  if (input.taskStatus === 'submitted' && input.nextAttemptAt) {
+    return createRetryScheduledRunState({ detail: input.detail, nextAttemptAt: input.nextAttemptAt });
+  }
+  if (
+    input.taskStatus === 'validation_failed'
+    || input.taskStatus === 'provider_failed'
+    || input.taskStatus === 'budget_exceeded'
+    || input.taskStatus === 'iteration_limit_reached'
+    || input.taskStatus === 'repeated_error_detected'
+    || input.taskStatus === 'approval_rejected'
+  ) {
+    return createBlockedRunState(input.taskStatus, input.detail);
+  }
+  return normalizeRunState(input.persistedStatus, { detail: input.detail });
 }
 
 function parseDiffStat(value: Prisma.JsonValue): { filesChanged: number; insertions: number; deletions: number } {

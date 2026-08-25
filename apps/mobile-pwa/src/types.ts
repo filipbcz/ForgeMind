@@ -1,3 +1,5 @@
+import type { TaskRunState } from '@forgemind/core';
+
 export type TaskStatus =
   | 'draft'
   | 'submitted'
@@ -363,6 +365,7 @@ export interface TaskUsageApi {
     provider: string;
     model: string;
     status: string;
+    state: TaskRunState;
     iterationCount: number;
     inputTokens: number;
     outputTokens: number;
@@ -400,6 +403,7 @@ export interface TaskQueueApi {
 
 export interface WorkerStatusApi {
   state: 'idle' | 'running';
+  runState: TaskRunState;
   queuePaused: boolean;
   queuePausedAt?: string;
   queuedTaskCount: number;

@@ -1,11 +1,11 @@
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { parseAgentConfigYaml, toCoreLimits, type AgentConfig } from '@forgemind/config';
-import { activeProjectContractRequirements, DEFAULT_LIMITS, evaluateLimits, isNonBlockingDeferredValidation, requiresApproval, type Limits, type LimitUsage } from '@forgemind/core';
+import { activeProjectContractRequirements, createBlockedRunState, createFailedRunState, createWaitingRunState, DEFAULT_LIMITS, evaluateLimits, isNonBlockingDeferredValidation, requiresApproval, type Limits, type LimitUsage } from '@forgemind/core';
 import { advanceRoadmapAfterTaskCapabilityWait, advanceRoadmapAfterTaskCompletion, createRepository, getPrismaClient, startNextRoadmapStep, type AIProviderConnectionSecret, type ForgeMindRepository } from '@forgemind/db';
 import { GitHubAppAdapter, createGitHubAdapterFromEnv, type GitHubChecksResult } from '@forgemind/github';
 import { buildProjectExtensionProposalPrompt, createProvider, formatProjectExtensionProposal, type AIProvider, type ProviderSessionContext, type ProviderUsageMeasurement, type ReviewResult, type ValidationCheck } from '@forgemind/providers';
-import type { AcceptanceEvidence, ApprovalType, Project, ProjectArchitectureUpdate, ProjectContract, ProviderKind, TaskStatus } from '@forgemind/core';
+import type { AcceptanceEvidence, ApprovalType, Project, ProjectArchitectureUpdate, ProjectContract, ProviderKind, RunBlockedReason, TaskStatus } from '@forgemind/core';
 import { toErrorMessage, type JsonValue } from '@forgemind/shared';
 import { formatProjectArchitectureContext, runWorkerTask, type WorkerTaskResult, type WorkerTaskResume } from './workflow.js';
 import { buildTargetedRepositoryContext, prepareCapabilityAuditWorkspace, runCapabilityAudit, runReleaseAudit } from './capability-audit.js';
@@ -19,6 +19,20 @@ import {
 } from './resource-policy.js';
 
 type ApprovedLimitSignal = 'diff_lines_limit_reached' | 'changed_files_limit_reached';
+
+function resolveBlockedRunReason(status: TaskStatus): RunBlockedReason {
+  if (
+    status === 'validation_failed'
+    || status === 'provider_failed'
+    || status === 'budget_exceeded'
+    || status === 'iteration_limit_reached'
+    || status === 'repeated_error_detected'
+    || status === 'approval_rejected'
+  ) {
+    return status;
+  }
+  return 'unknown';
+}
 
 class TaskCancellationError extends Error {
   constructor() {
@@ -543,6 +557,7 @@ export async function runDatabaseWorkerOnce(options: { deferInterruptSignals?: b
         taskRunId: claimed.taskRun.id,
         status: 'succeeded',
         summary: result.summary,
+        runState: createWaitingRunState('approval_required', { detail: result.summary }),
         iterationCount: attemptCount,
         ...getRunUsageFields()
       });
@@ -568,6 +583,10 @@ export async function runDatabaseWorkerOnce(options: { deferInterruptSignals?: b
         taskRunId: claimed.taskRun.id,
         status: 'succeeded',
         summary: result.summary,
+        runState: createWaitingRunState('unavailable_capability', {
+          detail: result.summary,
+          requiredCapabilities: result.requiredCapabilities ?? []
+        }),
         iterationCount: attemptCount,
         ...getRunUsageFields()
       });
@@ -587,6 +606,7 @@ export async function runDatabaseWorkerOnce(options: { deferInterruptSignals?: b
         status: 'failed',
         summary: result.summary,
         errorMessage: result.validation.stderr || 'Validation failed.',
+        runState: createBlockedRunState('validation_failed', result.validation.stderr || 'Validation failed.'),
         iterationCount: attemptCount,
         ...getRunUsageFields()
       });
@@ -598,6 +618,7 @@ export async function runDatabaseWorkerOnce(options: { deferInterruptSignals?: b
         status: 'failed',
         summary: result.summary,
         errorMessage: result.summary,
+        runState: createFailedRunState('unknown', result.summary),
         iterationCount: attemptCount,
         ...getRunUsageFields()
       });
@@ -674,6 +695,7 @@ export async function runDatabaseWorkerOnce(options: { deferInterruptSignals?: b
       taskRunId: claimed.taskRun.id,
       status: 'failed',
       errorMessage: message,
+      runState: createBlockedRunState(resolveBlockedRunReason(status), message),
       iterationCount: attemptCount,
       ...getRunUsageFields()
     });

@@ -29,7 +29,233 @@ export type TaskStatus =
   | 'validation_failed'
   | 'waiting_for_capability';
 
-export type RunStatus = 'queued' | 'running' | 'succeeded' | 'failed' | 'cancelled';
+export type RunStatus =
+  | 'queued'
+  | 'running'
+  | 'waiting'
+  | 'retry_scheduled'
+  | 'blocked'
+  | 'succeeded'
+  | 'failed'
+  | 'cancelled';
+
+export type RunWaitingReason =
+  | 'inactive_worker'
+  | 'paused_queue'
+  | 'unavailable_capability'
+  | 'approval_required'
+  | 'retry_backoff';
+
+export type RunBlockedReason =
+  | 'validation_failed'
+  | 'provider_failed'
+  | 'approval_rejected'
+  | 'budget_exceeded'
+  | 'iteration_limit_reached'
+  | 'repeated_error_detected'
+  | 'worker_limit'
+  | 'manual_review_required'
+  | 'unknown';
+
+export interface RunningRunState {
+  version: 1;
+  status: 'running';
+  reason?: never;
+  detail?: string;
+}
+
+export interface WaitingRunState {
+  version: 1;
+  status: 'waiting';
+  reason: RunWaitingReason;
+  detail?: string;
+  requiredCapabilities?: string[];
+  nextAttemptAt?: IsoDateString;
+}
+
+export interface RetryScheduledRunState {
+  version: 1;
+  status: 'retry_scheduled';
+  reason: Extract<RunWaitingReason, 'retry_backoff'>;
+  detail?: string;
+  nextAttemptAt?: IsoDateString;
+}
+
+export interface BlockedRunState {
+  version: 1;
+  status: 'blocked';
+  reason: RunBlockedReason;
+  detail?: string;
+}
+
+export interface FailedRunState {
+  version: 1;
+  status: 'failed';
+  reason?: RunBlockedReason;
+  detail?: string;
+}
+
+export interface CompletedRunState {
+  version: 1;
+  status: 'succeeded' | 'cancelled' | 'queued';
+  reason?: never;
+  detail?: string;
+}
+
+export type TaskRunState =
+  | RunningRunState
+  | WaitingRunState
+  | RetryScheduledRunState
+  | BlockedRunState
+  | FailedRunState
+  | CompletedRunState;
+
+export function createRunningRunState(detail?: string): RunningRunState {
+  return detail ? { version: 1, status: 'running', detail } : { version: 1, status: 'running' };
+}
+
+export function createWaitingRunState(
+  reason: RunWaitingReason,
+  input: { detail?: string; requiredCapabilities?: string[]; nextAttemptAt?: IsoDateString } = {}
+): WaitingRunState {
+  return {
+    version: 1,
+    status: 'waiting',
+    reason,
+    ...(input.detail ? { detail: input.detail } : {}),
+    ...(input.requiredCapabilities?.length ? { requiredCapabilities: input.requiredCapabilities } : {}),
+    ...(input.nextAttemptAt ? { nextAttemptAt: input.nextAttemptAt } : {})
+  };
+}
+
+export function createRetryScheduledRunState(
+  input: { detail?: string; nextAttemptAt?: IsoDateString } = {}
+): RetryScheduledRunState {
+  return {
+    version: 1,
+    status: 'retry_scheduled',
+    reason: 'retry_backoff',
+    ...(input.detail ? { detail: input.detail } : {}),
+    ...(input.nextAttemptAt ? { nextAttemptAt: input.nextAttemptAt } : {})
+  };
+}
+
+export function createBlockedRunState(reason: RunBlockedReason, detail?: string): BlockedRunState {
+  return {
+    version: 1,
+    status: 'blocked',
+    reason,
+    ...(detail ? { detail } : {})
+  };
+}
+
+export function createFailedRunState(reason?: RunBlockedReason, detail?: string): FailedRunState {
+  return {
+    version: 1,
+    status: 'failed',
+    ...(reason ? { reason } : {}),
+    ...(detail ? { detail } : {})
+  };
+}
+
+export function normalizeRunState(status: RunStatus, input: {
+  reason?: RunWaitingReason | RunBlockedReason;
+  detail?: string;
+  requiredCapabilities?: string[];
+  nextAttemptAt?: IsoDateString;
+} = {}): TaskRunState {
+  if (status === 'running') return createRunningRunState(input.detail);
+  if (status === 'waiting') {
+    return createWaitingRunState(isRunWaitingReason(input.reason) ? input.reason : 'inactive_worker', input);
+  }
+  if (status === 'retry_scheduled') return createRetryScheduledRunState(input);
+  if (status === 'blocked') {
+    return createBlockedRunState(isRunBlockedReason(input.reason) ? input.reason : 'unknown', input.detail);
+  }
+  if (status === 'failed') {
+    return createFailedRunState(isRunBlockedReason(input.reason) ? input.reason : undefined, input.detail);
+  }
+  return { version: 1, status, ...(input.detail ? { detail: input.detail } : {}) };
+}
+
+export function parseTaskRunState(value: JsonValue | undefined, fallback: TaskRunState): TaskRunState {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return fallback;
+  const record = value as Record<string, JsonValue>;
+  if (record.version !== 1 || typeof record.status !== 'string') return fallback;
+  const detail = typeof record.detail === 'string' ? record.detail : undefined;
+  if (record.status === 'running') return createRunningRunState(detail);
+  if (record.status === 'waiting') {
+    if (!isRunWaitingReason(record.reason)) return fallback;
+    return createWaitingRunState(record.reason, {
+      detail,
+      requiredCapabilities: Array.isArray(record.requiredCapabilities)
+        ? record.requiredCapabilities.filter((item): item is string => typeof item === 'string')
+        : undefined,
+      nextAttemptAt: typeof record.nextAttemptAt === 'string' ? record.nextAttemptAt : undefined
+    });
+  }
+  if (record.status === 'retry_scheduled') {
+    return createRetryScheduledRunState({
+      detail,
+      nextAttemptAt: typeof record.nextAttemptAt === 'string' ? record.nextAttemptAt : undefined
+    });
+  }
+  if (record.status === 'blocked') {
+    if (!isRunBlockedReason(record.reason)) return fallback;
+    return createBlockedRunState(record.reason, detail);
+  }
+  if (record.status === 'failed') {
+    return createFailedRunState(isRunBlockedReason(record.reason) ? record.reason : undefined, detail);
+  }
+  if (record.status === 'queued' || record.status === 'succeeded' || record.status === 'cancelled') {
+    return normalizeRunState(record.status, { detail });
+  }
+  return fallback;
+}
+
+export function getRunStateLabel(state: TaskRunState): string {
+  if (state.status === 'retry_scheduled') return 'Retry scheduled';
+  return state.status.replaceAll('_', ' ');
+}
+
+export function getRunStateDetail(state: TaskRunState): string | undefined {
+  if (state.detail) return state.detail;
+  if (state.status === 'waiting') {
+    if (state.reason === 'inactive_worker') return 'Waiting for an active worker.';
+    if (state.reason === 'paused_queue') return 'Waiting because the worker queue is paused.';
+    if (state.reason === 'unavailable_capability') {
+      const suffix = state.requiredCapabilities?.length ? `: ${state.requiredCapabilities.join(', ')}` : '.';
+      return `Waiting for unavailable capability${suffix}`;
+    }
+    if (state.reason === 'approval_required') return 'Waiting for approval.';
+    return 'Waiting for retry backoff.';
+  }
+  if (state.status === 'retry_scheduled') return 'Retry is scheduled after backoff.';
+  if (state.status === 'blocked' || state.status === 'failed') {
+    return state.reason ? state.reason.replaceAll('_', ' ') : undefined;
+  }
+  return undefined;
+}
+
+function isRunWaitingReason(value: unknown): value is RunWaitingReason {
+  return value === 'inactive_worker'
+    || value === 'paused_queue'
+    || value === 'unavailable_capability'
+    || value === 'approval_required'
+    || value === 'retry_backoff';
+}
+
+function isRunBlockedReason(value: unknown): value is RunBlockedReason {
+  return value === 'validation_failed'
+    || value === 'provider_failed'
+    || value === 'approval_rejected'
+    || value === 'budget_exceeded'
+    || value === 'iteration_limit_reached'
+    || value === 'repeated_error_detected'
+    || value === 'worker_limit'
+    || value === 'manual_review_required'
+    || value === 'unknown';
+}
 
 export type IterationPhase =
   | 'planning'
@@ -494,6 +720,7 @@ export interface TaskRun {
   provider: ProviderKind;
   model: string;
   status: RunStatus;
+  state: TaskRunState;
   iterationCount: number;
   inputTokens: number;
   outputTokens: number;
