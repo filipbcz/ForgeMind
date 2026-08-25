@@ -380,6 +380,7 @@ const WORKER_EVENT_PREFIXES = [
   'task_status_',
   'task_github_',
   'task_iteration_',
+  'task_retry_',
   'task_activity',
   'task_provider_activity',
   'task_worker_interrupted',
