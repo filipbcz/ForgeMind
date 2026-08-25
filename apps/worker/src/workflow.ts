@@ -1621,7 +1621,9 @@ async function deliverWorkerAttempt(input: {
   const taskInput = input.input;
   throwIfTaskAborted(taskInput.signal);
 
-  if (!state.skipCommitFromResume) {
+  if (state.skipCommitFromResume) {
+    await emitSkippedExternalEffect(taskInput.hooks, 'commit', 'git', attempt);
+  } else {
     throwIfTaskAborted(taskInput.signal);
     const commitStartedAt = Date.now();
     const commitInputHash = await collectValidationInputHash(git, workspacePath);
@@ -1652,14 +1654,18 @@ async function deliverWorkerAttempt(input: {
   }
   state.skipCommitFromResume = false;
 
-  if (config.autoPush && !state.skipPushFromResume) {
-    await runGitHubOperation(
-      taskInput.hooks,
-      'commit_and_push',
-      { branchName, workspacePath },
-      async () => github!.commitAndPush(taskInput.project, branchName, `AI: ${taskInput.task.title}`, workspacePath, taskInput.signal),
-      taskInput.signal
-    );
+  if (config.autoPush) {
+    if (state.skipPushFromResume) {
+      await emitSkippedExternalEffect(taskInput.hooks, 'commit_and_push', 'git', attempt);
+    } else {
+      await runGitHubOperation(
+        taskInput.hooks,
+        'commit_and_push',
+        { branchName, workspacePath },
+        async () => github!.commitAndPush(taskInput.project, branchName, `AI: ${taskInput.task.title}`, workspacePath, taskInput.signal),
+        taskInput.signal
+      );
+    }
   }
   state.skipPushFromResume = false;
 
@@ -1698,15 +1704,19 @@ async function deliverWorkerAttempt(input: {
     }
   }
 
-  if (config.createIssue && !state.issueCommented) {
-    await runGitHubOperation(
-      taskInput.hooks,
-      'comment_on_issue',
-      { issueNumber: issue.issueNumber },
-      async () => github!.commentOnIssue(taskInput.project, issue.issueNumber, renderIssueBody(taskInput.task), taskInput.signal),
-      taskInput.signal
-    );
-    state.issueCommented = true;
+  if (config.createIssue) {
+    if (state.issueCommented) {
+      await emitSkippedExternalEffect(taskInput.hooks, 'comment_on_issue', 'github', attempt);
+    } else {
+      await runGitHubOperation(
+        taskInput.hooks,
+        'comment_on_issue',
+        { issueNumber: issue.issueNumber },
+        async () => github!.commentOnIssue(taskInput.project, issue.issueNumber, renderIssueBody(taskInput.task), taskInput.signal),
+        taskInput.signal
+      );
+      state.issueCommented = true;
+    }
   }
 
   let githubChecks: GitHubChecksResult | undefined;
@@ -1715,11 +1725,19 @@ async function deliverWorkerAttempt(input: {
     const currentInputHash = hashCheckpointValue(`${headSha}:${state.pullRequest.pullRequestNumber}`);
     if (state.resumedGitHubChecks && state.resumedGitHubChecksInputHash === currentInputHash) {
       githubChecks = state.resumedGitHubChecks;
+      await emitSkippedExternalEffect(taskInput.hooks, 'wait_for_checks', 'github', attempt, {
+        inputHash: currentInputHash,
+        summary: state.resumedGitHubChecks.summary
+      });
     } else {
       state.skipChecksFromResume = false;
     }
   } else if (state.skipChecksFromResume) {
     githubChecks = state.resumedGitHubChecks;
+    await emitSkippedExternalEffect(taskInput.hooks, 'wait_for_checks', 'github', attempt, {
+      inputHash: state.resumedGitHubChecksInputHash ?? null,
+      summary: state.resumedGitHubChecks?.summary ?? null
+    });
   }
   if (config.requireCiGreen && config.autoPush && state.pullRequest && github?.waitForChecks && !state.skipChecksFromResume) {
     throwIfTaskAborted(taskInput.signal);
@@ -1864,6 +1882,10 @@ async function deliverWorkerAttempt(input: {
   if (config.autoMergePullRequest && state.pullRequest && state.skipMergeFromResume) {
     mergeConfirmed = true;
     mergeCommitSha = state.resumedMergeCommitSha;
+    await emitSkippedExternalEffect(taskInput.hooks, 'merge_pr', 'github', attempt, {
+      mergeCommitSha: mergeCommitSha ?? null,
+      pullRequestNumber: state.pullRequest.pullRequestNumber
+    });
   } else if (config.autoMergePullRequest && state.pullRequest) {
     if (!github?.mergePullRequest) {
       mergeFailure = 'The configured GitHub adapter does not support pull request merge.';
@@ -2745,6 +2767,51 @@ async function runGitHubOperation<T>(
       context
     });
     throw error;
+  }
+}
+
+async function emitSkippedExternalEffect(
+  hooks: WorkerTaskHooks | undefined,
+  operation: GitHubOperation | 'commit',
+  phase: TaskActivity['phase'],
+  attempt: number,
+  metadata?: JsonValue
+): Promise<void> {
+  await emitTaskActivity(hooks, {
+    phase,
+    state: 'completed',
+    title: `${describeExternalEffectForAudit(operation)} was skipped from checkpoint`,
+    detail: 'Checkpoint-safe retry reused a completed external effect.',
+    operation,
+    attempt,
+    elapsedMs: 0,
+    metadata: skippedExternalEffectMetadata(metadata)
+  });
+}
+
+function skippedExternalEffectMetadata(metadata?: JsonValue): JsonValue {
+  const base: Record<string, JsonValue> = { retryDecision: 'skip_completed_external_effect' };
+  if (metadata === undefined) return base;
+  if (metadata && typeof metadata === 'object' && !Array.isArray(metadata)) {
+    return { ...base, ...metadata };
+  }
+  return { ...base, value: metadata };
+}
+
+function describeExternalEffectForAudit(operation: GitHubOperation | 'commit'): string {
+  switch (operation) {
+    case 'commit':
+      return 'Git commit';
+    case 'commit_and_push':
+      return 'Git push';
+    case 'comment_on_issue':
+      return 'GitHub issue comment';
+    case 'wait_for_checks':
+      return 'GitHub checks wait';
+    case 'merge_pr':
+      return 'GitHub merge';
+    default:
+      return describeGitHubOperation(operation).completed;
   }
 }
 

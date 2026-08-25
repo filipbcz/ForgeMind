@@ -1003,6 +1003,16 @@ github:
         githubChecks: { status: 'success', summary: 'Current commit passed.', failures: [] }
       })
     }));
+    expect(repositoryMock.writeAudit).toHaveBeenCalledWith(expect.objectContaining({
+      actorType: 'system',
+      eventType: 'task_retry_resume_decision',
+      taskId: 'task_1',
+      payload: expect.objectContaining({
+        queueReason: 'task_retried',
+        resumeFrom: 'delivery',
+        skippedExternalEffects: expect.arrayContaining(['wait_for_checks'])
+      })
+    }));
   });
 
   it('restores merge completion only from a confirmed merge checkpoint', async () => {

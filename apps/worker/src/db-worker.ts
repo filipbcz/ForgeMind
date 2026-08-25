@@ -274,6 +274,27 @@ export async function runDatabaseWorkerOnce(options: { deferInterruptSignals?: b
     claimed.taskRun.id,
     claimed.task.maxIterations
   );
+  if (resumeContext?.workflowResume) {
+    const resume = resumeContext.workflowResume;
+    await repository.writeAudit({
+      actorType: 'system',
+      eventType: 'task_retry_resume_decision',
+      taskId: claimed.task.id,
+      payload: {
+        taskRunId: claimed.taskRun.id,
+        queueJobId: claimed.queueJobId ?? null,
+        queueReason: claimed.queueReason ?? null,
+        kind: resume.kind,
+        resumeFrom: resume.resumeFrom ?? null,
+        attempt: resume.attempt ?? null,
+        skippedExternalEffects: resume.completedOperations ?? [],
+        reusedValidationChecks: resume.passedValidationChecks?.map((check) => ({
+          command: check.command,
+          inputHash: check.inputHash ?? null
+        })) ?? []
+      }
+    });
+  }
   let costEstimate;
   try {
     costEstimate = await provider.estimateCost({ prompt: claimed.task.prompt, repositorySizeHint: 'small' });
