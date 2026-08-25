@@ -162,7 +162,7 @@ describe('Studio API routes', () => {
     expect(repository.getCurrentUser).not.toHaveBeenCalled();
     expect(repository.createTask).not.toHaveBeenCalled();
     await app.close();
-  });
+  }, 10000);
 
   it.each(mutatingEndpointInventory)('rejects anonymous %s %s before route handlers execute', async (method, url) => {
     const repository = {

@@ -1,6 +1,13 @@
-import type { ProjectRoadmapApi } from './types.js';
+import type { ProjectRoadmapApi, TaskSummary } from './types.js';
 
 export type ProjectProgressTone = 'active' | 'attention' | 'completed' | 'idle';
+export type ProjectOperationalAction =
+  | 'generate_roadmap'
+  | 'start_next_step'
+  | 'start_audit'
+  | 'retry_audit'
+  | 'review_extension'
+  | 'none';
 
 export interface ProjectProgressSummary {
   tone: ProjectProgressTone;
@@ -9,6 +16,15 @@ export interface ProjectProgressSummary {
   completedSteps: number;
   totalSteps: number;
   taskPosition?: number;
+}
+
+export interface ProjectOperationalOverview {
+  tone: ProjectProgressTone;
+  state: string;
+  activeStep: string;
+  blockers: string[];
+  primaryAction: ProjectOperationalAction;
+  primaryActionLabel?: string;
 }
 
 export function summarizeProjectProgress(
@@ -34,7 +50,7 @@ export function summarizeProjectProgress(
   const completedSteps = steps.filter((step) => step.status === 'completed').length;
   const taskStep = steps.find((step) => step.taskId === taskId);
   const runningStep = steps.find((step) => step.status === 'running');
-  const nextStep = steps.find((step) => step.status === 'pending');
+  const nextStep = steps.find((step) => step.status === 'pending' && !step.taskId);
   const auditJob = (roadmap?.auditJobs ?? []).find((job) => job.cycleId === latestCycle.id);
   const base = {
     completedSteps,
@@ -128,5 +144,163 @@ export function summarizeProjectProgress(
     tone: 'completed',
     headline: 'Projektový cyklus je dokončen',
     detail: 'V tomto cyklu už neprobíhá žádná další automatická operace.'
+  };
+}
+
+export function summarizeProjectOperationalOverview(
+  roadmap: ProjectRoadmapApi | undefined,
+  tasks: TaskSummary[] = []
+): ProjectOperationalOverview {
+  const latestCycle = [...(roadmap?.cycles ?? [])]
+    .sort((left, right) => right.cycleNumber - left.cycleNumber)[0];
+
+  if (!latestCycle) {
+    return {
+      tone: 'idle',
+      state: 'Bez roadmapy',
+      activeStep: 'Roadmapa zatím nebyla vytvořena.',
+      blockers: [],
+      primaryAction: 'generate_roadmap',
+      primaryActionLabel: 'Vytvořit implementační kroky'
+    };
+  }
+
+  const steps = (roadmap?.steps ?? [])
+    .filter((step) => step.cycleId === latestCycle.id)
+    .sort((left, right) => left.sequenceNumber - right.sequenceNumber);
+  const auditJob = (roadmap?.auditJobs ?? []).find((job) => job.cycleId === latestCycle.id);
+  const runningStep = steps.find((step) => step.status === 'running');
+  const waitingStep = steps.find((step) => step.status === 'waiting_for_capability');
+  const nextStep = steps.find((step) => step.status === 'pending' && !step.taskId);
+  const completedSteps = steps.filter((step) => step.status === 'completed').length;
+  const blockers = [
+    ...(waitingStep ? [`Krok ${waitingStep.sequenceNumber} čeká na validační prostředí.`] : []),
+    ...tasks
+      .filter((task) => task.projectId === roadmap?.projectId && task.status === 'waiting_for_capability')
+      .flatMap((task) => task.waitingForCapabilities?.length
+        ? [`${task.title}: čeká na ${task.waitingForCapabilities.join(', ')}.`]
+        : [`${task.title}: čeká na dostupnou worker capability.`]),
+    ...(auditJob?.status === 'blocked' || auditJob?.status === 'failed'
+      ? [auditJob.errorMessage ?? 'Projektový audit je zablokovaný.']
+      : []),
+    ...(latestCycle.status === 'blocked' ? ['Aktuální cyklus je zablokovaný.'] : []),
+    ...(latestCycle.status === 'partial' ? ['Některé požadavky zůstávají nesplněné.'] : [])
+  ];
+
+  if (auditJob?.status === 'claimed') {
+    return {
+      tone: 'active',
+      state: 'Probíhá audit',
+      activeStep: 'Závěrečný projektový audit ověřuje splnění kontraktu.',
+      blockers,
+      primaryAction: 'none'
+    };
+  }
+
+  if (auditJob?.status === 'pending') {
+    return {
+      tone: 'active',
+      state: 'Audit čeká ve frontě',
+      activeStep: 'Implementační kroky jsou hotové a čekají na závěrečné ověření.',
+      blockers,
+      primaryAction: 'none'
+    };
+  }
+
+  if (runningStep) {
+    return {
+      tone: 'active',
+      state: 'Běží implementace',
+      activeStep: `Krok ${runningStep.sequenceNumber}: ${runningStep.title}`,
+      blockers,
+      primaryAction: 'none'
+    };
+  }
+
+  if (waitingStep) {
+    return {
+      tone: 'attention',
+      state: 'Čeká na capability',
+      activeStep: `Krok ${waitingStep.sequenceNumber}: ${waitingStep.title}`,
+      blockers,
+      primaryAction: 'none'
+    };
+  }
+
+  if (auditJob?.status === 'blocked' || auditJob?.status === 'failed') {
+    return {
+      tone: 'attention',
+      state: 'Audit vyžaduje pozornost',
+      activeStep: 'Závěrečný audit nebyl úspěšně dokončen.',
+      blockers,
+      primaryAction: 'retry_audit',
+      primaryActionLabel: 'Opakovat pouze audit'
+    };
+  }
+
+  if (latestCycle.status === 'awaiting_extension_approval') {
+    return {
+      tone: 'attention',
+      state: 'Čeká rozhodnutí',
+      activeStep: 'AI navrhla rozšíření projektu po dokončeném cyklu.',
+      blockers,
+      primaryAction: 'review_extension',
+      primaryActionLabel: 'Zobrazit rozhodnutí'
+    };
+  }
+
+  if (
+    latestCycle.status === 'active'
+    && steps.length > 0
+    && steps.every((step) => step.status === 'completed')
+    && (!auditJob || auditJob.status === 'succeeded')
+  ) {
+    return {
+      tone: 'attention',
+      state: 'Audit čeká na spuštění',
+      activeStep: `${completedSteps}/${steps.length} kroků dokončeno.`,
+      blockers,
+      primaryAction: 'start_audit',
+      primaryActionLabel: 'Spustit závěrečný audit'
+    };
+  }
+
+  if (nextStep && latestCycle.status === 'active') {
+    return {
+      tone: 'active',
+      state: 'Připraven další krok',
+      activeStep: `Krok ${nextStep.sequenceNumber}: ${nextStep.title}`,
+      blockers,
+      primaryAction: 'start_next_step',
+      primaryActionLabel: 'Spustit další krok'
+    };
+  }
+
+  if (latestCycle.status === 'verifying') {
+    return {
+      tone: 'active',
+      state: 'Ověřuje se projekt',
+      activeStep: 'Implementace je hotová a probíhá závěrečné vyhodnocení.',
+      blockers,
+      primaryAction: 'none'
+    };
+  }
+
+  if (latestCycle.status === 'partial' || latestCycle.status === 'blocked') {
+    return {
+      tone: 'attention',
+      state: latestCycle.status === 'blocked' ? 'Cyklus je zablokovaný' : 'Cyklus je částečný',
+      activeStep: `${completedSteps}/${steps.length} kroků dokončeno.`,
+      blockers,
+      primaryAction: 'none'
+    };
+  }
+
+  return {
+    tone: 'completed',
+    state: 'Cyklus dokončen',
+    activeStep: `${completedSteps}/${steps.length} kroků dokončeno.`,
+    blockers,
+    primaryAction: 'none'
   };
 }
