@@ -2569,6 +2569,53 @@ github:
     expect(repositoryMock.failTask).not.toHaveBeenCalled();
   });
 
+  it('emits a capability waiting lifecycle state with concrete missing capabilities', async () => {
+    runWorkerTaskMock.mockResolvedValueOnce({
+      taskId: 'task_1',
+      status: 'waiting_for_capability',
+      issueUrl: 'https://github.com/demo/repo/issues/1',
+      branchName: 'ai/1-task',
+      pullRequestUrl: 'https://github.com/demo/repo/pull/1',
+      workspacePath: 'C:/tmp/worker',
+      validation: {
+        command: 'UnrealEditor.exe Flying.uproject',
+        exitCode: 0,
+        stdout: '',
+        stderr: '',
+        passed: true,
+        deferredChecks: [{
+          command: 'UnrealEditor.exe Flying.uproject',
+          criterion: 'Win64 starts',
+          requiredCapabilities: ['windows'],
+          missingCapabilities: ['windows']
+        }]
+      },
+      requiredCapabilities: ['windows'],
+      summary: 'Source delivery completed; waiting for Windows validation.',
+      approvals: [],
+      completedAt: new Date().toISOString()
+    });
+
+    const { runDatabaseWorkerOnce } = await import('./db-worker.js');
+    await runDatabaseWorkerOnce();
+
+    expect(repositoryMock.waitTaskForCapabilities).toHaveBeenCalledWith('task_1', ['windows'], expect.objectContaining({
+      validation: expect.objectContaining({
+        command: 'UnrealEditor.exe Flying.uproject',
+        deferredChecks: [expect.objectContaining({
+          requiredCapabilities: ['windows'],
+          missingCapabilities: ['windows']
+        })]
+      })
+    }));
+    expect(advanceRoadmapAfterTaskCapabilityWaitMock).toHaveBeenCalledWith(repositoryMock, 'task_1');
+    expect(repositoryMock.finishTaskRun).toHaveBeenCalledWith(expect.objectContaining({
+      taskRunId: 'run_1',
+      status: 'succeeded',
+      summary: 'Source delivery completed; waiting for Windows validation.'
+    }));
+  });
+
   it('runs capability and release audits before completing a roadmap cycle', async () => {
     const contract = {
       version: 1,

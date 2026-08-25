@@ -593,6 +593,7 @@ model TaskRun {
   finishedAt       DateTime?    @map("finished_at")
   summary          String?
   errorMessage     String?      @map("error_message")
+  runStateJson     Json         @default("{\"version\":1,\"status\":\"queued\"}") @map("run_state_json")
 
   task               Task                 @relation(fields: [taskId], references: [id])
   iterations         TaskIteration[]

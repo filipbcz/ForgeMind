@@ -18,6 +18,7 @@ import type {
   Project as CoreProject,
   TaskRun as CoreTaskRun
 } from '@forgemind/core';
+import { normalizeRunState, parseTaskRunState } from '@forgemind/core';
 import type { JsonValue } from '@forgemind/shared';
 import type { AcceptanceEvidence, Approval, AuditLog, Prisma, Project, ProjectArchitectureVersion, ProjectAuditJob, ProjectContractVersion, ProjectImplementationStep, ProjectRoadmapCycle, ProjectSpecificationVersion, Task, TaskRun } from '@prisma/client';
 
@@ -452,12 +453,15 @@ export function toTask(task: Task): ForgeTask {
 }
 
 export function toTaskRun(run: TaskRun): CoreTaskRun {
+  const detail = run.errorMessage ?? run.summary ?? undefined;
+  const fallbackState = normalizeRunState(run.status, { detail });
   return {
     id: run.id,
     taskId: run.taskId,
     provider: run.provider,
     model: run.model,
     status: run.status,
+    state: parseTaskRunState(run.runStateJson as JsonValue, fallbackState),
     iterationCount: run.iterationCount,
     inputTokens: run.inputTokens,
     outputTokens: run.outputTokens,

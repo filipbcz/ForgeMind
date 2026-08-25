@@ -147,10 +147,12 @@ function createMockPrisma() {
         taskRuns: []
       })),
       create: vi.fn(),
-      findMany: vi.fn(async () => [])
+      findMany: vi.fn(async () => []),
+      count: vi.fn(async () => 0)
     },
     taskRun: {
       create: taskRunCreate,
+      findMany: vi.fn(async () => []),
       findFirst: taskRunFindFirst,
       updateMany: vi.fn(async () => ({ count: 0 })),
       update: vi.fn(async (_args: unknown) => ({
@@ -189,6 +191,9 @@ function createMockPrisma() {
       count: vi.fn(async () => 1),
       updateMany: vi.fn(async () => ({ count: 1 }))
     },
+    projectAuditJob: {
+      count: vi.fn(async () => 0)
+    },
     projectImplementationStep: {
       updateMany: vi.fn(async () => ({ count: 1 }))
     },
@@ -214,7 +219,7 @@ function createMockPrisma() {
       }))
     },
     approval: { create: vi.fn(), findMany: vi.fn(), findUnique: vi.fn(), update: vi.fn(), updateMany: vi.fn() },
-    providerUsage: { create: vi.fn(), findMany: vi.fn() },
+    providerUsage: { create: vi.fn(), findMany: vi.fn(async () => []) },
     auditLog: { create: vi.fn(async () => ({ id: 'audit_1', createdAt: new Date() })), findMany: vi.fn() },
     notificationSettings: { findUnique: vi.fn(), upsert: vi.fn() },
     notificationSubscription: { findMany: vi.fn(), upsert: vi.fn(), findFirst: vi.fn(), delete: vi.fn(), count: vi.fn() },
@@ -435,12 +440,12 @@ describe('ForgeMindRepository task runs', () => {
     await repository.startTask('task_1');
 
     expect(taskRunCreate).toHaveBeenCalledWith({
-      data: {
+      data: expect.objectContaining({
         taskId: 'task_1',
         provider: 'codex',
         model: 'queued',
         status: 'queued'
-      }
+      })
     });
   });
 
@@ -558,11 +563,11 @@ describe('ForgeMindRepository task runs', () => {
         taskId: 'task_1',
         status: 'running'
       },
-      data: {
+      data: expect.objectContaining({
         status: 'failed',
         finishedAt: expect.any(Date),
         errorMessage: 'Worker execution was interrupted and will resume from the existing workspace.'
-      }
+      })
     });
     expect(prisma.task.update).toHaveBeenCalledWith({
       where: { id: 'task_1' },
@@ -658,11 +663,11 @@ describe('ForgeMindRepository task runs', () => {
         taskId: 'task_1',
         status: 'running'
       },
-      data: {
+      data: expect.objectContaining({
         status: 'failed',
         finishedAt: expect.any(Date),
         errorMessage: 'Worker received SIGTERM; execution will resume from the existing workspace.'
-      }
+      })
     });
     expect(prisma.taskQueueJob.update).toHaveBeenCalledWith({
       where: { id: 'queue_1' },
@@ -685,19 +690,19 @@ describe('ForgeMindRepository task runs', () => {
         taskId: 'task_1',
         status: { in: ['pending', 'claimed'] }
       },
-      data: {
+      data: expect.objectContaining({
         status: 'cancelled',
         errorMessage: 'Task cancelled by user.',
         finishedAt: expect.any(Date)
-      }
+      })
     });
     expect(prisma.taskRun.updateMany).toHaveBeenCalledWith({
       where: { taskId: 'task_1', status: 'running' },
-      data: {
+      data: expect.objectContaining({
         status: 'cancelled',
         errorMessage: 'Task cancelled by user.',
         finishedAt: expect.any(Date)
-      }
+      })
     });
     expect(prisma.projectImplementationStep.updateMany).toHaveBeenCalledWith({
       where: { taskId: 'task_1', status: 'running' },
@@ -979,6 +984,146 @@ describe('ForgeMindRepository task runs', () => {
         payload: { approvalId: 'approval_1' }
       })
     }));
+  });
+
+  it('maps persisted capability waits to the shared unavailable capability run state', async () => {
+    const { prisma } = createMockPrisma();
+    prisma.taskRun.findMany.mockResolvedValueOnce([{
+      id: 'run_1',
+      taskId: 'task_1',
+      provider: 'codex',
+      model: 'codex',
+      status: 'succeeded',
+      iterationCount: 1,
+      inputTokens: 0,
+      outputTokens: 0,
+      totalTokens: 0,
+      usageSource: 'estimated',
+      estimatedCostUsd: 0,
+      actualCostUsd: null,
+      startedAt: new Date('2026-08-25T00:00:00.000Z'),
+      finishedAt: new Date('2026-08-25T00:01:00.000Z'),
+      summary: 'Source delivery completed.',
+      errorMessage: null
+    }]);
+    prisma.task.findUnique.mockResolvedValueOnce({
+      status: 'waiting_for_capability',
+      waitingForCapabilities: ['windows']
+    });
+    const repository = new ForgeMindRepository(prisma);
+
+    const usage = await repository.getTaskUsage('task_1');
+
+    expect(usage.runs[0]?.state).toEqual(expect.objectContaining({
+      status: 'waiting',
+      reason: 'unavailable_capability',
+      requiredCapabilities: ['windows']
+    }));
+  });
+
+  it('returns persisted waiting and blocked reasons for historical task runs', async () => {
+    const { prisma } = createMockPrisma();
+    const waitingReasons = ['inactive_worker', 'paused_queue', 'unavailable_capability', 'approval_required', 'retry_backoff'] as const;
+    const blockedReasons = [
+      'validation_failed',
+      'provider_failed',
+      'approval_rejected',
+      'budget_exceeded',
+      'iteration_limit_reached',
+      'repeated_error_detected',
+      'worker_limit',
+      'manual_review_required',
+      'unknown'
+    ] as const;
+    prisma.taskRun.findMany.mockResolvedValueOnce([
+      ...waitingReasons.map((reason, index) => ({
+        id: `waiting_${reason}`,
+        taskId: 'task_1',
+        provider: 'codex',
+        model: 'codex',
+        status: 'succeeded',
+        runStateJson: { version: 1, status: 'waiting', reason, requiredCapabilities: reason === 'unavailable_capability' ? ['windows'] : [] },
+        iterationCount: index,
+        inputTokens: 0,
+        outputTokens: 0,
+        totalTokens: 0,
+        usageSource: 'estimated',
+        estimatedCostUsd: 0,
+        actualCostUsd: null,
+        startedAt: new Date(`2026-08-25T00:0${index}:00.000Z`),
+        finishedAt: new Date(`2026-08-25T00:0${index}:30.000Z`),
+        summary: null,
+        errorMessage: null
+      })),
+      ...blockedReasons.map((reason, index) => ({
+        id: `blocked_${reason}`,
+        taskId: 'task_1',
+        provider: 'codex',
+        model: 'codex',
+        status: 'failed',
+        runStateJson: { version: 1, status: 'blocked', reason },
+        iterationCount: index,
+        inputTokens: 0,
+        outputTokens: 0,
+        totalTokens: 0,
+        usageSource: 'estimated',
+        estimatedCostUsd: 0,
+        actualCostUsd: null,
+        startedAt: new Date(`2026-08-25T01:0${index}:00.000Z`),
+        finishedAt: new Date(`2026-08-25T01:0${index}:30.000Z`),
+        summary: null,
+        errorMessage: null
+      })),
+      {
+        id: 'latest_completed',
+        taskId: 'task_1',
+        provider: 'codex',
+        model: 'codex',
+        status: 'succeeded',
+        runStateJson: { version: 1, status: 'succeeded' },
+        iterationCount: 99,
+        inputTokens: 0,
+        outputTokens: 0,
+        totalTokens: 0,
+        usageSource: 'estimated',
+        estimatedCostUsd: 0,
+        actualCostUsd: null,
+        startedAt: new Date('2026-08-25T02:00:00.000Z'),
+        finishedAt: new Date('2026-08-25T02:00:30.000Z'),
+        summary: null,
+        errorMessage: null
+      }
+    ]);
+    const repository = new ForgeMindRepository(prisma);
+
+    const usage = await repository.getTaskUsage('task_1');
+
+    for (const reason of waitingReasons) {
+      expect(usage.runs.find((run) => run.id === `waiting_${reason}`)?.state).toEqual(expect.objectContaining({
+        status: 'waiting',
+        reason
+      }));
+    }
+    for (const reason of blockedReasons) {
+      expect(usage.runs.find((run) => run.id === `blocked_${reason}`)?.state).toEqual(expect.objectContaining({
+        status: 'blocked',
+        reason
+      }));
+    }
+  });
+
+  it('exposes paused queue and inactive worker as distinct shared run states', async () => {
+    const { prisma } = createMockPrisma();
+    const repository = new ForgeMindRepository(prisma);
+
+    const paused = await repository.setWorkerQueuePaused(true);
+    const pausedStatus = await repository.getWorkerStatus();
+    await repository.setWorkerQueuePaused(false);
+    const inactiveStatus = await repository.getWorkerStatus();
+
+    expect(paused.queuePaused).toBe(true);
+    expect(pausedStatus.runState).toEqual(expect.objectContaining({ status: 'waiting', reason: 'paused_queue' }));
+    expect(inactiveStatus.runState).toEqual(expect.objectContaining({ status: 'waiting', reason: 'inactive_worker' }));
   });
 });
 
