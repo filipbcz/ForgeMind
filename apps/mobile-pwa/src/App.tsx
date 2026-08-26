@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
-import { getRunStateDetail, getRunStateLabel } from '@forgemind/core';
+import { ROADMAP_GENERATION_CONFIRMATION, getRunStateDetail, getRunStateLabel } from '@forgemind/core';
 import {
   AlertTriangle,
   Activity,
@@ -654,7 +654,7 @@ export function App() {
   });
 
   const generateProjectRoadmapMutation = useMutation({
-    mutationFn: ({ projectId, input }: { projectId: string; input?: GenerateProjectRoadmapRequest }) =>
+    mutationFn: ({ projectId, input }: { projectId: string; input: GenerateProjectRoadmapRequest }) =>
       generateProjectRoadmapRequest(projectId, input),
     onSuccess: (roadmap) => {
       invalidateProjectData(roadmap.projectId);
@@ -2758,7 +2758,7 @@ export function ProjectsPanel(props: {
   onConfirmProjectBrief: (projectId: string, brief: string | null) => void;
   onAbandonProjectBriefReview: () => void;
   onUpdateProjectAutomation: (projectId: string, input: UpdateProjectRequest) => void;
-  onGenerateRoadmap: (projectId: string, input?: GenerateProjectRoadmapRequest) => void;
+  onGenerateRoadmap: (projectId: string, input: GenerateProjectRoadmapRequest) => void;
   onDecideExtension: (projectId: string, input: DecideProjectRoadmapExtensionRequest) => void;
   onRetryAudit: (projectId: string) => void;
   onStartAudit: (projectId: string) => void;
@@ -2793,6 +2793,7 @@ export function ProjectsPanel(props: {
   const [deleteGitHubRepository, setDeleteGitHubRepository] = useState(false);
   const [selectedProjectRoadmapView, setSelectedProjectRoadmapView] = useState<ProjectRoadmapView>('roadmap');
   const [projectStatusFilter, setProjectStatusFilter] = useState<ProjectItemStatusFilter>('active');
+  const [confirmingRoadmapGeneration, setConfirmingRoadmapGeneration] = useState(false);
   const roadmapCycles = [...(props.roadmap?.cycles ?? [])]
     .sort((left, right) => right.cycleNumber - left.cycleNumber);
   const latestCycle = roadmapCycles[0];
@@ -2824,6 +2825,7 @@ export function ProjectsPanel(props: {
   useEffect(() => {
     setBriefDraft(selectedProject?.brief ?? '');
     setReviewedBrief(undefined);
+    setConfirmingRoadmapGeneration(false);
   }, [selectedProject?.brief, selectedProject?.id]);
 
   useEffect(() => {
@@ -2958,7 +2960,8 @@ export function ProjectsPanel(props: {
                 }
                 onClick={() => {
                   if (operationalOverview.primaryAction === 'generate_roadmap') {
-                    props.onGenerateRoadmap(selectedProject.id);
+                    setConfirmingRoadmapGeneration(true);
+                    document.querySelector('.roadmap-generation-confirmation')?.scrollIntoView({ block: 'center' });
                   }
                   if (operationalOverview.primaryAction === 'start_next_step') {
                     props.onStartNextRoadmapStep(selectedProject.id);
@@ -3283,15 +3286,48 @@ export function ProjectsPanel(props: {
             <div className="project-action-groups" aria-label="Akce projektu">
               <div>
                 <span>Generování roadmapy</span>
+                <small>
+                  Ulozeni zadani roadmapu nespousti. Nova roadmapa vznikne az po potvrzeni tady; dokoncene kroky a jejich evidence
+                  zustanou v historii a pouziji se pri posouzeni dopadu.
+                </small>
                 <button
                   className="secondary-action"
                   type="button"
                   disabled={props.generatingRoadmap || !selectedProject.brief?.trim()}
-                  onClick={() => props.onGenerateRoadmap(selectedProject.id)}
+                  onClick={() => setConfirmingRoadmapGeneration(true)}
                 >
                   <LayoutList size={16} />
                   {props.roadmap?.cycles.length ? 'Pregenerovat kroky' : 'Vytvorit kroky'}
                 </button>
+                {confirmingRoadmapGeneration ? (
+                  <div className="roadmap-generation-confirmation" role="group" aria-label="Potvrzení generování roadmapy">
+                    <p>
+                      Potvrzenim vznikne novy roadmap cyklus. Existujici auditni historie, dokoncene kroky a evidence se nemazou.
+                    </p>
+                    <div className="actions">
+                      <button
+                        className="primary-action"
+                        type="button"
+                        disabled={props.generatingRoadmap}
+                        onClick={() => {
+                          setConfirmingRoadmapGeneration(false);
+                          props.onGenerateRoadmap(selectedProject.id, { confirmation: ROADMAP_GENERATION_CONFIRMATION });
+                        }}
+                      >
+                        <CheckCircle2 size={16} />
+                        Potvrdit generovani
+                      </button>
+                      <button
+                        className="secondary-action"
+                        type="button"
+                        disabled={props.generatingRoadmap}
+                        onClick={() => setConfirmingRoadmapGeneration(false)}
+                      >
+                        Zrusit
+                      </button>
+                    </div>
+                  </div>
+                ) : null}
               </div>
               <div>
                 <span>Spuštění dalšího kroku</span>

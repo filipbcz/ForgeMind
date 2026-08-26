@@ -792,6 +792,7 @@ export interface DeleteProjectResponse {
 
 export interface GenerateProjectRoadmapRequest {
   objective?: string;
+  confirmation: string;
 }
 
 export interface DecideProjectRoadmapExtensionRequest {

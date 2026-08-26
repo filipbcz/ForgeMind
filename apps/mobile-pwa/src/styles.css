@@ -1450,6 +1450,24 @@ a {
   font-weight: 700;
 }
 
+.project-action-groups small,
+.roadmap-generation-confirmation p {
+  margin: 0;
+  color: #4c5750;
+  font-size: 0.82rem;
+  line-height: 1.4;
+  overflow-wrap: anywhere;
+}
+
+.roadmap-generation-confirmation {
+  display: grid;
+  gap: 8px;
+}
+
+.roadmap-generation-confirmation .actions {
+  margin-top: 0;
+}
+
 .capability-disclosure {
   border: 1px solid #dbe3dc;
   border-radius: 8px;

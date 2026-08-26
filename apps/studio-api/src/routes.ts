@@ -24,7 +24,7 @@ import { advanceRoadmapAfterTaskCapabilityWait, advanceRoadmapAfterTaskCompletio
 import type { AIProviderConnectionKind, AIProviderConnectionSecret, ForgeMindRepository } from '@forgemind/db';
 import { parseGitHubWebhookPayload, projectGitHubWebhookEvent, verifyGitHubWebhookSignature } from './webhook.js';
 import type { NotificationService } from './notifications.js';
-import { activeProjectContractRequirements, applyProjectContractDelta, buildSpecificationChangeImpactReview, redactSecrets } from '@forgemind/core';
+import { ROADMAP_GENERATION_CONFIRMATION, activeProjectContractRequirements, applyProjectContractDelta, buildSpecificationChangeImpactReview, redactSecrets } from '@forgemind/core';
 import type { ApprovalType } from '@forgemind/core';
 import type { Project, ProjectArchitectureUpdate, ProjectContract, ProjectContractDelta, TaskMode } from '@forgemind/core';
 import { resolveRuntimeEnvVar } from './runtime-env.js';
@@ -117,6 +117,7 @@ const retrySchema = z.object({
 
 const roadmapGenerateSchema = z.object({
   objective: z.string().min(20).optional(),
+  confirmation: z.string().trim().optional(),
   contractRecovery: z.object({
     baseVersion: z.number().int().positive(),
     reason: z.string().trim().min(20),
@@ -1317,6 +1318,11 @@ export function registerRoutes(app: FastifyInstance, repository: ForgeMindReposi
       const project = await repository.getProject(id);
       if (!project) {
         return sendNotFound(reply, `Project "${id}" not found`);
+      }
+      if (input.confirmation !== ROADMAP_GENERATION_CONFIRMATION) {
+        return reply.code(409).send({
+          error: `Type "${ROADMAP_GENERATION_CONFIRMATION}" to confirm roadmap generation.`
+        });
       }
       await repository.assertProjectRoadmapRegenerationAllowed(project.id);
 

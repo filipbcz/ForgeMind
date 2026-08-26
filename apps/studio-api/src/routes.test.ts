@@ -678,6 +678,90 @@ describe('Studio API routes', () => {
     await app.close();
   });
 
+  it('saves a reviewed contract specification without generating a roadmap', async () => {
+    const currentSpecification = 'Build reporting.';
+    const repository = {
+      getCurrentUser: vi.fn(async () => ownerUser),
+      getProjectSpecifications: vi.fn(async () => ({
+        projectId: 'project_1',
+        current: {
+          id: 'spec_1',
+          projectId: 'project_1',
+          version: 1,
+          fullSpecification: currentSpecification,
+          changeSummary: 'Initial brief.',
+          source: 'initial_brief',
+          createdAt: '2026-08-10T10:00:00.000Z'
+        },
+        versions: []
+      })),
+      updateProject: vi.fn(async (id: string, input: Record<string, unknown>) => ({
+        id,
+        name: 'Project',
+        slug: 'project',
+        defaultBranch: 'main',
+        brief: input.brief,
+        isActive: true,
+        createdAt: '',
+        updatedAt: ''
+      })),
+      assertProjectRoadmapRegenerationAllowed: vi.fn(),
+      createProjectRoadmapCycle: vi.fn()
+    };
+    const app = Fastify();
+    const auth = createAuthService();
+    const headers = createOwnerAuthenticatedHeaders(auth);
+    registerRoutes(app, repository as never, undefined, auth);
+
+    const response = await app.inject({
+      method: 'PATCH',
+      url: '/api/projects/project_1',
+      headers,
+      payload: {
+        brief: 'Build reporting with export.',
+        specificationReview: {
+          baseSpecificationVersion: 1,
+          baseSpecificationHash: createHash('sha256').update(currentSpecification).digest('hex')
+        }
+      }
+    });
+
+    expect(response.statusCode).toBe(200);
+    expect(repository.updateProject).toHaveBeenCalledWith('project_1', { brief: 'Build reporting with export.' });
+    expect(repository.assertProjectRoadmapRegenerationAllowed).not.toHaveBeenCalled();
+    expect(repository.createProjectRoadmapCycle).not.toHaveBeenCalled();
+    await app.close();
+  });
+
+  it('requires explicit roadmap generation confirmation before provider planning', async () => {
+    const repository = {
+      getCurrentUser: vi.fn(async () => ownerUser),
+      getProject: vi.fn(async () => ({
+        id: 'project_1', name: 'Project', slug: 'project', defaultBranch: 'main',
+        brief: 'A sufficiently detailed project objective.', isActive: true, createdAt: '', updatedAt: ''
+      })),
+      assertProjectRoadmapRegenerationAllowed: vi.fn(),
+      getProjectSpecifications: vi.fn()
+    };
+    const app = Fastify();
+    const auth = createAuthService();
+    const headers = createOwnerAuthenticatedHeaders(auth);
+    registerRoutes(app, repository as never, undefined, auth);
+
+    const response = await app.inject({
+      method: 'POST',
+      url: '/api/projects/project_1/implementation-steps/generate',
+      headers,
+      payload: {}
+    });
+
+    expect(response.statusCode).toBe(409);
+    expect(response.json()).toEqual({ error: 'Type "GENERATE ROADMAP" to confirm roadmap generation.' });
+    expect(repository.assertProjectRoadmapRegenerationAllowed).not.toHaveBeenCalled();
+    expect(repository.getProjectSpecifications).not.toHaveBeenCalled();
+    await app.close();
+  });
+
   it('returns immutable project contract history with the current pointer', async () => {
     const current = {
       id: 'contract_2', projectId: 'project_1', specificationVersionId: 'spec_2', version: 2,
@@ -855,7 +939,7 @@ describe('Studio API routes', () => {
       method: 'POST',
       url: '/api/projects/project_1/implementation-steps/generate',
       headers,
-      payload: {}
+      payload: { confirmation: 'GENERATE ROADMAP' }
     });
 
     expect(response.statusCode).toBe(400);
