@@ -65,6 +65,7 @@ import {
   resolveApproval as resolveApprovalRequest,
   retryTask as retryTaskRequest,
   retryProjectAudit,
+  reviewProjectSpecificationChange,
   startProjectAudit,
   setWorkerQueuePaused,
   startNextProjectRoadmapStep,
@@ -96,6 +97,7 @@ import type {
   ProjectRoadmapApi,
   ProjectRoadmapCycleApi,
   ProjectSpecificationSnapshotApi,
+  SpecificationChangeImpactReviewApi,
   GitHubRepositoryApi,
   GitHubRepositoryOwnerApi,
   NotificationSettingsApi,
@@ -614,8 +616,14 @@ export function App() {
       queryClient.setQueryData<ProjectSummary[]>(['projects'], (projects) =>
         projects?.map((candidate) => candidate.id === project.id ? project : candidate)
       );
+      specificationReviewMutation.reset();
       invalidateProjectData(project.id);
     }
+  });
+
+  const specificationReviewMutation = useMutation({
+    mutationFn: ({ projectId, brief }: { projectId: string; brief: string | null }) =>
+      reviewProjectSpecificationChange(projectId, { brief })
   });
 
   const deleteProjectMutation = useMutation({
@@ -886,13 +894,9 @@ export function App() {
 
   function updateProjectBrief(projectId: string, formData: FormData) {
     updateProjectMutation.reset();
+    specificationReviewMutation.reset();
     const brief = String(formData.get('brief') || '').trim();
-    updateProjectMutation.mutate({
-      projectId,
-      input: {
-        brief: brief || null
-      }
-    });
+    specificationReviewMutation.mutate({ projectId, brief: brief || null });
   }
 
   return (
@@ -1054,6 +1058,9 @@ export function App() {
                   : undefined
             }
             saving={createProjectMutation.isPending}
+            reviewingSpecification={specificationReviewMutation.isPending}
+            specificationReview={specificationReviewMutation.data}
+            specificationReviewError={specificationReviewMutation.error ? formatUiError(specificationReviewMutation.error) : undefined}
             updatingProject={updateProjectMutation.isPending}
             updateProjectError={updateProjectMutation.error ? formatUiError(updateProjectMutation.error) : undefined}
             projectUpdated={updateProjectMutation.isSuccess}
@@ -1071,6 +1078,20 @@ export function App() {
             onCreateProject={createProject}
             onAssignProjectRepository={assignProjectRepository}
             onUpdateProjectBrief={updateProjectBrief}
+            onConfirmProjectBrief={(projectId, brief) => {
+              updateProjectMutation.reset();
+              updateProjectMutation.mutate({
+                projectId,
+                input: {
+                  brief,
+                  specificationReview: {
+                    baseSpecificationVersion: specificationReviewMutation.data?.baseSpecificationVersion,
+                    baseSpecificationHash: specificationReviewMutation.data?.baseSpecificationHash
+                  }
+                }
+              });
+            }}
+            onAbandonProjectBriefReview={() => specificationReviewMutation.reset()}
             onUpdateProjectAutomation={(projectId, input) => {
               updateProjectAutomationMutation.reset();
               updateProjectAutomationMutation.mutate({ projectId, input });
@@ -2607,6 +2628,94 @@ function ProjectOperationalActionButton(props: {
   );
 }
 
+function SpecificationReviewPanel(props: {
+  review: SpecificationChangeImpactReviewApi;
+  saving: boolean;
+  stale: boolean;
+  onConfirm: () => void;
+  onAbandon: () => void;
+}) {
+  return (
+    <section className="specification-review wide" aria-label="Kontrola zmeny specifikace">
+      <div className="section-heading">
+        <div>
+          <h4>Kontrola pred ulozenim</h4>
+          <p>Zakladni verze {props.review.baseSpecificationVersion ?? 0} · {props.review.changed ? 'zmena detekovana' : 'beze zmeny'}</p>
+        </div>
+        <span className={props.review.changed ? 'badge waiting' : 'badge completed'}>
+          {props.review.changed ? 'review' : 'beze zmeny'}
+        </span>
+      </div>
+      <div className="specification-review-impact">
+        <MetricBlock label="Pozadavky" value={String(props.review.impact.requirements.length)} />
+        <MetricBlock label="Nedokoncene kroky" value={String(props.review.impact.unfinishedSteps.length)} />
+        <MetricBlock label="Evidence" value={String(props.review.impact.evidence.length)} />
+      </div>
+      <div className="specification-review-columns">
+        <div>
+          <h5>Dopad na pozadavky</h5>
+          {props.review.impact.requirements.length > 0 ? (
+            <ul>
+              {props.review.impact.requirements.map((requirement) => (
+                <li key={requirement.id}>
+                  <strong>{requirement.id}</strong> {requirement.title}
+                  <small>{requirement.reason}</small>
+                </li>
+              ))}
+            </ul>
+          ) : <p className="muted">Zadny dopad na pozadavky.</p>}
+        </div>
+        <div>
+          <h5>Nedokoncene kroky</h5>
+          {props.review.impact.unfinishedSteps.length > 0 ? (
+            <ul>
+              {props.review.impact.unfinishedSteps.map((step) => (
+                <li key={step.id}>
+                  <strong>{step.title}</strong>
+                  <small>{step.status} · {step.requirementIds.join(', ') || 'bez pozadavku'}</small>
+                </li>
+              ))}
+            </ul>
+          ) : <p className="muted">Zadne nedokoncene kroky nejsou zmenou dotceny.</p>}
+        </div>
+        <div>
+          <h5>Evidence</h5>
+          {props.review.impact.evidence.length > 0 ? (
+            <ul>
+              {props.review.impact.evidence.map((evidence) => (
+                <li key={evidence.id}>
+                  <strong>{evidence.requirementId}</strong> {evidence.criterion}
+                  <small>{evidence.source} · {evidence.status} · kontrakt v{evidence.contractVersion}</small>
+                </li>
+              ))}
+            </ul>
+          ) : <p className="muted">Zadna existujici evidence neni zmenou dotcena.</p>}
+        </div>
+      </div>
+      <pre className="specification-diff">
+        {props.review.diff.map((line) => {
+          const marker = line.type === 'added' ? '+' : line.type === 'removed' ? '-' : ' ';
+          const number = line.type === 'added' ? line.newLineNumber : line.oldLineNumber;
+          return `${marker} ${String(number ?? '').padStart(3, ' ')} ${line.text}`;
+        }).join('\n')}
+      </pre>
+      {props.stale ? (
+        <div className="warning-banner">Text zadani se od kontroly zmenil. Spust kontrolu znovu pred ulozenim.</div>
+      ) : null}
+      <div className="actions">
+        <button className="primary-action" type="button" disabled={props.saving || props.stale} onClick={props.onConfirm}>
+          <CheckCircle2 size={18} />
+          Ulozit po kontrole
+        </button>
+        <button className="secondary-action" type="button" disabled={props.saving} onClick={props.onAbandon}>
+          <Ban size={18} />
+          Opustit navrh
+        </button>
+      </div>
+    </section>
+  );
+}
+
 export function ProjectsPanel(props: {
   projects: ProjectSummary[];
   tasks: TaskSummary[];
@@ -2626,6 +2735,9 @@ export function ProjectsPanel(props: {
   architecturesLoading: boolean;
   architecturesError?: string;
   saving: boolean;
+  reviewingSpecification: boolean;
+  specificationReview?: SpecificationChangeImpactReviewApi;
+  specificationReviewError?: string;
   updatingProject: boolean;
   updateProjectError?: string;
   projectUpdated: boolean;
@@ -2643,6 +2755,8 @@ export function ProjectsPanel(props: {
   onCreateProject: (formData: FormData) => void;
   onAssignProjectRepository: (projectId: string, formData: FormData) => void;
   onUpdateProjectBrief: (projectId: string, formData: FormData) => void;
+  onConfirmProjectBrief: (projectId: string, brief: string | null) => void;
+  onAbandonProjectBriefReview: () => void;
   onUpdateProjectAutomation: (projectId: string, input: UpdateProjectRequest) => void;
   onGenerateRoadmap: (projectId: string, input?: GenerateProjectRoadmapRequest) => void;
   onDecideExtension: (projectId: string, input: DecideProjectRoadmapExtensionRequest) => void;
@@ -2659,6 +2773,7 @@ export function ProjectsPanel(props: {
 }) {
   const selectedProject = props.projects.find((project) => project.id === props.selectedProjectId) ?? props.projects[0];
   const [briefDraft, setBriefDraft] = useState(selectedProject?.brief ?? '');
+  const [reviewedBrief, setReviewedBrief] = useState<string | null | undefined>(undefined);
   const [autoCreatePullRequest, setAutoCreatePullRequest] = useState(selectedProject?.autoCreatePullRequest ?? true);
   const [autoMergePullRequest, setAutoMergePullRequest] = useState(selectedProject?.autoMergePullRequest ?? false);
   const [autoCompleteTask, setAutoCompleteTask] = useState(selectedProject?.autoCompleteTask ?? false);
@@ -2700,9 +2815,15 @@ export function ProjectsPanel(props: {
     && selectedProject?.brief?.trim()
     && latestCycle.objective.trim() !== selectedProject.brief.trim()
   );
+  const normalizedBriefDraft = briefDraft.trim() || null;
+  const specificationReviewMatchesDraft = Boolean(
+    props.specificationReview
+    && reviewedBrief === normalizedBriefDraft
+  );
 
   useEffect(() => {
     setBriefDraft(selectedProject?.brief ?? '');
+    setReviewedBrief(undefined);
   }, [selectedProject?.brief, selectedProject?.id]);
 
   useEffect(() => {
@@ -2866,6 +2987,8 @@ export function ProjectsPanel(props: {
               className="task-form"
               onSubmit={(event) => {
                 event.preventDefault();
+                const nextBrief = String(new FormData(event.currentTarget).get('brief') || '').trim() || null;
+                setReviewedBrief(nextBrief);
                 props.onUpdateProjectBrief(selectedProject.id, new FormData(event.currentTarget));
               }}
             >
@@ -2880,6 +3003,7 @@ export function ProjectsPanel(props: {
                   placeholder="Sem patri plne zadani projektu. Prazdne pole zadani odstrani."
                 />
               </label>
+              {props.specificationReviewError ? <div className="error-banner wide">{props.specificationReviewError}</div> : null}
               {props.updateProjectError ? <div className="error-banner wide">{props.updateProjectError}</div> : null}
               {props.projectUpdated && briefDraft === (selectedProject.brief ?? '') ? (
                 <div className="success-banner wide">Zadani bylo ulozeno.</div>
@@ -2890,11 +3014,27 @@ export function ProjectsPanel(props: {
                 </div>
               ) : null}
               <div className="actions wide">
-                <button className="secondary-action" type="submit" disabled={props.updatingProject}>
-                  Ulozit zadani
+                <button className="secondary-action" type="submit" disabled={props.reviewingSpecification || props.updatingProject}>
+                  Zkontrolovat zmenu
                 </button>
               </div>
             </form>
+            {props.specificationReview ? (
+              <SpecificationReviewPanel
+                review={props.specificationReview}
+                stale={!specificationReviewMatchesDraft}
+                onAbandon={() => {
+                  setReviewedBrief(undefined);
+                  props.onAbandonProjectBriefReview();
+                }}
+                onConfirm={() => {
+                  if (specificationReviewMatchesDraft) {
+                    props.onConfirmProjectBrief(selectedProject.id, reviewedBrief ?? null);
+                  }
+                }}
+                saving={props.updatingProject}
+              />
+            ) : null}
             {props.specificationsLoading ? <p className="muted">Načítám aktuální specifikaci...</p> : null}
             {props.specificationsError ? <div className="error-banner">{props.specificationsError}</div> : null}
             {props.specifications ? (

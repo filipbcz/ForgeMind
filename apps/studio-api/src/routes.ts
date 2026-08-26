@@ -24,7 +24,7 @@ import { advanceRoadmapAfterTaskCapabilityWait, advanceRoadmapAfterTaskCompletio
 import type { AIProviderConnectionKind, AIProviderConnectionSecret, ForgeMindRepository } from '@forgemind/db';
 import { parseGitHubWebhookPayload, projectGitHubWebhookEvent, verifyGitHubWebhookSignature } from './webhook.js';
 import type { NotificationService } from './notifications.js';
-import { activeProjectContractRequirements, applyProjectContractDelta, redactSecrets } from '@forgemind/core';
+import { activeProjectContractRequirements, applyProjectContractDelta, buildSpecificationChangeImpactReview, redactSecrets } from '@forgemind/core';
 import type { ApprovalType } from '@forgemind/core';
 import type { Project, ProjectArchitectureUpdate, ProjectContract, ProjectContractDelta, TaskMode } from '@forgemind/core';
 import { resolveRuntimeEnvVar } from './runtime-env.js';
@@ -64,6 +64,10 @@ const projectSchema = z.object({
 
 const updateProjectSchema = projectSchema.partial().extend({
   brief: z.string().trim().min(20).nullable().optional(),
+  specificationReview: z.object({
+    baseSpecificationVersion: z.number().int().positive().optional(),
+    baseSpecificationHash: z.string().trim().min(1).optional()
+  }).optional(),
   validationProfile: validationProfileSchema.nullable().optional(),
   autoCreatePullRequest: z.boolean().optional(),
   autoMergePullRequest: z.boolean().optional(),
@@ -71,6 +75,10 @@ const updateProjectSchema = projectSchema.partial().extend({
   allowSafeOperationsWithoutApproval: z.boolean().optional(),
   defaultTaskMode: z.enum(['safe', 'auto', 'full_auto']).optional(),
   isActive: z.boolean().optional()
+});
+
+const specificationReviewSchema = z.object({
+  brief: z.string().trim().min(20).nullable()
 });
 
 const deleteProjectSchema = z.object({
@@ -1010,7 +1018,24 @@ export function registerRoutes(app: FastifyInstance, repository: ForgeMindReposi
     try {
       const { id } = idParamsSchema.parse(request.params);
       const input = updateProjectSchema.parse(request.body);
-      const project = await repository.updateProject(id, input);
+      const { specificationReview, ...projectInput } = input;
+      if (Object.prototype.hasOwnProperty.call(input, 'brief')) {
+        if (!specificationReview) {
+          return reply.code(409).send({ error: 'Review the specification diff and impact before saving a changed specification.' });
+        }
+        const specifications = await repository.getProjectSpecifications(id);
+        if (!specifications) {
+          return sendNotFound(reply, `Project "${id}" not found`);
+        }
+        const currentHash = hashSpecificationText(specifications.current.fullSpecification);
+        if (
+          specificationReview.baseSpecificationVersion !== specifications.current.version
+          || specificationReview.baseSpecificationHash !== currentHash
+        ) {
+          return reply.code(409).send({ error: 'Specification changed after review. Review the latest diff before saving.' });
+        }
+      }
+      const project = await repository.updateProject(id, projectInput);
       return project ? project : sendNotFound(reply, `Project "${id}" not found`);
     } catch (error) {
       return sendBadRequest(reply, error);
@@ -1133,6 +1158,43 @@ export function registerRoutes(app: FastifyInstance, repository: ForgeMindReposi
     const { id } = idParamsSchema.parse(request.params);
     const specifications = await repository.getProjectSpecifications(id);
     return specifications ? specifications : sendNotFound(reply, `Project "${id}" not found`);
+  });
+
+  app.post('/api/projects/:id/specification-review', async (request, reply) => {
+    try {
+      const { id } = idParamsSchema.parse(request.params);
+      const input = specificationReviewSchema.parse(request.body ?? {});
+      const [project, specifications, roadmap] = await Promise.all([
+        repository.getProject(id),
+        repository.getProjectSpecifications(id),
+        repository.getProjectRoadmap(id)
+      ]);
+      if (!project) {
+        return sendNotFound(reply, `Project "${id}" not found`);
+      }
+
+      const proposedSpecification = input.brief?.trim() ?? '';
+      const baseSpecificationHash = specifications?.current
+        ? hashSpecificationText(specifications.current.fullSpecification)
+        : undefined;
+      const review = buildSpecificationChangeImpactReview({
+        projectId: id,
+        currentSpecification: specifications?.current,
+        proposedSpecification,
+        requirements: project.projectContract?.requirements ?? [],
+        steps: roadmap?.steps ?? [],
+        evidence: roadmap?.evidence ?? []
+      });
+      return {
+        ...review,
+        diff: proposedSpecification === ''
+          ? review.diff.filter((line) => line.type !== 'added' || line.text !== '')
+          : review.diff,
+        baseSpecificationHash
+      };
+    } catch (error) {
+      return sendBadRequest(reply, error);
+    }
   });
 
   app.get('/api/projects/:id/contracts', async (request, reply) => {
@@ -2813,6 +2875,10 @@ async function removeGitHubConnection(repository: ForgeMindRepository) {
   }
 
   return maybeRepository.deleteGitHubConnection();
+}
+
+function hashSpecificationText(specification: string): string {
+  return createHash('sha256').update(specification).digest('hex');
 }
 
 function resolveProviderEnvModel(provider: string): string | null {

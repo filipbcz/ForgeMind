@@ -892,6 +892,69 @@ a {
   margin: 0 0 12px;
 }
 
+.specification-review {
+  display: grid;
+  gap: 14px;
+  margin-top: 16px;
+  padding-top: 16px;
+  border-top: 1px solid #dbe3de;
+}
+
+.specification-review-impact,
+.specification-review-columns {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 12px;
+}
+
+.specification-review-columns > div {
+  min-width: 0;
+}
+
+.specification-review h5 {
+  margin: 0 0 8px;
+  font-size: 0.86rem;
+}
+
+.specification-review ul {
+  display: grid;
+  gap: 8px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.specification-review li {
+  display: grid;
+  gap: 2px;
+  padding: 8px;
+  border: 1px solid #dbe3de;
+  border-radius: 6px;
+  background: #f8faf8;
+}
+
+.specification-review li small {
+  color: #69736c;
+  overflow-wrap: anywhere;
+}
+
+.specification-diff {
+  max-height: 320px;
+  margin: 0;
+  padding: 12px;
+  overflow: auto;
+  border: 1px solid #cbd5cf;
+  border-radius: 6px;
+  background: #17211b;
+  color: #f8faf8;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 0.8rem;
+  line-height: 1.5;
+  letter-spacing: 0;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
 .section-heading p {
   margin-top: 3px;
   color: #69736c;
@@ -2235,6 +2298,11 @@ a {
   }
 
   .technical-summary {
+    grid-template-columns: 1fr;
+  }
+
+  .specification-review-impact,
+  .specification-review-columns {
     grid-template-columns: 1fr;
   }
 
