@@ -2038,6 +2038,10 @@ function formatTokenUsage(usage: TaskUsageApi | undefined): string {
   return `${usage.totalTokens.toLocaleString('cs-CZ')} celkem${suffix}`;
 }
 
+function formatProviderRuntimeTimestamp(value?: string | null): string {
+  return value ? formatProgressTime(value) : 'Never';
+}
+
 function formatRunDetail(run: TaskRunApi, maxLength = 260): string {
   return truncateText(getRunStateDetail(run.state) ?? run.errorMessage ?? run.summary ?? 'Bez detailu.', maxLength);
 }
@@ -3822,6 +3826,8 @@ function SettingsPanel({
             <MetricBlock label="Model" value={providerStatus.currentModel ?? 'Nenastaveno'} />
             <MetricBlock label="Auth" value={providerStatus.authMode ?? providerStatus.credentialSource} />
             <MetricBlock label="Persistent" value={providerStatus.persistent ? 'Ano' : 'Ne'} />
+            <MetricBlock label="Circuit" value={providerStatus.currentRuntimeStatus?.circuitBreaker.state ?? 'closed'} />
+            <MetricBlock label="Last success" value={formatProviderRuntimeTimestamp(providerStatus.currentRuntimeStatus?.lastSuccessfulRequestAt)} />
           </>
         ) : null}
         {providerError || codexOAuthError ? <div className="error-banner">{providerError ?? codexOAuthError}</div> : null}
@@ -3846,6 +3852,11 @@ function SettingsPanel({
                   {connection.availability === 'status_unavailable' ? (
                     <small>Stav OAuth nelze docasne overit. Ulozene pripojeni zustava zachovane.</small>
                   ) : null}
+                  <small>
+                    Circuit {connection.runtimeStatus?.circuitBreaker.state ?? 'closed'}
+                    {' · '}
+                    Last success {formatProviderRuntimeTimestamp(connection.runtimeStatus?.lastSuccessfulRequestAt)}
+                  </small>
                 </div>
                 <div className="actions">
                   <button className="secondary-action" type="button" onClick={() => editProviderConnection(connection)}>

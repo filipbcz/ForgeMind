@@ -154,7 +154,9 @@ vi.mock('./capability-audit.js', () => ({
 }));
 
 describe('db-worker policy enforcement', () => {
-  beforeEach(() => {
+  beforeEach(async () => {
+    const { resetProviderCircuitBreakersForTests } = await import('./db-worker.js');
+    resetProviderCircuitBreakersForTests();
     vi.clearAllMocks();
     repositoryMock.getGitHubConnectionSecret.mockReset();
     repositoryMock.getGitHubConnectionSecret.mockResolvedValue(undefined);
@@ -1334,11 +1336,16 @@ github:
     expect(repositoryMock.finalizeQueueJob).toHaveBeenCalledWith('queue_1', 'failed', expect.stringContaining('estimate_cost failed'));
   });
 
-  it('uses fallback provider when primary provider estimate fails', async () => {
+  it('rejects non-equivalent fallback provider when primary provider estimate fails', async () => {
     const previousProvider = process.env.FORGEMIND_PROVIDER;
     const previousFallback = process.env.FORGEMIND_FALLBACK_PROVIDER;
     process.env.FORGEMIND_PROVIDER = 'openai';
     process.env.FORGEMIND_FALLBACK_PROVIDER = 'codex';
+    const fallbackEstimate = vi.fn(async () => ({
+      inputTokens: 20,
+      outputTokens: 10,
+      estimatedCostUsd: 0.02
+    }));
 
     createProviderMock.mockImplementation((kind: string) => {
       if (kind === 'openai') {
@@ -1357,11 +1364,7 @@ github:
       }
 
       return {
-        estimateCost: vi.fn(async () => ({
-          inputTokens: 20,
-          outputTokens: 10,
-          estimatedCostUsd: 0.02
-        })),
+        estimateCost: fallbackEstimate,
         plan: vi.fn(),
         implement: vi.fn(),
         review: vi.fn(),
@@ -1393,10 +1396,18 @@ github:
     const { runDatabaseWorkerOnce } = await import('./db-worker.js');
     const result = await runDatabaseWorkerOnce();
 
-    expect(result).toEqual(expect.objectContaining({ claimed: true, taskId: 'task_1' }));
+    expect(result).toEqual(expect.objectContaining({ claimed: true, taskId: 'task_1', status: 'provider_failed' }));
     expect(createProviderMock).toHaveBeenCalledWith('openai', undefined);
     expect(createProviderMock).toHaveBeenCalledWith('codex', undefined);
-    expect(repositoryMock.recordProviderUsage).not.toHaveBeenCalled();
+    expect(fallbackEstimate).not.toHaveBeenCalled();
+    expect(repositoryMock.writeAudit).toHaveBeenCalledWith(expect.objectContaining({
+      eventType: 'provider_fallback_skipped',
+      payload: expect.objectContaining({
+        primaryProvider: 'openai',
+        fallbackProvider: 'codex',
+        reason: 'fallback_not_semantically_equivalent'
+      })
+    }));
 
     if (previousProvider === undefined) {
       delete process.env.FORGEMIND_PROVIDER;
@@ -1407,6 +1418,148 @@ github:
       delete process.env.FORGEMIND_FALLBACK_PROVIDER;
     } else {
       process.env.FORGEMIND_FALLBACK_PROVIDER = previousFallback;
+    }
+  });
+
+  it('opens a bounded circuit breaker after retryable provider failures and audits fallback policy', async () => {
+    const previousConnectionId = process.env.FORGEMIND_PROVIDER_CONNECTION_ID;
+    const previousFallbackConnectionId = process.env.FORGEMIND_FALLBACK_PROVIDER_CONNECTION_ID;
+    const previousThreshold = process.env.FORGEMIND_PROVIDER_CIRCUIT_BREAKER_FAILURE_THRESHOLD;
+    const previousOpenMs = process.env.FORGEMIND_PROVIDER_CIRCUIT_BREAKER_OPEN_MS;
+    process.env.FORGEMIND_PROVIDER_CONNECTION_ID = 'conn_primary_codex';
+    process.env.FORGEMIND_FALLBACK_PROVIDER_CONNECTION_ID = 'conn_fallback_codex';
+    process.env.FORGEMIND_PROVIDER_CIRCUIT_BREAKER_FAILURE_THRESHOLD = '2';
+    process.env.FORGEMIND_PROVIDER_CIRCUIT_BREAKER_OPEN_MS = '60000';
+    const primaryEstimate = vi.fn(async () => {
+      throw new Error('Primary timed out');
+    });
+    const fallbackEstimate = vi.fn(async () => ({
+      inputTokens: 20,
+      outputTokens: 10,
+      estimatedCostUsd: 0.02
+    }));
+
+    try {
+      repositoryMock.getAIProviderConnectionSecretById.mockImplementation(async (connectionId: string) => {
+        if (connectionId === 'conn_primary_codex') {
+          return {
+            id: 'conn_primary_codex',
+            userId: 'user_1',
+            name: 'Primary Codex',
+            isDefault: false,
+            credentialSource: 'api_key',
+            provider: 'codex',
+            authMode: 'api_key',
+            model: 'gpt-5.5',
+            apiKeyFingerprint: 'fp_primary',
+            connectedAt: new Date().toISOString(),
+            updatedAt: new Date().toISOString(),
+            apiKey: 'key_primary'
+          };
+        }
+        if (connectionId === 'conn_fallback_codex') {
+          return {
+            id: 'conn_fallback_codex',
+            userId: 'user_1',
+            name: 'Fallback Codex',
+            isDefault: false,
+            credentialSource: 'api_key',
+            provider: 'codex',
+            authMode: 'api_key',
+            model: 'gpt-5.5',
+            apiKeyFingerprint: 'fp_fallback',
+            connectedAt: new Date().toISOString(),
+            updatedAt: new Date().toISOString(),
+            apiKey: 'key_fallback'
+          };
+        }
+        return undefined;
+      });
+      createProviderMock.mockImplementation((kind: string, config?: { apiKey?: string }) => ({
+        estimateCost: config?.apiKey === 'key_primary' ? primaryEstimate : fallbackEstimate,
+        plan: vi.fn(),
+        implement: vi.fn(),
+        review: vi.fn(),
+        kind,
+        async preflight() { return { provider: kind, ok: true, checkedAt: new Date().toISOString() }; },
+        supportsLocalRepo: () => true,
+        supportsGitHubNativeFlow: () => false
+      }));
+      runWorkerTaskMock.mockResolvedValue({
+        taskId: 'task_1',
+        status: 'ready_for_user_review',
+        issueUrl: 'https://github.com/demo/repo/issues/1',
+        branchName: 'ai/1-task',
+        workspacePath: 'C:/tmp/worker',
+        validation: {
+          command: 'node --version',
+          exitCode: 0,
+          stdout: '',
+          stderr: '',
+          passed: true
+        },
+        summary: 'done',
+        approvals: [],
+        completedAt: new Date().toISOString()
+      });
+
+      const { runDatabaseWorkerOnce } = await import('./db-worker.js');
+      await runDatabaseWorkerOnce();
+      await runDatabaseWorkerOnce();
+      await runDatabaseWorkerOnce();
+
+      expect(primaryEstimate).toHaveBeenCalledTimes(2);
+      expect(fallbackEstimate).toHaveBeenCalledTimes(3);
+      expect(repositoryMock.writeAudit).toHaveBeenCalledWith(expect.objectContaining({
+        eventType: 'provider_circuit_breaker_state',
+        payload: expect.objectContaining({
+          provider: 'codex',
+          connectionId: 'conn_primary_codex',
+          circuitBreaker: expect.objectContaining({
+            state: 'open',
+            failureCount: 2,
+            failureThreshold: 2
+          })
+        })
+      }));
+      expect(repositoryMock.writeAudit).toHaveBeenCalledWith(expect.objectContaining({
+        eventType: 'provider_fallback_used',
+        payload: expect.objectContaining({
+          primaryProvider: 'codex',
+          fallbackProvider: 'codex',
+          policy: 'semantically_equivalent_same_operation_retryable_primary_failure'
+        })
+      }));
+      expect(repositoryMock.writeAudit).toHaveBeenCalledWith(expect.objectContaining({
+        eventType: 'provider_request_succeeded',
+        payload: expect.objectContaining({
+          provider: 'codex',
+          operation: 'estimate_cost'
+        })
+      }));
+    } finally {
+      const { resetProviderCircuitBreakersForTests } = await import('./db-worker.js');
+      resetProviderCircuitBreakersForTests();
+      if (previousConnectionId === undefined) {
+        delete process.env.FORGEMIND_PROVIDER_CONNECTION_ID;
+      } else {
+        process.env.FORGEMIND_PROVIDER_CONNECTION_ID = previousConnectionId;
+      }
+      if (previousFallbackConnectionId === undefined) {
+        delete process.env.FORGEMIND_FALLBACK_PROVIDER_CONNECTION_ID;
+      } else {
+        process.env.FORGEMIND_FALLBACK_PROVIDER_CONNECTION_ID = previousFallbackConnectionId;
+      }
+      if (previousThreshold === undefined) {
+        delete process.env.FORGEMIND_PROVIDER_CIRCUIT_BREAKER_FAILURE_THRESHOLD;
+      } else {
+        process.env.FORGEMIND_PROVIDER_CIRCUIT_BREAKER_FAILURE_THRESHOLD = previousThreshold;
+      }
+      if (previousOpenMs === undefined) {
+        delete process.env.FORGEMIND_PROVIDER_CIRCUIT_BREAKER_OPEN_MS;
+      } else {
+        process.env.FORGEMIND_PROVIDER_CIRCUIT_BREAKER_OPEN_MS = previousOpenMs;
+      }
     }
   });
 
@@ -1443,7 +1596,7 @@ github:
           credentialSource: 'api_key',
           provider: 'codex',
           authMode: 'api_key',
-          model: 'gpt-5.5-mini',
+          model: 'gpt-5.5',
           apiKeyFingerprint: 'fp_fallback',
           connectedAt: new Date().toISOString(),
           updatedAt: new Date().toISOString(),
@@ -1498,7 +1651,7 @@ github:
     expect(result).toEqual(expect.objectContaining({ claimed: true, taskId: 'task_1' }));
     expect(createProviderMock).toHaveBeenCalledTimes(3);
     expect(createProviderMock).toHaveBeenNthCalledWith(1, 'codex', expect.objectContaining({ apiKey: 'key_primary', model: 'gpt-5.5' }));
-    expect(createProviderMock).toHaveBeenNthCalledWith(2, 'codex', expect.objectContaining({ apiKey: 'key_fallback', model: 'gpt-5.5-mini' }));
+    expect(createProviderMock).toHaveBeenNthCalledWith(2, 'codex', expect.objectContaining({ apiKey: 'key_fallback', model: 'gpt-5.5' }));
     expect(createProviderMock).toHaveBeenNthCalledWith(3, 'codex', expect.objectContaining({ apiKey: 'key_primary', model: 'gpt-5.5' }));
 
     if (previousPrimaryConnection === undefined) {

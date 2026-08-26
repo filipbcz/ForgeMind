@@ -6,6 +6,7 @@ import type {
   ProjectImplementationStepStatus as CoreProjectImplementationStepStatus,
   ProjectRoadmapCycleStatus as CoreProjectRoadmapCycleStatus,
   ProjectSpecificationSource,
+  ProviderConnectionRuntimeStatus,
   TaskRunState
 } from '@forgemind/core';
 
@@ -599,6 +600,7 @@ export interface ProviderStatusApi {
   currentProvider: 'openai' | 'codex' | 'github_copilot' | string | null;
   currentModel: string | null;
   currentConnectionId: string | null;
+  currentRuntimeStatus: ProviderConnectionRuntimeStatus | null;
   connections: ProviderConnectionApi[];
   fallbackProvider: 'openai' | 'codex' | 'github_copilot' | string | null;
   githubAdapter: string;
@@ -642,6 +644,7 @@ export interface ProviderConnectionApi {
   accountSummary?: string;
   available?: boolean | null;
   availability?: 'available' | 'reauthentication_required' | 'status_unavailable';
+  runtimeStatus?: ProviderConnectionRuntimeStatus | null;
   connectedAt: string;
   lastCheckedAt?: string;
   updatedAt: string;

@@ -356,6 +356,51 @@ describe('ForgeMindRepository task runs', () => {
     expect(JSON.stringify(persisted)).not.toContain('sk-object_1234567890abcdef');
   });
 
+  it('reads provider runtime status without a bounded global audit window', async () => {
+    const { prisma } = createMockPrisma();
+    const repository = new ForgeMindRepository(prisma);
+    prisma.auditLog.findMany.mockResolvedValueOnce([
+      {
+        id: 'audit_success',
+        actorType: 'system',
+        actorId: null,
+        eventType: 'provider_request_succeeded',
+        projectId: null,
+        taskId: 'task_1',
+        payload: {
+          operation: 'implement',
+          provider: 'codex',
+          connectionId: 'conn_1',
+          model: 'gpt-5.5',
+          circuitBreaker: {
+            state: 'closed',
+            failureCount: 0,
+            failureThreshold: 3
+          }
+        },
+        createdAt: new Date('2026-08-26T12:00:00.000Z')
+      }
+    ]);
+
+    const statuses = await repository.listProviderConnectionRuntimeStatuses();
+
+    expect(prisma.auditLog.findMany).toHaveBeenCalledWith({
+      where: {
+        eventType: { in: ['provider_request_succeeded', 'provider_circuit_breaker_state'] }
+      },
+      orderBy: { createdAt: 'desc' }
+    });
+    expect(statuses).toEqual([
+      expect.objectContaining({
+        provider: 'codex',
+        connectionId: 'conn_1',
+        model: 'gpt-5.5',
+        lastSuccessfulRequestAt: '2026-08-26T12:00:00.000Z',
+        lastSuccessfulOperation: 'implement'
+      })
+    ]);
+  });
+
   it('exports correlated diagnostics without representative secrets', async () => {
     const { prisma } = createMockPrisma();
     const createdAt = new Date('2026-08-25T10:00:00.000Z');

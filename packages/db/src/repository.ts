@@ -36,6 +36,7 @@ import {
   type ProjectSpecificationSnapshot,
   type Project,
   type ProjectCapability,
+  type ProviderConnectionRuntimeStatus,
   type ProviderKind,
   type RiskLevel,
   type RunStatus,
@@ -383,6 +384,7 @@ const WORKER_EVENT_PREFIXES = [
   'task_retry_',
   'task_activity',
   'task_provider_activity',
+  'provider_',
   'task_worker_interrupted',
   'task_failed',
   'project_audit_',
@@ -562,6 +564,53 @@ export class ForgeMindRepository {
     });
 
     return connection ? toAIProviderConnectionSnapshot(connection) : undefined;
+  }
+
+  async listProviderConnectionRuntimeStatuses(): Promise<ProviderConnectionRuntimeStatus[]> {
+    const events = await this.prisma.auditLog.findMany({
+      where: {
+        eventType: { in: ['provider_request_succeeded', 'provider_circuit_breaker_state'] }
+      },
+      orderBy: { createdAt: 'desc' }
+    });
+    const statuses = new Map<string, ProviderConnectionRuntimeStatus>();
+    const circuitBreakerSeen = new Set<string>();
+    for (const event of events) {
+      const payload = asJsonRecord(event.payload);
+      if (!payload) continue;
+      const provider = readProviderKind(payload.provider);
+      if (!provider) continue;
+      const connectionId = typeof payload.connectionId === 'string' ? payload.connectionId : null;
+      const model = typeof payload.model === 'string' ? payload.model : null;
+      const key = `${provider}:${connectionId ?? 'env'}`;
+      const current = statuses.get(key) ?? {
+        provider,
+        connectionId,
+        model,
+        lastSuccessfulRequestAt: null,
+        lastSuccessfulOperation: null,
+        circuitBreaker: {
+          state: 'closed',
+          failureCount: 0,
+          failureThreshold: 3
+        }
+      };
+      if (event.eventType === 'provider_request_succeeded' && !current.lastSuccessfulRequestAt) {
+        current.lastSuccessfulRequestAt = event.createdAt.toISOString();
+        current.lastSuccessfulOperation = typeof payload.operation === 'string' ? payload.operation : null;
+      }
+      const circuitBreaker = readProviderCircuitBreakerSnapshot(payload.circuitBreaker);
+      if (circuitBreaker && !circuitBreakerSeen.has(key)) {
+        current.circuitBreaker = circuitBreaker;
+        circuitBreakerSeen.add(key);
+      }
+      statuses.set(key, current);
+    }
+    return [...statuses.values()].sort((a, b) => {
+      const aTime = a.lastSuccessfulRequestAt ?? a.circuitBreaker.lastFailureAt ?? '';
+      const bTime = b.lastSuccessfulRequestAt ?? b.circuitBreaker.lastFailureAt ?? '';
+      return bTime.localeCompare(aTime);
+    });
   }
 
   async getAIProviderConnectionSecret(userId = LOCAL_USER_ID): Promise<AIProviderConnectionSecret | undefined> {
@@ -4523,6 +4572,33 @@ function toAIProviderConnectionSnapshot(connection: AiProviderConnection): AIPro
     connectedAt: connection.connectedAt.toISOString(),
     lastCheckedAt: connection.lastCheckedAt?.toISOString(),
     updatedAt: connection.updatedAt.toISOString()
+  };
+}
+
+function readProviderKind(value: Prisma.JsonValue | undefined): ProviderKind | undefined {
+  return value === 'openai' || value === 'codex' || value === 'github_copilot' ? value : undefined;
+}
+
+function readProviderCircuitBreakerSnapshot(value: Prisma.JsonValue | undefined): ProviderConnectionRuntimeStatus['circuitBreaker'] | undefined {
+  const record = asJsonRecord(value);
+  if (!record) return undefined;
+  const state = record.state;
+  if (state !== 'closed' && state !== 'open' && state !== 'half_open') return undefined;
+  const failureCount = typeof record.failureCount === 'number' ? record.failureCount : 0;
+  const failureThreshold = typeof record.failureThreshold === 'number' ? record.failureThreshold : 3;
+  const lastFailureKind = typeof record.lastFailureKind === 'string'
+    && ['authentication', 'quota', 'timeout', 'invalid_response', 'unavailable', 'unknown'].includes(record.lastFailureKind)
+    ? record.lastFailureKind as ProviderConnectionRuntimeStatus['circuitBreaker']['lastFailureKind']
+    : undefined;
+  return {
+    state,
+    failureCount,
+    failureThreshold,
+    openedAt: typeof record.openedAt === 'string' ? record.openedAt : undefined,
+    openedUntil: typeof record.openedUntil === 'string' ? record.openedUntil : undefined,
+    lastFailureAt: typeof record.lastFailureAt === 'string' ? record.lastFailureAt : undefined,
+    lastFailureKind,
+    lastFailureMessage: typeof record.lastFailureMessage === 'string' ? record.lastFailureMessage : undefined
   };
 }
 
