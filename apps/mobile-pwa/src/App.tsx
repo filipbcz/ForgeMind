@@ -76,6 +76,7 @@ import {
 } from './api.js';
 import { subscribeForPushNotifications, unsubscribeFromPushNotifications } from './pwa.js';
 import type {
+  AcceptanceEvidenceApi,
   ApprovalSummary,
   AssignProjectRepositoryRequest,
   AuditEventApi,
@@ -89,8 +90,11 @@ import type {
   GitHubAdapterStatusApi,
   GitHubBranchApi,
   ProjectArchitectureSnapshotApi,
+  ProjectAuditJobApi,
   ProjectContractSnapshotApi,
+  ProjectImplementationStepApi,
   ProjectRoadmapApi,
+  ProjectRoadmapCycleApi,
   ProjectSpecificationSnapshotApi,
   GitHubRepositoryApi,
   GitHubRepositoryOwnerApi,
@@ -121,6 +125,76 @@ import {
 
 type View = 'tasks' | 'new-task' | 'approvals' | 'projects' | 'settings';
 type RealtimeUiState = 'connected' | 'reconnecting' | 'fallback';
+type ProjectRoadmapView = 'roadmap' | 'history' | 'contract' | 'evidence' | 'audit';
+export type ProjectItemStatusFilter = 'active' | 'waiting' | 'failed' | 'completed';
+
+const projectRoadmapViews: Array<{ id: ProjectRoadmapView; label: string }> = [
+  { id: 'roadmap', label: 'Roadmap' },
+  { id: 'history', label: 'Historie cyklů' },
+  { id: 'contract', label: 'Kontrakt' },
+  { id: 'evidence', label: 'Evidence' },
+  { id: 'audit', label: 'Audity' }
+];
+
+const projectItemStatusFilters: Array<{ id: ProjectItemStatusFilter; label: string }> = [
+  { id: 'active', label: 'Aktivní' },
+  { id: 'waiting', label: 'Čekající' },
+  { id: 'failed', label: 'Selhané' },
+  { id: 'completed', label: 'Dokončené' }
+];
+
+export function projectStepMatchesStatusFilter(
+  step: ProjectImplementationStepApi,
+  filter: ProjectItemStatusFilter
+): boolean {
+  if (filter === 'active') return step.status === 'pending' || step.status === 'running';
+  if (filter === 'waiting') return step.status === 'waiting_for_capability';
+  if (filter === 'failed') return step.status === 'cancelled';
+  return step.status === 'completed';
+}
+
+export function projectCycleMatchesStatusFilter(
+  cycle: ProjectRoadmapCycleApi,
+  filter: ProjectItemStatusFilter
+): boolean {
+  if (filter === 'active') return cycle.status === 'active' || cycle.status === 'verifying' || cycle.status === 'partial';
+  if (filter === 'waiting') return cycle.status === 'awaiting_extension_approval';
+  if (filter === 'failed') return cycle.status === 'blocked';
+  return cycle.status === 'completed';
+}
+
+export function projectAuditMatchesStatusFilter(
+  job: ProjectAuditJobApi,
+  filter: ProjectItemStatusFilter
+): boolean {
+  if (filter === 'active') return job.status === 'claimed';
+  if (filter === 'waiting') return job.status === 'pending';
+  if (filter === 'failed') return job.status === 'failed' || job.status === 'blocked';
+  return job.status === 'succeeded';
+}
+
+export function projectEvidenceMatchesStatusFilter(
+  evidence: AcceptanceEvidenceApi,
+  filter: ProjectItemStatusFilter
+): boolean {
+  if (filter === 'active') return false;
+  if (filter === 'waiting') return evidence.status === 'deferred';
+  if (filter === 'failed') return evidence.status === 'failed' || evidence.status === 'blocked';
+  return evidence.status === 'passed';
+}
+
+export function canStartProjectAudit(
+  cycle: ProjectRoadmapCycleApi | undefined,
+  steps: ProjectImplementationStepApi[],
+  auditJob: ProjectAuditJobApi | undefined
+): boolean {
+  return Boolean(
+    cycle?.status === 'active'
+    && steps.length > 0
+    && steps.every((step) => step.status === 'completed')
+    && (!auditJob || auditJob.status === 'succeeded')
+  );
+}
 
 const terminalStatuses = new Set<TaskSummary['status']>([
   'completed',
@@ -2602,17 +2676,25 @@ export function ProjectsPanel(props: {
   const [validationTimeoutMinutes, setValidationTimeoutMinutes] = useState(selectedProject?.validationProfile?.commandTimeoutMinutes ?? 10);
   const [deleteConfirmation, setDeleteConfirmation] = useState('');
   const [deleteGitHubRepository, setDeleteGitHubRepository] = useState(false);
+  const [selectedProjectRoadmapView, setSelectedProjectRoadmapView] = useState<ProjectRoadmapView>('roadmap');
+  const [projectStatusFilter, setProjectStatusFilter] = useState<ProjectItemStatusFilter>('active');
   const roadmapCycles = [...(props.roadmap?.cycles ?? [])]
     .sort((left, right) => right.cycleNumber - left.cycleNumber);
   const latestCycle = roadmapCycles[0];
   const currentContract = props.contracts?.current?.contract ?? selectedProject?.projectContract;
   const cycleSteps = latestCycle ? props.roadmap?.steps.filter((step) => step.cycleId === latestCycle.id) ?? [] : [];
+  const latestAuditJob = latestCycle ? props.roadmap?.auditJobs.find((job) => job.cycleId === latestCycle.id) : undefined;
+  const filteredRoadmapCycles = roadmapCycles.filter((cycle) => projectCycleMatchesStatusFilter(cycle, projectStatusFilter));
+  const filteredRoadmapSteps = cycleSteps.filter((step) => projectStepMatchesStatusFilter(step, projectStatusFilter));
+  const filteredEvidence = (props.roadmap?.evidence ?? []).filter((evidence) => projectEvidenceMatchesStatusFilter(evidence, projectStatusFilter));
+  const filteredAuditJobs = (props.roadmap?.auditJobs ?? []).filter((job) => projectAuditMatchesStatusFilter(job, projectStatusFilter));
   const operationalOverview = summarizeProjectOperationalOverview(props.roadmap, props.tasks);
   const canStartNextRoadmapStep = Boolean(
     latestCycle?.status === 'active'
     && cycleSteps.some((step) => step.status === 'pending' && !step.taskId)
     && !cycleSteps.some((step) => step.status === 'running' || step.status === 'waiting_for_capability')
   );
+  const canStartAudit = canStartProjectAudit(latestCycle, cycleSteps, latestAuditJob);
   const roadmapUsesOlderBrief = Boolean(
     latestCycle?.cycleNumber === 1
     && selectedProject?.brief?.trim()
@@ -2810,14 +2892,6 @@ export function ProjectsPanel(props: {
               <div className="actions wide">
                 <button className="secondary-action" type="submit" disabled={props.updatingProject}>
                   Ulozit zadani
-                </button>
-                <button
-                  className="primary-action"
-                  type="button"
-                  disabled={props.generatingRoadmap || !selectedProject.brief?.trim()}
-                  onClick={() => props.onGenerateRoadmap(selectedProject.id)}
-                >
-                  {props.roadmap?.cycles.length ? 'Pregenerovat implementacni kroky' : 'Vytvorit implementacni kroky'}
                 </button>
               </div>
             </form>
@@ -3033,29 +3107,170 @@ export function ProjectsPanel(props: {
               </div>
             </form>
           </section>
-          <section className="plain-section">
+          <section className="plain-section project-roadmap-workspace">
             <div className="section-heading">
               <div>
-                <h3>Roadmap</h3>
+                <h3>Roadmap projektu</h3>
                 {latestCycle ? <p>Cyklus {latestCycle.cycleNumber} | {cycleSteps.length} kroku</p> : null}
               </div>
-              {canStartNextRoadmapStep ? (
+            </div>
+            <div className="project-view-tabs" aria-label="Projektové roadmap views">
+              {projectRoadmapViews.map((view) => (
+                <button
+                  key={view.id}
+                  className={selectedProjectRoadmapView === view.id ? 'segment active' : 'segment'}
+                  type="button"
+                  aria-pressed={selectedProjectRoadmapView === view.id}
+                  onClick={() => setSelectedProjectRoadmapView(view.id)}
+                >
+                  {view.label}
+                </button>
+              ))}
+            </div>
+            <div className="project-status-filters" aria-label="Filtr stavu položek">
+              {projectItemStatusFilters.map((filter) => (
+                <button
+                  key={filter.id}
+                  className={projectStatusFilter === filter.id ? 'segment active' : 'segment'}
+                  type="button"
+                  aria-pressed={projectStatusFilter === filter.id}
+                  onClick={() => setProjectStatusFilter(filter.id)}
+                >
+                  {filter.label}
+                </button>
+              ))}
+            </div>
+            <div className="project-action-groups" aria-label="Akce projektu">
+              <div>
+                <span>Generování roadmapy</span>
+                <button
+                  className="secondary-action"
+                  type="button"
+                  disabled={props.generatingRoadmap || !selectedProject.brief?.trim()}
+                  onClick={() => props.onGenerateRoadmap(selectedProject.id)}
+                >
+                  <LayoutList size={16} />
+                  {props.roadmap?.cycles.length ? 'Pregenerovat kroky' : 'Vytvorit kroky'}
+                </button>
+              </div>
+              <div>
+                <span>Spuštění dalšího kroku</span>
                 <button
                   className="primary-action"
                   type="button"
-                  disabled={props.startingRoadmapStep}
+                  disabled={!canStartNextRoadmapStep || props.startingRoadmapStep}
                   onClick={() => props.onStartNextRoadmapStep(selectedProject.id)}
                 >
                   <Play size={16} />
-                  {props.startingRoadmapStep ? 'Spoustim...' : 'Spustit dalsi krok'}
+                  Spustit dalsi krok
                 </button>
-              ) : null}
+              </div>
+              <div>
+                <span>Auditní akce</span>
+                <button
+                  className="secondary-action"
+                  type="button"
+                  disabled={props.startingAudit || !canStartAudit}
+                  onClick={() => props.onStartAudit(selectedProject.id)}
+                >
+                  <ClipboardCheck size={16} />
+                  Spustit závěrečný audit
+                </button>
+              </div>
             </div>
             {props.roadmapLoading ? <p>Nacitam roadmapu...</p> : null}
             {props.roadmapError ? <div className="error-banner">{props.roadmapError}</div> : null}
             {!props.roadmapLoading && !latestCycle ? <p>Zatim bez roadmap cyklu.</p> : null}
-            {latestCycle ? (
-              <>
+            {latestCycle && selectedProjectRoadmapView === 'roadmap' ? (
+              <div className="project-roadmap-view" aria-label="Aktivní roadmap view">
+                <div className="timeline">
+                  {filteredRoadmapSteps.length > 0 ? filteredRoadmapSteps.map((step) => {
+                    const task = step.taskId ? props.tasks.find((item) => item.id === step.taskId) : undefined;
+                    return (
+                      <div className="timeline-row" key={step.id}>
+                        <span>{step.sequenceNumber}.</span>
+                        <strong>{step.title}</strong>
+                        <small>
+                          {step.status}{step.requirementIds.length ? ` | ${step.requirementIds.join(', ')}` : ''}{task ? ` | ${task.title}` : ''}
+                        </small>
+                        {step.changeRationale ? <small>Duvod: {step.changeRationale}</small> : null}
+                        {step.dependsOnStepTitles.length > 0 ? <small>Navazuje na: {step.dependsOnStepTitles.join(', ')}</small> : null}
+                        {step.validationFocus.length > 0 ? <small>Overeni: {step.validationFocus.join(', ')}</small> : null}
+                      </div>
+                    );
+                  }) : <p className="empty-state">Žádné kroky neodpovídají filtru.</p>}
+                </div>
+              </div>
+            ) : null}
+            {latestCycle && selectedProjectRoadmapView === 'history' ? (
+              <div className="roadmap-cycle-list" aria-label="Cycle history view">
+                {filteredRoadmapCycles.length > 0 ? filteredRoadmapCycles.map((cycle) => {
+                  const isLatest = cycle.id === latestCycle.id;
+                  const steps = (props.roadmap?.steps ?? [])
+                    .filter((step) => step.cycleId === cycle.id)
+                    .sort((left, right) => left.sequenceNumber - right.sequenceNumber);
+                  const completedStepCount = steps.filter((step) => step.status === 'completed').length;
+                  const cycleContractVersion = props.contracts?.versions.find((version) => version.id === cycle.contractVersionId);
+                  const cycleContractLabel = cycleContractVersion?.changeSummary.startsWith('Imported legacy')
+                    && cycle.cycleNumber !== cycleContractVersion.version
+                    ? ' | puvodni kontrakt nebyl zaznamenan'
+                    : cycleContractVersion
+                      ? ` | kontrakt v${cycleContractVersion.version}`
+                      : '';
+                  return (
+                    <details className="roadmap-cycle" key={cycle.id}>
+                      <summary>
+                        <span className="roadmap-cycle-title">
+                          <small>{isLatest ? 'Aktuální cyklus' : 'Historie'}</small>
+                          <strong>Cyklus {cycle.cycleNumber}</strong>
+                          <span>{completedStepCount}/{steps.length} kroků dokončeno{cycleContractLabel}</span>
+                        </span>
+                        <span className={`badge ${cycle.status}`}>{cycle.status}</span>
+                        <ArrowDown size={18} />
+                      </summary>
+                      <div className="roadmap-cycle-body">
+                        <p>{cycle.objective}</p>
+                        {cycle.extensionProposal ? (
+                          <div className="prompt-response-panel roadmap-extension">
+                            <div className="prompt-response-header">
+                              <strong>{isLatest ? 'Další navržené rozšíření' : 'Navržené rozšíření cyklu'}</strong>
+                              <span>{cycle.status}</span>
+                            </div>
+                            <div className="prompt-response-body">
+                              <div className="prompt-response-block">
+                                <pre>{cycle.extensionProposal}</pre>
+                              </div>
+                            </div>
+                            {isLatest && cycle.status === 'awaiting_extension_approval' ? (
+                              <div className="actions">
+                                <button
+                                  className="primary-action"
+                                  type="button"
+                                  disabled={props.decidingExtension}
+                                  onClick={() => props.onDecideExtension(selectedProject.id, { approved: true, cycleId: cycle.id })}
+                                >
+                                  Schválit
+                                </button>
+                                <button
+                                  className="secondary-action"
+                                  type="button"
+                                  disabled={props.decidingExtension}
+                                  onClick={() => props.onDecideExtension(selectedProject.id, { approved: false, cycleId: cycle.id })}
+                                >
+                                  Zamítnout
+                                </button>
+                              </div>
+                            ) : null}
+                          </div>
+                        ) : null}
+                      </div>
+                    </details>
+                  );
+                }) : <p className="empty-state">Žádné cykly neodpovídají filtru.</p>}
+              </div>
+            ) : null}
+            {selectedProjectRoadmapView === 'contract' ? (
+              <div className="project-contract-view" aria-label="Contract view">
                 {props.contractsLoading ? <p className="muted">Nacitam historii projektoveho kontraktu...</p> : null}
                 {props.contractsError ? <div className="error-banner">{props.contractsError}</div> : null}
                 {currentContract ? (
@@ -3134,190 +3349,61 @@ export function ProjectsPanel(props: {
                             {' | '}{version.architecture.databaseSchemas?.length ?? 0} databazovych schemat
                             {' | '}{version.architecture.decisions.length} rozhodnuti
                           </small>
-                          {version.architecture.modules.length > 0 ? (
-                            <ul>
-                              {version.architecture.modules.map((module) => (
-                                <li key={module.name}>
-                                  <strong>{module.name}</strong>: {module.responsibility}
-                                  {module.dependencies.length ? ` | zavislosti: ${module.dependencies.join(', ')}` : ''}
-                                </li>
-                              ))}
-                            </ul>
-                          ) : null}
-                          {version.architecture.dependencyRules.length > 0 ? (
-                            <p>Pravidla zavislosti: {version.architecture.dependencyRules.join(' | ')}</p>
-                          ) : null}
-                          {version.architecture.knownDebt.length > 0 ? (
-                            <p>Znamy technicky dluh: {version.architecture.knownDebt.join(' | ')}</p>
-                          ) : null}
                         </div>
                       </details>
                     ))}
                   </div>
                 ) : null}
-                {(props.roadmap?.capabilities ?? []).length > 0 ? (
-                  <details className="capability-disclosure">
-                    <summary>
-                      Pozadavky kontraktu a jejich dukazy ({props.roadmap?.capabilities.length ?? 0})
-                    </summary>
-                    <div className="capability-list">
-                    {(props.roadmap?.capabilities ?? []).map((capability) => (
-                      <div className="capability-row" key={capability.requirement.id}>
+              </div>
+            ) : null}
+            {selectedProjectRoadmapView === 'evidence' ? (
+              <div className="project-evidence-view" aria-label="Evidence view">
+                {filteredEvidence.length > 0 ? (
+                  <div className="capability-list">
+                    {filteredEvidence.map((evidence) => (
+                      <div className="capability-row" key={evidence.id}>
                         <div>
-                          <strong>{capability.requirement.id}: {capability.requirement.title}</strong>
-                          <p>{capability.requirement.description}</p>
+                          <strong>{evidence.requirementId}: {evidence.criterion}</strong>
+                          <p>{evidence.source} | {evidence.evidenceKey}</p>
                         </div>
-                        <span data-status={capability.status}>{capability.status}</span>
+                        <span data-status={evidence.status}>{evidence.status}</span>
                         <small>
-                          Audit {capability.satisfiedCriteria}/{capability.totalCriteria} | evidence {capability.evidence.length} | work itemy {capability.workItemIds.length}
+                          {evidence.commitSha ? `Commit ${evidence.commitSha} | ` : ''}kontrakt v{evidence.contractVersion}
                         </small>
-                        {capability.evidence.length > 0 ? (
-                          <details>
-                            <summary>Dukazy</summary>
-                            <ul>
-                              {capability.evidence.map((evidence) => (
-                                <li key={evidence.id}>
-                                  <strong>{evidence.status}</strong> | {evidence.source} | {evidence.criterion}
-                                  {evidence.command ? <code>{evidence.command}</code> : null}
-                                </li>
-                              ))}
-                            </ul>
-                          </details>
-                        ) : null}
-                        {capability.workItemIds.length > 0 ? (
-                          <small>
-                            {(props.roadmap?.steps ?? [])
-                              .filter((step) => capability.workItemIds.includes(step.id))
-                              .map((step) => `${step.title} (${step.status})`)
-                              .join(' | ')}
-                          </small>
-                        ) : null}
+                        {evidence.command ? <code>{evidence.command}</code> : null}
                       </div>
                     ))}
+                  </div>
+                ) : <p className="empty-state">Žádná evidence neodpovídá filtru.</p>}
+              </div>
+            ) : null}
+            {selectedProjectRoadmapView === 'audit' ? (
+              <div className="audit-trail project-audit-view" aria-label="Audit view">
+                {filteredAuditJobs.length > 0 ? filteredAuditJobs.map((auditJob) => (
+                  <details className="audit-entry" key={auditJob.id}>
+                    <summary>
+                      <strong>Audit cyklu {roadmapCycles.find((cycle) => cycle.id === auditJob.cycleId)?.cycleNumber ?? auditJob.cycleId}</strong>
+                      <span>{auditJob.status} | pokus {auditJob.attemptCount}</span>
+                    </summary>
+                    <div className="audit-body">
+                      {auditJob.errorMessage ? <pre className="error-detail">{auditJob.errorMessage}</pre> : null}
+                      {(auditJob.status === 'failed' || auditJob.status === 'blocked') && auditJob.cycleId === latestCycle?.id ? (
+                        <div className="actions">
+                          <button
+                            className="secondary-action"
+                            type="button"
+                            disabled={props.retryingAudit}
+                            onClick={() => props.onRetryAudit(selectedProject.id)}
+                          >
+                            <RotateCcw size={16} />
+                            Opakovat pouze audit
+                          </button>
+                        </div>
+                      ) : null}
                     </div>
                   </details>
-                ) : null}
-                <div className="roadmap-cycle-list">
-                  {roadmapCycles.map((cycle) => {
-                    const isLatest = cycle.id === latestCycle.id;
-                    const steps = (props.roadmap?.steps ?? [])
-                      .filter((step) => step.cycleId === cycle.id)
-                      .sort((left, right) => left.sequenceNumber - right.sequenceNumber);
-                    const completedStepCount = steps.filter((step) => step.status === 'completed').length;
-                    const auditJob = props.roadmap?.auditJobs.find((job) => job.cycleId === cycle.id);
-                    const canStartAudit = isLatest
-                      && cycle.status === 'active'
-                      && steps.length > 0
-                      && steps.every((step) => step.status === 'completed')
-                      && (!auditJob || auditJob.status === 'succeeded');
-                    const cycleContractVersion = props.contracts?.versions.find((version) => version.id === cycle.contractVersionId);
-                    const cycleContractLabel = cycleContractVersion?.changeSummary.startsWith('Imported legacy')
-                      && cycle.cycleNumber !== cycleContractVersion.version
-                      ? ' | puvodni kontrakt nebyl zaznamenan'
-                      : cycleContractVersion
-                        ? ` | kontrakt v${cycleContractVersion.version}`
-                        : '';
-                    return (
-                      <details className="roadmap-cycle" key={cycle.id}>
-                        <summary>
-                          <span className="roadmap-cycle-title">
-                            <small>{isLatest ? 'Aktuální cyklus' : 'Historie'}</small>
-                            <strong>Cyklus {cycle.cycleNumber}</strong>
-                            <span>{completedStepCount}/{steps.length} kroků dokončeno{cycleContractLabel}</span>
-                          </span>
-                          <span className={`badge ${cycle.status}`}>{cycle.status}</span>
-                          <ArrowDown size={18} />
-                        </summary>
-                        <div className="roadmap-cycle-body">
-                          <p>{cycle.objective}</p>
-                          {auditJob ? (
-                            <div className={auditJob.status === 'failed' || auditJob.status === 'blocked' ? 'error-banner' : 'success-banner'}>
-                              Audit projektu: {auditJob.status} | pokus {auditJob.attemptCount}
-                              {auditJob.errorMessage ? <pre>{auditJob.errorMessage}</pre> : null}
-                              {isLatest && (auditJob.status === 'failed' || auditJob.status === 'blocked') ? (
-                                <div className="actions">
-                                  <button
-                                    className="secondary-action"
-                                    type="button"
-                                    disabled={props.retryingAudit}
-                                    onClick={() => props.onRetryAudit(selectedProject.id)}
-                                  >
-                                    <RotateCcw size={16} />
-                                    Opakovat pouze audit
-                                  </button>
-                                </div>
-                              ) : null}
-                            </div>
-                          ) : null}
-                          {canStartAudit ? (
-                            <div className="actions">
-                              <button
-                                className="primary-action"
-                                type="button"
-                                disabled={props.startingAudit}
-                                onClick={() => props.onStartAudit(selectedProject.id)}
-                              >
-                                <ClipboardCheck size={16} />
-                                Spustit závěrečný audit
-                              </button>
-                            </div>
-                          ) : null}
-                          <div className="timeline">
-                            {steps.map((step) => {
-                              const task = step.taskId ? props.tasks.find((item) => item.id === step.taskId) : undefined;
-                              return (
-                                <div className="timeline-row" key={step.id}>
-                                  <span>{step.sequenceNumber}.</span>
-                                  <strong>{step.title}</strong>
-                                  <small>
-                                    {step.status}{step.requirementIds.length ? ` | ${step.requirementIds.join(', ')}` : ''}{task ? ` | ${task.title}` : ''}
-                                  </small>
-                                  {step.changeRationale ? <small>Duvod: {step.changeRationale}</small> : null}
-                                  {step.dependsOnStepTitles.length > 0 ? <small>Navazuje na: {step.dependsOnStepTitles.join(', ')}</small> : null}
-                                  {step.validationFocus.length > 0 ? <small>Overeni: {step.validationFocus.join(', ')}</small> : null}
-                                </div>
-                              );
-                            })}
-                          </div>
-                          {cycle.extensionProposal ? (
-                            <div className="prompt-response-panel roadmap-extension">
-                              <div className="prompt-response-header">
-                                <strong>{isLatest ? 'Další navržené rozšíření' : 'Navržené rozšíření cyklu'}</strong>
-                                <span>{cycle.status}</span>
-                              </div>
-                              <div className="prompt-response-body">
-                                <div className="prompt-response-block">
-                                  <pre>{cycle.extensionProposal}</pre>
-                                </div>
-                              </div>
-                              {isLatest && cycle.status === 'awaiting_extension_approval' ? (
-                                <div className="actions">
-                                  <button
-                                    className="primary-action"
-                                    type="button"
-                                    disabled={props.decidingExtension}
-                                    onClick={() => props.onDecideExtension(selectedProject.id, { approved: true, cycleId: cycle.id })}
-                                  >
-                                    Schválit
-                                  </button>
-                                  <button
-                                    className="secondary-action"
-                                    type="button"
-                                    disabled={props.decidingExtension}
-                                    onClick={() => props.onDecideExtension(selectedProject.id, { approved: false, cycleId: cycle.id })}
-                                  >
-                                    Zamítnout
-                                  </button>
-                                </div>
-                              ) : null}
-                            </div>
-                          ) : null}
-                        </div>
-                      </details>
-                    );
-                  })}
-                </div>
-              </>
+                )) : <p className="empty-state">Žádné audity neodpovídají filtru.</p>}
+              </div>
             ) : null}
           </section>
           <section className="plain-section danger-zone">

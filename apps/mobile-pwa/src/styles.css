@@ -1348,6 +1348,45 @@ a {
   margin-top: 2px;
 }
 
+.project-roadmap-workspace,
+.project-roadmap-view,
+.project-contract-view,
+.project-evidence-view,
+.project-audit-view {
+  display: grid;
+  gap: 14px;
+}
+
+.project-view-tabs,
+.project-status-filters {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.project-action-groups {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 10px;
+}
+
+.project-action-groups > div {
+  min-width: 0;
+  display: grid;
+  align-content: start;
+  gap: 7px;
+  padding: 10px;
+  border: 1px solid #dde5dd;
+  border-radius: 8px;
+  background: #ffffff;
+}
+
+.project-action-groups span {
+  color: #69736c;
+  font-size: 0.78rem;
+  font-weight: 700;
+}
+
 .capability-disclosure {
   border: 1px solid #dbe3dc;
   border-radius: 8px;
@@ -1498,6 +1537,16 @@ a {
 .capability-row details code {
   display: block;
   margin-top: 3px;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.capability-row > code {
+  grid-column: 1 / -1;
+  padding: 8px 10px;
+  border: 1px solid #edf1ea;
+  border-radius: 8px;
+  background: #f7faf8;
   white-space: pre-wrap;
   overflow-wrap: anywhere;
 }
@@ -2067,6 +2116,7 @@ a {
   .detail-grid,
   .live-panel,
   .prompt-response-grid,
+  .project-action-groups,
   .task-form,
   .project-row,
   .repo-assignment-form {
