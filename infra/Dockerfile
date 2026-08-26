@@ -27,7 +27,6 @@ RUN npm ci
 COPY apps apps
 COPY packages packages
 
-RUN npm run db:generate
 RUN npm run build
 
 FROM node:22-bookworm-slim AS runtime-base
