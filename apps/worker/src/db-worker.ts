@@ -1,5 +1,6 @@
 import { tmpdir } from 'node:os';
-import { join, resolve } from 'node:path';
+import { rm } from 'node:fs/promises';
+import { isAbsolute, join, relative, resolve } from 'node:path';
 import { parseAgentConfigYaml, toCoreLimits, type AgentConfig } from '@forgemind/config';
 import { activeProjectContractRequirements, createBlockedRunState, createFailedRunState, createWaitingRunState, DEFAULT_LIMITS, evaluateLimits, isNonBlockingDeferredValidation, requiresApproval, type Limits, type LimitUsage } from '@forgemind/core';
 import { advanceRoadmapAfterTaskCapabilityWait, advanceRoadmapAfterTaskCompletion, createRepository, getPrismaClient, startNextRoadmapStep, type AIProviderConnectionSecret, type ForgeMindRepository } from '@forgemind/db';
@@ -96,7 +97,10 @@ export async function runDatabaseWorkerOnce(options: { deferInterruptSignals?: b
   for (const task of deferredCapabilityTasks) {
     if (isNonBlockingDeferredValidation(task.waitingForCapabilities ?? [])) {
       const completed = await repository.completeTaskWithDeferredValidation(task.id);
-      if (completed) await advanceRoadmapAfterTaskCompletion(repository, task.id);
+      if (completed) {
+        await advanceRoadmapAfterTaskCompletion(repository, task.id);
+        await cleanupCompletedTaskWorkspace(resolveWorkerWorkspaceRoot(), task.id);
+      }
     }
   }
   const recoveredProjectAudits = await repository.recoverStuckProjectAudits(claimTimeoutMinutes);
@@ -670,6 +674,9 @@ export async function runDatabaseWorkerOnce(options: { deferInterruptSignals?: b
         ...getRunUsageFields()
       });
       await finalizeQueueJob('succeeded');
+      if (result.status === 'completed') {
+        await cleanupCompletedTaskWorkspace(workspaceRoot, claimed.task.id);
+      }
     }
 
     return {
@@ -747,6 +754,22 @@ async function runWorkspaceRetentionCleanup(
     activeTaskIds,
     policy: resourcePolicy
   });
+}
+
+async function cleanupCompletedTaskWorkspace(workspaceRoot: string, taskId: string): Promise<void> {
+  const root = resolve(workspaceRoot);
+  const workspacePath = resolve(root, taskId);
+  const relativePath = relative(root, workspacePath);
+  if (!relativePath || relativePath.startsWith('..') || isAbsolute(relativePath)) {
+    console.warn(`Refusing to remove completed task workspace outside the configured root: ${workspacePath}`);
+    return;
+  }
+
+  try {
+    await rm(workspacePath, { recursive: true, force: true });
+  } catch (error) {
+    console.warn(`Unable to remove completed task workspace ${workspacePath}: ${toErrorMessage(error)}`);
+  }
 }
 
 function startTaskCancellationWatcher(

@@ -157,7 +157,7 @@ docker run --rm \
   alpine sh -c 'find /data -mindepth 1 -maxdepth 1 -exec rm -rf {} + && tar -C /data -xzf /backup/worker-workspaces.tar.gz'
 ```
 
-Run `infra/deploy/remote-deploy.sh` through the Raspberry workflow again. Before downloading a release it removes all Docker build cache and images not referenced by running containers, so multiple recent multi-gigabyte runtime images cannot exhaust the Raspberry Pi disk. Active images, containers, volumes, database data, and worker workspaces are preserved. The script then applies any newer Prisma migrations before starting API, worker, OAuth relay, and web.
+Run `infra/deploy/remote-deploy.sh` through the Raspberry workflow again. Before downloading a release it removes Docker build cache, images not referenced by containers, and workspaces belonging to tasks that have been completed for at least one hour. Active, failed, and otherwise retriable task workspaces are preserved. The script requires at least 6144 MB of free space before pulling release images; `FORGEMIND_DEPLOY_MIN_FREE_MB` can override that threshold when the host storage layout changes. It then applies newer Prisma migrations before starting API, worker, OAuth relay, and web. After a successful deployment, or when deployment fails, it removes newly unused images so the previous and next multi-gigabyte runtime layers do not remain on disk together.
 
 ## 6. Acceptance And Cutover
 

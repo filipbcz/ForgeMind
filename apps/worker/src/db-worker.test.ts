@@ -1,6 +1,6 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { join, resolve } from 'node:path';
-import { access, mkdir, utimes, writeFile } from 'node:fs/promises';
+import { access, mkdir, rm, utimes, writeFile } from 'node:fs/promises';
 import { randomUUID } from 'node:crypto';
 import { tmpdir } from 'node:os';
 
@@ -317,6 +317,43 @@ github: {}`;
       } else {
         process.env.FORGEMIND_WORKSPACE_ROOT = previousWorkspaceRoot;
       }
+    }
+  });
+
+  it('removes a workspace immediately after the task completes', async () => {
+    const previousWorkspaceRoot = process.env.FORGEMIND_WORKSPACE_ROOT;
+    const workspaceRoot = join(tmpdir(), `forgemind-db-worker-completed-${randomUUID()}`);
+    const workspacePath = join(workspaceRoot, 'task_1');
+    await mkdir(workspacePath, { recursive: true });
+    await writeFile(join(workspacePath, 'artifact.txt'), 'completed\n');
+    process.env.FORGEMIND_WORKSPACE_ROOT = workspaceRoot;
+
+    try {
+      runWorkerTaskMock.mockResolvedValueOnce({
+        taskId: 'task_1',
+        status: 'completed',
+        issueUrl: '',
+        branchName: 'main',
+        workspacePath,
+        validation: { command: 'true', exitCode: 0, stdout: '', stderr: '', passed: true },
+        summary: 'Task completed.',
+        approvals: [],
+        completedAt: new Date().toISOString()
+      });
+
+      const { runDatabaseWorkerOnce } = await import('./db-worker.js');
+      await runDatabaseWorkerOnce();
+
+      await expect(access(workspacePath)).rejects.toThrow();
+      expect(repositoryMock.finalizeQueueJob).toHaveBeenCalledWith('queue_1', 'succeeded');
+      expect(advanceRoadmapAfterTaskCompletionMock).toHaveBeenCalledWith(repositoryMock, 'task_1');
+    } finally {
+      if (previousWorkspaceRoot === undefined) {
+        delete process.env.FORGEMIND_WORKSPACE_ROOT;
+      } else {
+        process.env.FORGEMIND_WORKSPACE_ROOT = previousWorkspaceRoot;
+      }
+      await rm(workspaceRoot, { recursive: true, force: true });
     }
   });
 

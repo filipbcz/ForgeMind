@@ -452,7 +452,12 @@ export function registerRoutes(app: FastifyInstance, repository: ForgeMindReposi
       const status = await readCodexOAuthStatus(connection.codexHome);
       return {
         ...connection,
-        available: status.loggedIn,
+        available: status.verificationStatus === 'unavailable' ? null : status.loggedIn,
+        availability: status.verificationStatus === 'verified'
+          ? 'available'
+          : status.verificationStatus === 'logged_out'
+            ? 'reauthentication_required'
+            : 'status_unavailable',
         accountSummary: status.accountSummary ?? connection.accountSummary
       };
     }));
@@ -483,7 +488,7 @@ export function registerRoutes(app: FastifyInstance, repository: ForgeMindReposi
         openai: providerConnection?.provider === 'openai' || Boolean(process.env.OPENAI_API_KEY),
         codex:
           providerConnection?.provider === 'codex'
-            ? providerConnection.authMode !== 'codex_oauth' || connections.some((connection) => connection.id === providerConnection.id && connection.available)
+            ? providerConnection.authMode !== 'codex_oauth' || Boolean(providerConnection.codexHome)
             : Boolean(process.env.CODEX_API_KEY),
         github_copilot:
           providerConnection?.provider === 'github_copilot'

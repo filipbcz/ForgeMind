@@ -2,7 +2,7 @@ import { describe, expect, it } from 'vitest';
 import { mkdtemp, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { extractCodexAuthorizationUrl, selectCodexBinaryFromWhereOutput } from './codex-oauth.js';
+import { classifyCodexOAuthStatus, extractCodexAuthorizationUrl, selectCodexBinaryFromWhereOutput } from './codex-oauth.js';
 
 describe('Codex OAuth', () => {
   it('ignores the local callback listener and returns the external authorization URL', () => {
@@ -23,5 +23,11 @@ describe('Codex OAuth', () => {
     await Promise.all([writeFile(launcher, ''), writeFile(executable, '')]);
 
     expect(selectCodexBinaryFromWhereOutput(`${launcher}\r\n${executable}\r\n`)).toBe(executable);
+  });
+
+  it('distinguishes an expired login from a transient status failure', () => {
+    expect(classifyCodexOAuthStatus('Logged in using ChatGPT')).toBe('verified');
+    expect(classifyCodexOAuthStatus('Not logged in. Run codex login.')).toBe('logged_out');
+    expect(classifyCodexOAuthStatus('ENOSPC: no space left on device')).toBe('unavailable');
   });
 });

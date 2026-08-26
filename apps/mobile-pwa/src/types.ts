@@ -601,7 +601,8 @@ export interface ProviderConnectionApi {
   apiKeyFingerprint?: string;
   codexHome?: string;
   accountSummary?: string;
-  available?: boolean;
+  available?: boolean | null;
+  availability?: 'available' | 'reauthentication_required' | 'status_unavailable';
   connectedAt: string;
   lastCheckedAt?: string;
   updatedAt: string;

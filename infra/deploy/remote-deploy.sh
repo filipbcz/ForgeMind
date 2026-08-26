@@ -34,19 +34,99 @@ if [ -n "${COMPOSE_OVERRIDE}" ]; then
 fi
 compose=(docker compose --env-file "${ENV_FILE}" "${compose_files[@]}")
 
-docker network inspect shared-edge >/dev/null 2>&1 || docker network create shared-edge >/dev/null
+deployment_succeeded=false
+cleanup_failed_deployment() {
+  if [ "${deployment_succeeded}" = "true" ]; then
+    return
+  fi
 
-"${compose[@]}" up -d postgres
+  echo "Deployment did not complete; reclaiming images that are not referenced by containers."
+  docker image prune --all --force || true
+}
+trap cleanup_failed_deployment EXIT
+
+cleanup_completed_workspaces() {
+  local runtime_container runtime_image completed_task_ids
+  runtime_container="$("${compose[@]}" ps -q worker)"
+  if [ -z "${runtime_container}" ]; then
+    runtime_container="$("${compose[@]}" ps -q api)"
+  fi
+  if [ -z "${runtime_container}" ]; then
+    echo "No existing runtime container is available; skipping completed workspace cleanup."
+    return
+  fi
+
+  runtime_image="$(docker inspect --format='{{.Config.Image}}' "${runtime_container}")"
+  completed_task_ids="$(
+    "${compose[@]}" exec -T postgres sh -c 'psql -v ON_ERROR_STOP=1 -U "$POSTGRES_USER" -d "$POSTGRES_DB" -At' <<'SQL'
+SELECT id
+FROM tasks
+WHERE status = 'completed'
+  AND finished_at < CURRENT_TIMESTAMP - INTERVAL '1 hour'
+ORDER BY finished_at;
+SQL
+  )"
+  if [ -z "${completed_task_ids}" ]; then
+    echo "No completed task workspaces are old enough to remove."
+    return
+  fi
+
+  printf '%s\n' "${completed_task_ids}" \
+    | docker run --rm -i --entrypoint sh \
+        -v forgemind_worker_workspaces:/workspaces \
+        "${runtime_image}" -lc '
+          set -eu
+          removed_count=0
+          removed_kilobytes=0
+          while IFS= read -r task_id; do
+            [ -n "$task_id" ] || continue
+            if ! printf "%s" "$task_id" | grep -Eq "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"; then
+              echo "Refusing invalid workspace task id: $task_id" >&2
+              exit 1
+            fi
+            target="/workspaces/$task_id"
+            resolved="$(realpath -m "$target")"
+            if [ "$resolved" != "$target" ]; then
+              echo "Refusing unexpected workspace path: $resolved" >&2
+              exit 1
+            fi
+            if [ -d "$resolved" ]; then
+              size_kilobytes="$(du -sk "$resolved" | cut -f1)"
+              rm -rf -- "$resolved"
+              removed_count=$((removed_count + 1))
+              removed_kilobytes=$((removed_kilobytes + size_kilobytes))
+            fi
+          done
+          printf "Removed %s completed workspaces (%s KiB).\n" "$removed_count" "$removed_kilobytes"
+        '
+}
+
+assert_deploy_free_space() {
+  local available_kilobytes minimum_megabytes minimum_kilobytes
+  minimum_megabytes="${FORGEMIND_DEPLOY_MIN_FREE_MB:-6144}"
+  available_kilobytes="$(df -Pk "${APP_ROOT}" | awk 'NR == 2 { print $4 }')"
+  minimum_kilobytes="$((minimum_megabytes * 1024))"
+  if [ "${available_kilobytes}" -lt "${minimum_kilobytes}" ]; then
+    echo "Deployment requires at least ${minimum_megabytes} MB free before pulling release images; only $((available_kilobytes / 1024)) MB is available." >&2
+    exit 1
+  fi
+}
+
+docker network inspect shared-edge >/dev/null 2>&1 || docker network create shared-edge >/dev/null
 
 echo "Docker storage before deployment:"
 docker system df
 
-echo "Reclaiming unused Docker build cache and images before pulling the release."
+echo "Reclaiming unused Docker build cache and images before starting the deployment."
 docker builder prune --all --force
 docker image prune --all --force
 
+"${compose[@]}" up -d --wait postgres
+cleanup_completed_workspaces
+
 echo "Docker storage after pre-deployment cleanup:"
 docker system df
+assert_deploy_free_space
 
 if docker image inspect "${FORGEMIND_RUNTIME_BASE_IMAGE}" >/dev/null 2>&1; then
   echo "Runtime base cache hit: ${FORGEMIND_RUNTIME_BASE_IMAGE}"
@@ -117,8 +197,11 @@ for attempt in $(seq 1 60); do
   if [ "${STATUS}" = "healthy" ] && [ "${OAUTH_RELAY_STATUS}" = "running" ]; then
     echo "Deployment finished successfully."
     "${compose[@]}" ps
+    echo "Reclaiming release images that became unused after container replacement."
+    docker image prune --all --force || true
     echo "Docker storage after deployment:"
     docker system df
+    deployment_succeeded=true
     exit 0
   fi
 

@@ -21,6 +21,7 @@ interface PendingCodexLogin {
 
 export interface CodexOAuthStatus {
   loggedIn: boolean;
+  verificationStatus: 'verified' | 'logged_out' | 'unavailable';
   authMode: 'chatgpt' | 'api_key' | 'unknown' | null;
   accountSummary: string | null;
   codexHome: string;
@@ -166,23 +167,44 @@ export async function readCodexOAuthStatus(codexHome = resolveCodexHome()): Prom
       windowsHide: true
     });
     const rawOutput = stripAnsi(`${stdout}${stderr ? `\n${stderr}` : ''}`).trim();
+    const verificationStatus = classifyCodexOAuthStatus(rawOutput);
     return {
-      loggedIn: /Logged in using ChatGPT/i.test(rawOutput),
+      loggedIn: verificationStatus === 'verified',
+      verificationStatus,
       authMode: /ChatGPT/i.test(rawOutput) ? 'chatgpt' : /API key/i.test(rawOutput) ? 'api_key' : 'unknown',
       accountSummary: rawOutput || null,
       codexHome,
       rawOutput
     };
   } catch (error) {
-    const message = error instanceof Error ? error.message : String(error);
+    const rawOutput = extractProcessErrorOutput(error);
+    const verificationStatus = classifyCodexOAuthStatus(rawOutput);
     return {
       loggedIn: false,
+      verificationStatus,
       authMode: null,
       accountSummary: null,
       codexHome,
-      rawOutput: stripAnsi(message)
+      rawOutput
     };
   }
+}
+
+export function classifyCodexOAuthStatus(rawOutput: string): CodexOAuthStatus['verificationStatus'] {
+  if (/Logged in using (ChatGPT|an API key)/i.test(rawOutput)) return 'verified';
+  if (/not logged in|not authenticated|authentication required|run ['`"]?codex login/i.test(rawOutput)) return 'logged_out';
+  return 'unavailable';
+}
+
+function extractProcessErrorOutput(error: unknown): string {
+  if (!error || typeof error !== 'object') return stripAnsi(String(error));
+  const value = error as { message?: unknown; stdout?: unknown; stderr?: unknown };
+  const output = [value.stdout, value.stderr, value.message]
+    .filter((item): item is string | Buffer => typeof item === 'string' || Buffer.isBuffer(item))
+    .map((item) => item.toString())
+    .filter(Boolean)
+    .join('\n');
+  return stripAnsi(output || String(error)).trim();
 }
 
 export async function completeCodexOAuthBrowserLogin(loginId: string) {
