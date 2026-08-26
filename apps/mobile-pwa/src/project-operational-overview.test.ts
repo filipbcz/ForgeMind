@@ -2,8 +2,22 @@ import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import { createElement } from 'react';
 import { renderToStaticMarkup } from 'react-dom/server';
 import { describe, expect, it, vi } from 'vitest';
-import { ProjectsPanel } from './App.js';
-import type { ProjectRoadmapApi, ProjectSummary } from './types.js';
+import {
+  canStartProjectAudit,
+  projectAuditMatchesStatusFilter,
+  projectCycleMatchesStatusFilter,
+  projectEvidenceMatchesStatusFilter,
+  ProjectsPanel,
+  projectStepMatchesStatusFilter
+} from './App.js';
+import type {
+  AcceptanceEvidenceApi,
+  ProjectAuditJobApi,
+  ProjectImplementationStepApi,
+  ProjectRoadmapApi,
+  ProjectRoadmapCycleApi,
+  ProjectSummary
+} from './types.js';
 
 const project: ProjectSummary = {
   id: 'project_1',
@@ -131,24 +145,159 @@ describe('project operational overview layout', () => {
 
     expect(markup.indexOf('project-operational-overview')).toBeGreaterThan(-1);
     expect(markup.indexOf('Připraven další krok')).toBeLessThan(markup.indexOf('Open PR'));
-    expect(markup.indexOf('Spustit další krok')).toBeLessThan(markup.indexOf('roadmap-cycle-list'));
+    expect(markup.indexOf('Spustit další krok')).toBeLessThan(markup.indexOf('Roadmap projektu'));
   });
 
-  it('keeps rendered roadmap cycles collapsed by default', () => {
+  it('separates roadmap history contract evidence and audit views', () => {
     const markup = renderProjectsPanel();
 
-    expect(markup).toContain('<details class="roadmap-cycle">');
-    expect(markup).not.toContain('<details class="roadmap-cycle" open="">');
+    expect(markup).toContain('Projektové roadmap views');
+    expect(markup).toContain('Roadmap');
+    expect(markup).toContain('Historie cyklů');
+    expect(markup).toContain('Kontrakt');
+    expect(markup).toContain('Evidence');
+    expect(markup).toContain('Audity');
+    expect(markup).toContain('Aktivní roadmap view');
+    expect(markup).not.toContain('roadmap-cycle-list');
   });
 
-  it('keeps the mobile-reachable primary action before completed history content', () => {
+  it('renders status filters and distinct roadmap step and audit action groups', () => {
     const completedRoadmap = {
       ...roadmap,
       steps: roadmap.steps.map((step) => ({ ...step, status: 'completed' as const }))
     };
     const markup = renderProjectsPanel(completedRoadmap);
 
+    expect(markup).toContain('Filtr stavu položek');
+    expect(markup).toContain('Aktivní');
+    expect(markup).toContain('Čekající');
+    expect(markup).toContain('Selhané');
+    expect(markup).toContain('Dokončené');
+    expect(markup).toContain('Generování roadmapy');
+    expect(markup).toContain('Spuštění dalšího kroku');
+    expect(markup).toContain('Auditní akce');
+    expect(markup.indexOf('Generování roadmapy')).toBeLessThan(markup.indexOf('Spuštění dalšího kroku'));
+    expect(markup.indexOf('Spuštění dalšího kroku')).toBeLessThan(markup.indexOf('Auditní akce'));
+    expect(markup.indexOf('Pregenerovat kroky')).toBeGreaterThan(markup.indexOf('Generování roadmapy'));
+    expect(markup.indexOf('Spustit dalsi krok')).toBeGreaterThan(markup.indexOf('Spuštění dalšího kroku'));
+    expect(markup.lastIndexOf('Spustit závěrečný audit')).toBeGreaterThan(markup.indexOf('Auditní akce'));
     expect(markup.indexOf('Spustit závěrečný audit')).toBeGreaterThan(-1);
-    expect(markup.indexOf('Spustit závěrečný audit')).toBeLessThan(markup.indexOf('Foundation'));
+  });
+
+  it('keeps active roadmap steps scoped to the latest cycle', () => {
+    const sourceRoadmap: ProjectRoadmapApi = {
+      ...roadmap,
+      cycles: [
+        {
+          ...roadmap.cycles[0]!,
+          id: 'cycle_1',
+          cycleNumber: 1,
+          status: 'completed'
+        },
+        {
+          ...roadmap.cycles[0]!,
+          id: 'cycle_2',
+          cycleNumber: 2,
+          objective: 'Current cycle',
+          status: 'active'
+        }
+      ],
+      steps: [
+        {
+          ...roadmap.steps[1]!,
+          id: 'old_pending_step',
+          cycleId: 'cycle_1',
+          title: 'Historical pending step'
+        },
+        {
+          ...roadmap.steps[0]!,
+          id: 'current_completed_step',
+          cycleId: 'cycle_2',
+          title: 'Current completed step'
+        }
+      ]
+    };
+
+    const markup = renderProjectsPanel(sourceRoadmap);
+
+    expect(markup).toContain('Žádné kroky neodpovídají filtru.');
+    expect(markup).not.toContain('Historical pending step');
+    expect(markup).not.toContain('Current completed step');
+  });
+});
+
+describe('project roadmap status filters', () => {
+  it('maps implementation steps to active waiting failed and completed filters', () => {
+    const step = roadmap.steps[0]!;
+    const withStatus = (status: ProjectImplementationStepApi['status']): ProjectImplementationStepApi => ({ ...step, status });
+
+    expect(projectStepMatchesStatusFilter(withStatus('pending'), 'active')).toBe(true);
+    expect(projectStepMatchesStatusFilter(withStatus('running'), 'active')).toBe(true);
+    expect(projectStepMatchesStatusFilter(withStatus('waiting_for_capability'), 'waiting')).toBe(true);
+    expect(projectStepMatchesStatusFilter(withStatus('cancelled'), 'failed')).toBe(true);
+    expect(projectStepMatchesStatusFilter(withStatus('completed'), 'completed')).toBe(true);
+  });
+
+  it('maps cycles evidence and audits to the shared project filters', () => {
+    const cycle = roadmap.cycles[0]!;
+    const withCycleStatus = (status: ProjectRoadmapCycleApi['status']): ProjectRoadmapCycleApi => ({ ...cycle, status });
+    const audit: ProjectAuditJobApi = {
+      id: 'audit_1',
+      projectId: project.id,
+      cycleId: cycle.id,
+      requirementIds: [],
+      status: 'pending',
+      attemptCount: 1,
+      createdAt: '',
+      updatedAt: ''
+    };
+    const evidence: AcceptanceEvidenceApi = {
+      id: 'evidence_1',
+      projectId: project.id,
+      cycleId: cycle.id,
+      requirementId: 'REQ-1',
+      criterionKey: 'criterion',
+      criterion: 'criterion',
+      source: 'validation_command',
+      status: 'passed',
+      evidenceKey: 'npm-test',
+      contractVersion: 1,
+      payload: {},
+      createdAt: '',
+      updatedAt: ''
+    };
+
+    expect(projectCycleMatchesStatusFilter(withCycleStatus('active'), 'active')).toBe(true);
+    expect(projectCycleMatchesStatusFilter(withCycleStatus('awaiting_extension_approval'), 'waiting')).toBe(true);
+    expect(projectCycleMatchesStatusFilter(withCycleStatus('blocked'), 'failed')).toBe(true);
+    expect(projectCycleMatchesStatusFilter(withCycleStatus('completed'), 'completed')).toBe(true);
+    expect(projectAuditMatchesStatusFilter({ ...audit, status: 'claimed' }, 'active')).toBe(true);
+    expect(projectAuditMatchesStatusFilter(audit, 'waiting')).toBe(true);
+    expect(projectAuditMatchesStatusFilter({ ...audit, status: 'blocked' }, 'failed')).toBe(true);
+    expect(projectAuditMatchesStatusFilter({ ...audit, status: 'succeeded' }, 'completed')).toBe(true);
+    expect(projectEvidenceMatchesStatusFilter({ ...evidence, status: 'deferred' }, 'waiting')).toBe(true);
+    expect(projectEvidenceMatchesStatusFilter({ ...evidence, status: 'failed' }, 'failed')).toBe(true);
+    expect(projectEvidenceMatchesStatusFilter(evidence, 'completed')).toBe(true);
+  });
+
+  it('allows final audit only for an active completed latest cycle without a blocking audit job', () => {
+    const cycle = roadmap.cycles[0]!;
+    const completedSteps = roadmap.steps.map((step) => ({ ...step, status: 'completed' as const }));
+    const pendingAudit: ProjectAuditJobApi = {
+      id: 'audit_1',
+      projectId: project.id,
+      cycleId: cycle.id,
+      requirementIds: [],
+      status: 'pending',
+      attemptCount: 1,
+      createdAt: '',
+      updatedAt: ''
+    };
+
+    expect(canStartProjectAudit(cycle, completedSteps, undefined)).toBe(true);
+    expect(canStartProjectAudit({ ...cycle, status: 'completed' }, completedSteps, undefined)).toBe(false);
+    expect(canStartProjectAudit(cycle, completedSteps, pendingAudit)).toBe(false);
+    expect(canStartProjectAudit(cycle, completedSteps, { ...pendingAudit, status: 'succeeded' })).toBe(true);
+    expect(canStartProjectAudit(cycle, roadmap.steps, undefined)).toBe(false);
   });
 });
