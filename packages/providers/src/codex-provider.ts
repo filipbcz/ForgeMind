@@ -17,6 +17,7 @@ import type {
   ImplementResult,
   PlanInput,
   PlanResult,
+  ProviderPreflightResult,
   ReleaseAuditInput,
   ReleaseAuditResult,
   RoadmapRepairInput,
@@ -27,7 +28,7 @@ import type {
   ReviewInput,
   ReviewResult
 } from './provider.js';
-import { normalizeValidationChecks, parseImplementResult, parsePlanResult, parseProviderJsonObject, parseReviewResult } from './provider.js';
+import { ProviderContractError, normalizeProviderError, normalizeProviderPreflight, normalizeValidationChecks, parseImplementResult, parsePlanResult, parseProviderJsonObject, parseReviewResult } from './provider.js';
 import { emitCapturedUsage, normalizeTokenBreakdown } from './provider-usage.js';
 import { buildReviewPrompt } from './review-prompt.js';
 import { buildCapabilityAuditPrompt, buildReleaseAuditPrompt, normalizeAuditContentWithSingleRepair, normalizeCapabilityAuditResult, normalizeReleaseAuditResult } from './audit-prompt.js';
@@ -539,6 +540,23 @@ export class CodexProvider implements AIProvider {
     this.model = config?.model?.trim() || (process.env.CODEX_MODEL ?? DEFAULT_CODEX_MODEL);
   }
 
+  async preflight(signal?: AbortSignal): Promise<ProviderPreflightResult> {
+    return normalizeProviderPreflight(this.kind, async () => {
+      if (this.authMode === 'oauth') {
+        await this.verifyOAuthSession();
+        return;
+      }
+      const response = await fetch(buildCodexModelsUrl(this.apiBaseUrl), {
+        headers: { Authorization: `Bearer ${this.apiKey}` },
+        signal
+      });
+      if (!response.ok) {
+        throw normalizeCodexHttpError(response, 'Codex preflight failed.');
+      }
+      await readProviderJson(response, 'Codex preflight');
+    });
+  }
+
   async plan(input: PlanInput): Promise<PlanResult> {
     if (this.authMode === 'oauth') {
       return this.planWithCli(input);
@@ -580,11 +598,15 @@ export class CodexProvider implements AIProvider {
     const content = response.content;
     await emitCapturedUsage(input.onActivity, response.usage);
 
-    return {
-      ...parsePlanResult(content, 'Codex plan'),
-      providerPrompt: serializeMessages(messages),
-      providerResponse: content
-    };
+    try {
+      return {
+        ...parsePlanResult(content, 'Codex plan'),
+        providerPrompt: serializeMessages(messages),
+        providerResponse: content
+      };
+    } catch (error) {
+      throw normalizeProviderError(this.kind, error);
+    }
   }
 
   async repairRoadmap(input: RoadmapRepairInput): Promise<RoadmapRepairResult> {
@@ -623,11 +645,15 @@ export class CodexProvider implements AIProvider {
       content = response.content;
       await emitCapturedUsage(input.onActivity, response.usage);
     }
-    return {
-      ...parseProviderJsonObject(content, 'Codex roadmap repair') as unknown as RoadmapRepairResult,
-      providerPrompt,
-      providerResponse: content
-    };
+    try {
+      return {
+        ...parseProviderJsonObject(content, 'Codex roadmap repair') as unknown as RoadmapRepairResult,
+        providerPrompt,
+        providerResponse: content
+      };
+    } catch (error) {
+      throw normalizeProviderError(this.kind, error);
+    }
   }
 
   async implement(input: ImplementInput): Promise<ImplementResult> {
@@ -666,16 +692,20 @@ export class CodexProvider implements AIProvider {
     const content = response.content;
     await emitCapturedUsage(input.onActivity, response.usage);
 
-    const result = parseImplementResult(content, 'Codex implementation', true);
-    if (result.outcome === 'already_satisfied') {
-      result.changedFiles = [];
-      result.diffStat = { filesChanged: 0, insertions: 0, deletions: 0 };
-      result.fileUpdates = [];
+    try {
+      const result = parseImplementResult(content, 'Codex implementation', true);
+      if (result.outcome === 'already_satisfied') {
+        result.changedFiles = [];
+        result.diffStat = { filesChanged: 0, insertions: 0, deletions: 0 };
+        result.fileUpdates = [];
+      }
+      result.validationChecks = normalizeValidationChecks(result.validationChecks);
+      result.providerPrompt = serializeMessages(messages);
+      result.providerResponse = content;
+      return result;
+    } catch (error) {
+      throw normalizeProviderError(this.kind, error);
     }
-    result.validationChecks = normalizeValidationChecks(result.validationChecks);
-    result.providerPrompt = serializeMessages(messages);
-    result.providerResponse = content;
-    return result;
   }
 
   async review(input: ReviewInput): Promise<ReviewResult> {
@@ -698,11 +728,15 @@ export class CodexProvider implements AIProvider {
     const content = response.content;
     await emitCapturedUsage(input.onActivity, response.usage);
 
-    return {
-      ...parseReviewResult(content, 'Codex review'),
-      providerPrompt: serializeMessages(messages),
-      providerResponse: content
-    };
+    try {
+      return {
+        ...parseReviewResult(content, 'Codex review'),
+        providerPrompt: serializeMessages(messages),
+        providerResponse: content
+      };
+    } catch (error) {
+      throw normalizeProviderError(this.kind, error);
+    }
   }
 
   async auditCapability(input: CapabilityAuditInput): Promise<CapabilityAuditResult> {
@@ -1130,7 +1164,7 @@ export class CodexProvider implements AIProvider {
       }
       this.oauthSessionVerified = true;
     } catch {
-      throw new Error('Codex OAuth session is not active. Reconnect Codex in Settings before retrying this task.');
+      throw normalizeProviderError('codex', 'Codex OAuth session is not active. Reconnect Codex in Settings before retrying this task.');
     }
   }
 
@@ -1139,75 +1173,106 @@ export class CodexProvider implements AIProvider {
     session?: ProviderSessionContext,
     signal?: AbortSignal
   ): Promise<{ content: string; usage?: ProviderUsageMeasurement }> {
-    if (!this.apiKey) {
-      throw new Error('CODEX_API_KEY is required for Codex API key provider mode.');
-    }
+    try {
+      if (!this.apiKey) {
+        throw normalizeProviderError('codex', 'CODEX_API_KEY is required for Codex API key provider mode.');
+      }
 
-    const response = await fetch(this.apiBaseUrl, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        Authorization: `Bearer ${this.apiKey}`
-      },
-      signal,
-      body: JSON.stringify({
-        model: this.model,
-        previous_response_id: resolveCompatibleSessionId(session, 'codex', this.model),
-        input: messages.map((message) => ({
-          role: message.role,
-          content: [{ type: 'input_text', text: message.content }]
-        })),
-        temperature: 0.2,
-        max_output_tokens: 1000
-      })
-    });
+      const response = await fetch(this.apiBaseUrl, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${this.apiKey}`
+        },
+        signal,
+        body: JSON.stringify({
+          model: this.model,
+          previous_response_id: resolveCompatibleSessionId(session, 'codex', this.model),
+          input: messages.map((message) => ({
+            role: message.role,
+            content: [{ type: 'input_text', text: message.content }]
+          })),
+          temperature: 0.2,
+          max_output_tokens: 1000
+        })
+      });
 
-    if (!response.ok) {
-      const text = await response.text();
-      throw new Error(`Codex request failed with ${response.status}: ${text}`);
-    }
+      if (!response.ok) {
+        throw normalizeCodexHttpError(response, 'Codex request failed.');
+      }
 
-    const data = (await response.json()) as {
-      id?: string;
-      output_text?: string;
-      output?: Array<{ content?: Array<{ text?: string }> }>;
-      usage?: {
-        input_tokens?: number;
-        output_tokens?: number;
-        total_tokens?: number;
-        input_tokens_details?: { cached_tokens?: number };
+      const data = await readProviderJson<{
+        id?: string;
+        output_text?: string;
+        output?: Array<{ content?: Array<{ text?: string }> }>;
+        usage?: {
+          input_tokens?: number;
+          output_tokens?: number;
+          total_tokens?: number;
+          input_tokens_details?: { cached_tokens?: number };
+        };
+      }>(response, 'Codex request');
+
+      if (data.id && session) {
+        session.id = data.id;
+        session.provider = 'codex';
+        session.model = this.model;
+        await session?.onUpdate?.({ id: data.id, provider: 'codex', model: this.model });
+      }
+
+      let content = '';
+      if (typeof data.output_text === 'string' && data.output_text.trim().length > 0) {
+        content = data.output_text.trim();
+      } else {
+        content = data.output
+          ?.flatMap((item) => item.content ?? [])
+          .map((chunk) => chunk.text ?? '')
+          .join('\n')
+          .trim() ?? '';
+      }
+      if (!content) {
+        throw new ProviderContractError('Codex request returned an empty response.');
+      }
+
+      return {
+        content,
+        usage: normalizeTokenBreakdown({
+          provider: 'codex',
+          model: this.model,
+          inputTokens: data.usage?.input_tokens,
+          outputTokens: data.usage?.output_tokens,
+          cachedTokens: data.usage?.input_tokens_details?.cached_tokens,
+          totalTokens: data.usage?.total_tokens
+        })
       };
-    };
-
-    if (data.id && session) {
-      session.id = data.id;
-      session.provider = 'codex';
-      session.model = this.model;
-      await session?.onUpdate?.({ id: data.id, provider: 'codex', model: this.model });
+    } catch (error) {
+      throw normalizeProviderError(this.kind, error);
     }
+  }
+}
 
-    let content = '';
-    if (typeof data.output_text === 'string' && data.output_text.trim().length > 0) {
-      content = data.output_text.trim();
-    } else {
-      content = data.output
-        ?.flatMap((item) => item.content ?? [])
-        .map((chunk) => chunk.text ?? '')
-        .join('\n')
-        .trim() ?? '';
-    }
+function buildCodexModelsUrl(apiBaseUrl: string): URL {
+  const url = new URL(apiBaseUrl);
+  if (/\/responses\/?$/.test(url.pathname)) {
+    url.pathname = url.pathname.replace(/\/responses\/?$/, '/models');
+  } else if (!/\/models\/?$/.test(url.pathname)) {
+    url.pathname = `${url.pathname.replace(/\/$/, '')}/models`;
+  }
+  return url;
+}
 
-    return {
-      content,
-      usage: normalizeTokenBreakdown({
-        provider: 'codex',
-        model: this.model,
-        inputTokens: data.usage?.input_tokens,
-        outputTokens: data.usage?.output_tokens,
-        cachedTokens: data.usage?.input_tokens_details?.cached_tokens,
-        totalTokens: data.usage?.total_tokens
-      })
-    };
+function normalizeCodexHttpError(response: Response, message: string) {
+  return normalizeProviderError('codex', {
+    status: response.status,
+    message: `${message} HTTP ${response.status}.`
+  });
+}
+
+async function readProviderJson<T>(response: Response, operation: string): Promise<T> {
+  try {
+    return await response.json() as T;
+  } catch (error) {
+    throw new ProviderContractError(`${operation} returned invalid JSON.`);
   }
 }
 

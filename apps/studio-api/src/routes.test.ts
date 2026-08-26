@@ -2731,6 +2731,7 @@ describe('Studio API routes', () => {
 
     const workerProvider: AIProvider = {
       kind: 'codex',
+    async preflight() { return { provider: 'codex', ok: true, checkedAt: new Date().toISOString() }; },
       async plan(_input: PlanInput): Promise<PlanResult> {
         return {
           summary: 'Plan generated for pipeline test',

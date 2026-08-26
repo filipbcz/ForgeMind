@@ -185,6 +185,7 @@ describe('db-worker policy enforcement', () => {
       implement: vi.fn(),
       review: vi.fn(),
       kind: 'codex',
+    async preflight() { return { provider: 'codex', ok: true, checkedAt: new Date().toISOString() }; },
       supportsLocalRepo: () => true,
       supportsGitHubNativeFlow: () => false
     });
@@ -1313,6 +1314,7 @@ github:
       implement: vi.fn(),
       review: vi.fn(),
       kind: 'codex',
+    async preflight() { return { provider: 'codex', ok: true, checkedAt: new Date().toISOString() }; },
       supportsLocalRepo: () => true,
       supportsGitHubNativeFlow: () => false
     });
@@ -1348,6 +1350,7 @@ github:
           implement: vi.fn(),
           review: vi.fn(),
           kind: 'openai',
+          async preflight() { return { provider: 'openai', ok: true, checkedAt: new Date().toISOString() }; },
           supportsLocalRepo: () => true,
           supportsGitHubNativeFlow: () => false
         };
@@ -1363,6 +1366,7 @@ github:
         implement: vi.fn(),
         review: vi.fn(),
         kind: 'codex',
+    async preflight() { return { provider: 'codex', ok: true, checkedAt: new Date().toISOString() }; },
         supportsLocalRepo: () => true,
         supportsGitHubNativeFlow: () => false
       };
@@ -1465,6 +1469,7 @@ github:
       implement: vi.fn(),
       review: vi.fn(),
       kind: 'codex',
+    async preflight() { return { provider: 'codex', ok: true, checkedAt: new Date().toISOString() }; },
       supportsLocalRepo: () => true,
       supportsGitHubNativeFlow: () => false
     }));
@@ -2395,6 +2400,7 @@ github:
       implement: vi.fn(),
       review: vi.fn(),
       kind: 'codex',
+    async preflight() { return { provider: 'codex', ok: true, checkedAt: new Date().toISOString() }; },
       supportsLocalRepo: () => true,
       supportsGitHubNativeFlow: () => false
     });
@@ -2735,6 +2741,7 @@ github:
     });
     createProviderMock.mockReturnValue({
       kind: 'codex',
+    async preflight() { return { provider: 'codex', ok: true, checkedAt: new Date().toISOString() }; },
       supportsLocalRepo: () => true,
       supportsGitHubNativeFlow: () => false,
       estimateCost: vi.fn(),

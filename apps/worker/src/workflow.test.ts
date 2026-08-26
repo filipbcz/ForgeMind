@@ -108,6 +108,7 @@ const demoTask: ForgeTask = {
 function createProviderStub(overrides: Partial<AIProvider> = {}): AIProvider {
   return {
     kind: 'codex',
+    async preflight() { return { provider: 'codex', ok: true, checkedAt: new Date().toISOString() }; },
     async plan(): Promise<PlanResult> {
       return {
         summary: 'Plan summary',
@@ -583,6 +584,7 @@ describe('worker workflow', () => {
 
     const provider: AIProvider = {
       kind: 'codex',
+    async preflight() { return { provider: 'codex', ok: true, checkedAt: new Date().toISOString() }; },
       async plan(): Promise<PlanResult> {
         return {
           summary: 'Plan summary',
@@ -690,6 +692,7 @@ describe('worker workflow', () => {
 
     const provider: AIProvider = {
       kind: 'codex',
+    async preflight() { return { provider: 'codex', ok: true, checkedAt: new Date().toISOString() }; },
       async plan(): Promise<PlanResult> {
         return {
           summary: 'Plan summary',
@@ -795,6 +798,7 @@ describe('worker workflow', () => {
 
     const provider: AIProvider = {
       kind: 'codex',
+    async preflight() { return { provider: 'codex', ok: true, checkedAt: new Date().toISOString() }; },
       async plan(): Promise<PlanResult> {
         return {
           summary: 'Plan summary',
@@ -1789,6 +1793,7 @@ describe('worker workflow', () => {
 
     const provider: AIProvider = {
       kind: 'codex',
+    async preflight() { return { provider: 'codex', ok: true, checkedAt: new Date().toISOString() }; },
       plan,
       implement,
       review,
@@ -1883,6 +1888,7 @@ describe('worker workflow', () => {
     };
     const provider: AIProvider = {
       kind: 'codex',
+    async preflight() { return { provider: 'codex', ok: true, checkedAt: new Date().toISOString() }; },
       async plan(): Promise<PlanResult> {
         return {
           summary: 'Plan summary',
@@ -2014,6 +2020,7 @@ describe('worker workflow', () => {
 
     const provider: AIProvider = {
       kind: 'codex',
+    async preflight() { return { provider: 'codex', ok: true, checkedAt: new Date().toISOString() }; },
       async plan(input: PlanInput): Promise<PlanResult> {
         planCalls.push(input);
         if (planCalls.length === 1) {
@@ -2766,6 +2773,7 @@ describe('worker workflow', () => {
 
     const provider: AIProvider = {
       kind: 'codex',
+    async preflight() { return { provider: 'codex', ok: true, checkedAt: new Date().toISOString() }; },
       async plan(input: PlanInput): Promise<PlanResult> {
         if (input.validationFailure) {
           return {
@@ -2855,6 +2863,7 @@ describe('worker workflow', () => {
     };
     const provider: AIProvider = {
       kind: 'codex',
+    async preflight() { return { provider: 'codex', ok: true, checkedAt: new Date().toISOString() }; },
       async plan(_input: PlanInput): Promise<PlanResult> {
         return {
           summary: 'Plan summary',
@@ -3133,6 +3142,7 @@ describe('worker workflow', () => {
     };
     const provider: AIProvider = {
       kind: 'codex',
+    async preflight() { return { provider: 'codex', ok: true, checkedAt: new Date().toISOString() }; },
       async plan(_input: PlanInput): Promise<PlanResult> {
         return {
           summary: 'Plan summary',
@@ -3268,6 +3278,7 @@ describe('worker workflow', () => {
 
     const provider: AIProvider = {
       kind: 'codex',
+    async preflight() { return { provider: 'codex', ok: true, checkedAt: new Date().toISOString() }; },
       async plan(_input: PlanInput): Promise<PlanResult> {
         return {
           summary: 'Plan summary',
@@ -3331,6 +3342,7 @@ describe('worker workflow', () => {
 
     const provider: AIProvider = {
       kind: 'codex',
+    async preflight() { return { provider: 'codex', ok: true, checkedAt: new Date().toISOString() }; },
       async plan(_input: PlanInput): Promise<PlanResult> {
         return {
           summary: 'Plan summary',
@@ -3557,6 +3569,7 @@ describe('worker workflow', () => {
 
     const provider: AIProvider = {
       kind: 'codex',
+    async preflight() { return { provider: 'codex', ok: true, checkedAt: new Date().toISOString() }; },
       async plan(): Promise<PlanResult> {
         return {
           summary: 'Plan summary',
@@ -3613,6 +3626,7 @@ describe('worker workflow', () => {
     const workspaceRoot = join(tmpdir(), `forgemind-worker-review-timeout-${randomUUID()}`);
     const provider: AIProvider = {
       kind: 'codex',
+    async preflight() { return { provider: 'codex', ok: true, checkedAt: new Date().toISOString() }; },
       async plan(): Promise<PlanResult> {
         return {
           summary: 'Plan summary',
@@ -3678,6 +3692,7 @@ describe('worker workflow', () => {
 
     const provider: AIProvider = {
       kind: 'codex',
+    async preflight() { return { provider: 'codex', ok: true, checkedAt: new Date().toISOString() }; },
       async plan(_input: PlanInput): Promise<PlanResult> {
         return {
           summary: 'Plan summary',
@@ -3758,6 +3773,7 @@ describe('worker workflow', () => {
 
     const provider: AIProvider = {
       kind: 'codex',
+    async preflight() { return { provider: 'codex', ok: true, checkedAt: new Date().toISOString() }; },
       async plan(input: PlanInput): Promise<PlanResult> {
         if (input.validationFailure) {
           return {
@@ -3877,6 +3893,7 @@ describe('worker workflow', () => {
 
     const provider: AIProvider = {
       kind: 'codex',
+    async preflight() { return { provider: 'codex', ok: true, checkedAt: new Date().toISOString() }; },
       async plan(_input: PlanInput): Promise<PlanResult> {
         return {
           summary: 'Plan summary',
@@ -3971,6 +3988,7 @@ describe('worker workflow', () => {
 
     const provider: AIProvider = {
       kind: 'codex',
+    async preflight() { return { provider: 'codex', ok: true, checkedAt: new Date().toISOString() }; },
       async plan(_input: PlanInput): Promise<PlanResult> {
         return {
           summary: 'Plan summary',
@@ -4069,6 +4087,7 @@ describe('worker workflow', () => {
 
     const provider: AIProvider = {
       kind: 'codex',
+    async preflight() { return { provider: 'codex', ok: true, checkedAt: new Date().toISOString() }; },
       async plan(): Promise<PlanResult> {
         return {
           summary: 'Plan summary',
@@ -4199,6 +4218,7 @@ describe('worker workflow', () => {
 
     const provider: AIProvider = {
       kind: 'codex',
+    async preflight() { return { provider: 'codex', ok: true, checkedAt: new Date().toISOString() }; },
       async plan(): Promise<PlanResult> {
         return {
           summary: 'Plan summary',
@@ -4278,6 +4298,7 @@ describe('worker workflow', () => {
 
     const provider: AIProvider = {
       kind: 'codex',
+    async preflight() { return { provider: 'codex', ok: true, checkedAt: new Date().toISOString() }; },
       async plan(): Promise<PlanResult> {
         return {
           summary: 'Plan summary',

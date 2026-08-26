@@ -4,6 +4,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { listOpenAIModels, OpenAIProvider } from './openai-provider.js';
 import { CodexProvider, buildCodexExecArgs, normalizeCodexModels, resolveCodexBinary } from './codex-provider.js';
+import { ProviderContractError, normalizeProviderError } from './provider.js';
 
 function successfulResponse(body: unknown): Response {
   return {
@@ -53,6 +54,77 @@ describe('OpenAI provider', () => {
     process.env.OPENAI_API_KEY = 'test-key';
     const openai = new OpenAIProvider();
     expect(openai.kind).toBe('openai');
+  });
+
+  it('exposes a preflight check through the adapter contract', async () => {
+    process.env.OPENAI_API_KEY = 'test-key';
+    vi.mocked(fetch).mockResolvedValueOnce(successfulResponse({ data: [] }));
+
+    const result = await new OpenAIProvider().preflight();
+
+    expect(result).toMatchObject({ provider: 'openai', ok: true });
+    expect(new Date(result.checkedAt).toString()).not.toBe('Invalid Date');
+    expect(fetch).toHaveBeenLastCalledWith(new URL('https://api.openai.com/v1/models'), {
+      headers: { Authorization: 'Bearer test-key' },
+      signal: undefined
+    });
+  });
+
+  it('normalizes provider authentication, quota, timeout, and invalid-response errors', async () => {
+    expect(normalizeProviderError('openai', { status: 401, message: 'Unauthorized: Bearer sk-test_1234567890abcdef' }))
+      .toMatchObject({ provider: 'openai', kind: 'authentication', retryable: false, statusCode: 401 });
+    expect(normalizeProviderError('openai', { status: 429, message: 'quota exceeded' }))
+      .toMatchObject({ provider: 'openai', kind: 'quota', retryable: false, statusCode: 429 });
+    expect(normalizeProviderError('openai', Object.assign(new Error('request timed out'), { status: 504 })))
+      .toMatchObject({ provider: 'openai', kind: 'timeout', retryable: true, statusCode: 504 });
+    expect(normalizeProviderError('openai', new ProviderContractError('OpenAI request returned invalid JSON')))
+      .toMatchObject({ provider: 'openai', kind: 'invalid_response', retryable: false });
+  });
+
+  it('keeps normalized provider errors audit safe', () => {
+    const error = normalizeProviderError(
+      'openai',
+      new Error('Provider failed with Authorization: Bearer sk-test_1234567890abcdef')
+    );
+
+    expect(error.auditSafeMessage).toContain('[secret-redacted]');
+    expect(error.auditSafeMessage).not.toContain('sk-test_1234567890abcdef');
+    expect(error.message).toBe(error.auditSafeMessage);
+  });
+
+  it('returns normalized preflight failures without exposing response bodies', async () => {
+    process.env.OPENAI_API_KEY = 'test-key';
+    vi.mocked(fetch).mockResolvedValueOnce({ ok: false, status: 401 } as Response);
+
+    const result = await new OpenAIProvider().preflight();
+
+    expect(result.ok).toBe(false);
+    expect(result.error).toMatchObject({ provider: 'openai', kind: 'authentication', retryable: false, statusCode: 401 });
+  });
+
+  it('raises normalized invalid-response errors from malformed transport responses', async () => {
+    process.env.OPENAI_API_KEY = 'test-key';
+    vi.mocked(fetch).mockResolvedValueOnce(successfulResponse({ choices: [] }));
+
+    await expect(new OpenAIProvider().plan({ taskId: '1', title: 'Test', prompt: 'Plan this.' }))
+      .rejects.toMatchObject({ name: 'NormalizedProviderError', kind: 'invalid_response' });
+  });
+
+  it('does not expose OpenAI invalid JSON parser details in normalized errors', async () => {
+    process.env.OPENAI_API_KEY = 'test-key';
+    vi.mocked(fetch).mockResolvedValueOnce({
+      ok: true,
+      json: async () => {
+        throw new SyntaxError('Unexpected token p in JSON at position 1: prompt=ship-secret-feature');
+      }
+    } as unknown as Response);
+
+    await expect(new OpenAIProvider().plan({ taskId: '1', title: 'Test', prompt: 'Plan this.' }))
+      .rejects.toMatchObject({
+        name: 'NormalizedProviderError',
+        kind: 'invalid_response',
+        auditSafeMessage: 'OpenAI request returned invalid JSON.'
+      });
   });
 
   it('should call OpenAI API for planning', async () => {
@@ -260,6 +332,19 @@ describe('Codex provider', () => {
     expect(codex.kind).toBe('codex');
   });
 
+  it('exposes Codex API-key preflight through the adapter contract', async () => {
+    process.env.CODEX_API_KEY = 'test-key';
+    vi.mocked(fetch).mockResolvedValueOnce(successfulResponse({ data: [] }));
+
+    const result = await new CodexProvider({ authMode: 'api_key' }).preflight();
+
+    expect(result).toMatchObject({ provider: 'codex', ok: true });
+    expect(fetch).toHaveBeenLastCalledWith(new URL('https://api.openai.com/v1/models'), {
+      headers: { Authorization: 'Bearer test-key' },
+      signal: undefined
+    });
+  });
+
   it('uses bypass mode for Codex CLI workspace writes', () => {
     const args = buildCodexExecArgs({
       sandbox: 'workspace-write',
@@ -462,7 +547,7 @@ describe('Codex provider', () => {
     expect(result.diffStat).toEqual({ filesChanged: 0, insertions: 0, deletions: 0 });
   });
 
-  it('should surface Codex API errors with status and body', async () => {
+  it('normalizes Codex API errors without exposing response bodies', async () => {
     process.env.CODEX_API_KEY = 'test-key';
     const fetchMock = vi.mocked(fetch);
     fetchMock.mockResolvedValueOnce({
@@ -473,8 +558,39 @@ describe('Codex provider', () => {
 
     const codex = new CodexProvider();
 
-    await expect(codex.plan({ taskId: '1', title: 'Test', prompt: 'Plan this.' })).rejects.toThrow(
-      'Codex request failed with 503: temporarily unavailable'
-    );
+    let error: unknown;
+    try {
+      await codex.plan({ taskId: '1', title: 'Test', prompt: 'Plan this.' });
+    } catch (caught) {
+      error = caught;
+    }
+
+    expect(error).toMatchObject({
+      name: 'NormalizedProviderError',
+      provider: 'codex',
+      kind: 'unavailable',
+      statusCode: 503,
+      retryable: true,
+      auditSafeMessage: 'Codex request failed. HTTP 503.'
+    });
+    expect(error).toBeInstanceOf(Error);
+    expect((error as Error).message).not.toContain('temporarily unavailable');
+  });
+
+  it('does not expose Codex invalid JSON parser details in normalized errors', async () => {
+    process.env.CODEX_API_KEY = 'test-key';
+    vi.mocked(fetch).mockResolvedValueOnce({
+      ok: true,
+      json: async () => {
+        throw new SyntaxError('Unexpected token p in JSON at position 1: prompt=ship-secret-feature');
+      }
+    } as unknown as Response);
+
+    await expect(new CodexProvider().plan({ taskId: '1', title: 'Test', prompt: 'Plan this.' }))
+      .rejects.toMatchObject({
+        name: 'NormalizedProviderError',
+        kind: 'invalid_response',
+        auditSafeMessage: 'Codex request returned invalid JSON.'
+      });
   });
 });
