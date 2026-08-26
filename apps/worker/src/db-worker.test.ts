@@ -409,6 +409,32 @@ github: {}`;
     );
   });
 
+  it('characterizes failed workflow lifecycle persistence before queue finalization', async () => {
+    const { runDatabaseWorkerOnce } = await import('./db-worker.js');
+    const result = await runDatabaseWorkerOnce();
+
+    expect(result).toEqual(expect.objectContaining({
+      claimed: true,
+      taskId: 'task_1',
+      status: 'failed'
+    }));
+    expect(repositoryMock.finishTaskRun).toHaveBeenCalledWith(expect.objectContaining({
+      taskRunId: 'run_1',
+      status: 'failed',
+      errorMessage: 'GitHub API POST /repos/demo/repo/pulls failed with 500: Internal Server Error'
+    }));
+    expect(repositoryMock.failTask).toHaveBeenCalledWith(
+      'task_1',
+      'GitHub API POST /repos/demo/repo/pulls failed with 500: Internal Server Error',
+      'failed'
+    );
+    expect(repositoryMock.finalizeQueueJob).toHaveBeenCalledWith(
+      'queue_1',
+      'failed',
+      'GitHub API POST /repos/demo/repo/pulls failed with 500: Internal Server Error'
+    );
+  });
+
   it('aborts active workflow work when the task is cancelled in the database', async () => {
     repositoryMock.getTask
       .mockResolvedValueOnce({ ...createClaimedTask().task, status: 'running_ai' })
