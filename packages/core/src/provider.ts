@@ -23,3 +23,25 @@ export interface ProviderPreflightResult {
   checkedAt: string;
   error?: NormalizedProviderErrorDetails;
 }
+
+export type ProviderCircuitBreakerState = 'closed' | 'open' | 'half_open';
+
+export interface ProviderCircuitBreakerSnapshot {
+  state: ProviderCircuitBreakerState;
+  failureCount: number;
+  failureThreshold: number;
+  openedAt?: string;
+  openedUntil?: string;
+  lastFailureAt?: string;
+  lastFailureKind?: NormalizedProviderErrorKind;
+  lastFailureMessage?: string;
+}
+
+export interface ProviderConnectionRuntimeStatus {
+  provider: ProviderKind;
+  connectionId: string | null;
+  model: string | null;
+  lastSuccessfulRequestAt: string | null;
+  lastSuccessfulOperation: string | null;
+  circuitBreaker: ProviderCircuitBreakerSnapshot;
+}

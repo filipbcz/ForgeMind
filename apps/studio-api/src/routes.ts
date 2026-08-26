@@ -25,7 +25,7 @@ import type { AIProviderConnectionKind, AIProviderConnectionSecret, ForgeMindRep
 import { parseGitHubWebhookPayload, projectGitHubWebhookEvent, verifyGitHubWebhookSignature } from './webhook.js';
 import type { NotificationService } from './notifications.js';
 import { ROADMAP_GENERATION_CONFIRMATION, activeProjectContractRequirements, applyProjectContractDelta, buildSpecificationChangeImpactReview, redactSecrets } from '@forgemind/core';
-import type { ApprovalType } from '@forgemind/core';
+import type { ApprovalType, ProviderConnectionRuntimeStatus } from '@forgemind/core';
 import type { Project, ProjectArchitectureUpdate, ProjectContract, ProjectContractDelta, TaskMode } from '@forgemind/core';
 import { registerAuthRoutes } from './routes/auth-routes.js';
 import { registerNotificationRoutes } from './routes/notification-routes.js';
@@ -323,17 +323,21 @@ export function registerRoutes(app: FastifyInstance, repository: ForgeMindReposi
     const githubConnection = await readGitHubConnection(repository);
     const providerConnections = await listAIProviderConnections(repository);
     const providerConnection = await readAIProviderConnection(repository);
+    const runtimeStatuses = await listProviderConnectionRuntimeStatuses(repository);
+    const runtimeStatusByConnection = new Map(runtimeStatuses.map((status) => [providerRuntimeStatusKey(status.provider, status.connectionId), status]));
     const connections = await Promise.all(providerConnections.map(async (connection) => {
+      const runtimeStatus = runtimeStatusByConnection.get(providerRuntimeStatusKey(connection.provider, connection.id)) ?? null;
       if (connection.provider !== 'codex' || connection.authMode !== 'codex_oauth') {
-        return { ...connection, available: true };
+        return { ...connection, available: true, runtimeStatus };
       }
       if (!connection.codexHome) {
-        return { ...connection, available: false };
+        return { ...connection, available: false, runtimeStatus };
       }
 
       const status = await readCodexOAuthStatus(connection.codexHome);
       return {
         ...connection,
+        runtimeStatus,
         available: status.verificationStatus === 'unavailable' ? null : status.loggedIn,
         availability: status.verificationStatus === 'verified'
           ? 'available'
@@ -350,10 +354,14 @@ export function registerRoutes(app: FastifyInstance, repository: ForgeMindReposi
       : null;
     const currentProvider = providerConnection?.provider ?? envProvider;
     const currentModel = currentProvider ? (providerConnection?.model ?? resolveProviderEnvModel(currentProvider)) : null;
+    const currentRuntimeStatus = currentProvider
+      ? runtimeStatusByConnection.get(providerRuntimeStatusKey(currentProvider, providerConnection?.id ?? null)) ?? null
+      : null;
     return {
       currentProvider,
       currentModel,
       currentConnectionId: providerConnection?.id ?? null,
+      currentRuntimeStatus,
       connections,
       fallbackProvider: process.env.FORGEMIND_FALLBACK_PROVIDER ?? null,
       githubAdapter: githubConnection ? 'app' : getGitHubAdapterEnvStatus().adapter,
@@ -2543,6 +2551,17 @@ async function listAIProviderConnections(repository: ForgeMindRepository) {
 
   const connection = await readAIProviderConnection(repository);
   return connection ? [connection] : [];
+}
+
+async function listProviderConnectionRuntimeStatuses(repository: ForgeMindRepository) {
+  const maybeRepository = repository as ForgeMindRepository & {
+    listProviderConnectionRuntimeStatuses?: ForgeMindRepository['listProviderConnectionRuntimeStatuses'];
+  };
+  return maybeRepository.listProviderConnectionRuntimeStatuses ? maybeRepository.listProviderConnectionRuntimeStatuses() : [];
+}
+
+function providerRuntimeStatusKey(provider: ProviderConnectionRuntimeStatus['provider'], connectionId: string | null): string {
+  return `${provider}:${connectionId ?? 'env'}`;
 }
 
 async function readAIProviderConnectionSecret(repository: ForgeMindRepository) {

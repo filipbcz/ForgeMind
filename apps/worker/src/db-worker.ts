@@ -2,8 +2,8 @@ import { parseAgentConfigYaml, type AgentConfig } from '@forgemind/config';
 import { activeProjectContractRequirements, createBlockedRunState, createFailedRunState, createWaitingRunState, isNonBlockingDeferredValidation } from '@forgemind/core';
 import { advanceRoadmapAfterTaskCapabilityWait, advanceRoadmapAfterTaskCompletion, createRepository, getPrismaClient, startNextRoadmapStep, type AIProviderConnectionSecret, type ForgeMindRepository } from '@forgemind/db';
 import { GitHubAppAdapter, createGitHubAdapterFromEnv } from '@forgemind/github';
-import { buildProjectExtensionProposalPrompt, createProvider, formatProjectExtensionProposal, type AIProvider, type ProviderSessionContext, type ProviderUsageMeasurement } from '@forgemind/providers';
-import type { ProviderKind } from '@forgemind/core';
+import { buildProjectExtensionProposalPrompt, createProvider, formatProjectExtensionProposal, normalizeProviderError, type AIProvider, type ProviderSessionContext, type ProviderUsageMeasurement } from '@forgemind/providers';
+import type { NormalizedProviderErrorDetails, ProviderCircuitBreakerSnapshot, ProviderKind } from '@forgemind/core';
 import { toErrorMessage } from '@forgemind/shared';
 import { formatProjectArchitectureContext, runWorkerTask } from './workflow.js';
 import { buildTargetedRepositoryContext, prepareCapabilityAuditWorkspace, runCapabilityAudit, runReleaseAudit } from './capability-audit.js';
@@ -181,7 +181,17 @@ export async function runDatabaseWorkerOnce(options: { deferInterruptSignals?: b
     : undefined;
   const { provider, getLastProviderKind } = createPolicyAwareProvider({
     primary: primaryRuntimeProvider,
-    fallback: fallbackRuntimeProvider
+    fallback: fallbackRuntimeProvider,
+    audit: (event) => repository.writeAudit({
+      actorType: 'system',
+      eventType: event.eventType,
+      taskId: claimed.task.id,
+      payload: {
+        taskRunId: claimed.taskRun.id,
+        queueJobId: claimed.queueJobId ?? null,
+        ...event.payload
+      }
+    })
   });
   const reviewerSelection = await resolveReviewerSelection({
     repository,
@@ -715,7 +725,18 @@ async function runNextProjectAudit(input: {
     });
     const { provider, getLastProviderKind } = createPolicyAwareProvider({
       primary: buildRuntimeProvider(selection.primary.kind, selection.primary.connection),
-      fallback: selection.fallback ? buildRuntimeProvider(selection.fallback.kind, selection.fallback.connection) : undefined
+      fallback: selection.fallback ? buildRuntimeProvider(selection.fallback.kind, selection.fallback.connection) : undefined,
+      audit: (event) => input.repository.writeAudit({
+        actorType: 'system',
+        eventType: event.eventType,
+        projectId: claimed.project.id,
+        taskId: claimed.job.triggerTaskId,
+        payload: {
+          auditJobId: claimed.job.id,
+          cycleId: claimed.cycle.id,
+          ...event.payload
+        }
+      })
     });
     const triggerTask = claimed.job.triggerTaskId
       ? await input.repository.getTask(claimed.job.triggerTaskId)
@@ -988,6 +1009,8 @@ function formatGapStepDescription(step: {
 interface RuntimeProvider {
   kind: ProviderKind;
   contextId: string;
+  connectionId: string | null;
+  model: string | null;
   provider: AIProvider;
 }
 
@@ -997,6 +1020,8 @@ function buildRuntimeProvider(kind: ProviderKind, connection?: AIProviderConnect
   return {
     kind,
     contextId,
+    connectionId: connection?.id ?? null,
+    model: resolveProviderModel(kind, connection),
     provider: createProvider(kind, connection?.provider === kind ? {
       apiKey: connection.apiKey,
       authMode: connection.authMode,
@@ -1006,38 +1031,107 @@ function buildRuntimeProvider(kind: ProviderKind, connection?: AIProviderConnect
   };
 }
 
-function createPolicyAwareProvider(input: {
+interface ProviderPolicyAuditEvent {
+  eventType: string;
+  payload: Record<string, unknown>;
+}
+
+interface PolicyAwareProviderInput {
   primary: RuntimeProvider;
   fallback?: RuntimeProvider;
-}): { provider: AIProvider; getLastProviderKind: () => ProviderKind } {
+  audit?: (event: ProviderPolicyAuditEvent) => Promise<unknown>;
+}
+
+function createPolicyAwareProvider(input: PolicyAwareProviderInput): { provider: AIProvider; getLastProviderKind: () => ProviderKind } {
   let lastProviderKind: ProviderKind = input.primary.kind;
+  const failureThreshold = clampNumber(Number(process.env.FORGEMIND_PROVIDER_CIRCUIT_BREAKER_FAILURE_THRESHOLD ?? 3), 1, 10);
+  const openMs = clampNumber(Number(process.env.FORGEMIND_PROVIDER_CIRCUIT_BREAKER_OPEN_MS ?? 300_000), 1_000, 3_600_000);
 
   const callWithFallback = async <T>(operation: string, action: (provider: AIProvider) => Promise<T>, signal?: AbortSignal): Promise<T> => {
+    const primaryBreaker = getProviderCircuitBreaker(input.primary.contextId, failureThreshold);
+    const primaryAvailability = resolveCircuitBreakerAvailability(primaryBreaker);
+    if (primaryAvailability.state === 'open') {
+      await auditProviderCircuitBreaker(input, input.primary, operation, 'primary_skipped', primaryBreaker);
+      return callFallbackOrThrow(operation, action, signal, new ProviderExecutionError(operation, 'circuit breaker is open', input.primary.kind), true);
+    }
+
     try {
       const result = await action(input.primary.provider);
       lastProviderKind = input.primary.kind;
+      await recordProviderSuccess(input, input.primary, operation, primaryBreaker);
       return result;
     } catch (primaryError) {
       if (signal?.aborted) {
         throw signal.reason instanceof Error ? signal.reason : new TaskCancellationError();
       }
-      const fallback = input.fallback;
-      const shouldUseFallback = Boolean(
-        fallback
-        && (fallback.kind !== input.primary.kind || fallback.contextId !== input.primary.contextId)
-      );
-      if (fallback && shouldUseFallback) {
-        try {
-          const result = await action(fallback.provider);
-          lastProviderKind = fallback.kind;
-          return result;
-        } catch (fallbackError) {
-          throw new ProviderExecutionError(operation, toErrorMessage(fallbackError), fallback.kind);
-        }
-      }
-
-      throw new ProviderExecutionError(operation, toErrorMessage(primaryError), input.primary.kind);
+      const normalizedPrimaryError = normalizeProviderError(input.primary.kind, primaryError);
+      await recordProviderFailure(input, input.primary, operation, primaryBreaker, normalizedPrimaryError.toDetails(), openMs);
+      return callFallbackOrThrow(operation, action, signal, primaryError, normalizedPrimaryError.retryable);
     }
+  };
+
+  const callFallbackOrThrow = async <T>(
+    operation: string,
+    action: (provider: AIProvider) => Promise<T>,
+    signal: AbortSignal | undefined,
+    primaryError: unknown,
+    primaryIsRetryable: boolean
+  ): Promise<T> => {
+    const fallback = input.fallback;
+    const shouldUseFallback = Boolean(
+      primaryIsRetryable
+      && fallback
+      && providersAreSemanticallyEquivalent(input.primary, fallback)
+      && (fallback.kind !== input.primary.kind || fallback.contextId !== input.primary.contextId)
+    );
+    if (fallback && shouldUseFallback) {
+      const fallbackBreaker = getProviderCircuitBreaker(fallback.contextId, failureThreshold);
+      const fallbackAvailability = resolveCircuitBreakerAvailability(fallbackBreaker);
+      if (fallbackAvailability.state === 'open') {
+        await auditProviderCircuitBreaker(input, fallback, operation, 'primary_skipped', fallbackBreaker);
+        throw new ProviderExecutionError(operation, 'primary and fallback circuit breakers are open', input.primary.kind);
+      }
+      await input.audit?.({
+        eventType: 'provider_fallback_used',
+        payload: {
+          operation,
+          primaryProvider: input.primary.kind,
+          primaryConnectionId: input.primary.connectionId,
+          fallbackProvider: fallback.kind,
+          fallbackConnectionId: fallback.connectionId,
+          fallbackModel: fallback.model,
+          policy: 'semantically_equivalent_same_operation_retryable_primary_failure'
+        }
+      });
+      try {
+        const result = await action(fallback.provider);
+        lastProviderKind = fallback.kind;
+        await recordProviderSuccess(input, fallback, operation, fallbackBreaker);
+        return result;
+      } catch (fallbackError) {
+        const normalizedFallbackError = normalizeProviderError(fallback.kind, fallbackError);
+        await recordProviderFailure(input, fallback, operation, fallbackBreaker, normalizedFallbackError.toDetails(), openMs);
+        throw new ProviderExecutionError(operation, toErrorMessage(fallbackError), fallback.kind);
+      }
+    }
+
+    if (fallback && primaryIsRetryable && !providersAreSemanticallyEquivalent(input.primary, fallback)) {
+      await input.audit?.({
+        eventType: 'provider_fallback_skipped',
+        payload: {
+          operation,
+          primaryProvider: input.primary.kind,
+          primaryConnectionId: input.primary.connectionId,
+          primaryModel: input.primary.model,
+          fallbackProvider: fallback.kind,
+          fallbackConnectionId: fallback.connectionId,
+          fallbackModel: fallback.model,
+          reason: 'fallback_not_semantically_equivalent'
+        }
+      });
+    }
+
+    throw new ProviderExecutionError(operation, toErrorMessage(primaryError), input.primary.kind);
   };
 
   const provider: AIProvider = {
@@ -1077,6 +1171,147 @@ function createPolicyAwareProvider(input: {
     provider,
     getLastProviderKind: () => lastProviderKind
   };
+}
+
+function providersAreSemanticallyEquivalent(primary: RuntimeProvider, fallback: RuntimeProvider): boolean {
+  return primary.kind === fallback.kind && primary.model === fallback.model;
+}
+
+interface ProviderCircuitBreakerRuntimeState extends ProviderCircuitBreakerSnapshot {
+  halfOpenInFlight?: boolean;
+}
+
+const providerCircuitBreakers = new Map<string, ProviderCircuitBreakerRuntimeState>();
+
+export function resetProviderCircuitBreakersForTests(): void {
+  if (process.env.NODE_ENV === 'test') providerCircuitBreakers.clear();
+}
+
+function getProviderCircuitBreaker(contextId: string, failureThreshold: number): ProviderCircuitBreakerRuntimeState {
+  const existing = providerCircuitBreakers.get(contextId);
+  if (existing) {
+    existing.failureThreshold = failureThreshold;
+    return existing;
+  }
+  const created: ProviderCircuitBreakerRuntimeState = {
+    state: 'closed',
+    failureCount: 0,
+    failureThreshold
+  };
+  providerCircuitBreakers.set(contextId, created);
+  return created;
+}
+
+function resolveCircuitBreakerAvailability(state: ProviderCircuitBreakerRuntimeState): { state: 'closed' | 'open' | 'half_open' } {
+  if (state.state !== 'open' || !state.openedUntil) return { state: state.state };
+  const openedUntilMs = Date.parse(state.openedUntil);
+  if (Number.isFinite(openedUntilMs) && openedUntilMs > Date.now()) return { state: 'open' };
+  if (state.halfOpenInFlight) return { state: 'open' };
+  state.state = 'half_open';
+  state.halfOpenInFlight = true;
+  return { state: 'half_open' };
+}
+
+async function recordProviderSuccess(
+  input: PolicyAwareProviderInput,
+  runtimeProvider: RuntimeProvider,
+  operation: string,
+  breaker: ProviderCircuitBreakerRuntimeState
+): Promise<void> {
+  const wasRecovering = breaker.state !== 'closed' || breaker.failureCount > 0;
+  breaker.state = 'closed';
+  breaker.failureCount = 0;
+  breaker.openedAt = undefined;
+  breaker.openedUntil = undefined;
+  breaker.lastFailureAt = undefined;
+  breaker.lastFailureKind = undefined;
+  breaker.lastFailureMessage = undefined;
+  breaker.halfOpenInFlight = false;
+  await input.audit?.({
+    eventType: 'provider_request_succeeded',
+    payload: {
+      operation,
+      provider: runtimeProvider.kind,
+      connectionId: runtimeProvider.connectionId,
+      model: runtimeProvider.model,
+      circuitBreaker: snapshotProviderCircuitBreaker(breaker),
+      recoveredCircuitBreaker: wasRecovering
+    }
+  });
+}
+
+async function recordProviderFailure(
+  input: PolicyAwareProviderInput,
+  runtimeProvider: RuntimeProvider,
+  operation: string,
+  breaker: ProviderCircuitBreakerRuntimeState,
+  error: NormalizedProviderErrorDetails,
+  openMs: number
+): Promise<void> {
+  const now = new Date();
+  breaker.failureCount = Math.min(breaker.failureCount + 1, breaker.failureThreshold);
+  breaker.lastFailureAt = now.toISOString();
+  breaker.lastFailureKind = error.kind;
+  breaker.lastFailureMessage = error.auditSafeMessage;
+  breaker.halfOpenInFlight = false;
+  if (error.retryable && breaker.failureCount >= breaker.failureThreshold) {
+    breaker.state = 'open';
+    breaker.openedAt = now.toISOString();
+    breaker.openedUntil = new Date(now.getTime() + openMs).toISOString();
+  } else if (breaker.state === 'half_open') {
+    breaker.state = 'open';
+    breaker.openedAt = now.toISOString();
+    breaker.openedUntil = new Date(now.getTime() + openMs).toISOString();
+  }
+
+  await auditProviderCircuitBreaker(input, runtimeProvider, operation, 'failure_recorded', breaker, error);
+}
+
+async function auditProviderCircuitBreaker(
+  input: PolicyAwareProviderInput,
+  runtimeProvider: RuntimeProvider,
+  operation: string,
+  reason: 'failure_recorded' | 'primary_skipped',
+  breaker: ProviderCircuitBreakerRuntimeState,
+  error?: NormalizedProviderErrorDetails
+): Promise<void> {
+  await input.audit?.({
+    eventType: 'provider_circuit_breaker_state',
+    payload: {
+      operation,
+      reason,
+      provider: runtimeProvider.kind,
+      connectionId: runtimeProvider.connectionId,
+      model: runtimeProvider.model,
+      circuitBreaker: snapshotProviderCircuitBreaker(breaker),
+      error: error
+        ? {
+            kind: error.kind,
+            retryable: error.retryable,
+            statusCode: error.statusCode ?? null,
+            auditSafeMessage: error.auditSafeMessage
+          }
+        : null
+    }
+  });
+}
+
+function snapshotProviderCircuitBreaker(state: ProviderCircuitBreakerRuntimeState): ProviderCircuitBreakerSnapshot {
+  return {
+    state: state.state,
+    failureCount: state.failureCount,
+    failureThreshold: state.failureThreshold,
+    openedAt: state.openedAt,
+    openedUntil: state.openedUntil,
+    lastFailureAt: state.lastFailureAt,
+    lastFailureKind: state.lastFailureKind,
+    lastFailureMessage: state.lastFailureMessage
+  };
+}
+
+function clampNumber(value: number, min: number, max: number): number {
+  if (!Number.isFinite(value)) return min;
+  return Math.min(Math.max(Math.trunc(value), min), max);
 }
 
 function parseProjectConfig(configYaml?: string): AgentConfig | undefined {
