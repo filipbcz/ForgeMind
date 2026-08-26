@@ -130,7 +130,7 @@ Deployment runs automatically after a push to `main` or manually through the `De
 10. waits for the API health check.
 
 The OCI host does not run `npm ci` or compile the monorepo during deployment. The `main` image tags are defaults for manual Compose inspection; automated deployment always passes immutable SHA tags.
-Each deployment prints `docker system df` and a runtime-base cache hit or miss so unexpected OCI cache cleanup is visible directly in the Actions log.
+Each deployment prints `docker system df` before and after cleanup. The runtime base remains a build-only GHCR artifact and is not downloaded to the production host; only deployable runtime and web images consume production disk space.
 
 ## Provider configuration
 

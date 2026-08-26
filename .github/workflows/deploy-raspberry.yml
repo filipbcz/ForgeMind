@@ -119,7 +119,6 @@ jobs:
     env:
       APP_ROOT: /home/filip/forgemind
       RELEASE_ARCHIVE: forgemind-${{ github.sha }}.tar.gz
-      FORGEMIND_RUNTIME_BASE_IMAGE: ${{ needs.build_images.outputs.runtime_base_image }}
       FORGEMIND_RUNTIME_IMAGE: ${{ needs.build_images.outputs.runtime_image }}
       FORGEMIND_WEB_IMAGE: ${{ needs.build_images.outputs.web_image }}
     steps:
@@ -192,7 +191,6 @@ jobs:
               rm -f \"/tmp/${RELEASE_ARCHIVE}\"
               APP_ROOT=\"\${APP_ROOT}\" \
               FORGEMIND_COMPOSE_OVERRIDE=\"\${APP_ROOT}/app/infra/docker-compose.raspberry.yml\" \
-              FORGEMIND_RUNTIME_BASE_IMAGE='${FORGEMIND_RUNTIME_BASE_IMAGE}' \
               FORGEMIND_RUNTIME_IMAGE='${FORGEMIND_RUNTIME_IMAGE}' \
               FORGEMIND_WEB_IMAGE='${FORGEMIND_WEB_IMAGE}' \
               bash \"\${APP_ROOT}/app/infra/deploy/remote-deploy.sh\"

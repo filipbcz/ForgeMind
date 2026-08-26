@@ -8,7 +8,6 @@ COMPOSE_FILE="${APP_DIR}/infra/docker-compose.prod.yml"
 COMPOSE_OVERRIDE="${FORGEMIND_COMPOSE_OVERRIDE:-}"
 
 : "${FORGEMIND_RUNTIME_IMAGE:?FORGEMIND_RUNTIME_IMAGE is required}"
-: "${FORGEMIND_RUNTIME_BASE_IMAGE:?FORGEMIND_RUNTIME_BASE_IMAGE is required}"
 : "${FORGEMIND_WEB_IMAGE:?FORGEMIND_WEB_IMAGE is required}"
 
 if [ ! -s "${ENV_FILE}" ]; then
@@ -35,9 +34,20 @@ fi
 compose=(docker compose --env-file "${ENV_FILE}" "${compose_files[@]}")
 
 deployment_succeeded=false
+worker_was_drained=false
+worker_container=""
 cleanup_failed_deployment() {
   if [ "${deployment_succeeded}" = "true" ]; then
     return
+  fi
+
+  if [ "${worker_was_drained}" = "true" ]; then
+    echo "Deployment did not complete; restoring the worker."
+    if [ -n "${worker_container}" ] && docker inspect "${worker_container}" >/dev/null 2>&1; then
+      docker start "${worker_container}" >/dev/null || true
+    else
+      "${compose[@]}" up -d worker || true
+    fi
   fi
 
   echo "Deployment did not complete; reclaiming images that are not referenced by containers."
@@ -128,22 +138,16 @@ echo "Docker storage after pre-deployment cleanup:"
 docker system df
 assert_deploy_free_space
 
-if docker image inspect "${FORGEMIND_RUNTIME_BASE_IMAGE}" >/dev/null 2>&1; then
-  echo "Runtime base cache hit: ${FORGEMIND_RUNTIME_BASE_IMAGE}"
-else
-  echo "Runtime base cache miss; downloading ${FORGEMIND_RUNTIME_BASE_IMAGE}"
-  docker pull "${FORGEMIND_RUNTIME_BASE_IMAGE}"
+worker_container="$("${compose[@]}" ps -q worker)"
+if [ -n "${worker_container}" ]; then
+  WORKER_DRAIN_TIMEOUT_SECONDS="${FORGEMIND_WORKER_DRAIN_TIMEOUT_SECONDS:-5400}"
+  echo "Draining worker before downloading release images (timeout: ${WORKER_DRAIN_TIMEOUT_SECONDS}s)."
+  "${compose[@]}" stop --timeout "${WORKER_DRAIN_TIMEOUT_SECONDS}" worker
+  worker_was_drained=true
 fi
 
 docker pull "${FORGEMIND_RUNTIME_IMAGE}"
 docker pull "${FORGEMIND_WEB_IMAGE}"
-
-WORKER_CONTAINER="$("${compose[@]}" ps -q worker)"
-if [ -n "${WORKER_CONTAINER}" ]; then
-  WORKER_DRAIN_TIMEOUT_SECONDS="${FORGEMIND_WORKER_DRAIN_TIMEOUT_SECONDS:-5400}"
-  echo "Draining worker before migrations and replacement (timeout: ${WORKER_DRAIN_TIMEOUT_SECONDS}s)."
-  "${compose[@]}" stop --timeout "${WORKER_DRAIN_TIMEOUT_SECONDS}" worker
-fi
 
 MIGRATION_STATE_FILE="${APP_ROOT}/shared/migrations.sha256"
 MIGRATIONS_DIR="${APP_DIR}/packages/db/prisma/migrations"
