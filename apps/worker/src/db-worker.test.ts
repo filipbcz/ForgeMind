@@ -54,6 +54,28 @@ function createClaimedTask(queueReason = 'task_started') {
   };
 }
 
+function usageLimitConfigYaml(input: { softPercent: number; hardPercent: number }): string {
+  return `project:
+  id: demo
+  name: Demo
+  repo: github.com/demo/demo
+workflow:
+  create_issue: false
+  create_branch: false
+  create_draft_pr: false
+  auto_push: false
+ai: {}
+limits:
+  max_budget_usd: 1
+  soft_budget_threshold_percent: ${input.softPercent}
+  hard_budget_threshold_percent: ${input.hardPercent}
+commands: {}
+approval: {}
+sandbox:
+  allow_network: true
+github: {}`;
+}
+
 const repositoryMock = {
   recoverStuckQueueJobs: vi.fn(async () => ({ recoveredCount: 0, queueJobIds: [] })),
   requeueTasksWaitingForCapabilities: vi.fn(async () => 0),
@@ -1751,6 +1773,214 @@ github:
       totalTokens: 284947,
       usageSource: 'actual_total',
       actualCostUsd: null
+    }));
+  });
+
+  it('surfaces soft usage limits through budget approval workflow', async () => {
+    const claimed = createClaimedTask();
+    claimed.project.configYaml = usageLimitConfigYaml({ softPercent: 50, hardPercent: 100 });
+    repositoryMock.claimNextSubmittedTask.mockResolvedValueOnce(claimed);
+    runWorkerTaskMock.mockImplementationOnce(async (input: {
+      hooks?: {
+        onProviderActivity?: (activity: Record<string, unknown>) => Promise<void>;
+      };
+    }) => {
+      await input.hooks?.onProviderActivity?.({
+        phase: 'implementation',
+        attempt: 1,
+        kind: 'lifecycle',
+        message: 'Provider usage captured.',
+        elapsedMs: 0,
+        usage: {
+          provider: 'codex',
+          model: 'gpt-5.5',
+          totalTokens: 1000,
+          actualCostUsd: 0.5,
+          source: 'actual_breakdown'
+        }
+      });
+      throw new Error('Soft usage limit should pause the worker.');
+    });
+
+    const { runDatabaseWorkerOnce } = await import('./db-worker.js');
+    const result = await runDatabaseWorkerOnce();
+
+    expect(result).toEqual(expect.objectContaining({ claimed: true, taskId: 'task_1', status: 'needs_approval' }));
+    expect(repositoryMock.transitionTask).toHaveBeenCalledWith('task_1', 'needs_approval', expect.objectContaining({
+      approvals: ['budget_increase'],
+      limitSignal: 'soft_usage_limit_reached'
+    }));
+    expect(repositoryMock.createApproval).toHaveBeenCalledWith(expect.objectContaining({
+      taskId: 'task_1',
+      type: 'budget_increase',
+      title: 'Approval required: soft usage limit reached',
+      riskLevel: 'medium'
+    }));
+    expect(repositoryMock.writeAudit).toHaveBeenCalledWith(expect.objectContaining({
+      eventType: 'usage_limit_approval_requested',
+      payload: expect.objectContaining({
+        limitSignal: 'soft_usage_limit_reached',
+        retryBounded: true
+      })
+    }));
+    expect(repositoryMock.failTask).not.toHaveBeenCalled();
+    expect(repositoryMock.finalizeQueueJob).toHaveBeenCalledWith('queue_1', 'succeeded');
+  });
+
+  it('blocks hard usage limits until budget increase approval is granted', async () => {
+    const claimed = createClaimedTask();
+    claimed.project.configYaml = usageLimitConfigYaml({ softPercent: 50, hardPercent: 90 });
+    repositoryMock.claimNextSubmittedTask.mockResolvedValueOnce(claimed);
+    runWorkerTaskMock.mockImplementationOnce(async (input: {
+      hooks?: {
+        onProviderActivity?: (activity: Record<string, unknown>) => Promise<void>;
+      };
+    }) => {
+      await input.hooks?.onProviderActivity?.({
+        phase: 'implementation',
+        attempt: 1,
+        kind: 'lifecycle',
+        message: 'Provider usage captured.',
+        elapsedMs: 0,
+        usage: {
+          provider: 'codex',
+          model: 'gpt-5.5',
+          totalTokens: 1000,
+          actualCostUsd: 0.9,
+          source: 'actual_breakdown'
+        }
+      });
+      throw new Error('Hard usage limit should pause the worker.');
+    });
+
+    const { runDatabaseWorkerOnce } = await import('./db-worker.js');
+    const result = await runDatabaseWorkerOnce();
+
+    expect(result).toEqual(expect.objectContaining({ claimed: true, taskId: 'task_1', status: 'needs_approval' }));
+    expect(repositoryMock.transitionTask).toHaveBeenCalledWith('task_1', 'needs_approval', expect.objectContaining({
+      approvals: ['budget_increase'],
+      limitSignal: 'hard_usage_limit_reached'
+    }));
+    expect(repositoryMock.createApproval).toHaveBeenCalledWith(expect.objectContaining({
+      taskId: 'task_1',
+      type: 'budget_increase',
+      title: 'Approval required: hard usage limit reached',
+      riskLevel: 'critical'
+    }));
+    expect(repositoryMock.failTask).not.toHaveBeenCalled();
+  });
+
+  it('continues after an approved hard usage limit budget increase', async () => {
+    const claimed = createClaimedTask();
+    claimed.project.configYaml = usageLimitConfigYaml({ softPercent: 50, hardPercent: 90 });
+    repositoryMock.claimNextSubmittedTask.mockResolvedValueOnce(claimed);
+    const approvedBudgetIncrease = {
+      taskId: 'task_1',
+      type: 'budget_increase',
+      status: 'approved',
+      payload: { limitSignal: 'hard_usage_limit_reached' }
+    };
+    repositoryMock.listApprovals
+      .mockResolvedValueOnce([approvedBudgetIncrease])
+      .mockResolvedValueOnce([approvedBudgetIncrease]);
+    runWorkerTaskMock.mockImplementationOnce(async (input: {
+      hooks?: {
+        onProviderActivity?: (activity: Record<string, unknown>) => Promise<void>;
+      };
+    }) => {
+      await input.hooks?.onProviderActivity?.({
+        phase: 'implementation',
+        attempt: 1,
+        kind: 'lifecycle',
+        message: 'Provider usage captured.',
+        elapsedMs: 0,
+        usage: {
+          provider: 'codex',
+          model: 'gpt-5.5',
+          totalTokens: 1000,
+          actualCostUsd: 0.9,
+          source: 'actual_breakdown'
+        }
+      });
+      return {
+        taskId: 'task_1',
+        status: 'ready_for_user_review',
+        issueUrl: '',
+        branchName: 'ai/task',
+        workspacePath: 'C:/tmp/worker',
+        validation: { command: 'npm test', exitCode: 0, stdout: '', stderr: '', passed: true },
+        summary: 'done',
+        approvals: [],
+        completedAt: new Date().toISOString()
+      };
+    });
+
+    const { runDatabaseWorkerOnce } = await import('./db-worker.js');
+    const result = await runDatabaseWorkerOnce();
+
+    expect(result).toEqual(expect.objectContaining({ claimed: true, taskId: 'task_1' }));
+    expect(repositoryMock.transitionTask).not.toHaveBeenCalledWith('task_1', 'needs_approval', expect.objectContaining({
+      limitSignal: 'hard_usage_limit_reached'
+    }));
+    expect(repositoryMock.createApproval).not.toHaveBeenCalledWith(expect.objectContaining({
+      taskId: 'task_1',
+      type: 'budget_increase'
+    }));
+  });
+
+  it('does not let unrelated approved budget increases bypass hard usage limits', async () => {
+    const claimed = createClaimedTask();
+    claimed.project.configYaml = usageLimitConfigYaml({ softPercent: 50, hardPercent: 90 });
+    repositoryMock.claimNextSubmittedTask.mockResolvedValueOnce(claimed);
+    const unrelatedBudgetIncrease = {
+      taskId: 'other_task',
+      type: 'budget_increase',
+      status: 'approved',
+      payload: { limitSignal: 'hard_usage_limit_reached' }
+    };
+    const globalBudgetIncrease = {
+      taskId: 'global_budget_increase',
+      type: 'budget_increase',
+      status: 'approved',
+      payload: { limitSignal: 'hard_usage_limit_reached' }
+    };
+    repositoryMock.listApprovals
+      .mockResolvedValueOnce([unrelatedBudgetIncrease, globalBudgetIncrease])
+      .mockResolvedValueOnce([unrelatedBudgetIncrease, globalBudgetIncrease]);
+    runWorkerTaskMock.mockImplementationOnce(async (input: {
+      hooks?: {
+        onProviderActivity?: (activity: Record<string, unknown>) => Promise<void>;
+      };
+    }) => {
+      await input.hooks?.onProviderActivity?.({
+        phase: 'implementation',
+        attempt: 1,
+        kind: 'lifecycle',
+        message: 'Provider usage captured.',
+        elapsedMs: 0,
+        usage: {
+          provider: 'codex',
+          model: 'gpt-5.5',
+          totalTokens: 1000,
+          actualCostUsd: 0.9,
+          source: 'actual_breakdown'
+        }
+      });
+      throw new Error('Hard usage limit should not be bypassed by unrelated approval.');
+    });
+
+    const { runDatabaseWorkerOnce } = await import('./db-worker.js');
+    const result = await runDatabaseWorkerOnce();
+
+    expect(result).toEqual(expect.objectContaining({ claimed: true, taskId: 'task_1', status: 'needs_approval' }));
+    expect(repositoryMock.transitionTask).toHaveBeenCalledWith('task_1', 'needs_approval', expect.objectContaining({
+      approvals: ['budget_increase'],
+      limitSignal: 'hard_usage_limit_reached'
+    }));
+    expect(repositoryMock.createApproval).toHaveBeenCalledWith(expect.objectContaining({
+      taskId: 'task_1',
+      type: 'budget_increase',
+      title: 'Approval required: hard usage limit reached'
     }));
   });
 

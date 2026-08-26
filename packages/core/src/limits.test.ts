@@ -41,12 +41,54 @@ describe('limit evaluation', () => {
         runtimeMinutes: 0,
         changedFiles: 0,
         diffLines: 0,
-        repeatedErrorCount: 0
+        repeatedErrorCount: 0,
+        actualCostUsd: 0.74
       },
-      DEFAULT_LIMITS
+      {
+        ...DEFAULT_LIMITS,
+        maxBudgetUsd: 1,
+        softBudgetThresholdPercent: 75,
+        hardBudgetThresholdPercent: 100
+      }
     );
 
     expect(result.ok).toBe(true);
     expect(result.signals).toEqual([]);
+  });
+
+  it('separates soft and hard usage budget limits', () => {
+    expect(evaluateLimits(
+      {
+        iterations: 0,
+        runtimeMinutes: 0,
+        changedFiles: 0,
+        diffLines: 0,
+        repeatedErrorCount: 0,
+        actualCostUsd: 0.75
+      },
+      {
+        ...DEFAULT_LIMITS,
+        maxBudgetUsd: 1,
+        softBudgetThresholdPercent: 75,
+        hardBudgetThresholdPercent: 100
+      }
+    ).signals).toEqual(['soft_usage_limit_reached']);
+
+    expect(evaluateLimits(
+      {
+        iterations: 0,
+        runtimeMinutes: 0,
+        changedFiles: 0,
+        diffLines: 0,
+        repeatedErrorCount: 0,
+        actualCostUsd: 1
+      },
+      {
+        ...DEFAULT_LIMITS,
+        maxBudgetUsd: 1,
+        softBudgetThresholdPercent: 75,
+        hardBudgetThresholdPercent: 100
+      }
+    ).signals).toEqual(['hard_usage_limit_reached']);
   });
 });

@@ -14,6 +14,8 @@ export interface LimitUsage {
   changedFiles: number;
   diffLines: number;
   repeatedErrorCount: number;
+  estimatedCostUsd?: number;
+  actualCostUsd?: number;
 }
 
 export type LimitSignal =
@@ -21,7 +23,9 @@ export type LimitSignal =
   | 'runtime_limit_reached'
   | 'changed_files_limit_reached'
   | 'diff_lines_limit_reached'
-  | 'repeated_error_detected';
+  | 'repeated_error_detected'
+  | 'soft_usage_limit_reached'
+  | 'hard_usage_limit_reached';
 
 export interface LimitEvaluation {
   ok: boolean;
@@ -36,6 +40,18 @@ export function evaluateLimits(usage: LimitUsage, limits: Limits): LimitEvaluati
   if (usage.changedFiles > limits.maxChangedFiles) signals.push('changed_files_limit_reached');
   if (usage.diffLines > limits.maxDiffLines) signals.push('diff_lines_limit_reached');
   if (usage.repeatedErrorCount >= limits.maxRepeatedErrorCount) signals.push('repeated_error_detected');
+  const spendUsd = usage.actualCostUsd ?? usage.estimatedCostUsd;
+  if (spendUsd !== undefined && limits.maxBudgetUsd !== undefined) {
+    const hardPercent = limits.hardBudgetThresholdPercent ?? 100;
+    const softPercent = limits.softBudgetThresholdPercent;
+    const hardLimitUsd = (limits.maxBudgetUsd * hardPercent) / 100;
+    const softLimitUsd = softPercent === undefined ? undefined : (limits.maxBudgetUsd * softPercent) / 100;
+    if (spendUsd >= hardLimitUsd) {
+      signals.push('hard_usage_limit_reached');
+    } else if (softLimitUsd !== undefined && spendUsd >= softLimitUsd) {
+      signals.push('soft_usage_limit_reached');
+    }
+  }
 
   return {
     ok: signals.length === 0,

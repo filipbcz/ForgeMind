@@ -26,6 +26,9 @@ limits:
   max_changed_files: 12
   max_diff_lines: 500
   max_repeated_error_count: 3
+  max_budget_usd: 4
+  soft_budget_threshold_percent: 70
+  hard_budget_threshold_percent: 110
 commands:
   verify: npm run build
 approval:
@@ -55,5 +58,17 @@ describe('agent config parser', () => {
     expect(config.ai.reviewer_connection_id).toBe('reviewer-connection');
     expect(toCoreLimits(config).maxIterations).toBe(7);
     expect(toCoreLimits(config).maxDiffLines).toBe(500);
+    expect(toCoreLimits(config)).toMatchObject({
+      maxBudgetUsd: 4,
+      softBudgetThresholdPercent: 70,
+      hardBudgetThresholdPercent: 110
+    });
+  });
+
+  it('rejects hard budget thresholds below the soft threshold', () => {
+    expect(() => parseAgentConfigYaml(configYaml
+      .replace('soft_budget_threshold_percent: 70', 'soft_budget_threshold_percent: 80')
+      .replace('hard_budget_threshold_percent: 110', 'hard_budget_threshold_percent: 60')
+    )).toThrow('hard_budget_threshold_percent must be greater than or equal to soft_budget_threshold_percent');
   });
 });
