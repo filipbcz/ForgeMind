@@ -391,6 +391,293 @@ describe('Studio API routes', () => {
     await app.close();
   });
 
+  it('reviews specification changes without saving an invalid draft or deleting audit history', async () => {
+    const repository = {
+      getCurrentUser: vi.fn(async () => ownerUser),
+      getProject: vi.fn(async () => ({
+        id: 'project_1',
+        name: 'Project',
+        projectContract: {
+          version: 1,
+          summary: 'Reporting',
+          invariants: [],
+          prohibitedSubstitutes: [],
+          requirements: [{
+            id: 'REQ-REPORTING',
+            title: 'Reporting',
+            description: 'Build reporting.',
+            acceptanceCriteria: ['Reports render.'],
+            briefReferences: ['reporting']
+          }],
+          releaseCriteria: ['Ready']
+        }
+      })),
+      getProjectSpecifications: vi.fn(async () => ({
+        projectId: 'project_1',
+        current: {
+          id: 'spec_1',
+          projectId: 'project_1',
+          version: 1,
+          fullSpecification: 'Build reporting.\nKeep audit logs.',
+          changeSummary: 'Initial brief.',
+          source: 'initial_brief',
+          createdAt: '2026-08-10T10:00:00.000Z'
+        },
+        versions: []
+      })),
+      getProjectRoadmap: vi.fn(async () => ({
+        projectId: 'project_1',
+        cycles: [],
+        steps: [{
+          id: 'step_1',
+          projectId: 'project_1',
+          cycleId: 'cycle_1',
+          sequenceNumber: 1,
+          title: 'Build reports',
+          description: 'Implement reports.',
+          acceptanceCriteria: ['Reports render.'],
+          requirementIds: ['REQ-REPORTING'],
+          deliverables: [],
+          changeRationale: 'Needed for reporting.',
+          dependsOnStepTitles: [],
+          validationFocus: ['implementation'],
+          status: 'pending',
+          createdAt: '',
+          updatedAt: ''
+        }],
+        evidence: [{
+          id: 'evidence_1',
+          projectId: 'project_1',
+          cycleId: 'cycle_1',
+          requirementId: 'REQ-REPORTING',
+          criterionKey: 'Reports render.',
+          criterion: 'Reports render.',
+          source: 'repository_audit',
+          status: 'passed',
+          evidenceKey: 'audit:reports',
+          contractVersion: 1,
+          payload: {},
+          createdAt: '',
+          updatedAt: ''
+        }],
+        capabilities: [],
+        auditJobs: []
+      })),
+      updateProject: vi.fn(),
+      writeAudit: vi.fn()
+    };
+    const app = Fastify();
+    const auth = createAuthService();
+    const headers = createOwnerAuthenticatedHeaders(auth);
+    registerRoutes(app, repository as never, undefined, auth);
+
+    const response = await app.inject({
+      method: 'POST',
+      url: '/api/projects/project_1/specification-review',
+      headers,
+      payload: { brief: 'Build reporting with export.\nKeep audit logs.' }
+    });
+
+    expect(response.statusCode).toBe(200);
+    expect(response.json()).toMatchObject({
+      projectId: 'project_1',
+      baseSpecificationVersion: 1,
+      baseSpecificationHash: createHash('sha256').update('Build reporting.\nKeep audit logs.').digest('hex'),
+      changed: true,
+      impact: {
+        requirements: [expect.objectContaining({ id: 'REQ-REPORTING' })],
+        unfinishedSteps: [expect.objectContaining({ id: 'step_1' })],
+        evidence: [expect.objectContaining({ id: 'evidence_1' })]
+      }
+    });
+    expect(repository.updateProject).not.toHaveBeenCalled();
+    expect(repository.writeAudit).not.toHaveBeenCalled();
+    await app.close();
+  });
+
+  it('reviews clearing a specification against the cleared value and saves only after matching review metadata', async () => {
+    const currentSpecification = 'Build reporting.\nKeep audit logs.';
+    const baseSpecificationHash = createHash('sha256').update(currentSpecification).digest('hex');
+    const repository = {
+      getCurrentUser: vi.fn(async () => ownerUser),
+      getProject: vi.fn(async () => ({
+        id: 'project_1',
+        name: 'Project',
+        projectContract: {
+          version: 1,
+          summary: 'Reporting',
+          invariants: [],
+          prohibitedSubstitutes: [],
+          requirements: [{
+            id: 'REQ-REPORTING',
+            title: 'Reporting',
+            description: 'Build reporting.',
+            acceptanceCriteria: ['Reports render.'],
+            briefReferences: ['reporting']
+          }],
+          releaseCriteria: ['Ready']
+        }
+      })),
+      getProjectSpecifications: vi.fn(async () => ({
+        projectId: 'project_1',
+        current: {
+          id: 'spec_1',
+          projectId: 'project_1',
+          version: 1,
+          fullSpecification: currentSpecification,
+          changeSummary: 'Initial brief.',
+          source: 'initial_brief',
+          createdAt: '2026-08-10T10:00:00.000Z'
+        },
+        versions: []
+      })),
+      getProjectRoadmap: vi.fn(async () => ({
+        projectId: 'project_1',
+        cycles: [],
+        steps: [],
+        evidence: [],
+        capabilities: [],
+        auditJobs: []
+      })),
+      updateProject: vi.fn(async (id: string, input: Record<string, unknown>) => ({
+        id,
+        name: 'Project',
+        slug: 'project',
+        defaultBranch: 'main',
+        brief: input.brief ?? undefined,
+        isActive: true,
+        createdAt: '',
+        updatedAt: ''
+      }))
+    };
+    const app = Fastify();
+    const auth = createAuthService();
+    const headers = createOwnerAuthenticatedHeaders(auth);
+    registerRoutes(app, repository as never, undefined, auth);
+
+    const reviewResponse = await app.inject({
+      method: 'POST',
+      url: '/api/projects/project_1/specification-review',
+      headers,
+      payload: { brief: null }
+    });
+    const review = reviewResponse.json();
+
+    expect(reviewResponse.statusCode).toBe(200);
+    expect(review).toMatchObject({
+      baseSpecificationVersion: 1,
+      baseSpecificationHash,
+      changed: true
+    });
+    expect(review.diff.filter((line: { type: string }) => line.type === 'added')).toEqual([]);
+    expect(review.diff.filter((line: { type: string }) => line.type === 'removed')).toEqual([
+      expect.objectContaining({ text: 'Build reporting.' }),
+      expect.objectContaining({ text: 'Keep audit logs.' })
+    ]);
+
+    const saveResponse = await app.inject({
+      method: 'PATCH',
+      url: '/api/projects/project_1',
+      headers,
+      payload: {
+        brief: null,
+        specificationReview: {
+          baseSpecificationVersion: review.baseSpecificationVersion,
+          baseSpecificationHash: review.baseSpecificationHash
+        }
+      }
+    });
+
+    expect(saveResponse.statusCode).toBe(200);
+    expect(repository.updateProject).toHaveBeenCalledWith('project_1', { brief: null });
+    await app.close();
+  });
+
+  it('rejects a specification save when the reviewed base version is stale', async () => {
+    const repository = {
+      getCurrentUser: vi.fn(async () => ownerUser),
+      getProjectSpecifications: vi.fn(async () => ({
+        projectId: 'project_1',
+        current: {
+          id: 'spec_2',
+          projectId: 'project_1',
+          version: 2,
+          fullSpecification: 'Newer specification.',
+          changeSummary: 'Updated.',
+          source: 'manual_revision',
+          createdAt: '2026-08-10T11:00:00.000Z'
+        },
+        versions: []
+      })),
+      updateProject: vi.fn()
+    };
+    const app = Fastify();
+    const auth = createAuthService();
+    const headers = createOwnerAuthenticatedHeaders(auth);
+    registerRoutes(app, repository as never, undefined, auth);
+
+    const response = await app.inject({
+      method: 'PATCH',
+      url: '/api/projects/project_1',
+      headers,
+      payload: {
+        brief: 'Reviewed project objective with enough detail.',
+        specificationReview: {
+          baseSpecificationVersion: 1,
+          baseSpecificationHash: createHash('sha256').update('Older specification.').digest('hex')
+        }
+      }
+    });
+
+    expect(response.statusCode).toBe(409);
+    expect(response.json()).toEqual({ error: 'Specification changed after review. Review the latest diff before saving.' });
+    expect(repository.updateProject).not.toHaveBeenCalled();
+    await app.close();
+  });
+
+  it('requires specification review metadata for brief saves while allowing unrelated project updates', async () => {
+    const repository = {
+      getCurrentUser: vi.fn(async () => ownerUser),
+      updateProject: vi.fn(async (id: string, input: Record<string, unknown>) => ({
+        id,
+        name: input.name ?? 'Project',
+        slug: 'project',
+        defaultBranch: input.defaultBranch ?? 'main',
+        isActive: true,
+        createdAt: '',
+        updatedAt: ''
+      })),
+      getProjectSpecifications: vi.fn()
+    };
+    const app = Fastify();
+    const auth = createAuthService();
+    const headers = createOwnerAuthenticatedHeaders(auth);
+    registerRoutes(app, repository as never, undefined, auth);
+
+    const unrelatedResponse = await app.inject({
+      method: 'PATCH',
+      url: '/api/projects/project_1',
+      headers,
+      payload: { name: 'Renamed project' }
+    });
+
+    expect(unrelatedResponse.statusCode).toBe(200);
+    expect(repository.updateProject).toHaveBeenCalledWith('project_1', { name: 'Renamed project' });
+
+    const briefResponse = await app.inject({
+      method: 'PATCH',
+      url: '/api/projects/project_1',
+      headers,
+      payload: { brief: 'Changed project specification with enough detail.' }
+    });
+
+    expect(briefResponse.statusCode).toBe(409);
+    expect(briefResponse.json()).toEqual({ error: 'Review the specification diff and impact before saving a changed specification.' });
+    expect(repository.updateProject).toHaveBeenCalledTimes(1);
+    expect(repository.getProjectSpecifications).not.toHaveBeenCalled();
+    await app.close();
+  });
+
   it('returns immutable project contract history with the current pointer', async () => {
     const current = {
       id: 'contract_2', projectId: 'project_1', specificationVersionId: 'spec_2', version: 2,
@@ -909,15 +1196,13 @@ describe('Studio API routes', () => {
       headers,
       payload: {
         name: 'Updated demo',
-        defaultBranch: 'develop',
-        brief: 'Updated project objective with enough detail.'
+        defaultBranch: 'develop'
       }
     });
     expect(patchProjectResponse.statusCode).toBe(200);
     expect(repository.updateProject).toHaveBeenCalledWith('project_1', {
       name: 'Updated demo',
-      defaultBranch: 'develop',
-      brief: 'Updated project objective with enough detail.'
+      defaultBranch: 'develop'
     });
 
     const clearProjectBriefResponse = await app.inject({
@@ -926,8 +1211,8 @@ describe('Studio API routes', () => {
       headers,
       payload: { brief: null }
     });
-    expect(clearProjectBriefResponse.statusCode).toBe(200);
-    expect(repository.updateProject).toHaveBeenLastCalledWith('project_1', { brief: null });
+    expect(clearProjectBriefResponse.statusCode).toBe(409);
+    expect(repository.updateProject).toHaveBeenCalledTimes(1);
 
     const validationProfile = {
       version: 1 as const,

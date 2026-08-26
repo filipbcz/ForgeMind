@@ -30,6 +30,7 @@ import type {
   ProjectArchitectureSnapshotApi,
   ProjectContractSnapshotApi,
   ProjectRoadmapApi,
+  SpecificationChangeImpactReviewApi,
   ProjectSpecificationSnapshotApi,
   ProjectSummary,
   TaskApi,
@@ -153,6 +154,16 @@ export async function fetchProjectRoadmap(projectId: string): Promise<ProjectRoa
 
 export async function fetchProjectSpecifications(projectId: string): Promise<ProjectSpecificationSnapshotApi> {
   return request<ProjectSpecificationSnapshotApi>(`/api/projects/${projectId}/specifications`);
+}
+
+export async function reviewProjectSpecificationChange(
+  projectId: string,
+  input: { brief: string | null }
+): Promise<SpecificationChangeImpactReviewApi> {
+  return request<SpecificationChangeImpactReviewApi>(`/api/projects/${projectId}/specification-review`, {
+    method: 'POST',
+    body: JSON.stringify(input)
+  });
 }
 
 export async function fetchProjectContracts(projectId: string): Promise<ProjectContractSnapshotApi> {

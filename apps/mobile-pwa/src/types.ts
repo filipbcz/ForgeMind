@@ -221,6 +221,36 @@ export interface ProjectSpecificationSnapshotApi {
   versions: ProjectSpecificationVersionApi[];
 }
 
+export interface SpecificationChangeImpactReviewApi {
+  projectId: string;
+  baseSpecificationVersion?: number;
+  baseSpecificationHash?: string;
+  changed: boolean;
+  diff: Array<{
+    type: 'unchanged' | 'added' | 'removed';
+    oldLineNumber?: number;
+    newLineNumber?: number;
+    text: string;
+  }>;
+  impact: {
+    requirements: Array<{ id: string; title: string; reason: string }>;
+    unfinishedSteps: Array<{
+      id: string;
+      title: string;
+      status: ProjectImplementationStepStatus;
+      requirementIds: string[];
+    }>;
+    evidence: Array<{
+      id: string;
+      requirementId: string;
+      criterion: string;
+      status: AcceptanceEvidenceApi['status'];
+      contractVersion: number;
+      source: AcceptanceEvidenceApi['source'];
+    }>;
+  };
+}
+
 export interface ProjectImplementationStepApi {
   id: string;
   projectId: string;
@@ -730,6 +760,10 @@ export interface UpdateProjectRequest {
   defaultBranch?: string;
   configYaml?: string;
   brief?: string | null;
+  specificationReview?: {
+    baseSpecificationVersion?: number;
+    baseSpecificationHash?: string;
+  };
   validationProfile?: ProjectValidationProfileApi | null;
   autoCreatePullRequest?: boolean;
   autoMergePullRequest?: boolean;
