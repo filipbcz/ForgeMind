@@ -1,4 +1,7 @@
-import type { AcceptanceEvidenceSource, AcceptanceEvidenceStatus, ApprovalType, ProjectArchitectureUpdate, ProjectContract, ProjectContractDelta, ProjectContractRequirement, ProviderKind, ValidationCheckCategory } from '@forgemind/core';
+import { redactError } from '@forgemind/core';
+import type { AcceptanceEvidenceSource, AcceptanceEvidenceStatus, ApprovalType, NormalizedProviderErrorDetails, NormalizedProviderErrorKind, ProjectArchitectureUpdate, ProjectContract, ProjectContractDelta, ProjectContractRequirement, ProviderKind, ProviderPreflightResult, ValidationCheckCategory } from '@forgemind/core';
+
+export type { NormalizedProviderErrorDetails, NormalizedProviderErrorKind, ProviderPreflightResult } from '@forgemind/core';
 
 export interface ProviderActivity {
   kind: 'lifecycle' | 'stdout' | 'stderr' | 'workspace';
@@ -238,6 +241,119 @@ export class ProviderContractError extends Error {
   }
 }
 
+export class NormalizedProviderError extends Error implements NormalizedProviderErrorDetails {
+  readonly provider: ProviderKind;
+  readonly kind: NormalizedProviderErrorKind;
+  readonly auditSafeMessage: string;
+  readonly retryable: boolean;
+  readonly statusCode?: number;
+
+  constructor(details: NormalizedProviderErrorDetails, options?: { cause?: unknown }) {
+    super(details.message, options);
+    this.name = 'NormalizedProviderError';
+    this.provider = details.provider;
+    this.kind = details.kind;
+    this.auditSafeMessage = details.auditSafeMessage;
+    this.retryable = details.retryable;
+    this.statusCode = details.statusCode;
+  }
+
+  toJSON(): NormalizedProviderErrorDetails {
+    return this.toDetails();
+  }
+
+  toDetails(): NormalizedProviderErrorDetails {
+    return {
+      provider: this.provider,
+      kind: this.kind,
+      message: this.message,
+      auditSafeMessage: this.auditSafeMessage,
+      retryable: this.retryable,
+      ...(this.statusCode === undefined ? {} : { statusCode: this.statusCode })
+    };
+  }
+}
+
+export function normalizeProviderError(
+  provider: ProviderKind,
+  error: unknown,
+  fallbackMessage = 'Provider request failed.'
+): NormalizedProviderError {
+  if (error instanceof NormalizedProviderError) return error;
+
+  const statusCode = readStatusCode(error);
+  const rawMessage = readErrorMessage(error) ?? fallbackMessage;
+  const kind = classifyProviderError(error, rawMessage, statusCode);
+  const auditSafeMessage = redactError(rawMessage);
+  return new NormalizedProviderError({
+    provider,
+    kind,
+    message: auditSafeMessage || fallbackMessage,
+    auditSafeMessage: auditSafeMessage || fallbackMessage,
+    retryable: kind === 'timeout' || kind === 'unavailable',
+    statusCode
+  }, { cause: error });
+}
+
+export async function normalizeProviderPreflight(
+  provider: ProviderKind,
+  check: () => Promise<void>
+): Promise<ProviderPreflightResult> {
+  const checkedAt = new Date().toISOString();
+  try {
+    await check();
+    return { provider, ok: true, checkedAt };
+  } catch (error) {
+    const normalized = normalizeProviderError(provider, error, `${provider} provider preflight failed.`);
+    return {
+      provider,
+      ok: false,
+      checkedAt,
+      error: normalized.toDetails()
+    };
+  }
+}
+
+function classifyProviderError(
+  error: unknown,
+  message: string,
+  statusCode?: number
+): NormalizedProviderErrorKind {
+  if (error instanceof ProviderContractError) return 'invalid_response';
+  if (statusCode === 401 || statusCode === 403) return 'authentication';
+  if (statusCode === 429) return 'quota';
+  if (statusCode === 408 || statusCode === 504) return 'timeout';
+  if (statusCode && statusCode >= 500) return 'unavailable';
+
+  const normalized = message.toLowerCase();
+  if (error instanceof Error && error.name === 'AbortError') return 'timeout';
+  if (/\b(?:timeout|timed out|aborted)\b/.test(normalized)) return 'timeout';
+  if (/\b(?:unauthorized|forbidden|invalid[\s_-]?api[\s_-]?key|api[\s_-]?key|required|not active|login|auth(?:entication)?)\b/.test(normalized)) {
+    return 'authentication';
+  }
+  if (/\b(?:quota|rate[\s_-]?limit|insufficient[\s_-]?quota|billing)\b/.test(normalized)) return 'quota';
+  if (/\b(?:invalid json|invalid response|malformed|must return|empty response)\b/.test(normalized)) {
+    return 'invalid_response';
+  }
+  return 'unknown';
+}
+
+function readStatusCode(error: unknown): number | undefined {
+  if (!error || typeof error !== 'object') return undefined;
+  const status = (error as { status?: unknown; statusCode?: unknown }).status
+    ?? (error as { status?: unknown; statusCode?: unknown }).statusCode;
+  return typeof status === 'number' ? status : undefined;
+}
+
+function readErrorMessage(error: unknown): string | undefined {
+  if (error instanceof Error) return error.message;
+  if (error && typeof error === 'object' && typeof (error as { message?: unknown }).message === 'string') {
+    return (error as { message: string }).message;
+  }
+  const message = String(error || '').trim();
+  return message || undefined;
+}
+
 export function parseProviderJsonObject(content: string, operation: string): Record<string, unknown> {
   const jsonStart = content.indexOf('{');
   const jsonEnd = content.lastIndexOf('}');
@@ -437,6 +553,7 @@ export interface CostEstimateResult {
 
 export interface AIProvider {
   kind: ProviderKind;
+  preflight(signal?: AbortSignal): Promise<ProviderPreflightResult>;
   plan(input: PlanInput): Promise<PlanResult>;
   repairRoadmap?(input: RoadmapRepairInput): Promise<RoadmapRepairResult>;
   implement(input: ImplementInput): Promise<ImplementResult>;

@@ -9,11 +9,13 @@ import type {
   ImplementResult,
   PlanInput,
   PlanResult,
+  ProviderPreflightResult,
   ReleaseAuditInput,
   ReleaseAuditResult,
   ReviewInput,
   ReviewResult
 } from './provider.js';
+import { normalizeProviderPreflight } from './provider.js';
 import type { ProviderRuntimeConfig } from './index.js';
 import type { ProviderModelOption } from './openai-provider.js';
 
@@ -28,6 +30,12 @@ export class GitHubCopilotProvider implements AIProvider {
   readonly kind: ProviderKind = 'github_copilot';
 
   constructor(_config?: ProviderRuntimeConfig) {}
+
+  async preflight(): Promise<ProviderPreflightResult> {
+    return normalizeProviderPreflight(this.kind, async () => {
+      throw new Error(GITHUB_COPILOT_FROZEN_MESSAGE);
+    });
+  }
 
   async plan(_input: PlanInput): Promise<PlanResult> {
     throw new Error(GITHUB_COPILOT_FROZEN_MESSAGE);

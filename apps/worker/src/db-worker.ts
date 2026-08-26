@@ -1042,6 +1042,9 @@ function createPolicyAwareProvider(input: {
 
   const provider: AIProvider = {
     kind: input.primary.kind,
+    async preflight(signal) {
+      return callWithFallback('preflight', (provider) => provider.preflight(signal), signal);
+    },
     supportsLocalRepo: () => input.primary.provider.supportsLocalRepo(),
     supportsGitHubNativeFlow: () => input.primary.provider.supportsGitHubNativeFlow(),
     async plan(planInput) {

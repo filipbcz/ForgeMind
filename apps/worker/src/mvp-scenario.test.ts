@@ -52,6 +52,7 @@ function createTask(projectId: string, title: string): ForgeTask {
 function createPassingProvider(): AIProvider {
   return {
     kind: 'codex',
+    async preflight() { return { provider: 'codex', ok: true, checkedAt: new Date().toISOString() }; },
     async plan(_input: PlanInput): Promise<PlanResult> {
       return {
         summary: 'Plan summary',
@@ -95,6 +96,7 @@ function createPassingProvider(): AIProvider {
 function createApprovalProvider(approvalRequired: boolean): AIProvider {
   return {
     kind: 'codex',
+    async preflight() { return { provider: 'codex', ok: true, checkedAt: new Date().toISOString() }; },
     async plan(_input: PlanInput): Promise<PlanResult> {
       return {
         summary: 'Plan summary',

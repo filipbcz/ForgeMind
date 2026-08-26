@@ -7,8 +7,10 @@ import type {
   CostEstimateResult,
   ImplementInput,
   ImplementResult,
+  NormalizedProviderError,
   PlanInput,
   PlanResult,
+  ProviderPreflightResult,
   ReleaseAuditInput,
   ReleaseAuditResult,
   RoadmapRepairInput,
@@ -16,7 +18,7 @@ import type {
   ReviewInput,
   ReviewResult
 } from './provider.js';
-import { normalizeValidationChecks, parseImplementResult, parsePlanResult, parseProviderJsonObject, parseReviewResult } from './provider.js';
+import { ProviderContractError, normalizeProviderError, normalizeProviderPreflight, normalizeValidationChecks, parseImplementResult, parsePlanResult, parseProviderJsonObject, parseReviewResult } from './provider.js';
 import { emitCapturedUsage, normalizeTokenBreakdown } from './provider-usage.js';
 import { buildReviewPrompt } from './review-prompt.js';
 import { buildCapabilityAuditPrompt, buildReleaseAuditPrompt, normalizeAuditContentWithSingleRepair, normalizeCapabilityAuditResult, normalizeReleaseAuditResult } from './audit-prompt.js';
@@ -32,20 +34,15 @@ export interface ProviderModelOption {
 }
 
 export async function listOpenAIModels(apiKey: string, apiBaseUrl = process.env.OPENAI_API_BASE_URL ?? DEFAULT_OPENAI_API_URL): Promise<ProviderModelOption[]> {
-  const url = new URL(apiBaseUrl);
-  if (/\/(?:chat\/completions|responses)\/?$/.test(url.pathname)) {
-    url.pathname = url.pathname.replace(/\/(?:chat\/completions|responses)\/?$/, '/models');
-  } else if (!/\/models\/?$/.test(url.pathname)) {
-    url.pathname = `${url.pathname.replace(/\/$/, '')}/models`;
-  }
+  const url = buildOpenAIModelsUrl(apiBaseUrl);
   const response = await fetch(url, {
     headers: { Authorization: `Bearer ${apiKey}` }
   });
   if (!response.ok) {
-    throw new Error(`OpenAI model listing failed with ${response.status}: ${await response.text()}`);
+    throw normalizeOpenAIHttpError(response, 'OpenAI model listing failed.');
   }
 
-  const payload = (await response.json()) as { data?: Array<{ id?: string; owned_by?: string }> };
+  const payload = await readProviderJson<{ data?: Array<{ id?: string; owned_by?: string }> }>(response, 'OpenAI model listing');
   return (payload.data ?? [])
     .filter((model): model is { id: string; owned_by?: string } => Boolean(model.id))
     .map((model) => ({ id: model.id, name: model.owned_by ? `${model.id} (${model.owned_by})` : model.id }))
@@ -71,6 +68,19 @@ export class OpenAIProvider implements AIProvider {
     this.apiKey = key;
     this.apiBaseUrl = process.env.OPENAI_API_BASE_URL ?? DEFAULT_OPENAI_API_URL;
     this.model = config?.model?.trim() || (process.env.OPENAI_MODEL ?? DEFAULT_OPENAI_MODEL);
+  }
+
+  async preflight(signal?: AbortSignal): Promise<ProviderPreflightResult> {
+    return normalizeProviderPreflight(this.kind, async () => {
+      const response = await fetch(buildOpenAIModelsUrl(this.apiBaseUrl), {
+        headers: { Authorization: `Bearer ${this.apiKey}` },
+        signal
+      });
+      if (!response.ok) {
+        throw normalizeOpenAIHttpError(response, 'OpenAI preflight failed.');
+      }
+      await readProviderJson(response, 'OpenAI preflight');
+    });
   }
 
   async plan(input: PlanInput): Promise<PlanResult> {
@@ -110,11 +120,15 @@ export class OpenAIProvider implements AIProvider {
     const content = response.content;
     await emitCapturedUsage(input.onActivity, response.usage);
 
-    return {
-      ...parsePlanResult(content, 'OpenAI plan'),
-      providerPrompt: serializeMessages(messages),
-      providerResponse: content
-    };
+    try {
+      return {
+        ...parsePlanResult(content, 'OpenAI plan'),
+        providerPrompt: serializeMessages(messages),
+        providerResponse: content
+      };
+    } catch (error) {
+      throw normalizeProviderError(this.kind, error);
+    }
   }
 
   async repairRoadmap(input: RoadmapRepairInput): Promise<RoadmapRepairResult> {
@@ -138,11 +152,15 @@ export class OpenAIProvider implements AIProvider {
     ];
     const response = await this.requestChat(messages);
     await emitCapturedUsage(input.onActivity, response.usage);
-    return {
-      ...parseProviderJsonObject(response.content, 'OpenAI roadmap repair') as unknown as RoadmapRepairResult,
-      providerPrompt: serializeMessages(messages),
-      providerResponse: response.content
-    };
+    try {
+      return {
+        ...parseProviderJsonObject(response.content, 'OpenAI roadmap repair') as unknown as RoadmapRepairResult,
+        providerPrompt: serializeMessages(messages),
+        providerResponse: response.content
+      };
+    } catch (error) {
+      throw normalizeProviderError(this.kind, error);
+    }
   }
 
   async implement(input: ImplementInput): Promise<ImplementResult> {
@@ -171,17 +189,21 @@ export class OpenAIProvider implements AIProvider {
     const content = response.content;
     await emitCapturedUsage(input.onActivity, response.usage);
 
-    const result = parseImplementResult(content, 'OpenAI implementation', true);
-    if (result.outcome === 'already_satisfied') {
-      result.changedFiles = [];
-      result.diffStat = { filesChanged: 0, insertions: 0, deletions: 0 };
-      result.fileUpdates = [];
-    }
-    result.validationChecks = normalizeValidationChecks(result.validationChecks);
-    result.providerPrompt = serializeMessages(messages);
-    result.providerResponse = content;
+    try {
+      const result = parseImplementResult(content, 'OpenAI implementation', true);
+      if (result.outcome === 'already_satisfied') {
+        result.changedFiles = [];
+        result.diffStat = { filesChanged: 0, insertions: 0, deletions: 0 };
+        result.fileUpdates = [];
+      }
+      result.validationChecks = normalizeValidationChecks(result.validationChecks);
+      result.providerPrompt = serializeMessages(messages);
+      result.providerResponse = content;
 
-    return result;
+      return result;
+    } catch (error) {
+      throw normalizeProviderError(this.kind, error);
+    }
   }
 
   async review(input: ReviewInput): Promise<ReviewResult> {
@@ -200,11 +222,15 @@ export class OpenAIProvider implements AIProvider {
     const content = response.content;
     await emitCapturedUsage(input.onActivity, response.usage);
 
-    return {
-      ...parseReviewResult(content, 'OpenAI review'),
-      providerPrompt: serializeMessages(messages),
-      providerResponse: content
-    };
+    try {
+      return {
+        ...parseReviewResult(content, 'OpenAI review'),
+        providerPrompt: serializeMessages(messages),
+        providerResponse: content
+      };
+    } catch (error) {
+      throw normalizeProviderError(this.kind, error);
+    }
   }
 
   async auditCapability(input: CapabilityAuditInput): Promise<CapabilityAuditResult> {
@@ -302,45 +328,77 @@ export class OpenAIProvider implements AIProvider {
     messages: Array<{ role: 'system' | 'user' | 'assistant'; content: string }>,
     signal?: AbortSignal
   ): Promise<{ content: string; usage?: import('./provider.js').ProviderUsageMeasurement }> {
-    const response = await fetch(this.apiBaseUrl, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        Authorization: `Bearer ${this.apiKey}`
-      },
-      signal,
-      body: JSON.stringify({
-        model: this.model,
-        messages,
-        temperature: 0.2,
-        max_tokens: 800
-      })
-    });
+    try {
+      const response = await fetch(this.apiBaseUrl, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${this.apiKey}`
+        },
+        signal,
+        body: JSON.stringify({
+          model: this.model,
+          messages,
+          temperature: 0.2,
+          max_tokens: 800
+        })
+      });
 
-    if (!response.ok) {
-      const text = await response.text();
-      throw new Error(`OpenAI request failed with ${response.status}: ${text}`);
-    }
+      if (!response.ok) {
+        throw normalizeOpenAIHttpError(response, 'OpenAI request failed.');
+      }
 
-    const data = (await response.json()) as {
-      choices?: Array<{ message?: { content?: string } }>;
-      usage?: {
-        prompt_tokens?: number;
-        completion_tokens?: number;
-        total_tokens?: number;
-        prompt_tokens_details?: { cached_tokens?: number };
+      const data = await readProviderJson<{
+        choices?: Array<{ message?: { content?: string } }>;
+        usage?: {
+          prompt_tokens?: number;
+          completion_tokens?: number;
+          total_tokens?: number;
+          prompt_tokens_details?: { cached_tokens?: number };
+        };
+      }>(response, 'OpenAI request');
+      const content = data.choices?.[0]?.message?.content?.trim() ?? '';
+      if (!content) {
+        throw new ProviderContractError('OpenAI request returned an empty response.');
+      }
+      return {
+        content,
+        usage: normalizeTokenBreakdown({
+          provider: 'openai',
+          model: this.model,
+          inputTokens: data.usage?.prompt_tokens,
+          outputTokens: data.usage?.completion_tokens,
+          cachedTokens: data.usage?.prompt_tokens_details?.cached_tokens,
+          totalTokens: data.usage?.total_tokens
+        })
       };
-    };
-    return {
-      content: data.choices?.[0]?.message?.content?.trim() ?? '',
-      usage: normalizeTokenBreakdown({
-        provider: 'openai',
-        model: this.model,
-        inputTokens: data.usage?.prompt_tokens,
-        outputTokens: data.usage?.completion_tokens,
-        cachedTokens: data.usage?.prompt_tokens_details?.cached_tokens,
-        totalTokens: data.usage?.total_tokens
-      })
-    };
+    } catch (error) {
+      throw normalizeProviderError(this.kind, error);
+    }
+  }
+}
+
+function buildOpenAIModelsUrl(apiBaseUrl: string): URL {
+  const url = new URL(apiBaseUrl);
+  if (/\/(?:chat\/completions|responses)\/?$/.test(url.pathname)) {
+    url.pathname = url.pathname.replace(/\/(?:chat\/completions|responses)\/?$/, '/models');
+  } else if (!/\/models\/?$/.test(url.pathname)) {
+    url.pathname = `${url.pathname.replace(/\/$/, '')}/models`;
+  }
+  return url;
+}
+
+function normalizeOpenAIHttpError(response: Response, message: string): NormalizedProviderError {
+  return normalizeProviderError('openai', {
+    status: response.status,
+    message: `${message} HTTP ${response.status}.`
+  });
+}
+
+async function readProviderJson<T>(response: Response, operation: string): Promise<T> {
+  try {
+    return await response.json() as T;
+  } catch (error) {
+    throw new ProviderContractError(`${operation} returned invalid JSON.`);
   }
 }
