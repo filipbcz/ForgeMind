@@ -456,6 +456,26 @@ export async function runDatabaseWorkerOnce(options: { deferInterruptSignals?: b
                 : null
             }
           });
+          if (normalizedUsage) {
+            await handleWorkerLimitsOrThrow(
+              repository,
+              claimed.task.id,
+              {
+                iterations: attemptCount,
+                runtimeMinutes: (Date.now() - startedAtMs) / 60_000,
+                changedFiles,
+                diffLines,
+                repeatedErrorCount,
+                estimatedCostUsd: costEstimate.estimatedCostUsd,
+                actualCostUsd: measuredUsage.completeCost ? measuredUsage.actualCostUsd : undefined
+              },
+              limits,
+              resumeContext?.ignoredLimitSignals ?? [],
+              claimed.task.mode,
+              new Set((projectConfig?.approval.required_for ?? []).filter(isApprovalType)),
+              claimed.project.allowSafeOperationsWithoutApproval ?? false
+            );
+          }
         },
         onIteration: async (iteration) => {
           iterationNumber += 1;

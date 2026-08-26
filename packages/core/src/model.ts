@@ -315,6 +315,9 @@ export interface Limits {
   maxChangedFiles: number;
   maxDiffLines: number;
   maxRepeatedErrorCount: number;
+  maxBudgetUsd?: number;
+  softBudgetThresholdPercent?: number;
+  hardBudgetThresholdPercent?: number;
 }
 
 export interface Project {
