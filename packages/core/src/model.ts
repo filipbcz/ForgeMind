@@ -564,6 +564,8 @@ export interface ProjectContractSnapshot {
   versions: ProjectContractVersion[];
 }
 
+export const ROADMAP_GENERATION_CONFIRMATION = 'GENERATE ROADMAP';
+
 export type AcceptanceEvidenceSource = 'validation_command' | 'github_check' | 'repository_audit' | 'artifact';
 export type AcceptanceEvidenceStatus = 'passed' | 'failed' | 'blocked' | 'deferred';
 

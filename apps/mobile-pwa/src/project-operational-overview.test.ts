@@ -187,6 +187,14 @@ describe('project operational overview layout', () => {
     expect(markup.indexOf('Spustit závěrečný audit')).toBeGreaterThan(-1);
   });
 
+  it('explains that contract save and roadmap generation are separate while preserving evidence', () => {
+    const markup = renderProjectsPanel();
+
+    expect(markup).toContain('Ulozeni zadani roadmapu nespousti.');
+    expect(markup).toContain('Nova roadmapa vznikne az po potvrzeni tady');
+    expect(markup).toContain('dokoncene kroky a jejich evidence');
+  });
+
   it('keeps active roadmap steps scoped to the latest cycle', () => {
     const sourceRoadmap: ProjectRoadmapApi = {
       ...roadmap,
