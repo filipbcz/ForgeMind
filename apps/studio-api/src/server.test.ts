@@ -160,6 +160,7 @@ describe('Studio API server', () => {
   });
 
   it('requires CSRF protection for browser-originated mutations before handlers execute', async () => {
+    useDevelopmentHttpEnv();
     app = Fastify();
     const handler = vi.fn(async () => ({ ok: true }));
     await registerHttpGuardrails(app);
