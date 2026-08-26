@@ -4,6 +4,7 @@ import { createHash, randomUUID } from 'node:crypto';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, expect, it, vi } from 'vitest';
+import { ROADMAP_GENERATION_CONFIRMATION } from '@forgemind/core';
 import type { AIProvider, CostEstimateResult, ImplementInput, ImplementResult, PlanInput, PlanResult, ReviewInput, ReviewResult } from '@forgemind/providers';
 import type { GitHubAdapter } from '@forgemind/github';
 import { createAuthService } from './auth.js';
@@ -758,6 +759,35 @@ describe('Studio API routes', () => {
     expect(response.statusCode).toBe(409);
     expect(response.json()).toEqual({ error: 'Type "GENERATE ROADMAP" to confirm roadmap generation.' });
     expect(repository.assertProjectRoadmapRegenerationAllowed).not.toHaveBeenCalled();
+    expect(repository.getProjectSpecifications).not.toHaveBeenCalled();
+    await app.close();
+  });
+
+  it('characterizes confirmed roadmap generation as a repository-gated provider route', async () => {
+    const repository = {
+      getCurrentUser: vi.fn(async () => ownerUser),
+      getProject: vi.fn(async () => ({
+        id: 'project_1', name: 'Project', slug: 'project', defaultBranch: 'main',
+        brief: '', isActive: true, createdAt: '', updatedAt: ''
+      })),
+      assertProjectRoadmapRegenerationAllowed: vi.fn(),
+      getProjectSpecifications: vi.fn()
+    };
+    const app = Fastify();
+    const auth = createAuthService();
+    const headers = createOwnerAuthenticatedHeaders(auth);
+    registerRoutes(app, repository as never, undefined, auth);
+
+    const response = await app.inject({
+      method: 'POST',
+      url: '/api/projects/project_1/implementation-steps/generate',
+      headers,
+      payload: { confirmation: ROADMAP_GENERATION_CONFIRMATION }
+    });
+
+    expect(response.statusCode).toBe(400);
+    expect(response.json()).toEqual({ error: 'Project brief is required before generating implementation steps.' });
+    expect(repository.assertProjectRoadmapRegenerationAllowed).toHaveBeenCalledWith('project_1');
     expect(repository.getProjectSpecifications).not.toHaveBeenCalled();
     await app.close();
   });

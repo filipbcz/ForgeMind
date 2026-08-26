@@ -16,6 +16,7 @@ import type {
   ProjectImplementationStepApi,
   ProjectRoadmapApi,
   ProjectRoadmapCycleApi,
+  SpecificationChangeImpactReviewApi,
   ProjectSummary
 } from './types.js';
 
@@ -91,7 +92,10 @@ const roadmap: ProjectRoadmapApi = {
   auditJobs: []
 };
 
-function renderProjectsPanel(sourceRoadmap: ProjectRoadmapApi = roadmap): string {
+function renderProjectsPanel(
+  sourceRoadmap: ProjectRoadmapApi = roadmap,
+  specificationReview?: SpecificationChangeImpactReviewApi
+): string {
   const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
 
   return renderToStaticMarkup(
@@ -108,6 +112,7 @@ function renderProjectsPanel(sourceRoadmap: ProjectRoadmapApi = roadmap): string
         specificationsLoading: false,
         contractsLoading: false,
         architecturesLoading: false,
+        specificationReview,
         saving: false,
         reviewingSpecification: false,
         updatingProject: false,
@@ -193,6 +198,39 @@ describe('project operational overview layout', () => {
     expect(markup).toContain('Ulozeni zadani roadmapu nespousti.');
     expect(markup).toContain('Nova roadmapa vznikne az po potvrzeni tady');
     expect(markup).toContain('dokoncene kroky a jejich evidence');
+  });
+
+  it('characterizes stale specification review impact before a brief can be saved', () => {
+    const review: SpecificationChangeImpactReviewApi = {
+      projectId: project.id,
+      baseSpecificationVersion: 3,
+      baseSpecificationHash: 'hash_3',
+      changed: true,
+      diff: [
+        { type: 'removed', oldLineNumber: 1, text: 'Build the original dashboard.' },
+        { type: 'added', newLineNumber: 1, text: 'Build the updated dashboard.' }
+      ],
+      impact: {
+        requirements: [{ id: 'REQ-OPS', title: 'Operations', reason: 'Brief text changed.' }],
+        unfinishedSteps: [{ id: 'step_2', title: 'Mobile action', status: 'pending', requirementIds: ['REQ-OPS'] }],
+        evidence: [{
+          id: 'evidence_1',
+          requirementId: 'REQ-OPS',
+          criterion: 'Dashboard renders.',
+          status: 'passed',
+          contractVersion: 2,
+          source: 'repository_audit'
+        }]
+      }
+    };
+
+    const markup = renderProjectsPanel(roadmap, review);
+
+    expect(markup).toContain('Kontrola pred ulozenim');
+    expect(markup).toContain('Zakladni verze 3');
+    expect(markup).toContain('REQ-OPS');
+    expect(markup).toContain('Text zadani se od kontroly zmenil. Spust kontrolu znovu pred ulozenim.');
+    expect(markup).toMatch(/<button class="primary-action" type="button" disabled="">[\s\S]*Ulozit po kontrole<\/button>/);
   });
 
   it('keeps active roadmap steps scoped to the latest cycle', () => {
