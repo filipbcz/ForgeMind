@@ -77,7 +77,6 @@ import {
 } from './api.js';
 import { subscribeForPushNotifications, unsubscribeFromPushNotifications } from './pwa.js';
 import type {
-  AcceptanceEvidenceApi,
   ApprovalSummary,
   AssignProjectRepositoryRequest,
   AuditEventApi,
@@ -91,11 +90,8 @@ import type {
   GitHubAdapterStatusApi,
   GitHubBranchApi,
   ProjectArchitectureSnapshotApi,
-  ProjectAuditJobApi,
   ProjectContractSnapshotApi,
-  ProjectImplementationStepApi,
   ProjectRoadmapApi,
-  ProjectRoadmapCycleApi,
   ProjectSpecificationSnapshotApi,
   SpecificationChangeImpactReviewApi,
   GitHubRepositoryApi,
@@ -124,79 +120,29 @@ import {
   resolveCurrentActivity,
   sanitizeProviderActivityDetail
 } from './activity-display.js';
+import {
+  canStartProjectAudit,
+  projectAuditMatchesStatusFilter,
+  projectCycleMatchesStatusFilter,
+  projectEvidenceMatchesStatusFilter,
+  projectItemStatusFilters,
+  projectRoadmapViews,
+  projectStepMatchesStatusFilter
+} from './project-roadmap-domain.js';
+import type { ProjectItemStatusFilter, ProjectRoadmapView } from './project-roadmap-domain.js';
+import { useSelectedProject, useSelectedTask } from './use-mobile-selection.js';
+
+export {
+  canStartProjectAudit,
+  projectAuditMatchesStatusFilter,
+  projectCycleMatchesStatusFilter,
+  projectEvidenceMatchesStatusFilter,
+  projectStepMatchesStatusFilter
+} from './project-roadmap-domain.js';
+export type { ProjectItemStatusFilter } from './project-roadmap-domain.js';
 
 type View = 'tasks' | 'new-task' | 'approvals' | 'projects' | 'settings';
 type RealtimeUiState = 'connected' | 'reconnecting' | 'fallback';
-type ProjectRoadmapView = 'roadmap' | 'history' | 'contract' | 'evidence' | 'audit';
-export type ProjectItemStatusFilter = 'active' | 'waiting' | 'failed' | 'completed';
-
-const projectRoadmapViews: Array<{ id: ProjectRoadmapView; label: string }> = [
-  { id: 'roadmap', label: 'Roadmap' },
-  { id: 'history', label: 'Historie cyklů' },
-  { id: 'contract', label: 'Kontrakt' },
-  { id: 'evidence', label: 'Evidence' },
-  { id: 'audit', label: 'Audity' }
-];
-
-const projectItemStatusFilters: Array<{ id: ProjectItemStatusFilter; label: string }> = [
-  { id: 'active', label: 'Aktivní' },
-  { id: 'waiting', label: 'Čekající' },
-  { id: 'failed', label: 'Selhané' },
-  { id: 'completed', label: 'Dokončené' }
-];
-
-export function projectStepMatchesStatusFilter(
-  step: ProjectImplementationStepApi,
-  filter: ProjectItemStatusFilter
-): boolean {
-  if (filter === 'active') return step.status === 'pending' || step.status === 'running';
-  if (filter === 'waiting') return step.status === 'waiting_for_capability';
-  if (filter === 'failed') return step.status === 'cancelled';
-  return step.status === 'completed';
-}
-
-export function projectCycleMatchesStatusFilter(
-  cycle: ProjectRoadmapCycleApi,
-  filter: ProjectItemStatusFilter
-): boolean {
-  if (filter === 'active') return cycle.status === 'active' || cycle.status === 'verifying' || cycle.status === 'partial';
-  if (filter === 'waiting') return cycle.status === 'awaiting_extension_approval';
-  if (filter === 'failed') return cycle.status === 'blocked';
-  return cycle.status === 'completed';
-}
-
-export function projectAuditMatchesStatusFilter(
-  job: ProjectAuditJobApi,
-  filter: ProjectItemStatusFilter
-): boolean {
-  if (filter === 'active') return job.status === 'claimed';
-  if (filter === 'waiting') return job.status === 'pending';
-  if (filter === 'failed') return job.status === 'failed' || job.status === 'blocked';
-  return job.status === 'succeeded';
-}
-
-export function projectEvidenceMatchesStatusFilter(
-  evidence: AcceptanceEvidenceApi,
-  filter: ProjectItemStatusFilter
-): boolean {
-  if (filter === 'active') return false;
-  if (filter === 'waiting') return evidence.status === 'deferred';
-  if (filter === 'failed') return evidence.status === 'failed' || evidence.status === 'blocked';
-  return evidence.status === 'passed';
-}
-
-export function canStartProjectAudit(
-  cycle: ProjectRoadmapCycleApi | undefined,
-  steps: ProjectImplementationStepApi[],
-  auditJob: ProjectAuditJobApi | undefined
-): boolean {
-  return Boolean(
-    cycle?.status === 'active'
-    && steps.length > 0
-    && steps.every((step) => step.status === 'completed')
-    && (!auditJob || auditJob.status === 'succeeded')
-  );
-}
 
 const terminalStatuses = new Set<TaskSummary['status']>([
   'completed',
@@ -289,8 +235,6 @@ const statusIcons: Record<TaskSummary['status'], typeof Clock3> = {
 export function App() {
   const queryClient = useQueryClient();
   const [view, setView] = useState<View>('tasks');
-  const [selectedTaskId, setSelectedTaskId] = useState<string>('');
-  const [selectedProjectId, setSelectedProjectId] = useState<string>('');
   const [globalRealtimeState, setGlobalRealtimeState] = useState<RealtimeUiState>('fallback');
   const [taskRealtimeState, setTaskRealtimeState] = useState<RealtimeUiState>('fallback');
   const [globalRealtimeMeta, setGlobalRealtimeMeta] = useState<RealtimeConnectionMeta>({ state: 'idle' });
@@ -339,14 +283,7 @@ export function App() {
   const githubAdapterStatus = githubAdapterStatusQuery.data;
   const githubRepositories = githubRepositoriesQuery.data ?? [];
   const githubRepositoryOwners = githubRepositoryOwnersQuery.data ?? [];
-
-  useEffect(() => {
-    if (!selectedProjectId && projects[0]) {
-      setSelectedProjectId(projects[0].id);
-    }
-  }, [projects, selectedProjectId]);
-
-  const selectedProject = useMemo(() => projects.find((project) => project.id === selectedProjectId) ?? projects[0], [projects, selectedProjectId]);
+  const { selectedProject, setSelectedProjectId } = useSelectedProject(projects);
   const projectRoadmapQuery = useQuery({
     queryKey: ['projects', selectedProject?.id, 'roadmap'],
     queryFn: () => fetchProjectRoadmap(selectedProject?.id ?? ''),
@@ -372,13 +309,7 @@ export function App() {
     retry: 1
   });
 
-  useEffect(() => {
-    if (!selectedTaskId && tasks[0]) {
-      setSelectedTaskId(tasks[0].id);
-    }
-  }, [selectedTaskId, tasks]);
-
-  const selectedTask = useMemo(() => tasks.find((task) => task.id === selectedTaskId) ?? tasks[0], [selectedTaskId, tasks]);
+  const { selectedTask, setSelectedTaskId } = useSelectedTask(tasks);
   const selectedTaskIsActive = activeStatuses.has(selectedTask?.status ?? 'draft');
   const selectedTaskPollInterval = selectedTaskIsActive ? (taskRealtimeState === 'connected' ? false : 15000) : false;
   const taskProjectRoadmapQuery = useQuery({

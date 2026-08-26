@@ -1,4 +1,13 @@
-import type { TaskRunState } from '@forgemind/core';
+import type {
+  AcceptanceEvidenceSource,
+  AcceptanceEvidenceStatus,
+  ProjectAuditJobStatus,
+  ProjectCapabilityStatus,
+  ProjectImplementationStepStatus as CoreProjectImplementationStepStatus,
+  ProjectRoadmapCycleStatus as CoreProjectRoadmapCycleStatus,
+  ProjectSpecificationSource,
+  TaskRunState
+} from '@forgemind/core';
 
 export type TaskStatus =
   | 'draft'
@@ -166,7 +175,7 @@ export interface ProjectArchitectureSnapshotApi {
   versions: ProjectArchitectureVersionApi[];
 }
 
-export type ProjectRoadmapCycleStatus = 'active' | 'verifying' | 'partial' | 'blocked' | 'awaiting_extension_approval' | 'completed';
+export type ProjectRoadmapCycleStatus = CoreProjectRoadmapCycleStatus;
 
 export interface ProjectAuditJobApi {
   id: string;
@@ -174,7 +183,7 @@ export interface ProjectAuditJobApi {
   cycleId: string;
   triggerTaskId?: string;
   requirementIds: string[];
-  status: 'pending' | 'claimed' | 'succeeded' | 'blocked' | 'failed';
+  status: ProjectAuditJobStatus;
   attemptCount: number;
   nextAttemptAt?: string;
   errorMessage?: string;
@@ -183,7 +192,7 @@ export interface ProjectAuditJobApi {
   claimedAt?: string;
   finishedAt?: string;
 }
-export type ProjectImplementationStepStatus = 'pending' | 'running' | 'waiting_for_capability' | 'completed' | 'cancelled';
+export type ProjectImplementationStepStatus = CoreProjectImplementationStepStatus;
 
 export interface ProjectRoadmapCycleApi {
   id: string;
@@ -200,7 +209,7 @@ export interface ProjectRoadmapCycleApi {
   completedAt?: string;
 }
 
-export type ProjectSpecificationSourceApi = 'initial_brief' | 'approved_extension' | 'manual_revision';
+export type ProjectSpecificationSourceApi = ProjectSpecificationSource;
 
 export interface ProjectSpecificationVersionApi {
   id: string;
@@ -290,8 +299,8 @@ export interface AcceptanceEvidenceApi {
   requirementId: string;
   criterionKey: string;
   criterion: string;
-  source: 'validation_command' | 'github_check' | 'repository_audit' | 'artifact';
-  status: 'passed' | 'failed' | 'blocked' | 'deferred';
+  source: AcceptanceEvidenceSource;
+  status: AcceptanceEvidenceStatus;
   evidenceKey: string;
   contractVersion: number;
   commitSha?: string;
@@ -305,7 +314,7 @@ export interface AcceptanceEvidenceApi {
 
 export interface ProjectCapabilityApi {
   requirement: ProjectContractApi['requirements'][number];
-  status: 'pending' | 'implementing' | 'verifying' | 'partial' | 'blocked' | 'satisfied';
+  status: ProjectCapabilityStatus;
   workItemIds: string[];
   evidence: AcceptanceEvidenceApi[];
   satisfiedCriteria: number;
