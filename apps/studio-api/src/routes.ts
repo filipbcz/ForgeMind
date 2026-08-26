@@ -27,7 +27,9 @@ import type { NotificationService } from './notifications.js';
 import { ROADMAP_GENERATION_CONFIRMATION, activeProjectContractRequirements, applyProjectContractDelta, buildSpecificationChangeImpactReview, redactSecrets } from '@forgemind/core';
 import type { ApprovalType } from '@forgemind/core';
 import type { Project, ProjectArchitectureUpdate, ProjectContract, ProjectContractDelta, TaskMode } from '@forgemind/core';
-import { resolveRuntimeEnvVar } from './runtime-env.js';
+import { registerAuthRoutes } from './routes/auth-routes.js';
+import { registerNotificationRoutes } from './routes/notification-routes.js';
+import { registerWorkerRoutes } from './routes/worker-routes.js';
 
 const validationProfileSchema = z.object({
   version: z.literal(1).default(1),
@@ -217,37 +219,6 @@ const roadmapExtensionApprovalSchema = z.object({
   objectiveOverride: z.string().min(20).optional()
 });
 
-const githubCallbackQuerySchema = z.object({
-  code: z.string().optional(),
-  state: z.string().optional()
-});
-
-const notificationSubscriptionSchema = z.object({
-  endpoint: z.string().url(),
-  keys: z
-    .object({
-      p256dh: z.string().optional(),
-      auth: z.string().optional()
-    })
-    .optional(),
-  deviceName: z.string().min(1).optional()
-});
-
-const notificationSettingsSchema = z.object({
-  pushEnabled: z.boolean().optional(),
-  approvalRequests: z.boolean().optional(),
-  taskUpdates: z.boolean().optional(),
-  budgetAlerts: z.boolean().optional()
-});
-
-const workerEventsQuerySchema = z.object({
-  limit: z.coerce.number().int().min(1).max(100).optional().default(20)
-});
-
-const workerQueueControlSchema = z.object({
-  paused: z.boolean()
-});
-
 const providerConnectSchema = z
   .object({
     connectionId: z.string().min(1).optional(),
@@ -336,84 +307,7 @@ export function registerRoutes(app: FastifyInstance, repository: ForgeMindReposi
 
   app.addHook('preHandler', async (request, reply) => requireAuthorizedMutation(request, reply, repository, auth));
 
-  app.post('/api/auth/github/login', async (_request, reply) => {
-    try {
-      if (!auth) {
-        return reply.code(503).send({ error: 'Auth service is not configured.' });
-      }
-
-      const currentUser = await repository.getCurrentUser();
-      const login = auth.startGitHubLogin();
-      await repository.writeAudit({
-        actorType: 'user',
-        actorId: currentUser.id,
-        eventType: 'auth_github_login_started',
-        payload: { provider: 'github', mode: login.mode }
-      });
-      return reply.code(202).send(login);
-    } catch (error) {
-      return sendBadRequest(reply, error);
-    }
-  });
-
-  app.get('/api/auth/github/callback', async (request, reply) => {
-    try {
-      if (!auth) {
-        return reply.code(503).send({ error: 'Auth service is not configured.' });
-      }
-
-      const input = githubCallbackQuerySchema.parse(request.query);
-      const currentUser = await repository.getCurrentUser();
-      const session = auth.completeGitHubCallback(input, currentUser);
-      reply.header('Set-Cookie', serializeSessionCookie(session.session.id));
-      await repository.writeAudit({
-        actorType: 'user',
-        actorId: currentUser.id,
-        eventType: 'auth_github_callback_completed',
-        payload: {
-          provider: 'github',
-          mode: session.session.mode,
-          providerAccess: session.session.providerAccess
-        }
-      });
-      return reply.send(session);
-    } catch (error) {
-      return sendBadRequest(reply, error);
-    }
-  });
-
-  app.post('/api/auth/logout', async (_request, reply) => {
-    try {
-      if (!auth) {
-        return reply.code(503).send({ error: 'Auth service is not configured.' });
-      }
-
-      const currentUser = await repository.getCurrentUser();
-      const result = auth.logout(currentUser.id);
-      reply.header('Set-Cookie', 'forgemind_session=; HttpOnly; SameSite=Lax; Path=/; Max-Age=0');
-      await repository.writeAudit({
-        actorType: 'user',
-        actorId: currentUser.id,
-        eventType: 'auth_logout',
-        payload: { provider: 'github', loggedOut: result.loggedOut }
-      });
-      return reply.send(result);
-    } catch (error) {
-      return sendBadRequest(reply, error);
-    }
-  });
-
-  app.get('/api/auth/session', async (_request, reply) => {
-    if (!auth) {
-      return reply.code(503).send({ error: 'Auth service is not configured.' });
-    }
-
-    const currentUser = await repository.getCurrentUser();
-    return {
-      user: currentUser,
-      session: auth.getSession(currentUser.id)
-    };
-  });
+  registerAuthRoutes(app, repository, auth);
 
   app.get('/health', async () => ({
     ok: true,
@@ -423,28 +317,7 @@ export function registerRoutes(app: FastifyInstance, repository: ForgeMindReposi
 
   app.get('/api/me', async () => repository.getCurrentUser());
 
-  app.get('/api/worker/status', async () => repository.getWorkerStatus());
-
-  app.put('/api/worker/queue', async (request, reply) => {
-    try {
-      const input = workerQueueControlSchema.parse(request.body);
-      await repository.setWorkerQueuePaused(input.paused);
-      return repository.getWorkerStatus();
-    } catch (error) {
-      return sendBadRequest(reply, error);
-    }
-  });
-
-  app.get('/api/worker/events', async (request) => {
-    const query = workerEventsQuerySchema.parse(request.query ?? {});
-    return repository.getRecentWorkerEvents(query.limit);
-  });
-
-  app.get('/api/metrics', async (_request, reply) => {
-    const snapshot = await repository.getOperationalMetrics();
-    reply.header('Content-Type', 'text/plain; version=0.0.4; charset=utf-8');
-    return formatMetrics(snapshot);
-  });
+  registerWorkerRoutes(app, repository);
 
   app.get('/api/providers/status', async (_request) => {
     const githubConnection = await readGitHubConnection(repository);
@@ -1824,86 +1697,7 @@ export function registerRoutes(app: FastifyInstance, repository: ForgeMindReposi
     return reply.code(202).send({ ok: true, event, delivery, duplicate: false, auditId: audit.id });
   });
 
-  app.post('/api/notifications/subscribe', async (request, reply) => {
-    try {
-      if (!notifications) {
-        return reply.code(503).send({ error: 'Notifications service is not configured.' });
-      }
-
-      const currentUser = await repository.getCurrentUser();
-      const input = notificationSubscriptionSchema.parse(request.body);
-      const subscription = await notifications.subscribe(currentUser.id, input);
-      await repository.writeAudit({
-        actorType: 'user',
-        actorId: currentUser.id,
-        eventType: 'notifications_subscribed',
-        payload: { endpoint: input.endpoint, deviceName: input.deviceName ?? null }
-      });
-      return reply.code(201).send(subscription);
-    } catch (error) {
-      return sendBadRequest(reply, error);
-    }
-  });
-
-  app.post('/api/notifications/unsubscribe', async (request, reply) => {
-    try {
-      if (!notifications) {
-        return reply.code(503).send({ error: 'Notifications service is not configured.' });
-      }
-
-      const currentUser = await repository.getCurrentUser();
-      const input = z.object({ endpoint: z.string().url() }).parse(request.body);
-      const result = await notifications.unsubscribe(currentUser.id, input.endpoint);
-      await repository.writeAudit({
-        actorType: 'user',
-        actorId: currentUser.id,
-        eventType: 'notifications_unsubscribed',
-        payload: { endpoint: input.endpoint, removed: result.removed }
-      });
-      return reply.send(result);
-    } catch (error) {
-      return sendBadRequest(reply, error);
-    }
-  });
-
-  app.get('/api/notifications/vapid-public-key', async (_request, reply) => {
-    const publicKey = resolveRuntimeEnvVar('VAPID_PUBLIC_KEY');
-    if (!publicKey) {
-      return reply.code(503).send({ error: 'VAPID_PUBLIC_KEY is not configured.' });
-    }
-
-    return reply.send({ publicKey });
-  });
-
-  app.get('/api/notifications/settings', async (request, reply) => {
-    if (!notifications) {
-      return reply.code(503).send({ error: 'Notifications service is not configured.' });
-    }
-
-    const currentUser = await repository.getCurrentUser();
-    return notifications.getSettings(currentUser.id);
-  });
-
-  app.put('/api/notifications/settings', async (request, reply) => {
-    try {
-      if (!notifications) {
-        return reply.code(503).send({ error: 'Notifications service is not configured.' });
-      }
-
-      const currentUser = await repository.getCurrentUser();
-      const input = notificationSettingsSchema.parse(request.body);
-      const settings = await notifications.updateSettings(currentUser.id, input);
-      await repository.writeAudit({
-        actorType: 'user',
-        actorId: currentUser.id,
-        eventType: 'notification_settings_updated',
-        payload: input
-      });
-      return reply.send(settings);
-    } catch (error) {
-      return sendBadRequest(reply, error);
-    }
-  });
+  registerNotificationRoutes(app, repository, notifications);
 }
 
 async function requireAuthorizedMutation(
@@ -1986,11 +1780,6 @@ function readSessionId(request: FastifyRequest): string | undefined {
   }
 }
 
-function serializeSessionCookie(sessionId: string): string {
-  const secure = process.env.FORGEMIND_SESSION_COOKIE_SECURE === 'true' ? '; Secure' : '';
-  return `forgemind_session=${encodeURIComponent(sessionId)}; HttpOnly; SameSite=Lax; Path=/${secure}`;
-}
-
 function requiresOwnerRole(request: FastifyRequest): boolean {
   const path = request.url.split('?')[0] ?? request.url;
   return path === '/api/worker/queue'
@@ -2055,55 +1844,6 @@ function stableJson(value: unknown): string {
     .filter(([, item]) => item !== undefined)
     .sort(([left], [right]) => left.localeCompare(right));
   return `{${entries.map(([key, item]) => `${JSON.stringify(key)}:${stableJson(item)}`).join(',')}}`;
-}
-
-function formatMetrics(snapshot: Awaited<ReturnType<ForgeMindRepository['getOperationalMetrics']>>): string {
-  return [
-    '# HELP forgemind_tasks_total Total number of tasks.',
-    '# TYPE forgemind_tasks_total gauge',
-    `forgemind_tasks_total ${snapshot.tasks.total}`,
-    `forgemind_tasks_draft ${snapshot.tasks.draft}`,
-    `forgemind_tasks_submitted ${snapshot.tasks.submitted}`,
-    `forgemind_tasks_active ${snapshot.tasks.active}`,
-    `forgemind_tasks_needs_approval ${snapshot.tasks.needsApproval}`,
-    `forgemind_tasks_completed ${snapshot.tasks.completed}`,
-    `forgemind_tasks_failed ${snapshot.tasks.failed}`,
-    `forgemind_tasks_cancelled ${snapshot.tasks.cancelled}`,
-    `forgemind_tasks_provider_failed_total ${snapshot.tasks.providerFailed}`,
-    `forgemind_tasks_budget_exceeded_total ${snapshot.tasks.budgetExceeded}`,
-    `forgemind_tasks_iteration_limit_reached_total ${snapshot.tasks.iterationLimitReached}`,
-    `forgemind_tasks_repeated_error_detected_total ${snapshot.tasks.repeatedErrorDetected}`,
-    `forgemind_tasks_validation_failed_total ${snapshot.tasks.validationFailed}`,
-    '',
-    '# HELP forgemind_queue_jobs Queue job gauges and wait metrics.',
-    '# TYPE forgemind_queue_jobs gauge',
-    `forgemind_queue_jobs_pending ${snapshot.queue.pending}`,
-    `forgemind_queue_jobs_claimed ${snapshot.queue.claimed}`,
-    `forgemind_queue_jobs_failed ${snapshot.queue.failed}`,
-    `forgemind_queue_wait_seconds_avg ${snapshot.queue.averagePendingWaitSeconds.toFixed(3)}`,
-    `forgemind_queue_wait_seconds_max ${snapshot.queue.maxPendingWaitSeconds.toFixed(3)}`,
-    '',
-    '# HELP forgemind_approvals Approval state counters.',
-    '# TYPE forgemind_approvals gauge',
-    `forgemind_approvals_pending ${snapshot.approvals.pending}`,
-    `forgemind_approvals_approved ${snapshot.approvals.approved}`,
-    `forgemind_approvals_rejected ${snapshot.approvals.rejected}`,
-    `forgemind_approvals_cancelled ${snapshot.approvals.cancelled}`,
-    '',
-    '# HELP forgemind_runs Task run gauges and duration metrics.',
-    '# TYPE forgemind_runs gauge',
-    `forgemind_runs_queued ${snapshot.runs.queued}`,
-    `forgemind_runs_running ${snapshot.runs.running}`,
-    `forgemind_runs_succeeded ${snapshot.runs.succeeded}`,
-    `forgemind_runs_failed ${snapshot.runs.failed}`,
-    `forgemind_runs_cancelled ${snapshot.runs.cancelled}`,
-    `forgemind_run_duration_seconds_avg ${snapshot.runs.averageDurationSeconds.toFixed(3)}`,
-    `forgemind_run_duration_seconds_max ${snapshot.runs.maxDurationSeconds.toFixed(3)}`,
-    '',
-    '# HELP forgemind_metrics_generated_at_unix Unix timestamp when metrics were generated.',
-    '# TYPE forgemind_metrics_generated_at_unix gauge',
-    `forgemind_metrics_generated_at_unix ${Math.floor(new Date(snapshot.generatedAt).getTime() / 1000)}`
-  ].join('\n');
 }
 
 function buildTaskPrompt(input: z.infer<typeof createTaskSchema>): string {
