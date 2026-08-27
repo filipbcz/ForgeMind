@@ -25,6 +25,8 @@ describe('review prompt', () => {
     expect(prompt).toContain('Treat exit code 0 as evidence that a command completed, not by itself as proof');
     expect(prompt).toContain('exit code 0 establishes that every chained command exited successfully');
     expect(prompt).toContain('meaningfully verify the acceptance criteria');
+    expect(prompt).toContain('smallest exact command checks needed to prove it in validationChecks');
+    expect(prompt).toContain('Commands proposed in validationChecks will be safety-checked and executed by ForgeMind');
     expect(prompt).toContain('Return one criterionResults entry for every explicit acceptance criterion');
     expect(prompt).toContain('Implement profile selection without changing authentication.');
     expect(prompt).toContain('A profile can be selected.');

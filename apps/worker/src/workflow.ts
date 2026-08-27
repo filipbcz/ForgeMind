@@ -406,6 +406,7 @@ export async function runWorkerTask(input: WorkerTaskInput): Promise<WorkerTaskR
   const retryReasons: string[] = [];
   const appliedSafeImprovements = new Set<string>();
   const resolvedReviewBlockers = new Set<string>();
+  let reviewerRequiredValidationChecks: ValidationCheck[] = [];
   const approvedApprovals = new Set(normalizeRuntimeApprovals(input.resume?.approvedApprovals ?? []));
   let completedAttempts = 0;
   const verifyCommandApprovals = filterApprovedApprovals(
@@ -494,7 +495,7 @@ export async function runWorkerTask(input: WorkerTaskInput): Promise<WorkerTaskR
       ?? await provider.implement({
         taskId: input.task.id,
         prompt: executionPrompt,
-        plan,
+        plan: { ...plan, validationChecks },
         repositoryPath: workspacePath,
         session: input.providerSession,
         signal: input.signal,
@@ -541,7 +542,10 @@ export async function runWorkerTask(input: WorkerTaskInput): Promise<WorkerTaskR
     };
     if (!isResumedImplementation && !config.verifyCommand?.trim()) {
       if (hasAuthoritativeResumeValidationPlan) {
-        const proposedChecks = normalizeValidationChecks(implementation.validationChecks);
+        const proposedChecks = mergeValidationCheckUpdates(
+          normalizeValidationChecks(implementation.validationChecks),
+          reviewerRequiredValidationChecks
+        );
         const newArchitectureCommands = implementation.architectureUpdate?.validationCommands ?? [];
         if (proposedChecks.length > 0 || newArchitectureCommands.length > 0) {
           validationChecks = await resolveValidationChecks({
@@ -556,7 +560,13 @@ export async function runWorkerTask(input: WorkerTaskInput): Promise<WorkerTaskR
         }
       } else {
         validationChecks = await resolveValidationChecks({
-          plan: { ...plan, validationChecks: implementation.validationChecks },
+          plan: {
+            ...plan,
+            validationChecks: mergeValidationCheckUpdates(
+              normalizeValidationChecks(implementation.validationChecks),
+              reviewerRequiredValidationChecks
+            )
+          },
           installCommand,
           architectureCommands: [
             ...(input.project.projectArchitecture?.validationCommands ?? []),
@@ -1279,6 +1289,22 @@ export async function runWorkerTask(input: WorkerTaskInput): Promise<WorkerTaskR
           new Set((validation.deferredChecks ?? []).flatMap((check) => check.criterion ? [check.criterion.trim()] : []))
         );
       }
+      const reviewValidationChecks = normalizeValidationChecks(review.validationChecks);
+      if (review.blockers.length > 0 && reviewValidationChecks.length > 0) {
+        reviewerRequiredValidationChecks = mergeValidationCheckUpdates(
+          reviewerRequiredValidationChecks,
+          reviewValidationChecks
+        );
+        validationChecks = await resolveValidationChecks({
+          plan: {
+            ...plan,
+            validationChecks: mergeValidationCheckUpdates(validationChecks, reviewValidationChecks)
+          },
+          installCommand,
+          validationProfile: input.project.validationProfile,
+          workspacePath
+        });
+      }
       await emitTaskActivity(input.hooks, {
         phase: 'review',
         state: review.blockers.length > 0 ? 'failed' : 'completed',
@@ -1298,6 +1324,7 @@ export async function runWorkerTask(input: WorkerTaskInput): Promise<WorkerTaskR
         validationResult: {
           blockers: review.blockers,
           riskyChanges: review.riskyChanges,
+          validationChecks: validationChecksToJson(validationChecks),
           criterionResults: review.criterionResults ?? [],
           alreadySatisfied: satisfactionReview,
           attempt

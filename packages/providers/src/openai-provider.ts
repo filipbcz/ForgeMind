@@ -211,7 +211,7 @@ export class OpenAIProvider implements AIProvider {
     const messages: Array<{ role: 'system' | 'user' | 'assistant'; content: string }> = [
       {
         role: 'system',
-        content: 'You are an AI code reviewer. Follow the review packet constraints and return JSON with summary, blockers, safeImprovements, riskyChanges, and criterionResults when requested.'
+        content: 'You are an AI code reviewer. Follow the review packet constraints and return JSON with summary, blockers, safeImprovements, riskyChanges, validationChecks, and criterionResults when requested.'
       },
       {
         role: 'user',

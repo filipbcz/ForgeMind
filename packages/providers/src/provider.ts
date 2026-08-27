@@ -225,6 +225,7 @@ export interface ReviewResult {
   blockers: string[];
   safeImprovements: string[];
   riskyChanges: ApprovalType[];
+  validationChecks?: ValidationCheck[];
   criterionResults?: Array<{
     criterion: string;
     status: 'satisfied' | 'not_satisfied' | 'insufficient_evidence' | 'deferred';
@@ -421,6 +422,9 @@ export function parseReviewResult(content: string, operation: string): ReviewRes
   requireStringArray(value, 'blockers', operation);
   requireStringArray(value, 'safeImprovements', operation);
   requireStringArray(value, 'riskyChanges', operation);
+  if (value.validationChecks !== undefined && !Array.isArray(value.validationChecks)) {
+    throw new ProviderContractError(`${operation} field "validationChecks" must be an array.`);
+  }
   if (value.criterionResults !== undefined) {
     if (!Array.isArray(value.criterionResults) || value.criterionResults.some((item) => {
       if (!item || typeof item !== 'object' || Array.isArray(item)) return true;
@@ -433,7 +437,10 @@ export function parseReviewResult(content: string, operation: string): ReviewRes
       throw new ProviderContractError(`${operation} field "criterionResults" must contain structured criterion verdicts.`);
     }
   }
-  return value as unknown as ReviewResult;
+  return {
+    ...value,
+    validationChecks: normalizeValidationChecks(value.validationChecks)
+  } as unknown as ReviewResult;
 }
 
 function requireString(value: Record<string, unknown>, field: string, operation: string): void {

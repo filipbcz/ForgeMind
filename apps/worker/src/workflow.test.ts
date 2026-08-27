@@ -3424,6 +3424,73 @@ describe('worker workflow', () => {
     expect(reviewInputs[1]?.previousReviewBlockers).toEqual(['Add missing guard clause']);
   }, 10000);
 
+  it('preserves reviewer-proposed validation evidence across a correction attempt', async () => {
+    const workspaceRoot = join(tmpdir(), `forgemind-worker-review-validation-${randomUUID()}`);
+    const reviewInputs: ReviewInput[] = [];
+    let reviewAttempt = 0;
+    const originalCheck = 'node --version';
+    const missingEvidenceCheck = `node -e "process.exit(require('fs').existsSync('status.txt') ? 0 : 1)"`;
+
+    const provider: AIProvider = {
+      kind: 'codex',
+      async preflight() { return { provider: 'codex', ok: true, checkedAt: new Date().toISOString() }; },
+      async plan(): Promise<PlanResult> {
+        return {
+          summary: 'Plan summary',
+          steps: ['Write implementation marker'],
+          acceptanceCriteria: ['The marker has executable validation evidence.'],
+          validationChecks: [{ kind: 'command', command: originalCheck }]
+        };
+      },
+      async implement(input: ImplementInput): Promise<ImplementResult> {
+        return {
+          summary: `Attempt ${input.attemptNumber}`,
+          changedFiles: ['status.txt'],
+          diffStat: { filesChanged: 1, insertions: 1, deletions: input.attemptNumber === 1 ? 0 : 1 },
+          requestedApprovals: [],
+          validationChecks: [{ kind: 'command', command: originalCheck }],
+          fileUpdates: [{ path: 'status.txt', content: `attempt-${input.attemptNumber}\n` }]
+        };
+      },
+      async review(input: ReviewInput): Promise<ReviewResult> {
+        reviewInputs.push(input);
+        reviewAttempt += 1;
+        return reviewAttempt === 1
+          ? {
+              summary: 'The marker-specific check was not executed.',
+              blockers: ['Missing executable evidence for the marker.'],
+              safeImprovements: [],
+              riskyChanges: [],
+              validationChecks: [{ kind: 'command', command: missingEvidenceCheck, category: 'smoke' }]
+            }
+          : {
+              summary: 'Review passed.',
+              blockers: [],
+              safeImprovements: [],
+              riskyChanges: [],
+              validationChecks: []
+            };
+      },
+      async estimateCost(): Promise<CostEstimateResult> {
+        return { inputTokens: 0, outputTokens: 0, estimatedCostUsd: 0 };
+      },
+      supportsLocalRepo() { return true; },
+      supportsGitHubNativeFlow() { return false; }
+    };
+
+    const result = await runWorkerTask({
+      project: demoProject,
+      task: { ...demoTask, id: `task_${randomUUID()}`, maxIterations: 2 },
+      provider,
+      workspaceRoot
+    });
+
+    expect(result.status).toBe('ready_for_user_review');
+    expect(reviewInputs).toHaveLength(2);
+    expect(reviewInputs[0]?.validation.command).not.toContain(missingEvidenceCheck);
+    expect(reviewInputs[1]?.validation.command).toContain(missingEvidenceCheck);
+  }, 15000);
+
   it('includes committed task-branch changes in every correction review packet', async () => {
     const workspaceRoot = join(tmpdir(), `forgemind-worker-cumulative-review-${randomUUID()}`);
     const task = { ...demoTask, id: `task_${randomUUID()}`, maxIterations: 2 };

@@ -59,12 +59,13 @@ export function buildCodexReviewSchema(): Record<string, unknown> {
   return {
     type: 'object',
     additionalProperties: false,
-    required: ['summary', 'blockers', 'safeImprovements', 'riskyChanges', 'criterionResults'],
+    required: ['summary', 'blockers', 'safeImprovements', 'riskyChanges', 'validationChecks', 'criterionResults'],
     properties: {
       summary: { type: 'string' },
       blockers: { type: 'array', items: { type: 'string' } },
       safeImprovements: { type: 'array', items: { type: 'string' } },
       riskyChanges: { type: 'array', items: { type: 'string', enum: APPROVAL_TYPES } },
+      validationChecks: validationChecksJsonSchema(),
       criterionResults: {
         type: 'array',
         items: {
@@ -717,7 +718,7 @@ export class CodexProvider implements AIProvider {
     const messages: Array<{ role: 'system' | 'user' | 'assistant'; content: string }> = [
       {
         role: 'system',
-        content: 'You are Codex reviewer. Follow the review packet constraints and return JSON with summary, blockers, safeImprovements, riskyChanges, and criterionResults.'
+        content: 'You are Codex reviewer. Follow the review packet constraints and return JSON with summary, blockers, safeImprovements, riskyChanges, validationChecks, and criterionResults.'
       },
       {
         role: 'user',
