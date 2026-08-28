@@ -1682,8 +1682,8 @@ describe('Studio API routes', () => {
         method: 'GET',
         url: `/api/auth/github/callback?code=test-github-code&state=${encodeURIComponent(loginPayload.state)}`
       });
-      expect(callbackResponse.statusCode).toBe(200);
-      expect(callbackResponse.json().session.provider).toBe('github');
+      expect(callbackResponse.statusCode).toBe(302);
+      expect(callbackResponse.headers.location).toBe('http://localhost:4000');
       const sessionCookie = callbackResponse.headers['set-cookie'];
 
       const logoutResponse = await app.inject({
@@ -1798,7 +1798,7 @@ describe('Studio API routes', () => {
         method: 'GET',
         url: `/api/auth/github/callback?code=test-github-code&state=${encodeURIComponent(loginPayload.state)}`
       });
-      expect(callbackResponse.statusCode).toBe(200);
+      expect(callbackResponse.statusCode).toBe(302);
       const sessionCookie = callbackResponse.headers['set-cookie'];
       const sessionHeaders = { cookie: requireSetCookieHeader(sessionCookie) };
       const frozenCopilotRiskHeaders = withRiskApproval(sessionHeaders, 'approval_provider_frozen_1');
@@ -1806,7 +1806,8 @@ describe('Studio API routes', () => {
 
       const sessionAfter = await app.inject({
         method: 'GET',
-        url: '/api/auth/session'
+        url: '/api/auth/session',
+        headers: sessionHeaders
       });
       expect(sessionAfter.statusCode).toBe(200);
       expect(sessionAfter.json().session.provider).toBe('github');

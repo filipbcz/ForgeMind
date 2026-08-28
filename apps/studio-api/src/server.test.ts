@@ -12,6 +12,7 @@ import {
 const guardedEnvNames = [
   'NODE_ENV',
   'FORGEMIND_CORS_ORIGINS',
+  'FORGEMIND_AUTH_SESSION_SECRET',
   'FORGEMIND_SESSION_COOKIE_SECURE',
   'FORGEMIND_SENSITIVE_RATE_LIMIT_MAX',
   'FORGEMIND_SENSITIVE_RATE_LIMIT_WINDOW_MS',
@@ -116,6 +117,7 @@ describe('Studio API server', () => {
     process.env.NODE_ENV = 'production';
     process.env.FORGEMIND_CORS_ORIGINS = 'https://studio.example';
     process.env.FORGEMIND_SESSION_COOKIE_SECURE = 'true';
+    process.env.FORGEMIND_AUTH_SESSION_SECRET = 'production-test-session-secret';
     app = await createApp();
 
     const allowed = await app.inject({

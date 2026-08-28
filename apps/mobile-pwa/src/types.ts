@@ -35,6 +35,31 @@ export type TaskStatus =
   | 'validation_failed'
   | 'waiting_for_capability';
 
+export interface AuthSessionApi {
+  provider: 'github';
+  mode: 'oauth_scaffold';
+  userId: string;
+  createdAt: string;
+  providerAccess: 'pending_token_exchange';
+}
+
+export interface AuthSessionResponse {
+  user: {
+    id: string;
+    email: string;
+    name: string;
+    role: 'owner' | 'operator';
+  };
+  session: AuthSessionApi | null;
+}
+
+export interface AuthLoginStartResponse {
+  provider: 'github';
+  mode: 'oauth_scaffold';
+  state: string;
+  authUrl: string;
+}
+
 export interface ProjectApi {
   id: string;
   name: string;

@@ -1,6 +1,8 @@
 import type {
   ApprovalApi,
   ApprovalSummary,
+  AuthLoginStartResponse,
+  AuthSessionResponse,
   AssignProjectRepositoryRequest,
   AuditEventApi,
   CreateProjectRequest,
@@ -49,6 +51,24 @@ const inferredApiUrl =
     : window.location.origin;
 
 export const API_URL = import.meta.env.VITE_API_URL ?? inferredApiUrl;
+
+export async function fetchAuthSession(): Promise<AuthSessionResponse> {
+  return request<AuthSessionResponse>('/api/auth/session');
+}
+
+export async function startGitHubLogin(): Promise<AuthLoginStartResponse> {
+  return request<AuthLoginStartResponse>('/api/auth/github/login', {
+    method: 'POST',
+    body: '{}'
+  });
+}
+
+export async function logout(): Promise<void> {
+  await request('/api/auth/logout', {
+    method: 'POST',
+    body: '{}'
+  });
+}
 
 export function buildWebSocketUrl(taskId?: string): string {
   const base = new URL(API_URL);

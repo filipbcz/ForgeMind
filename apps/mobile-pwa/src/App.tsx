@@ -14,6 +14,8 @@ import {
   GitBranch,
   Github,
   LayoutList,
+  LogIn,
+  LogOut,
   Pause,
   Play,
   Plus,
@@ -53,6 +55,7 @@ import {
   fetchProviderStatus,
   fetchNotificationVapidPublicKey,
   fetchApprovals,
+  fetchAuthSession,
   fetchProjects,
   fetchTaskDiff,
   fetchTaskLogs,
@@ -62,11 +65,13 @@ import {
   fetchWorkerEvents,
   fetchWorkerStatus,
   generateProjectRoadmap as generateProjectRoadmapRequest,
+  logout as logoutRequest,
   resolveApproval as resolveApprovalRequest,
   retryTask as retryTaskRequest,
   retryProjectAudit,
   reviewProjectSpecificationChange,
   startProjectAudit,
+  startGitHubLogin,
   setWorkerQueuePaused,
   startNextProjectRoadmapStep,
   subscribeNotification,
@@ -243,6 +248,7 @@ export function App() {
   const globalPollInterval = globalRealtimeState === 'connected' ? false : 15000;
 
   const projectsQuery = useQuery({ queryKey: ['projects'], queryFn: fetchProjects, retry: 1 });
+  const authSessionQuery = useQuery({ queryKey: ['auth-session'], queryFn: fetchAuthSession, retry: 1 });
   const tasksQuery = useQuery({ queryKey: ['tasks'], queryFn: fetchTasks, refetchInterval: globalPollInterval, retry: 1 });
   const approvalsQuery = useQuery({ queryKey: ['approvals'], queryFn: fetchApprovals, refetchInterval: globalPollInterval, retry: 1 });
   const notificationSettingsQuery = useQuery({
@@ -643,6 +649,16 @@ export function App() {
     }
   });
 
+  const authLoginMutation = useMutation({
+    mutationFn: startGitHubLogin,
+    onSuccess: (login) => window.location.assign(login.authUrl)
+  });
+
+  const logoutMutation = useMutation({
+    mutationFn: logoutRequest,
+    onSuccess: () => queryClient.invalidateQueries({ queryKey: ['auth-session'] })
+  });
+
   const completeTaskMutation = useMutation({
     mutationFn: completeTaskRequest,
     onSuccess: (task) => {
@@ -861,6 +877,17 @@ export function App() {
             </div>
           </div>
           <div className="topbar-actions">
+            {authSessionQuery.data?.session ? (
+              <button className="secondary-action" type="button" disabled={logoutMutation.isPending} onClick={() => logoutMutation.mutate()}>
+                <LogOut size={18} />
+                Odhlásit
+              </button>
+            ) : (
+              <button className="secondary-action" type="button" disabled={authLoginMutation.isPending} onClick={() => authLoginMutation.mutate()}>
+                <LogIn size={18} />
+                Přihlásit přes GitHub
+              </button>
+            )}
             <button
               className="secondary-action"
               type="button"
@@ -882,6 +909,9 @@ export function App() {
         {hasApiError ? <div className="error-banner">API není dostupné, zobrazuji lokální fallback.</div> : null}
         {workerQueueControlMutation.error ? (
           <div className="error-banner">Změna stavu fronty selhala: {workerQueueControlMutation.error.message}</div>
+        ) : null}
+        {authLoginMutation.error || logoutMutation.error ? (
+          <div className="error-banner">Přihlášení selhalo: {formatUiError(authLoginMutation.error ?? logoutMutation.error)}</div>
         ) : null}
 
         {view === 'tasks' ? (
@@ -923,6 +953,12 @@ export function App() {
                   || retryTaskMutation.isPending
                   || completeTaskMutation.isPending
                 }
+                actionError={formatOptionalUiError(
+                  startTaskMutation.error
+                  ?? cancelTaskMutation.error
+                  ?? retryTaskMutation.error
+                  ?? completeTaskMutation.error
+                )}
                 onStart={(taskId) => startTaskMutation.mutate(taskId)}
                 onCancel={(taskId) => cancelTaskMutation.mutate(taskId)}
                 onRetry={(taskId) => retryTaskMutation.mutate(taskId)}
@@ -1147,6 +1183,10 @@ function RealtimeStatusBadge({
 
 function formatUiError(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
+}
+
+function formatOptionalUiError(error: unknown): string | undefined {
+  return error === null || error === undefined ? undefined : formatUiError(error);
 }
 
 function formatSpecificationSource(source: ProjectSpecificationSnapshotApi['current']['source']): string {
@@ -1556,6 +1596,7 @@ function TaskDetail(props: {
   realtimeState: RealtimeUiState;
   realtimeMeta: RealtimeConnectionMeta;
   busy: boolean;
+  actionError?: string;
   onStart: (taskId: string) => void;
   onCancel: (taskId: string) => void;
   onRetry: (taskId: string) => void;
@@ -1610,6 +1651,16 @@ function TaskDetail(props: {
           <div>
             <strong>Task skoncil chybou</strong>
             <pre>{latestError}</pre>
+          </div>
+        </section>
+      ) : null}
+
+      {props.actionError ? (
+        <section className="task-error" role="alert">
+          <AlertTriangle size={20} />
+          <div>
+            <strong>Akci nelze provést</strong>
+            <pre>{props.actionError}</pre>
           </div>
         </section>
       ) : null}
