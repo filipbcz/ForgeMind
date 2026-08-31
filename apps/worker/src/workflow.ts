@@ -368,7 +368,6 @@ export async function runWorkerTask(input: WorkerTaskInput): Promise<WorkerTaskR
   let validationChecks = await resolveValidationChecks({
     plan,
     installCommand,
-    explicitVerifyCommand: config.verifyCommand,
     architectureCommands: input.resume?.validationChecks?.length
       ? undefined
       : input.project.projectArchitecture?.validationCommands,
@@ -540,7 +539,7 @@ export async function runWorkerTask(input: WorkerTaskInput): Promise<WorkerTaskR
       changedFiles: uniqueStrings([...implementation.changedFiles, ...substantiveChangedFiles]).filter(isSubstantiveImplementationPath),
       diffStat: actualDiffStat
     };
-    if (!isResumedImplementation && !config.verifyCommand?.trim()) {
+    if (!isResumedImplementation) {
       if (hasAuthoritativeResumeValidationPlan) {
         const proposedChecks = mergeValidationCheckUpdates(
           normalizeValidationChecks(implementation.validationChecks),
@@ -646,8 +645,7 @@ export async function runWorkerTask(input: WorkerTaskInput): Promise<WorkerTaskR
 
     const alreadySatisfied = implementation.outcome === 'already_satisfied';
     const hasAlreadySatisfiedValidation = Boolean(
-      config.verifyCommand?.trim()
-      || normalizeValidationChecks(implementation.validationChecks).length > 0
+      normalizeValidationChecks(implementation.validationChecks).length > 0
     );
     if (
       substantiveChangedFiles.length === 0
@@ -2234,28 +2232,11 @@ function validationCheckIdentity(check: ValidationCheck): string {
 export async function resolveValidationChecks(input: {
   plan: PlanResult;
   installCommand?: string;
-  explicitVerifyCommand?: string;
   architectureCommands?: string[];
   validationProfile?: ProjectValidationProfile;
   workspacePath?: string;
 }): Promise<ValidationCheck[]> {
-  let checks: ValidationCheck[];
-  if (input.explicitVerifyCommand?.trim()) {
-    checks = [
-      {
-        kind: 'command',
-        command: input.explicitVerifyCommand.trim(),
-        rationale: 'Configured project validation command.'
-      }
-    ];
-  } else {
-    const plannedChecks = normalizeValidationChecks(input.plan.validationChecks);
-    if (plannedChecks.length > 0) {
-      checks = plannedChecks;
-    } else {
-      checks = [];
-    }
-  }
+  let checks = normalizeValidationChecks(input.plan.validationChecks);
 
   const architectureChecks = (input.architectureCommands ?? [])
     .map((command) => command.trim())
@@ -2904,7 +2885,6 @@ function describeGitHubOperation(operation: GitHubOperation) {
 interface WorkerConfig {
   providerKind: ProviderKind;
   mode: TaskMode;
-  verifyCommand?: string;
   installCommand?: string;
   issueLabel: string;
   branchPrefix: string;
@@ -2940,7 +2920,6 @@ function resolveWorkerConfig(project: Project, input: WorkerTaskInput): WorkerCo
   return {
     providerKind: input.providerKind ?? config?.ai.primary_provider ?? 'codex',
     mode: input.task.mode ?? config?.workflow.default_mode ?? 'safe',
-    verifyCommand: input.verifyCommand ?? config?.commands.verify ?? config?.commands.build,
     installCommand: config?.commands.install,
     issueLabel: config?.github.issue_label ?? 'ai-task',
     branchPrefix: config?.github.branch_prefix ?? 'ai/',
@@ -3407,7 +3386,6 @@ async function writeAgentsInstructions(
     lines.push(`- create draft PR: ${projectConfig.workflow.create_draft_pr}`);
     lines.push(`- auto push: ${projectConfig.workflow.auto_push}`);
     lines.push(`- require CI green: ${projectConfig.github.require_ci_green}`);
-    lines.push('', '## Verification', `- verify command: ${projectConfig.commands.verify ?? projectConfig.commands.build ?? 'not configured'}`);
   } else {
     lines.push('## Agent Configuration', '- no project config provided, using defaults');
   }

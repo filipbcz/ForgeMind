@@ -113,7 +113,8 @@ function createProviderStub(overrides: Partial<AIProvider> = {}): AIProvider {
       return {
         summary: 'Plan summary',
         steps: ['Implement task'],
-        acceptanceCriteria: ['Validation passes']
+        acceptanceCriteria: ['Validation passes'],
+        validationChecks: [{ kind: 'command', command: 'node --version', category: 'smoke' }]
       };
     },
     async implement(): Promise<ImplementResult> {
@@ -122,6 +123,7 @@ function createProviderStub(overrides: Partial<AIProvider> = {}): AIProvider {
         changedFiles: ['status.txt'],
         diffStat: { filesChanged: 1, insertions: 1, deletions: 0 },
         requestedApprovals: [],
+        validationChecks: [{ kind: 'command', command: 'node --version', category: 'smoke' }],
         fileUpdates: [{ path: 'status.txt', content: 'ok\n' }]
       };
     },
@@ -184,6 +186,56 @@ function createGitHubStub(overrides: Partial<GitHubAdapter> = {}): GitHubAdapter
 }
 
 describe('worker workflow', () => {
+  it('uses task-specific validation without a configured command baseline', async () => {
+    const workspaceRoot = join(tmpdir(), `forgemind-worker-task-validation-${randomUUID()}`);
+    const configuredFailure = `node -e "process.exit(41)"`;
+    const overrideFailure = `node -e "process.exit(42)"`;
+    const environmentFailure = `node -e "process.exit(43)"`;
+    const taskCheck = `node -e "process.exit(0)"`;
+    let generatedInstructions = '';
+    const provider = createProviderStub({
+      async plan(): Promise<PlanResult> {
+        return {
+          summary: 'Use task validation',
+          steps: ['Implement task'],
+          acceptanceCriteria: ['Task check passes'],
+          validationChecks: [{ kind: 'command', command: taskCheck, category: 'smoke' }]
+        };
+      },
+      async implement(input: ImplementInput): Promise<ImplementResult> {
+        generatedInstructions = await readFile(join(input.repositoryPath, 'AGENTS.md'), 'utf8');
+        return {
+          summary: 'Implementation summary',
+          changedFiles: ['status.txt'],
+          diffStat: { filesChanged: 1, insertions: 1, deletions: 0 },
+          requestedApprovals: [],
+          validationChecks: [{ kind: 'command', command: taskCheck, category: 'smoke' }],
+          fileUpdates: [{ path: 'status.txt', content: 'ok\n' }]
+        };
+      }
+    });
+
+    vi.stubEnv('FORGEMIND_VERIFY_COMMAND', environmentFailure);
+    const result = await runWorkerTask({
+      project: {
+        ...demoProject,
+        configYaml: noGitProjectConfig
+          .replace('verify: "node --version"', `verify: '${configuredFailure}'\n  build: '${configuredFailure}'`)
+      },
+      task: { ...demoTask, id: `task_${randomUUID()}` },
+      provider,
+      verifyCommand: overrideFailure,
+      workspaceRoot
+    }).finally(() => vi.unstubAllEnvs());
+
+    expect(result.status).toBe('ready_for_user_review');
+    expect(result.validation).toMatchObject({ command: taskCheck, exitCode: 0, passed: true });
+    expect(generatedInstructions).not.toContain(configuredFailure);
+    expect(generatedInstructions).not.toContain(environmentFailure);
+    expect(generatedInstructions).not.toContain('verify command:');
+    expect(generatedInstructions).not.toContain('## Verification');
+  }, 10000);
+
   it('infers a frozen dependency install from the repository lockfile', async () => {
     const workspacePath = join(tmpdir(), `forgemind-worker-install-${randomUUID()}`);
     await mkdir(workspacePath, { recursive: true });
@@ -884,6 +936,7 @@ describe('worker workflow', () => {
   it('keeps an approved protected operation valid across correction attempts in the same task', async () => {
     const workspaceRoot = join(tmpdir(), `forgemind-worker-approved-operation-retry-${randomUUID()}`);
     const attempts: ImplementInput[] = [];
+    const validationCommand = `node -e "const { readFileSync } = require('node:fs'); process.exit(readFileSync('status.txt', 'utf8').trim() === 'pass' ? 0 : 1)"`;
     const provider: AIProvider = {
       ...createProviderStub(),
       async plan(input: PlanInput): Promise<PlanResult> {
@@ -902,7 +955,8 @@ describe('worker workflow', () => {
         return {
           summary: 'Plan summary',
           steps: ['Implement task'],
-          acceptanceCriteria: ['Validation passes']
+          acceptanceCriteria: ['Validation passes'],
+          validationChecks: [{ kind: 'command', command: validationCommand }]
         };
       },
       async implement(input: ImplementInput): Promise<ImplementResult> {
@@ -912,7 +966,7 @@ describe('worker workflow', () => {
           changedFiles: ['status.txt'],
           diffStat: { filesChanged: 1, insertions: 1, deletions: 0 },
           requestedApprovals: ['delete_files'],
-          validationChecks: [],
+          validationChecks: [{ kind: 'command', command: validationCommand }],
           fileUpdates: [{
             path: 'status.txt',
             content: input.attemptNumber === 1 ? 'fail\n' : 'pass\n'
@@ -925,7 +979,6 @@ describe('worker workflow', () => {
       project: demoProject,
       task: { ...demoTask, id: `task_${randomUUID()}`, maxIterations: 2 },
       provider,
-      verifyCommand: `node -e "const { readFileSync } = require('node:fs'); process.exit(readFileSync('status.txt', 'utf8').trim() === 'pass' ? 0 : 1)"`,
       workspaceRoot,
       resume: {
         kind: 'approved_operation',
@@ -1202,10 +1255,7 @@ describe('worker workflow', () => {
   it('emits a structured audit activity when validation command access is denied by filesystem isolation', async () => {
     const workspaceRoot = join(tmpdir(), `forgemind-worker-denied-command-${randomUUID()}`);
     const activities: TaskActivity[] = [];
-    const project: Project = {
-      ...demoProject,
-      configYaml: noGitProjectConfig.replace('verify: "node --version"', 'verify: "cat /var/run/docker.sock"')
-    };
+    const project: Project = { ...demoProject };
     const task: ForgeTask = {
       ...demoTask,
       id: `task_${randomUUID()}`,
@@ -1216,7 +1266,26 @@ describe('worker workflow', () => {
     const result = await runWorkerTask({
       project,
       task,
-      provider: createProviderStub(),
+      provider: createProviderStub({
+        async plan(): Promise<PlanResult> {
+          return {
+            summary: 'Validate filesystem isolation',
+            steps: ['Run the task-specific validation'],
+            acceptanceCriteria: ['Forbidden paths remain inaccessible'],
+            validationChecks: [{ kind: 'command', command: 'cat /var/run/docker.sock' }]
+          };
+        },
+        async implement(): Promise<ImplementResult> {
+          return {
+            summary: 'Implementation summary',
+            changedFiles: ['status.txt'],
+            diffStat: { filesChanged: 1, insertions: 1, deletions: 0 },
+            requestedApprovals: [],
+            validationChecks: [{ kind: 'command', command: 'cat /var/run/docker.sock' }],
+            fileUpdates: [{ path: 'status.txt', content: 'ok\n' }]
+          };
+        }
+      }),
       reviewProvider: createProviderStub(),
       workspaceRoot,
       hooks: {
@@ -2638,6 +2707,23 @@ describe('worker workflow', () => {
     expect(checks.map((check) => check.command)).toEqual(['npm test', 'npm run architecture:check']);
   });
 
+  it('combines task-specific checks with install and persisted architecture validation', async () => {
+    const checks = await resolveValidationChecks({
+      plan: {
+        summary: 'Plan', steps: [], acceptanceCriteria: [],
+        validationChecks: [{ kind: 'command', command: 'npm run test:task', category: 'smoke' }]
+      },
+      installCommand: 'npm ci',
+      architectureCommands: ['npm run architecture:check']
+    });
+
+    expect(checks.map((check) => check.command)).toEqual([
+      'npm ci',
+      'npm run test:task',
+      'npm run architecture:check'
+    ]);
+  });
+
   it('drops architecture checks already covered by a broader planned command', async () => {
     const checks = await resolveValidationChecks({
       plan: {
@@ -2771,6 +2857,7 @@ describe('worker workflow', () => {
   it('retries implementation after a validation failure within max iterations', async () => {
     const workspaceRoot = join(tmpdir(), `forgemind-worker-retry-${randomUUID()}`);
     const attempts: ImplementInput[] = [];
+    const validationCommand = `node -e "const { readFileSync } = require('node:fs'); process.exit(readFileSync('status.txt', 'utf8').trim() === 'pass' ? 0 : 1)"`;
 
     const provider: AIProvider = {
       kind: 'codex',
@@ -2791,7 +2878,8 @@ describe('worker workflow', () => {
         return {
           summary: 'Plan summary',
           steps: ['Write validation marker'],
-          acceptanceCriteria: ['Validation should pass']
+          acceptanceCriteria: ['Validation should pass'],
+          validationChecks: [{ kind: 'command', command: validationCommand }]
         };
       },
       async implement(input: ImplementInput): Promise<ImplementResult> {
@@ -2803,6 +2891,7 @@ describe('worker workflow', () => {
           changedFiles: ['status.txt'],
           diffStat: { filesChanged: 1, insertions: 1, deletions: 1 },
           requestedApprovals: [],
+          validationChecks: [{ kind: 'command', command: validationCommand }],
           fileUpdates: [
             {
               path: 'status.txt',
@@ -2842,7 +2931,6 @@ describe('worker workflow', () => {
         maxIterations: 2
       },
       provider,
-      verifyCommand: `node -e "const { readFileSync } = require('node:fs'); process.exit(readFileSync('status.txt', 'utf8').trim() === 'pass' ? 0 : 1)"`,
       workspaceRoot
     });
 
@@ -3838,6 +3926,7 @@ describe('worker workflow', () => {
     const workspaceRoot = join(tmpdir(), `forgemind-worker-pr-body-${randomUUID()}`);
     const createdPrs: CreateDraftPullRequestInput[] = [];
     const attempts: ImplementInput[] = [];
+    const validationCommand = `node -e "const { readFileSync } = require('node:fs'); process.exit(readFileSync('status.txt', 'utf8').trim() === 'pass' ? 0 : 1)"`;
 
     const provider: AIProvider = {
       kind: 'codex',
@@ -3858,7 +3947,8 @@ describe('worker workflow', () => {
         return {
           summary: 'Plan summary',
           steps: ['Implement fix'],
-          acceptanceCriteria: ['PR body should include retry notes']
+          acceptanceCriteria: ['PR body should include retry notes'],
+          validationChecks: [{ kind: 'command', command: validationCommand }]
         };
       },
       async implement(input: ImplementInput): Promise<ImplementResult> {
@@ -3868,6 +3958,7 @@ describe('worker workflow', () => {
           changedFiles: ['status.txt'],
           diffStat: { filesChanged: 1, insertions: 1, deletions: 0 },
           requestedApprovals: [],
+          validationChecks: [{ kind: 'command', command: validationCommand }],
           fileUpdates: [
             {
               path: 'status.txt',
@@ -3939,7 +4030,6 @@ describe('worker workflow', () => {
       },
       provider,
       github,
-      verifyCommand: `node -e "const { readFileSync } = require('node:fs'); process.exit(readFileSync('status.txt', 'utf8').trim() === 'pass' ? 0 : 1)"`,
       workspaceRoot
     });
 
@@ -4341,7 +4431,7 @@ describe('worker workflow', () => {
     expect(result.status).toBe('ready_for_user_review');
   }, 10000);
 
-  it('blocks forbidden verify command by requesting approval', async () => {
+  it('blocks a forbidden task-specific validation command by requesting approval', async () => {
     const workspaceRoot = join(tmpdir(), `forgemind-worker-command-policy-${randomUUID()}`);
 
     const result = await runWorkerTask({
@@ -4351,8 +4441,16 @@ describe('worker workflow', () => {
         id: `task_${randomUUID()}`,
         mode: 'safe'
       },
-      provider: createProviderStub(),
-      verifyCommand: 'sudo npm test',
+      provider: createProviderStub({
+        async plan(): Promise<PlanResult> {
+          return {
+            summary: 'Validate the task',
+            steps: ['Run validation'],
+            acceptanceCriteria: ['Validation passes'],
+            validationChecks: [{ kind: 'command', command: 'sudo npm test' }]
+          };
+        }
+      }),
       workspaceRoot
     });
 

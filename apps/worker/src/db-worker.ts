@@ -131,7 +131,6 @@ export async function runDatabaseWorkerOnce(options: { deferInterruptSignals?: b
     completeCost: true
   };
   const startedAtMs = Date.now();
-  const verifyCommand = resolveVerifyCommand(claimed.project.configYaml);
   const workspaceRoot = resolveWorkerWorkspaceRoot();
   const projectConfig = parseProjectConfig(claimed.project.configYaml);
   const requiresGitHub = !projectConfig
@@ -316,7 +315,6 @@ export async function runDatabaseWorkerOnce(options: { deferInterruptSignals?: b
       providerKind: selection.primary.kind,
       provider,
       reviewProvider,
-      verifyCommand,
       workspaceRoot,
       resourcePolicy,
       usageSummary: `Pre-run estimate: ${costEstimate.inputTokens} input tokens, ${costEstimate.outputTokens} output tokens, ${costEstimate.estimatedCostUsd.toFixed(4)} USD`,
@@ -1489,23 +1487,6 @@ function resolveProviderModel(provider: ProviderKind, connection: AIProviderConn
   }
 
   return provider;
-}
-
-function resolveVerifyCommand(configYaml?: string): string | undefined {
-  if (process.env.FORGEMIND_VERIFY_COMMAND) {
-    return process.env.FORGEMIND_VERIFY_COMMAND;
-  }
-
-  if (!configYaml) {
-    return undefined;
-  }
-
-  try {
-    const config = parseAgentConfigYaml(configYaml);
-    return config.commands.verify ?? config.commands.build;
-  } catch {
-    return undefined;
-  }
 }
 
 class ProviderExecutionError extends Error {
