@@ -66,6 +66,40 @@ enum QueueJobStatus {
   cancelled
 }
 
+enum WorkerDeviceStatus {
+  offline
+  idle
+  reserved
+  running
+  draining
+  revoked
+}
+
+enum WorkerSessionStatus {
+  active
+  draining
+  cancelled
+  expired
+  closed
+}
+
+enum ExecutionJobStatus {
+  queued
+  leased
+  running
+  succeeded
+  failed
+  cancelled
+  expired
+}
+
+enum ExecutionLeaseStatus {
+  active
+  released
+  expired
+  cancelled
+}
+
 enum IterationPhase {
   planning
   implementation
@@ -220,6 +254,7 @@ model Project {
   auditJobs                  ProjectAuditJob[]
   aiProviderConnection       AiProviderConnection?         @relation(fields: [aiProviderConnectionId], references: [id], onDelete: SetNull)
   chatThreads                ChatThread[]
+  windowsExecutionJobs       WindowsExecutionJob[]
 
   @@map("projects")
 }
@@ -509,9 +544,92 @@ model Task {
   sourceArchitectureVersions ProjectArchitectureVersion[] @relation("ArchitectureSourceTask")
   acceptanceEvidence         AcceptanceEvidence[]
   checkpoints                TaskCheckpoint[]
+  windowsExecutionJobs       WindowsExecutionJob[]
 
   @@index([projectId, status])
   @@map("tasks")
+}
+
+model WorkerDevice {
+  id                String             @id @default(uuid())
+  schemaVersion     Int                @default(1) @map("schema_version")
+  platform          String
+  runnerVersion     String             @map("runner_version")
+  displayName       String             @map("display_name")
+  status            WorkerDeviceStatus @default(offline)
+  capabilities      Json               @default("[]")
+  probeEvidence     Json               @default("[]") @map("probe_evidence")
+  metadata          Json               @default("{}")
+  lastHeartbeatAt   DateTime?           @map("last_heartbeat_at")
+  createdAt         DateTime           @default(now()) @map("created_at")
+  updatedAt         DateTime           @updatedAt @map("updated_at")
+
+  sessions WorkerSession[]
+  leases   WindowsExecutionLease[]
+
+  @@index([status, lastHeartbeatAt])
+  @@map("worker_devices")
+}
+
+model WorkerSession {
+  id              String              @id @default(uuid())
+  schemaVersion   Int                 @default(1) @map("schema_version")
+  deviceId        String              @map("device_id")
+  status          WorkerSessionStatus @default(active)
+  startedAt       DateTime            @default(now()) @map("started_at")
+  expiresAt       DateTime            @map("expires_at")
+  lastHeartbeatAt DateTime            @default(now()) @map("last_heartbeat_at")
+  endedAt         DateTime?           @map("ended_at")
+
+  device WorkerDevice             @relation(fields: [deviceId], references: [id], onDelete: Cascade)
+  leases WindowsExecutionLease[]
+
+  @@index([deviceId, status, expiresAt])
+  @@map("worker_sessions")
+}
+
+model WindowsExecutionJob {
+  id                   String             @id @default(uuid())
+  schemaVersion        Int                @default(1) @map("schema_version")
+  projectId            String             @map("project_id")
+  taskId               String             @map("task_id")
+  runId                String             @map("run_id")
+  status               ExecutionJobStatus @default(queued)
+  requiredCapabilities Json               @default("[]") @map("required_capabilities")
+  packet               Json
+  createdAt            DateTime           @default(now()) @map("created_at")
+  updatedAt            DateTime           @updatedAt @map("updated_at")
+
+  project Project                 @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  task    Task                    @relation(fields: [taskId], references: [id], onDelete: Cascade)
+  run     TaskRun                 @relation(fields: [runId], references: [id], onDelete: Cascade)
+  leases  WindowsExecutionLease[]
+
+  @@index([status, createdAt])
+  @@index([taskId, status])
+  @@map("windows_execution_jobs")
+}
+
+model WindowsExecutionLease {
+  id          String               @id @default(uuid())
+  schemaVersion Int                @default(1) @map("schema_version")
+  jobId       String               @map("job_id")
+  deviceId    String               @map("device_id")
+  sessionId   String               @map("session_id")
+  status      ExecutionLeaseStatus @default(active)
+  claimedAt   DateTime             @default(now()) @map("claimed_at")
+  expiresAt   DateTime             @map("expires_at")
+  nonce       String
+  releasedAt  DateTime?            @map("released_at")
+
+  job     WindowsExecutionJob @relation(fields: [jobId], references: [id], onDelete: Cascade)
+  device  WorkerDevice       @relation(fields: [deviceId], references: [id], onDelete: Cascade)
+  session WorkerSession      @relation(fields: [sessionId], references: [id], onDelete: Cascade)
+
+  @@index([status, expiresAt])
+  @@index([sessionId, status])
+  @@unique([sessionId, nonce])
+  @@map("windows_execution_leases")
 }
 
 model ProjectRoadmapCycle {
@@ -756,6 +874,7 @@ model TaskRun {
   providerUsage      ProviderUsage[]
   acceptanceEvidence AcceptanceEvidence[]
   checkpoints        TaskCheckpoint[]
+  windowsExecutionJobs WindowsExecutionJob[]
 
   @@index([taskId, status])
   @@map("task_runs")

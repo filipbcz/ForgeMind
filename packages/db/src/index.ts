@@ -21,3 +21,4 @@ export * from './mappers.js';
 export * from './roadmap.js';
 export * from './repository.js';
 export * from './specification.js';
+export * from './windows-worker-repository.js';
