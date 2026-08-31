@@ -715,6 +715,68 @@ describe('ForgeMindRepository task runs', () => {
     );
   });
 
+  it('does not let the Linux queue claim run a stale job for a capability-waiting task', async () => {
+    const { prisma } = createMockPrisma();
+    prisma.task.findUnique = vi.fn(async () => ({
+      id: 'task_1',
+      projectId: 'project_1',
+      status: 'waiting_for_capability',
+      waitingForCapabilities: ['windows'],
+      taskRuns: []
+    }));
+    const repository = new ForgeMindRepository(prisma);
+
+    const claimed = await repository.claimNextSubmittedTask('codex', 'codex');
+
+    expect(claimed).toBeUndefined();
+    expect(prisma.task.update).not.toHaveBeenCalled();
+    expect(prisma.taskQueueJob.update).toHaveBeenLastCalledWith({
+      where: { id: 'queue_1' },
+      data: expect.objectContaining({
+        status: 'failed',
+        claimedAt: null,
+        errorMessage: 'Task "task_1" is waiting_for_capability; queue job was not claimed.',
+        finishedAt: expect.any(Date)
+      })
+    });
+  });
+
+  it('requeues a capability wait only when every required capability is available', async () => {
+    const { prisma } = createMockPrisma();
+    const waitingTask = {
+      id: 'task_1', projectId: 'project_1', status: 'waiting_for_capability',
+      waitingForCapabilities: ['windows', 'unreal-engine-5.8']
+    };
+    prisma.task.findMany.mockResolvedValue([waitingTask]);
+    prisma.task.findUnique.mockResolvedValue(waitingTask);
+    prisma.taskQueueJob.count.mockResolvedValue(0);
+    prisma.projectImplementationStep.findFirst = vi.fn(async () => null);
+    prisma.project.findUnique.mockResolvedValue({ configYaml: null });
+    const repository = new ForgeMindRepository(prisma);
+
+    await expect(repository.requeueTasksWaitingForCapabilities(new Set(['windows']))).resolves.toBe(0);
+    expect(prisma.taskQueueJob.create).not.toHaveBeenCalled();
+
+    await expect(repository.requeueTasksWaitingForCapabilities(
+      new Set(['windows', 'unreal-engine-5.8'])
+    )).resolves.toBe(1);
+    expect(prisma.task.update).toHaveBeenCalledWith({
+      where: { id: 'task_1' },
+      data: expect.objectContaining({
+        status: 'submitted',
+        waitingForCapabilities: [],
+        finishedAt: null
+      })
+    });
+    expect(prisma.taskQueueJob.create).toHaveBeenCalledWith({
+      data: expect.objectContaining({
+        taskId: 'task_1',
+        reason: 'capability_available',
+        status: 'pending'
+      })
+    });
+  });
+
   it('does not claim another task while the persistent queue control is paused', async () => {
     const { prisma, taskQueueJobFindFirst } = createMockPrisma();
     const repository = new ForgeMindRepository(prisma);

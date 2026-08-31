@@ -745,7 +745,7 @@ github:
     }));
   });
 
-  it('resumes a capability gate at validation while preserving completed delivery checkpoints', async () => {
+  it('resumes deferred validation from safe checkpoints without repeating portable checks or delivery effects', async () => {
     repositoryMock.claimNextSubmittedTask.mockResolvedValueOnce(createClaimedTask('capability_available'));
     repositoryMock.getTaskDiff.mockResolvedValueOnce({
       taskId: 'task_1', filesChanged: 1, insertions: 5, deletions: 0,
@@ -767,6 +767,7 @@ github:
       { eventType: 'task_activity', payload: { phase: 'git', state: 'completed', operation: 'commit_and_push' }, createdAt: '2026-08-02T10:00:45.000Z' }
     ]);
     repositoryMock.listTaskCheckpoints.mockResolvedValueOnce([
+      { key: 'validation:npm-test', phase: 'validation', status: 'completed', inputHash: 'tree-hash', output: { evidenceVersion: 1, command: 'npm test', exitCode: 0, stdout: 'ok', stderr: '' } },
       { key: 'validation:deferred', phase: 'validation', status: 'completed', inputHash: 'tree-hash', output: { evidenceVersion: 1, deferred: true, command: 'UnrealEditor.exe Flying.uproject' } },
       { key: 'external:wait_for_checks', phase: 'github', status: 'completed', inputHash: 'checks-hash', output: { status: 'success', summary: 'passed', failures: [] } },
       { key: 'external:merge_pr', phase: 'github', status: 'completed', inputHash: 'merge-hash', output: { merged: true, sha: 'abcdef1234567' } }
@@ -785,14 +786,28 @@ github:
         kind: 'capability_available',
         resumeFrom: 'validation',
         validation: undefined,
-        validationChecks: expect.arrayContaining([
-          expect.objectContaining({ command: 'UnrealEditor.exe Flying.uproject', requiredCapabilities: ['windows'] })
-        ]),
-        passedValidationChecks: [expect.objectContaining({ command: 'npm test' })],
+        validationChecks: [
+          expect.objectContaining({ command: 'npm test', requiredCapabilities: [] }),
+          expect.objectContaining({
+            command: 'UnrealEditor.exe Flying.uproject',
+            requiredCapabilities: ['windows']
+          })
+        ],
+        passedValidationChecks: [expect.objectContaining({
+          command: 'npm test',
+          inputHash: 'tree-hash',
+          passed: true
+        })],
         completedOperations: expect.arrayContaining(['commit_and_push', 'wait_for_checks', 'merge_pr']),
         mergeCommitSha: 'abcdef1234567'
       })
     }));
+    expect(repositoryMock.transitionTask).toHaveBeenNthCalledWith(1, 'task_1', 'ready_for_user_review', {
+      pullRequestUrl: null,
+      branchName: 'ai/1-task'
+    });
+    expect(repositoryMock.transitionTask).toHaveBeenNthCalledWith(2, 'task_1', 'completed');
+    expect(repositoryMock.finalizeQueueJob).toHaveBeenCalledWith('queue_1', 'succeeded');
   });
 
   it.each([
