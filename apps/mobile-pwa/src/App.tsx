@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from 'react';
+import { useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { ROADMAP_GENERATION_CONFIRMATION, getRunStateDetail, getRunStateLabel } from '@forgemind/core';
 import {
@@ -16,6 +16,7 @@ import {
   LayoutList,
   LogIn,
   LogOut,
+  MessageSquare,
   Pause,
   Play,
   Plus,
@@ -71,7 +72,7 @@ import {
   retryProjectAudit,
   reviewProjectSpecificationChange,
   startProjectAudit,
-  startGitHubLogin,
+  startGoogleLogin,
   setWorkerQueuePaused,
   startNextProjectRoadmapStep,
   subscribeNotification,
@@ -84,6 +85,7 @@ import { subscribeForPushNotifications, unsubscribeFromPushNotifications } from 
 import type {
   ApprovalSummary,
   AssignProjectRepositoryRequest,
+  AuthSessionResponse,
   AuditEventApi,
   CodexOAuthStartResponse,
   CreateProjectRequest,
@@ -136,6 +138,7 @@ import {
 } from './project-roadmap-domain.js';
 import type { ProjectItemStatusFilter, ProjectRoadmapView } from './project-roadmap-domain.js';
 import { useSelectedProject, useSelectedTask } from './use-mobile-selection.js';
+import { ChatPanel } from './ChatPanel.js';
 
 export {
   canStartProjectAudit,
@@ -146,7 +149,7 @@ export {
 } from './project-roadmap-domain.js';
 export type { ProjectItemStatusFilter } from './project-roadmap-domain.js';
 
-type View = 'tasks' | 'new-task' | 'approvals' | 'projects' | 'settings';
+type View = 'tasks' | 'chat' | 'new-task' | 'approvals' | 'projects' | 'settings';
 type RealtimeUiState = 'connected' | 'reconnecting' | 'fallback';
 
 const terminalStatuses = new Set<TaskSummary['status']>([
@@ -239,6 +242,53 @@ const statusIcons: Record<TaskSummary['status'], typeof Clock3> = {
 
 export function App() {
   const queryClient = useQueryClient();
+  const authSessionQuery = useQuery({ queryKey: ['auth-session'], queryFn: fetchAuthSession, retry: 1 });
+  const authLoginMutation = useMutation({
+    mutationFn: startGoogleLogin,
+    onSuccess: (login) => window.location.assign(login.authUrl)
+  });
+
+  useEffect(() => {
+    const handleAuthenticationRequired = () => {
+      void queryClient.invalidateQueries({ queryKey: ['auth-session'] });
+    };
+    window.addEventListener('forgemind:authentication-required', handleAuthenticationRequired);
+    return () => window.removeEventListener('forgemind:authentication-required', handleAuthenticationRequired);
+  }, [queryClient]);
+
+  if (authSessionQuery.isPending) {
+    return <AuthScreen title="Ověřuji přihlášení" detail="Kontroluji zabezpečenou session." />;
+  }
+
+  if (authSessionQuery.error) {
+    return <AuthScreen title="Přihlášení nelze ověřit" detail={formatUiError(authSessionQuery.error)} />;
+  }
+
+  if (!authSessionQuery.data?.configured) {
+    return <AuthScreen title="Google přihlášení není nastavené" detail="Doplňte OAuth konfiguraci na serveru ForgeMind." />;
+  }
+
+  if (!authSessionQuery.data.session || !authSessionQuery.data.user) {
+    return (
+      <AuthScreen
+        title="Přihlášení do ForgeMind"
+        detail="Přístup k projektům a příkazům vyžaduje povolený Google účet."
+        action={(
+          <button className="primary-action" type="button" disabled={authLoginMutation.isPending} onClick={() => authLoginMutation.mutate()}>
+            <LogIn size={18} />
+            Přihlásit přes Google
+          </button>
+        )}
+        error={authLoginMutation.error ? formatUiError(authLoginMutation.error) : undefined}
+      />
+    );
+  }
+
+  return <AuthenticatedApp auth={authSessionQuery.data} />;
+}
+
+function AuthenticatedApp({ auth }: { auth: AuthSessionResponse }) {
+  const queryClient = useQueryClient();
   const [view, setView] = useState<View>('tasks');
   const [globalRealtimeState, setGlobalRealtimeState] = useState<RealtimeUiState>('fallback');
   const [taskRealtimeState, setTaskRealtimeState] = useState<RealtimeUiState>('fallback');
@@ -248,7 +298,6 @@ export function App() {
   const globalPollInterval = globalRealtimeState === 'connected' ? false : 15000;
 
   const projectsQuery = useQuery({ queryKey: ['projects'], queryFn: fetchProjects, retry: 1 });
-  const authSessionQuery = useQuery({ queryKey: ['auth-session'], queryFn: fetchAuthSession, retry: 1 });
   const tasksQuery = useQuery({ queryKey: ['tasks'], queryFn: fetchTasks, refetchInterval: globalPollInterval, retry: 1 });
   const approvalsQuery = useQuery({ queryKey: ['approvals'], queryFn: fetchApprovals, refetchInterval: globalPollInterval, retry: 1 });
   const notificationSettingsQuery = useQuery({
@@ -649,11 +698,6 @@ export function App() {
     }
   });
 
-  const authLoginMutation = useMutation({
-    mutationFn: startGitHubLogin,
-    onSuccess: (login) => window.location.assign(login.authUrl)
-  });
-
   const logoutMutation = useMutation({
     mutationFn: logoutRequest,
     onSuccess: () => queryClient.invalidateQueries({ queryKey: ['auth-session'] })
@@ -857,6 +901,7 @@ export function App() {
           </div>
         </div>
         <NavButton active={view === 'tasks'} icon={LayoutList} label="Tasks" onClick={() => setView('tasks')} />
+        <NavButton active={view === 'chat'} icon={MessageSquare} label="AI Chat" onClick={() => setView('chat')} />
         <NavButton active={view === 'new-task'} icon={Plus} label="New task" onClick={() => setView('new-task')} />
         <NavButton active={view === 'approvals'} icon={ShieldCheck} label={`Approvals ${pendingApprovals.length}`} onClick={() => setView('approvals')} />
         <NavButton active={view === 'projects'} icon={FolderPlus} label="Projects" onClick={() => setView('projects')} />
@@ -877,17 +922,11 @@ export function App() {
             </div>
           </div>
           <div className="topbar-actions">
-            {authSessionQuery.data?.session ? (
-              <button className="secondary-action" type="button" disabled={logoutMutation.isPending} onClick={() => logoutMutation.mutate()}>
-                <LogOut size={18} />
-                Odhlásit
-              </button>
-            ) : (
-              <button className="secondary-action" type="button" disabled={authLoginMutation.isPending} onClick={() => authLoginMutation.mutate()}>
-                <LogIn size={18} />
-                Přihlásit přes GitHub
-              </button>
-            )}
+            <span className="signed-in-user">{auth.user?.name}</span>
+            <button className="secondary-action" type="button" disabled={logoutMutation.isPending} onClick={() => logoutMutation.mutate()}>
+              <LogOut size={18} />
+              Odhlásit
+            </button>
             <button
               className="secondary-action"
               type="button"
@@ -897,7 +936,7 @@ export function App() {
               {workerStatusQuery.data?.queuePaused ? <Play size={18} /> : <Pause size={18} />}
               {workerStatusQuery.data?.queuePaused ? 'Obnovit frontu' : 'Pozastavit frontu'}
             </button>
-            {view !== 'new-task' ? (
+            {view !== 'new-task' && view !== 'chat' ? (
               <button className="primary-action" type="button" onClick={() => setView('new-task')}>
                 <Plus size={18} />
                 Nový task
@@ -910,8 +949,8 @@ export function App() {
         {workerQueueControlMutation.error ? (
           <div className="error-banner">Změna stavu fronty selhala: {workerQueueControlMutation.error.message}</div>
         ) : null}
-        {authLoginMutation.error || logoutMutation.error ? (
-          <div className="error-banner">Přihlášení selhalo: {formatUiError(authLoginMutation.error ?? logoutMutation.error)}</div>
+        {logoutMutation.error ? (
+          <div className="error-banner">Odhlášení selhalo: {formatUiError(logoutMutation.error)}</div>
         ) : null}
 
         {view === 'tasks' ? (
@@ -966,6 +1005,13 @@ export function App() {
               />
             ) : null}
           </section>
+        ) : null}
+
+        {view === 'chat' ? (
+          <ChatPanel
+            projects={projects}
+            providerConnections={providerStatusQuery.data?.connections ?? []}
+          />
         ) : null}
 
         {view === 'new-task' ? <NewTaskForm projects={projects} saving={createTaskMutation.isPending} onSubmit={createTask} /> : null}
@@ -1146,6 +1192,7 @@ export function App() {
 
       <nav className="bottom-nav" aria-label="Mobilní navigace">
         <NavButton compact active={view === 'tasks'} icon={LayoutList} label="Tasks" onClick={() => setView('tasks')} />
+        <NavButton compact active={view === 'chat'} icon={MessageSquare} label="Chat" onClick={() => setView('chat')} />
         <NavButton compact active={view === 'new-task'} icon={Plus} label="New" onClick={() => setView('new-task')} />
         <NavButton compact active={view === 'approvals'} icon={ShieldCheck} label="Approve" onClick={() => setView('approvals')} />
         <NavButton compact active={view === 'projects'} icon={FolderPlus} label="Projects" onClick={() => setView('projects')} />
@@ -1156,11 +1203,32 @@ export function App() {
 }
 
 function viewTitle(view: View) {
+  if (view === 'chat') return 'AI Chat';
   if (view === 'new-task') return 'Nový úkol';
   if (view === 'approvals') return 'Schválení';
   if (view === 'projects') return 'Projekty';
   if (view === 'settings') return 'Nastavení';
   return 'Přehled tasků';
+}
+
+function AuthScreen(props: { title: string; detail: string; action?: ReactNode; error?: string }) {
+  return (
+    <main className="auth-screen">
+      <section className="auth-panel" aria-labelledby="auth-title">
+        <div className="brand">
+          <img src="/icon.svg" alt="" />
+          <div>
+            <strong>ForgeMind</strong>
+            <span>Secure workspace</span>
+          </div>
+        </div>
+        <h1 id="auth-title">{props.title}</h1>
+        <p>{props.detail}</p>
+        {props.action}
+        {props.error ? <div className="error-banner">{props.error}</div> : null}
+      </section>
+    </main>
+  );
 }
 
 function RealtimeStatusBadge({

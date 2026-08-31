@@ -8,6 +8,7 @@ import { toErrorMessage } from '@forgemind/shared';
 import { formatProjectArchitectureContext, runWorkerTask } from './workflow.js';
 import { buildTargetedRepositoryContext, prepareCapabilityAuditWorkspace, runCapabilityAudit, runReleaseAudit } from './capability-audit.js';
 import { resolveWorkerCapabilities } from './worker-capabilities.js';
+import { runNextChatTurn } from './chat-worker.js';
 import { hasSatisfiedReleaseAudit, recordTaskAcceptanceEvidence, sanitizeAuditErrorMessage } from './db-worker/audit.js';
 import { buildIterationErrorFingerprint, resolveTaskResumeContext } from './db-worker/checkpoints.js';
 import { cleanupCompletedTaskWorkspace, installWorkerInterruptionRecovery, resolveWorkerWorkspaceRoot, runWorkspaceRetentionCleanup, startProjectAuditHeartbeat, startQueueClaimHeartbeat, startTaskCancellationWatcher, TaskCancellationError, throwIfTaskCancelled } from './db-worker/lifecycle.js';
@@ -22,6 +23,8 @@ import {
 export { recordTaskAcceptanceEvidence } from './db-worker/audit.js';
 export { resolveWorkerWorkspaceRoot } from './db-worker/lifecycle.js';
 
+let preferChatQueue = true;
+
 export async function runDatabaseWorkerOnce(options: { deferInterruptSignals?: boolean } = {}) {
   const repository = createRepository(getPrismaClient());
   const defaultAIProviderConnection = await readAIProviderConnectionSecret(repository);
@@ -33,6 +36,7 @@ export async function runDatabaseWorkerOnce(options: { deferInterruptSignals?: b
   const providerModel = resolveProviderModel(providerKind, defaultAIProviderConnection);
   const claimTimeoutMinutes = Number(process.env.FORGEMIND_QUEUE_CLAIM_TIMEOUT_MINUTES ?? 2);
   const recovery = await repository.recoverStuckQueueJobs(claimTimeoutMinutes);
+  const recoveredChatRuns = await repository.recoverStuckChatRuns(claimTimeoutMinutes);
   const workerCapabilities = resolveWorkerCapabilities();
   const requeuedCapabilityTasks = await repository.requeueTasksWaitingForCapabilities(workerCapabilities);
   const deferredCapabilityTasks = await repository.listTasksWaitingForCapabilities();
@@ -46,6 +50,13 @@ export async function runDatabaseWorkerOnce(options: { deferInterruptSignals?: b
     }
   }
   const recoveredProjectAudits = await repository.recoverStuckProjectAudits(claimTimeoutMinutes);
+  if (preferChatQueue) {
+    const chatResult = await runNextChatTurn(repository);
+    if (chatResult) {
+      preferChatQueue = false;
+      return chatResult;
+    }
+  }
   const auditResult = await runNextProjectAudit({
     repository,
     defaultConnection: defaultAIProviderConnection,
@@ -58,14 +69,21 @@ export async function runDatabaseWorkerOnce(options: { deferInterruptSignals?: b
   const claimed = await repository.claimNextSubmittedTask(providerKind, providerModel);
 
   if (!claimed) {
+    const chatResult = await runNextChatTurn(repository);
+    if (chatResult) {
+      preferChatQueue = false;
+      return chatResult;
+    }
     return {
       claimed: false,
       message: 'No submitted task or project audit found.',
       recoveredQueueJobs: recovery.recoveredCount,
+      recoveredChatRuns,
       recoveredProjectAudits,
       requeuedCapabilityTasks
     };
   }
+  preferChatQueue = true;
   const stopQueueHeartbeat = startQueueClaimHeartbeat(repository, claimed.queueJobId, claimTimeoutMinutes);
   const taskAbortController = new AbortController();
   const stopCancellationWatcher = startTaskCancellationWatcher(repository, claimed.task.id, taskAbortController);

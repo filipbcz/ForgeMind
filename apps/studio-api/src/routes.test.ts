@@ -31,19 +31,8 @@ async function loadRunWorkerTask() {
 }
 
 function createAuthenticatedHeaders(auth: AuthService, user: AuthUser): Record<string, string> {
-  const previousClientId = process.env.GITHUB_CLIENT_ID;
-  const previousCallbackUrl = process.env.GITHUB_CALLBACK_URL;
-  process.env.GITHUB_CLIENT_ID = 'github-client-id';
-  process.env.GITHUB_CALLBACK_URL = 'http://localhost:4000/api/auth/github/callback';
-
-  try {
-    const login = auth.startGitHubLogin();
-    const { session } = auth.completeGitHubCallback({ code: 'test-github-code', state: login.state }, user);
-    return { authorization: `Bearer ${session.id}` };
-  } finally {
-    restoreEnv('GITHUB_CLIENT_ID', previousClientId);
-    restoreEnv('GITHUB_CALLBACK_URL', previousCallbackUrl);
-  }
+  const session = auth.createTestSession(user);
+  return { authorization: `Bearer ${session.id}` };
 }
 
 const ownerUser: AuthUser = { id: 'user_1', email: 'owner@example.com', name: 'Owner', role: 'owner' };
@@ -127,7 +116,9 @@ const mutatingEndpointInventory = [
   ['PUT', '/api/projects/project_1/config'],
   ['POST', '/api/projects/project_1/audit/retry'],
   ['POST', '/api/projects/project_1/audit/start'],
+  ['POST', '/api/projects/project_1/contracts'],
   ['POST', '/api/projects/project_1/implementation-steps/start-next'],
+  ['POST', '/api/projects/project_1/implementation-steps/reconcile'],
   ['POST', '/api/projects/project_1/implementation-steps/generate'],
   ['POST', '/api/projects/project_1/extension/decision'],
   ['POST', '/api/tasks'],
@@ -135,12 +126,58 @@ const mutatingEndpointInventory = [
   ['POST', '/api/tasks/task_1/cancel'],
   ['POST', '/api/tasks/task_1/retry'],
   ['POST', '/api/tasks/task_1/complete'],
+  ['POST', '/api/chat/threads'],
+  ['POST', '/api/chat/threads/00000000-0000-4000-8000-000000000001/continue-with-repository'],
+  ['PATCH', '/api/chat/threads/00000000-0000-4000-8000-000000000001'],
+  ['DELETE', '/api/chat/threads/00000000-0000-4000-8000-000000000001'],
+  ['POST', '/api/chat/threads/00000000-0000-4000-8000-000000000001/messages'],
+  ['POST', '/api/chat/runs/00000000-0000-4000-8000-000000000001/retry'],
+  ['POST', '/api/chat/runs/00000000-0000-4000-8000-000000000001/cancel'],
+  ['POST', '/api/chat/approvals/00000000-0000-4000-8000-000000000001/approve'],
+  ['POST', '/api/chat/approvals/00000000-0000-4000-8000-000000000001/reject'],
   ['POST', '/api/approvals/approval_1/approve'],
   ['POST', '/api/approvals/approval_1/reject'],
   ['POST', '/api/approvals/approval_1/comment'],
   ['POST', '/api/notifications/subscribe'],
   ['POST', '/api/notifications/unsubscribe'],
   ['PUT', '/api/notifications/settings']
+] as const;
+
+const authenticatedReadEndpointInventory = [
+  '/api/me',
+  '/api/providers/status',
+  '/api/providers/connections',
+  '/api/providers/codex/oauth/status',
+  '/api/providers/codex/oauth/authorize?loginId=00000000-0000-4000-8000-000000000001',
+  '/api/providers/codex/oauth/00000000-0000-4000-8000-000000000001/status',
+  '/api/github/status',
+  '/api/github/repositories',
+  '/api/github/repository-owners',
+  '/api/github/branches?owner=demo&repo=repo',
+  '/api/projects',
+  '/api/projects/project_1',
+  '/api/projects/project_1/config',
+  '/api/projects/project_1/roadmap',
+  '/api/projects/project_1/specifications',
+  '/api/projects/project_1/contracts',
+  '/api/projects/project_1/architectures',
+  '/api/tasks',
+  '/api/tasks/task_1',
+  '/api/tasks/task_1/queue',
+  '/api/tasks/task_1/logs',
+  '/api/tasks/task_1/runs',
+  '/api/tasks/task_1/diagnostics',
+  '/api/tasks/task_1/diff',
+  '/api/tasks/task_1/usage',
+  '/api/approvals',
+  '/api/approvals/approval_1',
+  '/api/chat/threads',
+  '/api/chat/threads/00000000-0000-4000-8000-000000000001',
+  '/api/notifications/vapid-public-key',
+  '/api/notifications/settings',
+  '/api/worker/status',
+  '/api/worker/events',
+  '/api/metrics'
 ] as const;
 
 describe('Studio API routes', () => {
@@ -159,7 +196,7 @@ describe('Studio API routes', () => {
     });
 
     expect(response.statusCode).toBe(503);
-    expect(response.json()).toEqual({ error: 'Auth service is not configured for mutating API requests.' });
+    expect(response.json()).toEqual({ error: 'Authentication service is not configured.' });
     expect(repository.getCurrentUser).not.toHaveBeenCalled();
     expect(repository.createTask).not.toHaveBeenCalled();
     await app.close();
@@ -180,9 +217,22 @@ describe('Studio API routes', () => {
     });
 
     expect(response.statusCode).toBe(401);
-    expect(response.json()).toEqual({ error: 'Authentication required for mutating API requests.' });
+    expect(response.json()).toEqual({ error: 'Authentication required.' });
     expect(repository.getCurrentUser).not.toHaveBeenCalled();
     expect(repository.createTask).not.toHaveBeenCalled();
+    await app.close();
+  });
+
+  it.each(authenticatedReadEndpointInventory)('rejects anonymous GET %s before route handlers execute', async (url) => {
+    const repository = { getCurrentUser: vi.fn() };
+    const app = Fastify();
+    registerRoutes(app, repository as never, undefined, createAuthService());
+
+    const response = await app.inject({ method: 'GET', url });
+
+    expect(response.statusCode).toBe(401);
+    expect(response.json()).toEqual({ error: 'Authentication required.' });
+    expect(repository.getCurrentUser).not.toHaveBeenCalled();
     await app.close();
   });
 
@@ -206,6 +256,69 @@ describe('Studio API routes', () => {
     expect(response.statusCode).toBe(403);
     expect(response.json()).toEqual({ error: 'Approved config_change approval required for this mutation.' });
     expect(repository.setWorkerQueuePaused).not.toHaveBeenCalled();
+    await app.close();
+  });
+
+  it('accepts an authorized chat-run delegation for a protected mutation', async () => {
+    const auth = createAuthService();
+    const repository = {
+      getCurrentUser: vi.fn(async () => ownerUser),
+      isChatApiMutationAuthorized: vi.fn(async () => true),
+      setWorkerQueuePaused: vi.fn(async () => ({ queuePaused: true, updatedAt: new Date().toISOString() })),
+      getWorkerStatus: vi.fn(async () => ({ state: 'idle', queuePaused: true, queuedTaskCount: 0, activeTaskCount: 0, updatedAt: new Date().toISOString() }))
+    };
+    const app = Fastify();
+    registerRoutes(app, repository as never, undefined, auth);
+
+    const response = await app.inject({
+      method: 'PUT',
+      url: '/api/worker/queue',
+      headers: { ...createOwnerAuthenticatedHeaders(auth), 'x-forgemind-chat-run-id': 'run_1' },
+      payload: { paused: true }
+    });
+
+    expect(response.statusCode).toBe(200);
+    expect(repository.isChatApiMutationAuthorized).toHaveBeenCalledWith(expect.objectContaining({
+      runId: 'run_1', userId: ownerUser.id, type: 'config_change', method: 'PUT', path: '/api/worker/queue'
+    }));
+    expect(repository.setWorkerQueuePaused).toHaveBeenCalledWith(true);
+    await app.close();
+  });
+
+  it('allows authenticated task lifecycle mutations without a duplicate risk approval', async () => {
+    const auth = createAuthService();
+    const task = {
+      id: 'task_1',
+      projectId: 'project_1',
+      title: 'Retry task',
+      prompt: 'Retry the failed task.',
+      status: 'submitted',
+      priority: 'medium',
+      mode: 'safe',
+      maxIterations: 10,
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString()
+    };
+    const repository = {
+      getCurrentUser: vi.fn(async () => ownerUser),
+      retryTask: vi.fn(async () => task),
+      enqueueTask: vi.fn(async () => undefined),
+      getTaskQueuePosition: vi.fn(async () => ({ queueDepth: 1, queuePosition: 1 })),
+      writeAudit: vi.fn(async () => ({ id: 'audit_1' }))
+    };
+    const app = Fastify();
+    registerRoutes(app, repository as never, undefined, auth);
+
+    const response = await app.inject({
+      method: 'POST',
+      url: '/api/tasks/task_1/retry',
+      headers: createOwnerAuthenticatedHeaders(auth),
+      payload: { start: true }
+    });
+
+    expect(response.statusCode).toBe(200);
+    expect(repository.retryTask).toHaveBeenCalledWith('task_1', true);
+    expect(repository.enqueueTask).toHaveBeenCalledWith('task_1', 'task_retried');
     await app.close();
   });
 
@@ -380,12 +493,14 @@ describe('Studio API routes', () => {
     };
     const specifications = { projectId: 'project_1', current, versions: [current] };
     const repository = {
+      getCurrentUser: vi.fn(async () => ownerUser),
       getProjectSpecifications: vi.fn(async () => specifications)
     };
     const app = Fastify();
-    registerRoutes(app, repository as never);
+    const auth = createAuthService();
+    registerRoutes(app, repository as never, undefined, auth);
 
-    const response = await app.inject({ method: 'GET', url: '/api/projects/project_1/specifications' });
+    const response = await app.inject({ method: 'GET', url: '/api/projects/project_1/specifications', headers: createOwnerAuthenticatedHeaders(auth) });
 
     expect(response.statusCode).toBe(200);
     expect(response.json()).toEqual(specifications);
@@ -799,14 +914,86 @@ describe('Studio API routes', () => {
       changeSummary: 'Added reporting.', source: 'approved_extension', parentVersionId: 'contract_1', createdAt: '2026-08-10T10:00:00.000Z'
     };
     const contracts = { projectId: 'project_1', current, versions: [current] };
-    const repository = { getProjectContracts: vi.fn(async () => contracts) };
+    const repository = { getCurrentUser: vi.fn(async () => ownerUser), getProjectContracts: vi.fn(async () => contracts) };
     const app = Fastify();
-    registerRoutes(app, repository as never);
+    const auth = createAuthService();
+    registerRoutes(app, repository as never, undefined, auth);
 
-    const response = await app.inject({ method: 'GET', url: '/api/projects/project_1/contracts' });
+    const response = await app.inject({ method: 'GET', url: '/api/projects/project_1/contracts', headers: createOwnerAuthenticatedHeaders(auth) });
 
     expect(response.statusCode).toBe(200);
     expect(response.json()).toEqual(contracts);
+    await app.close();
+  });
+
+  it('persists a manually supplied initial project contract version', async () => {
+    const contracts = { projectId: 'project_1', current: { version: 1 }, versions: [{ version: 1 }] };
+    const repository = {
+      getCurrentUser: vi.fn(async () => ownerUser),
+      createManualProjectContractVersion: vi.fn(async () => contracts)
+    };
+    const app = Fastify();
+    const auth = createAuthService();
+    registerRoutes(app, repository as never, undefined, auth);
+    const contract = {
+      version: 1,
+      summary: 'Initial contract.',
+      invariants: ['Existing behavior remains available.'],
+      prohibitedSubstitutes: [],
+      requirements: [{
+        id: 'REQ-DEMO', title: 'Demo', description: 'Deliver the requested behavior.',
+        acceptanceCriteria: ['The behavior is covered by an automated test.'], briefReferences: []
+      }],
+      releaseCriteria: ['All project validation commands pass.']
+    };
+
+    const response = await app.inject({
+      method: 'POST',
+      url: '/api/projects/project_1/contracts',
+      headers: createOwnerAuthenticatedHeaders(auth),
+      payload: { contract, changeSummary: 'Created from AI chat.' }
+    });
+
+    expect(response.statusCode).toBe(201);
+    expect(repository.createManualProjectContractVersion).toHaveBeenCalledWith({
+      projectId: 'project_1', contract, contractDelta: undefined, changeSummary: 'Created from AI chat.'
+    });
+    await app.close();
+  });
+
+  it('reconciles roadmap step states through an exactly authorized chat mutation', async () => {
+    const reconciliation = {
+      projectId: 'project_1', examinedSteps: 2,
+      updatedSteps: [{
+        stepId: 'step_1', taskId: 'task_1', taskStatus: 'completed',
+        previousStatus: 'running', status: 'completed'
+      }]
+    };
+    const roadmap = { projectId: 'project_1', cycles: [], steps: [], evidence: [], capabilities: [], auditJobs: [] };
+    const repository = {
+      getCurrentUser: vi.fn(async () => ownerUser),
+      isChatApiMutationAuthorized: vi.fn(async () => true),
+      reconcileProjectImplementationSteps: vi.fn(async () => reconciliation),
+      getProjectRoadmap: vi.fn(async () => roadmap)
+    };
+    const app = Fastify();
+    const auth = createAuthService();
+    registerRoutes(app, repository as never, undefined, auth);
+
+    const response = await app.inject({
+      method: 'POST',
+      url: '/api/projects/project_1/implementation-steps/reconcile',
+      headers: { ...createOwnerAuthenticatedHeaders(auth), 'x-forgemind-chat-run-id': 'run_1' },
+      payload: {}
+    });
+
+    expect(response.statusCode).toBe(200);
+    expect(response.json()).toEqual({ reconciliation, roadmap });
+    expect(repository.isChatApiMutationAuthorized).toHaveBeenCalledWith(expect.objectContaining({
+      runId: 'run_1', userId: ownerUser.id, type: 'risky_refactor', method: 'POST',
+      path: '/api/projects/project_1/implementation-steps/reconcile'
+    }));
+    expect(repository.reconcileProjectImplementationSteps).toHaveBeenCalledWith('project_1');
     await app.close();
   });
 
@@ -1065,7 +1252,8 @@ describe('Studio API routes', () => {
 
     const response = await app.inject({
       method: 'GET',
-      url: '/api/worker/status'
+      url: '/api/worker/status',
+      headers
     });
 
     expect(response.statusCode).toBe(200);
@@ -1093,7 +1281,8 @@ describe('Studio API routes', () => {
 
     const eventsResponse = await app.inject({
       method: 'GET',
-      url: '/api/worker/events?limit=10'
+      url: '/api/worker/events?limit=10',
+      headers
     });
 
     expect(eventsResponse.statusCode).toBe(200);
@@ -1101,7 +1290,8 @@ describe('Studio API routes', () => {
 
     const metricsResponse = await app.inject({
       method: 'GET',
-      url: '/api/metrics'
+      url: '/api/metrics',
+      headers
     });
 
     expect(metricsResponse.statusCode).toBe(200);
@@ -1299,7 +1489,8 @@ describe('Studio API routes', () => {
 
     const getProjectResponse = await app.inject({
       method: 'GET',
-      url: '/api/projects/project_1'
+      url: '/api/projects/project_1',
+      headers
     });
     expect(getProjectResponse.statusCode).toBe(200);
     expect(repository.getProject).toHaveBeenCalledWith('project_1');
@@ -1415,7 +1606,8 @@ describe('Studio API routes', () => {
 
     const getConfigResponse = await app.inject({
       method: 'GET',
-      url: '/api/projects/project_1/config'
+      url: '/api/projects/project_1/config',
+      headers
     });
     expect(getConfigResponse.statusCode).toBe(200);
     expect(repository.getProjectConfig).toHaveBeenCalledWith('project_1');
@@ -1431,14 +1623,16 @@ describe('Studio API routes', () => {
 
     const getRunsResponse = await app.inject({
       method: 'GET',
-      url: '/api/tasks/task_1/runs'
+      url: '/api/tasks/task_1/runs',
+      headers
     });
     expect(getRunsResponse.statusCode).toBe(200);
     expect(repository.getTaskUsage).toHaveBeenCalledWith('task_1');
 
     const getDiagnosticsResponse = await app.inject({
       method: 'GET',
-      url: '/api/tasks/task_1/diagnostics'
+      url: '/api/tasks/task_1/diagnostics',
+      headers
     });
     expect(getDiagnosticsResponse.statusCode).toBe(200);
     expect(repository.exportTaskDiagnostics).toHaveBeenCalledWith('task_1');
@@ -1489,7 +1683,8 @@ describe('Studio API routes', () => {
 
     const getQueueResponse = await app.inject({
       method: 'GET',
-      url: '/api/tasks/task_1/queue'
+      url: '/api/tasks/task_1/queue',
+      headers
     });
     expect(getQueueResponse.statusCode).toBe(200);
     expect(repository.getTaskQueuePosition).toHaveBeenCalledWith('task_1');
@@ -1626,12 +1821,7 @@ describe('Studio API routes', () => {
     await app.close();
   });
 
-  it('exposes GitHub auth scaffold endpoints', async () => {
-    const previousClientId = process.env.GITHUB_CLIENT_ID;
-    const previousCallbackUrl = process.env.GITHUB_CALLBACK_URL;
-    process.env.GITHUB_CLIENT_ID = 'github-client-id';
-    process.env.GITHUB_CALLBACK_URL = 'http://localhost:4000/api/auth/github/callback';
-
+  it('exposes only the authenticated Google session and revokes it on logout', async () => {
     const repository = {
       getCurrentUser: vi.fn(async () => ({ id: 'user_1', email: 'owner@example.com', name: 'Owner', role: 'owner' })),
       getWorkerStatus: vi.fn(async () => ({
@@ -1665,39 +1855,47 @@ describe('Studio API routes', () => {
 
     const app = Fastify();
 
-    try {
-      const auth = createAuthService();
-      registerRoutes(app, repository as never, createNotificationService(), auth);
+    const auth = createAuthService();
+    registerRoutes(app, repository as never, createNotificationService(), auth);
+    const session = auth.createTestSession(ownerUser);
+    const cookie = `forgemind_session=${encodeURIComponent(session.id)}`;
 
-      const loginResponse = await app.inject({
-        method: 'POST',
-        url: '/api/auth/github/login'
-      });
-      expect(loginResponse.statusCode).toBe(202);
-      const loginPayload = loginResponse.json();
-      expect(loginPayload.provider).toBe('github');
-      expect(loginPayload.state).toBeTruthy();
+    const sessionResponse = await app.inject({ method: 'GET', url: '/api/auth/session', headers: { cookie } });
+    expect(sessionResponse.statusCode).toBe(200);
+    expect(sessionResponse.json()).toMatchObject({ user: ownerUser, session: { provider: 'google' } });
 
-      const callbackResponse = await app.inject({
-        method: 'GET',
-        url: `/api/auth/github/callback?code=test-github-code&state=${encodeURIComponent(loginPayload.state)}`
-      });
-      expect(callbackResponse.statusCode).toBe(302);
-      expect(callbackResponse.headers.location).toBe('http://localhost:4000');
-      const sessionCookie = callbackResponse.headers['set-cookie'];
+    const logoutResponse = await app.inject({ method: 'POST', url: '/api/auth/logout', headers: { cookie } });
+    expect(logoutResponse.statusCode).toBe(200);
+    expect(logoutResponse.json().userId).toBe('user_1');
+    expect((await app.inject({ method: 'GET', url: '/api/auth/session', headers: { cookie } })).json().session).toBeNull();
+    await app.close();
+  });
 
-      const logoutResponse = await app.inject({
-        method: 'POST',
-        url: '/api/auth/logout',
-        headers: { cookie: requireSetCookieHeader(sessionCookie) }
-      });
-      expect(logoutResponse.statusCode).toBe(200);
-      expect(logoutResponse.json().userId).toBe('user_1');
-    } finally {
-      await app.close();
-      restoreEnv('GITHUB_CLIENT_ID', previousClientId);
-      restoreEnv('GITHUB_CALLBACK_URL', previousCallbackUrl);
-    }
+  it('starts only the Google browser login flow', async () => {
+    const repository = { getCurrentUser: vi.fn(async () => ownerUser) };
+    const auth = createAuthService(undefined, {
+      clientId: 'google-client-id',
+      clientSecret: 'google-client-secret',
+      callbackUrl: 'http://localhost:4000/api/auth/google/callback',
+      allowedEmails: new Set([ownerUser.email])
+    });
+    const app = Fastify();
+    registerRoutes(app, repository as never, undefined, auth);
+
+    const response = await app.inject({ method: 'POST', url: '/api/auth/google/login' });
+    expect(response.statusCode).toBe(202);
+    expect(response.json()).toMatchObject({ provider: 'google', mode: 'oauth' });
+    expect(response.json().authUrl).toContain('accounts.google.com/o/oauth2/v2/auth');
+    expect(requireSetCookieHeader(response.headers['set-cookie'])).toContain('forgemind_google_oauth=');
+
+    const legacySession = auth.createTestSession(ownerUser);
+    const legacyResponse = await app.inject({
+      method: 'POST',
+      url: '/api/auth/github/login',
+      headers: { authorization: `Bearer ${legacySession.id}` }
+    });
+    expect(legacyResponse.statusCode).toBe(404);
+    await app.close();
   });
 
   it('exposes auth session and provider connect/status endpoints', async () => {
@@ -1769,11 +1967,6 @@ describe('Studio API routes', () => {
     const previousFallback = process.env.FORGEMIND_FALLBACK_PROVIDER;
     const previousOpenAIKey = process.env.OPENAI_API_KEY;
     const previousOpenAIModel = process.env.OPENAI_MODEL;
-    const previousClientId = process.env.GITHUB_CLIENT_ID;
-    const previousCallbackUrl = process.env.GITHUB_CALLBACK_URL;
-    process.env.GITHUB_CLIENT_ID = 'github-client-id';
-    process.env.GITHUB_CALLBACK_URL = 'http://localhost:4000/api/auth/github/callback';
-
     const app = Fastify();
 
     try {
@@ -1787,20 +1980,8 @@ describe('Studio API routes', () => {
       expect(sessionBefore.statusCode).toBe(200);
       expect(sessionBefore.json().session).toBeNull();
 
-      const loginResponse = await app.inject({
-        method: 'POST',
-        url: '/api/auth/github/login'
-      });
-      expect(loginResponse.statusCode).toBe(202);
-      const loginPayload = loginResponse.json();
-
-      const callbackResponse = await app.inject({
-        method: 'GET',
-        url: `/api/auth/github/callback?code=test-github-code&state=${encodeURIComponent(loginPayload.state)}`
-      });
-      expect(callbackResponse.statusCode).toBe(302);
-      const sessionCookie = callbackResponse.headers['set-cookie'];
-      const sessionHeaders = { cookie: requireSetCookieHeader(sessionCookie) };
+      const testSession = auth.createTestSession(ownerUser);
+      const sessionHeaders = { cookie: `forgemind_session=${encodeURIComponent(testSession.id)}` };
       const frozenCopilotRiskHeaders = withRiskApproval(sessionHeaders, 'approval_provider_frozen_1');
       const providerConnectRiskHeaders = withRiskApproval(sessionHeaders, 'approval_provider_connect_1');
 
@@ -1810,11 +1991,12 @@ describe('Studio API routes', () => {
         headers: sessionHeaders
       });
       expect(sessionAfter.statusCode).toBe(200);
-      expect(sessionAfter.json().session.provider).toBe('github');
+      expect(sessionAfter.json().session.provider).toBe('google');
 
       const statusResponse = await app.inject({
         method: 'GET',
-        url: '/api/providers/status'
+        url: '/api/providers/status',
+        headers: sessionHeaders
       });
       expect(statusResponse.statusCode).toBe(200);
       expect(statusResponse.json().availableProviders).toContain('openai');
@@ -1866,8 +2048,6 @@ describe('Studio API routes', () => {
       restoreEnv('FORGEMIND_FALLBACK_PROVIDER', previousFallback);
       restoreEnv('OPENAI_API_KEY', previousOpenAIKey);
       restoreEnv('OPENAI_MODEL', previousOpenAIModel);
-      restoreEnv('GITHUB_CLIENT_ID', previousClientId);
-      restoreEnv('GITHUB_CALLBACK_URL', previousCallbackUrl);
       await app.close();
     }
   });
@@ -1966,7 +2146,8 @@ describe('Studio API routes', () => {
 
     const statusBefore = await app.inject({
       method: 'GET',
-      url: '/api/github/status'
+      url: '/api/github/status',
+      headers: sessionHeaders
     });
     expect(statusBefore.statusCode).toBe(200);
     expect(statusBefore.json().adapter).toBe('none');
@@ -2024,7 +2205,8 @@ describe('Studio API routes', () => {
     } as Response);
     const repositoriesResponse = await app.inject({
       method: 'GET',
-      url: '/api/github/repositories?limit=10'
+      url: '/api/github/repositories?limit=10',
+      headers: sessionHeaders
     });
     expect(repositoriesResponse.statusCode).toBe(200);
     expect(repositoriesResponse.json()).toEqual([
@@ -2064,7 +2246,8 @@ describe('Studio API routes', () => {
       } as Response);
     const ownersResponse = await app.inject({
       method: 'GET',
-      url: '/api/github/repository-owners?limit=10'
+      url: '/api/github/repository-owners?limit=10',
+      headers: sessionHeaders
     });
     expect(ownersResponse.statusCode).toBe(200);
     expect(ownersResponse.json()).toEqual([
@@ -2102,7 +2285,8 @@ describe('Studio API routes', () => {
     } as Response);
     const branchesResponse = await app.inject({
       method: 'GET',
-      url: '/api/github/branches?owner=demo&repo=repo&limit=10'
+      url: '/api/github/branches?owner=demo&repo=repo&limit=10',
+      headers: sessionHeaders
     });
     expect(branchesResponse.statusCode).toBe(200);
     expect(branchesResponse.json()).toEqual([
@@ -2193,14 +2377,16 @@ describe('Studio API routes', () => {
 
     const getSettingsResponse = await app.inject({
       method: 'GET',
-      url: '/api/notifications/settings'
+      url: '/api/notifications/settings',
+      headers
     });
     expect(getSettingsResponse.statusCode).toBe(200);
     expect(getSettingsResponse.json().subscriptions).toHaveLength(1);
 
     const vapidKeyResponse = await app.inject({
       method: 'GET',
-      url: '/api/notifications/vapid-public-key'
+      url: '/api/notifications/vapid-public-key',
+      headers
     });
     expect(vapidKeyResponse.statusCode).toBe(200);
     expect(vapidKeyResponse.json().publicKey).toBe('BMOCK_PUBLIC_VAPID_KEY');
@@ -2841,7 +3027,8 @@ describe('Studio API routes', () => {
 
     const listTasksResponse = await app.inject({
       method: 'GET',
-      url: '/api/tasks'
+      url: '/api/tasks',
+      headers: createOwnerAuthenticatedHeaders(auth)
     });
     expect(listTasksResponse.statusCode).toBe(200);
     const apiTasks = listTasksResponse.json() as Array<{

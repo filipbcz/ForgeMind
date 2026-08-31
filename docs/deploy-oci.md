@@ -31,7 +31,7 @@ Create `/opt/forgemind/shared/server.env` from `infra/deploy/server.env.example`
 
 - `POSTGRES_PASSWORD` in both `POSTGRES_PASSWORD` and `DATABASE_URL`
 - `FORGEMIND_CREDENTIAL_KEY`
-- `GITHUB_CALLBACK_URL` when GitHub login is configured
+- `FORGEMIND_AUTH_SESSION_SECRET`, Google OAuth client credentials, exact HTTPS callback URL, and `FORGEMIND_GOOGLE_ALLOWED_EMAIL`
 - `VAPID_PUBLIC_KEY` and `VAPID_PRIVATE_KEY` when push notifications are enabled
 
 Generate the credential key with:

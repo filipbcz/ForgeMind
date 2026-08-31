@@ -2,6 +2,10 @@ import type {
   AcceptanceEvidence as CoreAcceptanceEvidence,
   Approval as CoreApproval,
   AuditEvent,
+  ChatApproval as CoreChatApproval,
+  ChatMessage as CoreChatMessage,
+  ChatRun as CoreChatRun,
+  ChatThread as CoreChatThread,
   ForgeTask,
   ProjectAuditJob as CoreProjectAuditJob,
   ProjectImplementationStep as CoreProjectImplementationStep,
@@ -20,7 +24,7 @@ import type {
 } from '@forgemind/core';
 import { normalizeRunState, parseTaskRunState } from '@forgemind/core';
 import type { JsonValue } from '@forgemind/shared';
-import type { AcceptanceEvidence, Approval, AuditLog, Prisma, Project, ProjectArchitectureVersion, ProjectAuditJob, ProjectContractVersion, ProjectImplementationStep, ProjectRoadmapCycle, ProjectSpecificationVersion, Task, TaskRun } from '@prisma/client';
+import type { AcceptanceEvidence, Approval, AuditLog, ChatApproval, ChatMessage, ChatRun, ChatThread, Prisma, Project, ProjectArchitectureVersion, ProjectAuditJob, ProjectContractVersion, ProjectImplementationStep, ProjectRoadmapCycle, ProjectSpecificationVersion, Task, TaskRun } from '@prisma/client';
 
 export function toProject(project: Project): CoreProject {
   return {
@@ -501,8 +505,95 @@ export function toAuditEvent(event: AuditLog): AuditEvent {
     eventType: event.eventType,
     projectId: event.projectId ?? undefined,
     taskId: event.taskId ?? undefined,
+    chatThreadId: event.chatThreadId ?? undefined,
+    chatRunId: event.chatRunId ?? undefined,
     payload: event.payload as JsonValue,
     createdAt: event.createdAt.toISOString()
+  };
+}
+
+export function toChatThread(thread: ChatThread): CoreChatThread {
+  return {
+    id: thread.id,
+    userId: thread.userId,
+    projectId: thread.projectId ?? undefined,
+    providerConnectionId: thread.providerConnectionId ?? undefined,
+    title: thread.title,
+    status: thread.status,
+    mode: thread.mode,
+    repositoryOwner: thread.repositoryOwner ?? undefined,
+    repositoryName: thread.repositoryName ?? undefined,
+    baseBranch: thread.baseBranch ?? undefined,
+    branchName: thread.branchName ?? undefined,
+    contextSummary: thread.contextSummary ?? undefined,
+    providerSessionId: thread.providerSessionId ?? undefined,
+    providerSessionProvider: thread.providerSessionProvider ?? undefined,
+    providerSessionModel: thread.providerSessionModel ?? undefined,
+    providerSessionConnectionId: thread.providerSessionConnectionId ?? undefined,
+    providerSessionUpdatedAt: thread.providerSessionUpdatedAt?.toISOString(),
+    lastMessageAt: thread.lastMessageAt?.toISOString(),
+    archivedAt: thread.archivedAt?.toISOString(),
+    createdAt: thread.createdAt.toISOString(),
+    updatedAt: thread.updatedAt.toISOString()
+  };
+}
+
+export function toChatMessage(message: ChatMessage): CoreChatMessage {
+  return {
+    id: message.id,
+    threadId: message.threadId,
+    runId: message.runId ?? undefined,
+    sequence: message.sequence,
+    role: message.role,
+    content: message.content,
+    metadata: message.metadataJson === null ? undefined : message.metadataJson as JsonValue,
+    createdAt: message.createdAt.toISOString()
+  };
+}
+
+export function toChatRun(run: ChatRun): CoreChatRun {
+  return {
+    id: run.id,
+    threadId: run.threadId,
+    status: run.status,
+    prompt: run.prompt,
+    provider: run.provider ?? undefined,
+    model: run.model ?? undefined,
+    attemptCount: run.attemptCount,
+    inputTokens: run.inputTokens,
+    outputTokens: run.outputTokens,
+    totalTokens: run.totalTokens,
+    cachedTokens: run.cachedTokens,
+    actualCostUsd: run.actualCostUsd === null ? undefined : Number(run.actualCostUsd),
+    errorMessage: run.errorMessage ?? undefined,
+    responseSummary: run.responseSummary ?? undefined,
+    result: run.resultJson === null ? undefined : run.resultJson as JsonValue,
+    stopRequested: run.stopRequested,
+    nextAttemptAt: run.nextAttemptAt?.toISOString(),
+    claimedAt: run.claimedAt?.toISOString(),
+    heartbeatAt: run.heartbeatAt?.toISOString(),
+    startedAt: run.startedAt?.toISOString(),
+    finishedAt: run.finishedAt?.toISOString(),
+    createdAt: run.createdAt.toISOString(),
+    updatedAt: run.updatedAt.toISOString()
+  };
+}
+
+export function toChatApproval(approval: ChatApproval): CoreChatApproval {
+  return {
+    id: approval.id,
+    threadId: approval.threadId,
+    runId: approval.runId,
+    type: approval.type,
+    status: approval.status,
+    requestedBy: approval.requestedBy as CoreChatApproval['requestedBy'],
+    approvedByUserId: approval.approvedByUserId ?? undefined,
+    title: approval.title,
+    description: approval.description,
+    riskLevel: approval.riskLevel,
+    payload: approval.payloadJson as JsonValue,
+    createdAt: approval.createdAt.toISOString(),
+    resolvedAt: approval.resolvedAt?.toISOString()
   };
 }
 

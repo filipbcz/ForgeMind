@@ -81,6 +81,8 @@ const repositoryMock = {
   requeueTasksWaitingForCapabilities: vi.fn(async () => 0),
   listTasksWaitingForCapabilities: vi.fn(async () => []),
   recoverStuckProjectAudits: vi.fn(async () => 0),
+  recoverStuckChatRuns: vi.fn(async () => 0),
+  claimNextChatRun: vi.fn(async (): Promise<unknown> => undefined),
   getGitHubConnectionSecret: vi.fn(async () => undefined),
   getAIProviderConnectionSecret: vi.fn(async () => undefined),
   getAIProviderConnectionSecretById: vi.fn(async (_connectionId: string): Promise<unknown> => undefined),
@@ -288,13 +290,16 @@ github: {}`;
     const workspaceRoot = join(tmpdir(), `forgemind-db-worker-retention-${randomUUID()}`);
     const oldInactiveWorkspace = join(workspaceRoot, 'task_old');
     const oldActiveWorkspace = join(workspaceRoot, 'task_active');
+    const chatWorkspaceRoot = join(workspaceRoot, 'chat');
     await mkdir(oldInactiveWorkspace, { recursive: true });
     await mkdir(oldActiveWorkspace, { recursive: true });
+    await mkdir(chatWorkspaceRoot, { recursive: true });
     await writeFile(join(oldInactiveWorkspace, 'artifact.txt'), 'old\n');
     await writeFile(join(oldActiveWorkspace, 'artifact.txt'), 'active\n');
     const oldDate = new Date(Date.now() - 2 * 24 * 60 * 60 * 1000);
     await utimes(oldInactiveWorkspace, oldDate, oldDate);
     await utimes(oldActiveWorkspace, oldDate, oldDate);
+    await utimes(chatWorkspaceRoot, oldDate, oldDate);
     process.env.FORGEMIND_WORKSPACE_ROOT = workspaceRoot;
 
     try {
@@ -336,6 +341,7 @@ github: {}`;
 
       await expect(access(oldInactiveWorkspace)).rejects.toThrow();
       await expect(access(oldActiveWorkspace)).resolves.toBeUndefined();
+      await expect(access(chatWorkspaceRoot)).resolves.toBeUndefined();
     } finally {
       if (previousWorkspaceRoot === undefined) {
         delete process.env.FORGEMIND_WORKSPACE_ROOT;

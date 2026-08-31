@@ -61,6 +61,7 @@ services:
       - ${FORGEMIND_ENV_FILE:-/opt/forgemind/shared/server.env}
     environment:
       FORGEMIND_CODEX_BYPASS_READ_ONLY_SANDBOX: "true"
+      FORGEMIND_INTERNAL_API_URL: "http://api:4000"
     depends_on:
       postgres:
         condition: service_healthy

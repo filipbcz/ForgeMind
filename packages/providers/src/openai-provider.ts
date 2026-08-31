@@ -1,6 +1,8 @@
 import type { ProviderKind } from '@forgemind/core';
 import type {
   AIProvider,
+  ChatInput,
+  ChatResult,
   CapabilityAuditInput,
   CapabilityAuditResult,
   CostEstimateInput,
@@ -18,11 +20,12 @@ import type {
   ReviewInput,
   ReviewResult
 } from './provider.js';
-import { ProviderContractError, normalizeProviderError, normalizeProviderPreflight, normalizeValidationChecks, parseImplementResult, parsePlanResult, parseProviderJsonObject, parseReviewResult } from './provider.js';
+import { ProviderContractError, normalizeProviderError, normalizeProviderPreflight, normalizeValidationChecks, parseChatResult, parseImplementResult, parsePlanResult, parseProviderJsonObject, parseReviewResult } from './provider.js';
 import { emitCapturedUsage, normalizeTokenBreakdown } from './provider-usage.js';
 import { buildReviewPrompt } from './review-prompt.js';
 import { buildCapabilityAuditPrompt, buildReleaseAuditPrompt, normalizeAuditContentWithSingleRepair, normalizeCapabilityAuditResult, normalizeReleaseAuditResult } from './audit-prompt.js';
 import type { ProviderRuntimeConfig } from './index.js';
+import { buildRepositoryChatPrompt } from './chat-prompt.js';
 
 const DEFAULT_OPENAI_API_URL = 'https://api.openai.com/v1/chat/completions';
 const DEFAULT_OPENAI_MODEL = 'gpt-4o-mini';
@@ -201,6 +204,28 @@ export class OpenAIProvider implements AIProvider {
       result.providerResponse = content;
 
       return result;
+    } catch (error) {
+      throw normalizeProviderError(this.kind, error);
+    }
+  }
+
+  async chat(input: ChatInput): Promise<ChatResult> {
+    const providerPrompt = buildRepositoryChatPrompt(input, false);
+    const messages: Array<{ role: 'system' | 'user' | 'assistant'; content: string }> = [
+      {
+        role: 'system',
+        content: 'You are ForgeMind Repository Chat. Answer directly and return JSON with response, changedFiles, requestedApprovals, validationChecks, fileUpdates, and forgeMindActions. This API mode cannot edit files directly, so every file change must be returned in fileUpdates. Use forgeMindActions for ForgeMind application operations.'
+      },
+      { role: 'user', content: providerPrompt }
+    ];
+    const response = await this.requestChat(messages, input.signal);
+    await emitCapturedUsage(input.onActivity, response.usage);
+    try {
+      return {
+        ...parseChatResult(response.content, 'OpenAI chat'),
+        providerPrompt: serializeMessages(messages),
+        providerResponse: response.content
+      };
     } catch (error) {
       throw normalizeProviderError(this.kind, error);
     }

@@ -118,14 +118,36 @@ enum AiProviderAuthMode {
   codex_oauth
 }
 
+enum ChatThreadStatus {
+  active
+  archived
+}
+
+enum ChatRunStatus {
+  queued
+  running
+  waiting_for_approval
+  succeeded
+  failed
+  cancelled
+  interrupted
+}
+
+enum ChatMessageRole {
+  user
+  assistant
+  system
+}
+
 model User {
-  id           String   @id @default(uuid())
-  email        String   @unique
-  name         String
-  githubUserId String?  @unique @map("github_user_id")
-  role         UserRole @default(owner)
-  createdAt    DateTime @default(now()) @map("created_at")
-  updatedAt    DateTime @updatedAt @map("updated_at")
+  id            String   @id @default(uuid())
+  email         String   @unique
+  name          String
+  githubUserId  String?  @unique @map("github_user_id")
+  googleSubject String?  @unique @map("google_subject")
+  role          UserRole @default(owner)
+  createdAt     DateTime @default(now()) @map("created_at")
+  updatedAt     DateTime @updatedAt @map("updated_at")
 
   tasks                     Task[]
   approvals                 Approval[]
@@ -133,8 +155,26 @@ model User {
   notificationSubscriptions NotificationSubscription[]
   githubConnection          GitHubConnection?
   aiProviderConnections     AiProviderConnection[]
+  chatThreads               ChatThread[]
+  approvedChatApprovals     ChatApproval[]
+  authSessions              AuthSession[]
 
   @@map("users")
+}
+
+model AuthSession {
+  tokenHash  String    @id @map("token_hash")
+  userId     String    @map("user_id")
+  createdAt  DateTime  @default(now()) @map("created_at")
+  expiresAt  DateTime  @map("expires_at")
+  lastSeenAt DateTime  @default(now()) @map("last_seen_at")
+  revokedAt  DateTime? @map("revoked_at")
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId, expiresAt])
+  @@index([expiresAt])
+  @@map("auth_sessions")
 }
 
 model Project {
@@ -179,6 +219,7 @@ model Project {
   acceptanceEvidence         AcceptanceEvidence[]
   auditJobs                  ProjectAuditJob[]
   aiProviderConnection       AiProviderConnection?         @relation(fields: [aiProviderConnectionId], references: [id], onDelete: SetNull)
+  chatThreads                ChatThread[]
 
   @@map("projects")
 }
@@ -274,12 +315,127 @@ model AiProviderConnection {
   createdAt         DateTime           @default(now()) @map("created_at")
   updatedAt         DateTime           @updatedAt @map("updated_at")
 
-  user     User      @relation(fields: [userId], references: [id])
-  projects Project[]
+  user        User         @relation(fields: [userId], references: [id])
+  projects    Project[]
+  chatThreads ChatThread[]
 
   @@unique([userId, name])
   @@index([userId, isDefault])
   @@map("ai_provider_connections")
+}
+
+model ChatThread {
+  id                          String           @id @default(uuid())
+  userId                      String           @map("user_id")
+  projectId                   String?          @map("project_id")
+  providerConnectionId        String?          @map("provider_connection_id")
+  title                       String
+  status                      ChatThreadStatus @default(active)
+  mode                        TaskMode         @default(safe)
+  repositoryOwner             String?          @map("repository_owner")
+  repositoryName              String?          @map("repository_name")
+  baseBranch                  String?          @map("base_branch")
+  branchName                  String?          @map("branch_name")
+  contextSummary              String?          @map("context_summary")
+  providerSessionId           String?          @map("provider_session_id")
+  providerSessionProvider     ProviderKind?    @map("provider_session_provider")
+  providerSessionModel        String?          @map("provider_session_model")
+  providerSessionConnectionId String?          @map("provider_session_connection_id")
+  providerSessionUpdatedAt    DateTime?        @map("provider_session_updated_at")
+  lastMessageAt               DateTime?        @map("last_message_at")
+  archivedAt                  DateTime?        @map("archived_at")
+  createdAt                   DateTime         @default(now()) @map("created_at")
+  updatedAt                   DateTime         @updatedAt @map("updated_at")
+
+  user               User                  @relation(fields: [userId], references: [id], onDelete: Cascade)
+  project            Project?              @relation(fields: [projectId], references: [id], onDelete: SetNull)
+  providerConnection AiProviderConnection? @relation(fields: [providerConnectionId], references: [id], onDelete: SetNull)
+  messages           ChatMessage[]
+  runs               ChatRun[]
+  approvals          ChatApproval[]
+  auditLog           AuditLog[]
+
+  @@index([userId, status, updatedAt])
+  @@index([projectId])
+  @@map("chat_threads")
+}
+
+model ChatRun {
+  id              String        @id @default(uuid())
+  threadId        String        @map("thread_id")
+  status          ChatRunStatus @default(queued)
+  prompt          String
+  provider        ProviderKind?
+  model           String?
+  attemptCount    Int           @default(0) @map("attempt_count")
+  inputTokens     Int           @default(0) @map("input_tokens")
+  outputTokens    Int           @default(0) @map("output_tokens")
+  totalTokens     Int           @default(0) @map("total_tokens")
+  cachedTokens    Int           @default(0) @map("cached_tokens")
+  actualCostUsd   Decimal?      @map("actual_cost_usd") @db.Decimal(10, 4)
+  errorMessage    String?       @map("error_message")
+  responseSummary String?       @map("response_summary")
+  resultJson      Json?         @map("result_json")
+  stopRequested   Boolean       @default(false) @map("stop_requested")
+  nextAttemptAt   DateTime?     @map("next_attempt_at")
+  claimedAt       DateTime?     @map("claimed_at")
+  heartbeatAt     DateTime?     @map("heartbeat_at")
+  startedAt       DateTime?     @map("started_at")
+  finishedAt      DateTime?     @map("finished_at")
+  createdAt       DateTime      @default(now()) @map("created_at")
+  updatedAt       DateTime      @updatedAt @map("updated_at")
+
+  thread    ChatThread     @relation(fields: [threadId], references: [id], onDelete: Cascade)
+  messages  ChatMessage[]
+  approvals ChatApproval[]
+  auditLog  AuditLog[]
+
+  @@index([status, nextAttemptAt, createdAt])
+  @@index([threadId, createdAt])
+  @@map("chat_runs")
+}
+
+model ChatMessage {
+  id           String          @id @default(uuid())
+  threadId     String          @map("thread_id")
+  runId        String?         @map("run_id")
+  sequence     Int
+  role         ChatMessageRole
+  content      String
+  metadataJson Json?           @map("metadata_json")
+  createdAt    DateTime        @default(now()) @map("created_at")
+
+  thread ChatThread @relation(fields: [threadId], references: [id], onDelete: Cascade)
+  run    ChatRun?   @relation(fields: [runId], references: [id], onDelete: SetNull)
+
+  @@unique([threadId, sequence])
+  @@index([threadId, createdAt])
+  @@index([runId])
+  @@map("chat_messages")
+}
+
+model ChatApproval {
+  id               String         @id @default(uuid())
+  threadId         String         @map("thread_id")
+  runId            String         @map("run_id")
+  type             ApprovalType
+  status           ApprovalStatus @default(pending)
+  requestedBy      String         @map("requested_by")
+  approvedByUserId String?        @map("approved_by_user_id")
+  title            String
+  description      String
+  riskLevel        RiskLevel      @map("risk_level")
+  payloadJson      Json           @map("payload_json")
+  createdAt        DateTime       @default(now()) @map("created_at")
+  resolvedAt       DateTime?      @map("resolved_at")
+
+  thread         ChatThread @relation(fields: [threadId], references: [id], onDelete: Cascade)
+  run            ChatRun    @relation(fields: [runId], references: [id], onDelete: Cascade)
+  approvedByUser User?      @relation(fields: [approvedByUserId], references: [id])
+
+  @@index([threadId, status])
+  @@index([runId, status])
+  @@map("chat_approvals")
 }
 
 model NotificationSettings {
@@ -314,32 +470,32 @@ model NotificationSubscription {
 }
 
 model Task {
-  id                          String        @id @default(uuid())
-  projectId                   String        @map("project_id")
-  createdByUserId             String        @map("created_by_user_id")
-  title                       String
-  prompt                      String
-  mode                        TaskMode      @default(safe)
-  status                      TaskStatus    @default(draft)
-  waitingForCapabilities      Json          @default("[]") @map("waiting_for_capabilities")
-  deferredValidationCapabilities Json       @default("[]") @map("deferred_validation_capabilities")
-  githubIssueNumber           Int?          @map("github_issue_number")
-  githubIssueUrl              String?       @map("github_issue_url")
-  branchName                  String?       @map("branch_name")
-  architectureVersionId       String?       @map("architecture_version_id")
-  pullRequestNumber           Int?          @map("pull_request_number")
-  pullRequestUrl              String?       @map("pull_request_url")
-  providerSessionId           String?       @map("provider_session_id")
-  providerSessionProvider     ProviderKind? @map("provider_session_provider")
-  providerSessionModel        String?       @map("provider_session_model")
-  providerSessionConnectionId String?       @map("provider_session_connection_id")
-  providerSessionUpdatedAt    DateTime?     @map("provider_session_updated_at")
-  maxIterations               Int           @default(10) @map("max_iterations")
-  maxBudgetUsd                Decimal       @default(2.00) @map("max_budget_usd") @db.Decimal(10, 2)
-  createdAt                   DateTime      @default(now()) @map("created_at")
-  updatedAt                   DateTime      @updatedAt @map("updated_at")
-  startedAt                   DateTime?     @map("started_at")
-  finishedAt                  DateTime?     @map("finished_at")
+  id                             String        @id @default(uuid())
+  projectId                      String        @map("project_id")
+  createdByUserId                String        @map("created_by_user_id")
+  title                          String
+  prompt                         String
+  mode                           TaskMode      @default(safe)
+  status                         TaskStatus    @default(draft)
+  waitingForCapabilities         Json          @default("[]") @map("waiting_for_capabilities")
+  deferredValidationCapabilities Json          @default("[]") @map("deferred_validation_capabilities")
+  githubIssueNumber              Int?          @map("github_issue_number")
+  githubIssueUrl                 String?       @map("github_issue_url")
+  branchName                     String?       @map("branch_name")
+  architectureVersionId          String?       @map("architecture_version_id")
+  pullRequestNumber              Int?          @map("pull_request_number")
+  pullRequestUrl                 String?       @map("pull_request_url")
+  providerSessionId              String?       @map("provider_session_id")
+  providerSessionProvider        ProviderKind? @map("provider_session_provider")
+  providerSessionModel           String?       @map("provider_session_model")
+  providerSessionConnectionId    String?       @map("provider_session_connection_id")
+  providerSessionUpdatedAt       DateTime?     @map("provider_session_updated_at")
+  maxIterations                  Int           @default(10) @map("max_iterations")
+  maxBudgetUsd                   Decimal       @default(2.00) @map("max_budget_usd") @db.Decimal(10, 2)
+  createdAt                      DateTime      @default(now()) @map("created_at")
+  updatedAt                      DateTime      @updatedAt @map("updated_at")
+  startedAt                      DateTime?     @map("started_at")
+  finishedAt                     DateTime?     @map("finished_at")
 
   project                    Project                      @relation(fields: [projectId], references: [id])
   createdByUser              User                         @relation(fields: [createdByUserId], references: [id])
@@ -352,7 +508,7 @@ model Task {
   architectureVersion        ProjectArchitectureVersion?  @relation("TaskEffectiveArchitecture", fields: [architectureVersionId], references: [id], onDelete: SetNull)
   sourceArchitectureVersions ProjectArchitectureVersion[] @relation("ArchitectureSourceTask")
   acceptanceEvidence         AcceptanceEvidence[]
-  checkpoints               TaskCheckpoint[]
+  checkpoints                TaskCheckpoint[]
 
   @@index([projectId, status])
   @@map("tasks")
@@ -699,19 +855,25 @@ model ProviderUsage {
 }
 
 model AuditLog {
-  id        String         @id @default(uuid())
-  actorType AuditActorType @map("actor_type")
-  actorId   String?        @map("actor_id")
-  eventType String         @map("event_type")
-  projectId String?        @map("project_id")
-  taskId    String?        @map("task_id")
-  payload   Json           @map("payload_json")
-  createdAt DateTime       @default(now()) @map("created_at")
+  id           String         @id @default(uuid())
+  actorType    AuditActorType @map("actor_type")
+  actorId      String?        @map("actor_id")
+  eventType    String         @map("event_type")
+  projectId    String?        @map("project_id")
+  taskId       String?        @map("task_id")
+  chatThreadId String?        @map("chat_thread_id")
+  chatRunId    String?        @map("chat_run_id")
+  payload      Json           @map("payload_json")
+  createdAt    DateTime       @default(now()) @map("created_at")
 
-  project Project? @relation(fields: [projectId], references: [id])
-  task    Task?    @relation(fields: [taskId], references: [id])
+  project    Project?    @relation(fields: [projectId], references: [id])
+  task       Task?       @relation(fields: [taskId], references: [id])
+  chatThread ChatThread? @relation(fields: [chatThreadId], references: [id], onDelete: SetNull)
+  chatRun    ChatRun?    @relation(fields: [chatRunId], references: [id], onDelete: SetNull)
 
   @@index([eventType, createdAt])
   @@index([taskId, createdAt])
+  @@index([chatThreadId, createdAt])
+  @@index([chatRunId, createdAt])
   @@map("audit_log")
 }

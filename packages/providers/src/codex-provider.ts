@@ -13,6 +13,8 @@ import type {
   CapabilityAuditResult,
   CostEstimateInput,
   CostEstimateResult,
+  ChatInput,
+  ChatResult,
   ImplementInput,
   ImplementResult,
   PlanInput,
@@ -28,11 +30,12 @@ import type {
   ReviewInput,
   ReviewResult
 } from './provider.js';
-import { ProviderContractError, normalizeProviderError, normalizeProviderPreflight, normalizeValidationChecks, parseImplementResult, parsePlanResult, parseProviderJsonObject, parseReviewResult } from './provider.js';
+import { ProviderContractError, normalizeProviderError, normalizeProviderPreflight, normalizeValidationChecks, parseChatResult, parseImplementResult, parsePlanResult, parseProviderJsonObject, parseReviewResult } from './provider.js';
 import { emitCapturedUsage, normalizeTokenBreakdown } from './provider-usage.js';
 import { buildReviewPrompt } from './review-prompt.js';
 import { buildCapabilityAuditPrompt, buildReleaseAuditPrompt, normalizeAuditContentWithSingleRepair, normalizeCapabilityAuditResult, normalizeReleaseAuditResult } from './audit-prompt.js';
 import type { ProviderRuntimeConfig } from './index.js';
+import { buildRepositoryChatPrompt } from './chat-prompt.js';
 import type { ProviderModelOption } from './openai-provider.js';
 
 const DEFAULT_CODEX_API_URL = 'https://api.openai.com/v1/responses';
@@ -704,6 +707,44 @@ export class CodexProvider implements AIProvider {
       result.providerPrompt = serializeMessages(messages);
       result.providerResponse = content;
       return result;
+    } catch (error) {
+      throw normalizeProviderError(this.kind, error);
+    }
+  }
+
+  async chat(input: ChatInput): Promise<ChatResult> {
+    const continueSession = Boolean(resolveCompatibleSessionId(input.session, 'codex', this.model));
+    const providerPrompt = buildRepositoryChatPrompt(input, continueSession);
+    let content: string;
+    if (this.authMode === 'oauth') {
+      content = await this.runCodexExec({
+        repositoryPath: input.repositoryPath,
+        packetOnly: !input.repositoryAttached,
+        sandbox: input.repositoryAttached ? 'workspace-write' : 'read-only',
+        onActivity: input.onActivity,
+        session: input.session,
+        signal: input.signal,
+        schema: repositoryChatJsonSchema(),
+        prompt: providerPrompt
+      });
+    } else {
+      const messages: Array<{ role: 'system' | 'user' | 'assistant'; content: string }> = [
+        {
+          role: 'system',
+          content: 'You are ForgeMind Repository Chat. Answer the user directly and return only JSON matching the requested chat schema. Use fileUpdates for repository changes and forgeMindActions for ForgeMind application operations.'
+        },
+        { role: 'user', content: providerPrompt }
+      ];
+      const response = await this.requestResponses(messages, input.session, input.signal);
+      content = response.content;
+      await emitCapturedUsage(input.onActivity, response.usage);
+    }
+    try {
+      return {
+        ...parseChatResult(content, 'Codex chat'),
+        providerPrompt,
+        providerResponse: content
+      };
     } catch (error) {
       throw normalizeProviderError(this.kind, error);
     }
@@ -1781,6 +1822,46 @@ export function buildCodexImplementationPrompt(input: ImplementInput, continueSe
   ]
     .filter(Boolean)
     .join('\n\n');
+}
+
+function repositoryChatJsonSchema(): Record<string, unknown> {
+  return {
+    type: 'object',
+    additionalProperties: false,
+    required: ['response', 'changedFiles', 'requestedApprovals', 'validationChecks', 'fileUpdates', 'forgeMindActions'],
+    properties: {
+      response: { type: 'string' },
+      changedFiles: { type: 'array', items: { type: 'string' } },
+      requestedApprovals: { type: 'array', items: { type: 'string', enum: APPROVAL_TYPES } },
+      validationChecks: validationChecksJsonSchema(),
+      fileUpdates: {
+        type: 'array',
+        items: {
+          type: 'object',
+          additionalProperties: false,
+          required: ['path', 'content'],
+          properties: {
+            path: { type: 'string' },
+            content: { type: 'string' }
+          }
+        }
+      },
+      forgeMindActions: {
+        type: 'array',
+        items: {
+          type: 'object',
+          additionalProperties: false,
+          required: ['method', 'path', 'bodyJson', 'rationale'],
+          properties: {
+            method: { type: 'string', enum: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE'] },
+            path: { type: 'string' },
+            bodyJson: { type: 'string' },
+            rationale: { type: 'string' }
+          }
+        }
+      }
+    }
+  };
 }
 
 export function parseCodexCliTotalTokens(stderr: string): number | undefined {

@@ -5,6 +5,12 @@ import type {
   AuthSessionResponse,
   AssignProjectRepositoryRequest,
   AuditEventApi,
+  ChatApprovalApi,
+  ChatMessageApi,
+  ChatRunApi,
+  ChatThreadApi,
+  ChatThreadDetailApi,
+  CreateChatThreadRequest,
   CreateProjectRequest,
   CreateTaskRequest,
   CodexOAuthCompleteResponse,
@@ -40,6 +46,7 @@ import type {
   TaskQueueApi,
   TaskSummary,
   TaskUsageApi,
+  UpdateChatThreadRequest,
   UpdateProjectRequest,
   WorkerEventApi,
   WorkerStatusApi
@@ -56,8 +63,8 @@ export async function fetchAuthSession(): Promise<AuthSessionResponse> {
   return request<AuthSessionResponse>('/api/auth/session');
 }
 
-export async function startGitHubLogin(): Promise<AuthLoginStartResponse> {
-  return request<AuthLoginStartResponse>('/api/auth/github/login', {
+export async function startGoogleLogin(): Promise<AuthLoginStartResponse> {
+  return request<AuthLoginStartResponse>('/api/auth/google/login', {
     method: 'POST',
     body: '{}'
   });
@@ -68,6 +75,49 @@ export async function logout(): Promise<void> {
     method: 'POST',
     body: '{}'
   });
+}
+
+export async function fetchChatThreads(includeArchived = false): Promise<ChatThreadApi[]> {
+  return request<ChatThreadApi[]>(`/api/chat/threads?includeArchived=${includeArchived}`);
+}
+
+export async function fetchChatThread(threadId: string): Promise<ChatThreadDetailApi> {
+  return request<ChatThreadDetailApi>(`/api/chat/threads/${threadId}`);
+}
+
+export async function createChatThread(input: CreateChatThreadRequest): Promise<ChatThreadApi> {
+  return request<ChatThreadApi>('/api/chat/threads', { method: 'POST', body: JSON.stringify(input) });
+}
+
+export async function continueChatThreadWithRepository(threadId: string, input: CreateChatThreadRequest): Promise<ChatThreadApi> {
+  return request<ChatThreadApi>(`/api/chat/threads/${threadId}/continue-with-repository`, {
+    method: 'POST',
+    body: JSON.stringify(input)
+  });
+}
+
+export async function updateChatThread(threadId: string, input: UpdateChatThreadRequest): Promise<ChatThreadApi> {
+  return request<ChatThreadApi>(`/api/chat/threads/${threadId}`, { method: 'PATCH', body: JSON.stringify(input) });
+}
+
+export async function deleteChatThread(threadId: string, confirmation: string): Promise<{ deleted: true; threadId: string }> {
+  return request(`/api/chat/threads/${threadId}`, { method: 'DELETE', body: JSON.stringify({ confirmation }) });
+}
+
+export async function sendChatMessage(threadId: string, content: string): Promise<{ message: ChatMessageApi; run: ChatRunApi }> {
+  return request(`/api/chat/threads/${threadId}/messages`, { method: 'POST', body: JSON.stringify({ content }) });
+}
+
+export async function retryChatRun(runId: string): Promise<ChatRunApi> {
+  return request<ChatRunApi>(`/api/chat/runs/${runId}/retry`, { method: 'POST', body: '{}' });
+}
+
+export async function cancelChatRun(runId: string): Promise<ChatRunApi> {
+  return request<ChatRunApi>(`/api/chat/runs/${runId}/cancel`, { method: 'POST', body: '{}' });
+}
+
+export async function resolveChatApproval(approvalId: string, decision: 'approve' | 'reject'): Promise<ChatApprovalApi> {
+  return request<ChatApprovalApi>(`/api/chat/approvals/${approvalId}/${decision}`, { method: 'POST', body: '{}' });
 }
 
 export function buildWebSocketUrl(taskId?: string): string {
@@ -97,6 +147,9 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
   });
 
   if (!response.ok) {
+    if (response.status === 401 && path !== '/api/auth/session' && typeof window !== 'undefined') {
+      window.dispatchEvent(new Event('forgemind:authentication-required'));
+    }
     const body = await response.text();
     throw new Error(formatRequestError(body, response.status));
   }

@@ -1,5 +1,5 @@
 import { redactError } from '@forgemind/core';
-import type { AcceptanceEvidenceSource, AcceptanceEvidenceStatus, ApprovalType, NormalizedProviderErrorDetails, NormalizedProviderErrorKind, ProjectArchitectureUpdate, ProjectContract, ProjectContractDelta, ProjectContractRequirement, ProviderKind, ProviderPreflightResult, ValidationCheckCategory } from '@forgemind/core';
+import type { AcceptanceEvidenceSource, AcceptanceEvidenceStatus, ApprovalType, NormalizedProviderErrorDetails, NormalizedProviderErrorKind, ProjectArchitectureUpdate, ProjectContract, ProjectContractDelta, ProjectContractRequirement, ProviderKind, ProviderPreflightResult, TaskMode, ValidationCheckCategory } from '@forgemind/core';
 
 export type { NormalizedProviderErrorDetails, NormalizedProviderErrorKind, ProviderPreflightResult } from '@forgemind/core';
 
@@ -167,6 +167,38 @@ export interface ImplementInput {
 export interface FileUpdate {
   path: string;
   content: string;
+}
+
+export interface ChatInput {
+  runId: string;
+  message: string;
+  conversationContext: string;
+  repositoryPath?: string;
+  repositoryAttached: boolean;
+  mode: TaskMode;
+  approvedOperations?: ApprovalType[];
+  forgeMindContext?: string;
+  onActivity?: ProviderActivityHandler;
+  session?: ProviderSessionContext;
+  signal?: AbortSignal;
+}
+
+export interface ForgeMindApiAction {
+  method: 'GET' | 'POST' | 'PUT' | 'PATCH' | 'DELETE';
+  path: string;
+  bodyJson: string;
+  rationale: string;
+}
+
+export interface ChatResult {
+  response: string;
+  changedFiles: string[];
+  requestedApprovals: ApprovalType[];
+  validationChecks: ValidationCheck[];
+  fileUpdates?: FileUpdate[];
+  forgeMindActions?: ForgeMindApiAction[];
+  providerPrompt?: string;
+  providerResponse?: string;
 }
 
 export interface ImplementResult {
@@ -416,6 +448,40 @@ export function parseImplementResult(content: string, operation: string, require
   return value as unknown as ImplementResult;
 }
 
+export function parseChatResult(content: string, operation: string): ChatResult {
+  const value = parseProviderJsonObject(content, operation);
+  requireString(value, 'response', operation);
+  requireStringArray(value, 'changedFiles', operation);
+  requireStringArray(value, 'requestedApprovals', operation);
+  if (value.validationChecks !== undefined && !Array.isArray(value.validationChecks)) {
+    throw new ProviderContractError(`${operation} field "validationChecks" must be an array.`);
+  }
+  if (value.fileUpdates !== undefined && (!Array.isArray(value.fileUpdates) || value.fileUpdates.some((item) => {
+    if (!item || typeof item !== 'object' || Array.isArray(item)) return true;
+    const update = item as Record<string, unknown>;
+    return typeof update.path !== 'string' || !update.path.trim() || typeof update.content !== 'string';
+  }))) {
+    throw new ProviderContractError(`${operation} field "fileUpdates" must contain path/content objects.`);
+  }
+  if (value.forgeMindActions !== undefined && (!Array.isArray(value.forgeMindActions) || value.forgeMindActions.some((item) => {
+    if (!item || typeof item !== 'object' || Array.isArray(item)) return true;
+    const action = item as Record<string, unknown>;
+    return !['GET', 'POST', 'PUT', 'PATCH', 'DELETE'].includes(String(action.method))
+      || typeof action.path !== 'string'
+      || !action.path.trim()
+      || typeof action.bodyJson !== 'string'
+      || typeof action.rationale !== 'string'
+      || !action.rationale.trim();
+  }))) {
+    throw new ProviderContractError(`${operation} field "forgeMindActions" must contain method/path/rationale objects.`);
+  }
+  return {
+    ...(value as unknown as ChatResult),
+    validationChecks: normalizeValidationChecks(value.validationChecks),
+    forgeMindActions: (value.forgeMindActions as ForgeMindApiAction[] | undefined) ?? []
+  };
+}
+
 export function parseReviewResult(content: string, operation: string): ReviewResult {
   const value = parseProviderJsonObject(content, operation);
   requireString(value, 'summary', operation);
@@ -564,6 +630,7 @@ export interface AIProvider {
   plan(input: PlanInput): Promise<PlanResult>;
   repairRoadmap?(input: RoadmapRepairInput): Promise<RoadmapRepairResult>;
   implement(input: ImplementInput): Promise<ImplementResult>;
+  chat?(input: ChatInput): Promise<ChatResult>;
   review(input: ReviewInput): Promise<ReviewResult>;
   auditCapability?(input: CapabilityAuditInput): Promise<CapabilityAuditResult>;
   auditRelease?(input: ReleaseAuditInput): Promise<ReleaseAuditResult>;

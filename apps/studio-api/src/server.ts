@@ -76,8 +76,8 @@ export async function createApp() {
 
   const repository = createRepository(getPrismaClient());
   const notificationService = createNotificationService(repository, createWebPushDispatcher());
-  const authService = createAuthService();
-  const realtime = registerRealtimeGateway(app);
+  const authService = createAuthService(repository);
+  const realtime = registerRealtimeGateway(app, repository, authService);
   registerRoutes(app, repository, notificationService, authService);
 
   startTaskNotificationBridge(app, repository, notificationService, realtime);
@@ -172,6 +172,25 @@ export function validateProductionHttpSecurityConfig() {
   if (process.env.FORGEMIND_SESSION_COOKIE_SECURE !== 'true') {
     throw new Error('Unsafe production HTTP configuration: set FORGEMIND_SESSION_COOKIE_SECURE=true.');
   }
+
+  for (const name of [
+    'GOOGLE_OAUTH_CLIENT_ID',
+    'GOOGLE_OAUTH_CLIENT_SECRET',
+    'GOOGLE_OAUTH_CALLBACK_URL',
+    'FORGEMIND_GOOGLE_ALLOWED_EMAIL'
+  ]) {
+    if (!process.env[name]?.trim()) {
+      throw new Error(`Unsafe production HTTP configuration: set ${name} for Google authentication.`);
+    }
+  }
+
+  const callbackUrl = new URL(process.env.GOOGLE_OAUTH_CALLBACK_URL!);
+  if (callbackUrl.protocol !== 'https:') {
+    throw new Error('Unsafe production HTTP configuration: GOOGLE_OAUTH_CALLBACK_URL must use https.');
+  }
+  if (callbackUrl.pathname !== '/api/auth/google/callback' || callbackUrl.search || callbackUrl.hash) {
+    throw new Error('Unsafe production HTTP configuration: GOOGLE_OAUTH_CALLBACK_URL must end exactly with /api/auth/google/callback.');
+  }
 }
 
 export function resolveAllowedCorsOrigins(): Set<string> {
@@ -236,12 +255,12 @@ function isProtectedApiMutation(request: FastifyRequest): boolean {
     return false;
   }
   const path = request.url.split('?')[0] ?? request.url;
-  return path.startsWith('/api/') && path !== '/api/auth/github/login' && path !== '/api/webhooks/github';
+  return path.startsWith('/api/') && path !== '/api/auth/google/login' && path !== '/api/webhooks/github';
 }
 
 function isSensitiveEndpoint(request: FastifyRequest): boolean {
   const path = request.url.split('?')[0] ?? request.url;
-  if (path === '/api/auth/github/login') {
+  if (path === '/api/auth/google/login') {
     return true;
   }
   return isProtectedApiMutation(request);

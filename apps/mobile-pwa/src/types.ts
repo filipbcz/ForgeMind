@@ -36,28 +36,142 @@ export type TaskStatus =
   | 'waiting_for_capability';
 
 export interface AuthSessionApi {
-  provider: 'github';
-  mode: 'oauth_scaffold';
+  provider: 'google';
+  mode: 'oauth';
   userId: string;
   createdAt: string;
-  providerAccess: 'pending_token_exchange';
+  expiresAt: string;
 }
 
 export interface AuthSessionResponse {
+  configured: boolean;
   user: {
     id: string;
     email: string;
     name: string;
     role: 'owner' | 'operator';
-  };
+  } | null;
   session: AuthSessionApi | null;
 }
 
 export interface AuthLoginStartResponse {
-  provider: 'github';
-  mode: 'oauth_scaffold';
-  state: string;
+  provider: 'google';
+  mode: 'oauth';
   authUrl: string;
+}
+
+export type ChatRunStatus = 'queued' | 'running' | 'waiting_for_approval' | 'succeeded' | 'failed' | 'cancelled' | 'interrupted';
+
+export interface ChatThreadApi {
+  id: string;
+  userId: string;
+  projectId?: string;
+  providerConnectionId?: string;
+  title: string;
+  status: 'active' | 'archived';
+  mode: 'safe' | 'auto' | 'full_auto';
+  repositoryOwner?: string;
+  repositoryName?: string;
+  baseBranch?: string;
+  branchName?: string;
+  contextSummary?: string;
+  providerSessionId?: string;
+  providerSessionProvider?: 'codex' | 'openai' | 'github_copilot';
+  providerSessionModel?: string;
+  providerSessionConnectionId?: string;
+  providerSessionUpdatedAt?: string;
+  lastMessageAt?: string;
+  archivedAt?: string;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface ChatMessageApi {
+  id: string;
+  threadId: string;
+  runId?: string;
+  sequence: number;
+  role: 'user' | 'assistant' | 'system';
+  content: string;
+  metadata?: unknown;
+  createdAt: string;
+}
+
+export interface ChatRunApi {
+  id: string;
+  threadId: string;
+  status: ChatRunStatus;
+  prompt: string;
+  provider?: 'codex' | 'openai' | 'github_copilot';
+  model?: string;
+  attemptCount: number;
+  inputTokens: number;
+  outputTokens: number;
+  totalTokens: number;
+  cachedTokens: number;
+  actualCostUsd?: number;
+  errorMessage?: string;
+  responseSummary?: string;
+  result?: {
+    interimResponses?: string[];
+    branchName?: string;
+    changedFiles?: string[];
+    diff?: string;
+    untracked?: Array<{ path: string; content: string }>;
+    validation?: { passed?: boolean; command?: string; exitCode?: number; stdout?: string; stderr?: string } | null;
+  };
+  stopRequested: boolean;
+  nextAttemptAt?: string;
+  claimedAt?: string;
+  heartbeatAt?: string;
+  startedAt?: string;
+  finishedAt?: string;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface ChatApprovalApi {
+  id: string;
+  threadId: string;
+  runId: string;
+  type: string;
+  status: 'pending' | 'approved' | 'rejected' | 'cancelled';
+  requestedBy: 'agent' | 'system';
+  title: string;
+  description: string;
+  riskLevel: 'low' | 'medium' | 'high' | 'critical';
+  payload: unknown;
+  createdAt: string;
+  resolvedAt?: string;
+}
+
+export interface ChatThreadDetailApi {
+  thread: ChatThreadApi;
+  messages: ChatMessageApi[];
+  runs: ChatRunApi[];
+  approvals: ChatApprovalApi[];
+  events: AuditEventApi[];
+}
+
+export interface CreateChatThreadRequest {
+  title: string;
+  projectId?: string;
+  providerConnectionId?: string;
+  mode?: 'safe' | 'auto' | 'full_auto';
+  repositoryOwner?: string;
+  repositoryName?: string;
+  baseBranch?: string;
+}
+
+export interface UpdateChatThreadRequest extends Partial<Omit<CreateChatThreadRequest,
+  'projectId' | 'providerConnectionId' | 'repositoryOwner' | 'repositoryName' | 'baseBranch'>> {
+  projectId?: string | null;
+  providerConnectionId?: string | null;
+  repositoryOwner?: string | null;
+  repositoryName?: string | null;
+  baseBranch?: string | null;
+  branchName?: string | null;
+  status?: 'active' | 'archived';
 }
 
 export interface ProjectApi {
@@ -392,6 +506,8 @@ export interface AuditEventApi {
   eventType: string;
   projectId?: string;
   taskId?: string;
+  chatThreadId?: string;
+  chatRunId?: string;
   payload: unknown;
   createdAt: string;
 }
@@ -519,6 +635,7 @@ export interface RealtimeAuditEventMessage {
 export interface RealtimeConnectedMessage {
   type: 'connected';
   taskId?: string;
+  chatThreadId?: string;
 }
 
 export interface RealtimeHeartbeatMessage {

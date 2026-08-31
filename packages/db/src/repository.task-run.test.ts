@@ -960,6 +960,43 @@ describe('ForgeMindRepository task runs', () => {
     });
   });
 
+  it('reconciles inconsistent roadmap steps only from linked terminal task states', async () => {
+    const { prisma } = createMockPrisma();
+    const finishedAt = new Date('2026-08-31T05:00:00.000Z');
+    prisma.project.findUnique.mockResolvedValueOnce({ id: 'project_1' });
+    prisma.projectImplementationStep.findMany = vi.fn(async () => [{
+      id: 'step_completed', projectId: 'project_1', cycleId: 'cycle_1', sequenceNumber: 1,
+      status: 'running', task: { id: 'task_completed', status: 'completed', finishedAt }
+    }, {
+      id: 'step_failed', projectId: 'project_1', cycleId: 'cycle_1', sequenceNumber: 2,
+      status: 'running', task: { id: 'task_failed', status: 'validation_failed', finishedAt }
+    }, {
+      id: 'step_active', projectId: 'project_1', cycleId: 'cycle_1', sequenceNumber: 3,
+      status: 'running', task: { id: 'task_active', status: 'reviewing', finishedAt: null }
+    }]);
+    prisma.projectImplementationStep.update = vi.fn(async () => ({}));
+    const repository = new ForgeMindRepository(prisma);
+
+    const result = await repository.reconcileProjectImplementationSteps('project_1');
+
+    expect(result).toEqual({
+      projectId: 'project_1', examinedSteps: 3,
+      updatedSteps: [{
+        stepId: 'step_completed', taskId: 'task_completed', taskStatus: 'completed',
+        previousStatus: 'running', status: 'completed'
+      }, {
+        stepId: 'step_failed', taskId: 'task_failed', taskStatus: 'validation_failed',
+        previousStatus: 'running', status: 'cancelled'
+      }]
+    });
+    expect(prisma.projectImplementationStep.update).toHaveBeenNthCalledWith(1, {
+      where: { id: 'step_completed' }, data: { status: 'completed', completedAt: finishedAt }
+    });
+    expect(prisma.projectImplementationStep.update).toHaveBeenNthCalledWith(2, {
+      where: { id: 'step_failed' }, data: { status: 'cancelled', completedAt: null }
+    });
+  });
+
   it('reopens a completed roadmap step when its task is retried', async () => {
     const { prisma } = createMockPrisma();
     prisma.task.findUnique.mockResolvedValueOnce({
@@ -1324,6 +1361,36 @@ describe('ForgeMindRepository task runs', () => {
     expect(paused.queuePaused).toBe(true);
     expect(pausedStatus.runState).toEqual(expect.objectContaining({ status: 'waiting', reason: 'paused_queue' }));
     expect(inactiveStatus.runState).toEqual(expect.objectContaining({ status: 'waiting', reason: 'inactive_worker' }));
+  });
+});
+
+describe('chat API mutation delegation', () => {
+  it('uses the chat mode and exact approved mutation binding', async () => {
+    const findUnique = vi.fn();
+    const repository = new ForgeMindRepository({ chatRun: { findUnique } } as never);
+    const input = {
+      runId: 'run_1', userId: 'user_1', type: 'config_change' as const,
+      method: 'PUT', path: '/api/worker/queue', bodyHash: 'body_hash'
+    };
+
+    findUnique.mockResolvedValueOnce({
+      status: 'running', thread: { userId: 'user_1', mode: 'full_auto' }, approvals: []
+    });
+    await expect(repository.isChatApiMutationAuthorized(input)).resolves.toBe(true);
+
+    findUnique.mockResolvedValueOnce({
+      status: 'running', thread: { userId: 'user_1', mode: 'safe' }, approvals: []
+    });
+    await expect(repository.isChatApiMutationAuthorized(input)).resolves.toBe(false);
+
+    findUnique.mockResolvedValueOnce({
+      status: 'running', thread: { userId: 'user_1', mode: 'safe' }, approvals: [{
+        type: 'config_change', status: 'approved', payloadJson: {
+          apiMutation: { method: 'PUT', path: '/api/worker/queue', actorId: 'user_1', bodyHash: 'body_hash' }
+        }
+      }]
+    });
+    await expect(repository.isChatApiMutationAuthorized(input)).resolves.toBe(true);
   });
 });
 

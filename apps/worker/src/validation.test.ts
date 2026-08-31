@@ -113,7 +113,7 @@ describe('validation runner', () => {
     const workspacePath = await mkdtemp(join(tmpdir(), 'forgemind-validation-workspace-'));
     const outsidePath = await mkdtemp(join(tmpdir(), 'forgemind-validation-outside-'));
     await writeFile(join(outsidePath, 'secret.txt'), 'secret\n', 'utf8');
-    await symlink(outsidePath, join(workspacePath, 'outside-link'), 'dir');
+    await symlink(outsidePath, join(workspacePath, 'outside-link'), process.platform === 'win32' ? 'junction' : 'dir');
 
     const result = await runValidationChecks(
       [{ kind: 'command', command: 'cat outside-link/secret.txt' }],

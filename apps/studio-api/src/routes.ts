@@ -27,8 +27,9 @@ import type { NotificationService } from './notifications.js';
 import { ROADMAP_GENERATION_CONFIRMATION, activeProjectContractRequirements, applyProjectContractDelta, buildSpecificationChangeImpactReview, redactSecrets } from '@forgemind/core';
 import type { ApprovalType, ProviderConnectionRuntimeStatus } from '@forgemind/core';
 import type { Project, ProjectArchitectureUpdate, ProjectContract, ProjectContractDelta, TaskMode } from '@forgemind/core';
-import { registerAuthRoutes } from './routes/auth-routes.js';
+import { readSessionId, registerAuthRoutes } from './routes/auth-routes.js';
 import { registerNotificationRoutes } from './routes/notification-routes.js';
+import { registerChatRoutes } from './routes/chat-routes.js';
 import { registerWorkerRoutes } from './routes/worker-routes.js';
 
 const validationProfileSchema = z.object({
@@ -186,6 +187,14 @@ const projectContractDeltaPlanSchema = z.object({
   compatibilityImpacts: z.array(z.string().trim().min(1))
 });
 
+const manualProjectContractVersionSchema = z.object({
+  contract: projectContractPlanSchema.optional(),
+  contractDelta: projectContractDeltaPlanSchema.optional(),
+  changeSummary: z.string().trim().min(1).max(2_000)
+}).refine((value) => Boolean(value.contract) !== Boolean(value.contractDelta), {
+  message: 'Provide exactly one of contract or contractDelta.'
+});
+
 const architectureUpdatePlanSchema = z.object({
   summary: z.string().trim().min(1).nullable().optional(),
   modules: z.array(z.object({
@@ -305,9 +314,10 @@ export function registerRoutes(app: FastifyInstance, repository: ForgeMindReposi
   const dispatcher = createTaskDispatchService(repository);
   const processedWebhookDeliveries = new Set<string>();
 
-  app.addHook('preHandler', async (request, reply) => requireAuthorizedMutation(request, reply, repository, auth));
+  app.addHook('preHandler', async (request, reply) => requireAuthorizedRequest(request, reply, repository, auth));
 
-  registerAuthRoutes(app, repository, auth);
+  if (auth) registerAuthRoutes(app, repository, auth);
+  registerChatRoutes(app, repository);
 
   app.get('/health', async () => ({
     ok: true,
@@ -1090,6 +1100,22 @@ export function registerRoutes(app: FastifyInstance, repository: ForgeMindReposi
     return contracts ? contracts : sendNotFound(reply, `Project "${id}" not found`);
   });
 
+  app.post('/api/projects/:id/contracts', async (request, reply) => {
+    try {
+      const { id } = idParamsSchema.parse(request.params);
+      const input = manualProjectContractVersionSchema.parse(request.body ?? {});
+      const contracts = await repository.createManualProjectContractVersion({
+        projectId: id,
+        contract: input.contract,
+        contractDelta: input.contractDelta ? normalizeProjectContractDelta(input.contractDelta) : undefined,
+        changeSummary: input.changeSummary
+      });
+      return reply.code(201).send(contracts);
+    } catch (error) {
+      return sendBadRequest(reply, error);
+    }
+  });
+
   app.get('/api/projects/:id/architectures', async (request, reply) => {
     const { id } = idParamsSchema.parse(request.params);
     const architectures = await repository.getProjectArchitectures(id);
@@ -1187,6 +1213,18 @@ export function registerRoutes(app: FastifyInstance, repository: ForgeMindReposi
       return task
         ? reply.code(201).send(task)
         : reply.code(409).send({ error: 'The next implementation step was already reserved or started.' });
+    } catch (error) {
+      return sendBadRequest(reply, error);
+    }
+  });
+
+  app.post('/api/projects/:id/implementation-steps/reconcile', async (request, reply) => {
+    try {
+      const { id } = idParamsSchema.parse(request.params);
+      const reconciliation = await repository.reconcileProjectImplementationSteps(id);
+      if (!reconciliation) return sendNotFound(reply, `Project "${id}" not found`);
+      const roadmap = await repository.getProjectRoadmap(id);
+      return { reconciliation, roadmap };
     } catch (error) {
       return sendBadRequest(reply, error);
     }
@@ -1708,28 +1746,28 @@ export function registerRoutes(app: FastifyInstance, repository: ForgeMindReposi
   registerNotificationRoutes(app, repository, notifications);
 }
 
-async function requireAuthorizedMutation(
+async function requireAuthorizedRequest(
   request: FastifyRequest,
   reply: FastifyReply,
   repository: ForgeMindRepository,
   auth: AuthService | undefined
 ) {
-  if (!isProtectedMutationRequest(request)) {
+  if (!isProtectedApiRequest(request)) {
     return;
   }
 
   if (!auth) {
-    return reply.code(503).send({ error: 'Auth service is not configured for mutating API requests.' });
+    return reply.code(503).send({ error: 'Authentication service is not configured.' });
   }
 
-  const sessionId = readSessionId(request);
+  const sessionId = readSessionId(request.headers.authorization, request.headers.cookie);
   if (!sessionId) {
-    return reply.code(401).send({ error: 'Authentication required for mutating API requests.' });
+    return reply.code(401).send({ error: 'Authentication required.' });
   }
 
-  const session = auth.getSessionById(sessionId);
+  const session = await auth.getSessionById(sessionId);
   if (!session) {
-    return reply.code(401).send({ error: 'Authentication required for mutating API requests.' });
+    return reply.code(401).send({ error: 'Authentication required.' });
   }
 
   const currentUser = await repository.getCurrentUser();
@@ -1741,8 +1779,19 @@ async function requireAuthorizedMutation(
     return reply.code(403).send({ error: 'Owner role required for this mutation.' });
   }
 
-  const approvalType = requiredRiskApprovalType(request);
+  const approvalType = isMutationRequest(request) ? requiredRiskApprovalType(request) : undefined;
   if (approvalType) {
+    const chatRunId = readSingleHeader(request.headers['x-forgemind-chat-run-id']);
+    if (chatRunId && await repository.isChatApiMutationAuthorized({
+      runId: chatRunId,
+      userId: currentUser.id,
+      type: approvalType,
+      method: request.method,
+      path: request.url.split('?')[0] ?? request.url,
+      bodyHash: hashApiMutationBody(request.body ?? null)
+    })) {
+      return;
+    }
     const approvalId = readSingleHeader(request.headers['x-forgemind-approval-id']);
     if (!approvalId) {
       return reply.code(403).send({ error: `Approved ${approvalType} approval required for this mutation.` });
@@ -1758,45 +1807,28 @@ async function requireAuthorizedMutation(
   }
 }
 
-function isProtectedMutationRequest(request: FastifyRequest): boolean {
-  if (!['POST', 'PUT', 'PATCH', 'DELETE'].includes(request.method)) {
-    return false;
-  }
+function isProtectedApiRequest(request: FastifyRequest): boolean {
+  if (request.method === 'OPTIONS') return false;
   const path = request.url.split('?')[0] ?? request.url;
-  if (!path.startsWith('/api/')) {
-    return false;
-  }
-  return path !== '/api/auth/github/login' && path !== '/api/webhooks/github';
+  if (!path.startsWith('/api/')) return false;
+  return path !== '/api/auth/session'
+    && path !== '/api/auth/google/login'
+    && path !== '/api/auth/google/callback'
+    && path !== '/api/webhooks/github';
 }
 
-function readSessionId(request: FastifyRequest): string | undefined {
-  const authorization = request.headers.authorization;
-  if (authorization?.startsWith('Bearer ')) {
-    return authorization.slice('Bearer '.length).trim() || undefined;
-  }
-
-  const cookie = Array.isArray(request.headers.cookie) ? request.headers.cookie.join(';') : request.headers.cookie;
-  const sessionCookie = cookie
-    ?.split(';')
-    .map((item) => item.trim())
-    .find((item) => item.startsWith('forgemind_session='));
-  const encodedSessionId = sessionCookie?.slice('forgemind_session='.length);
-  try {
-    return encodedSessionId ? decodeURIComponent(encodedSessionId) : undefined;
-  } catch {
-    return undefined;
-  }
+function isMutationRequest(request: FastifyRequest): boolean {
+  return ['POST', 'PUT', 'PATCH', 'DELETE'].includes(request.method);
 }
 
 function requiresOwnerRole(request: FastifyRequest): boolean {
   const path = request.url.split('?')[0] ?? request.url;
-  return path === '/api/worker/queue'
+  return path === '/api/metrics'
+    || path === '/api/worker/queue'
     || path.startsWith('/api/github/')
-    || path === '/api/providers/models'
-    || path.startsWith('/api/providers/connect')
-    || path.startsWith('/api/providers/connections/')
-    || path.startsWith('/api/providers/codex/oauth/')
-    || path.startsWith('/api/approvals/')
+    || path.startsWith('/api/providers/')
+    || path.startsWith('/api/approvals')
+    || path.endsWith('/implementation-steps/reconcile')
     || (request.method === 'DELETE' && path.startsWith('/api/projects/'));
 }
 
@@ -1807,8 +1839,8 @@ function requiredRiskApprovalType(request: FastifyRequest): ApprovalType | undef
   if (path.startsWith('/api/providers/connect') || path.startsWith('/api/providers/connections/') || path === '/api/providers/codex/oauth/complete') {
     return 'config_change';
   }
+  if (path.endsWith('/implementation-steps/reconcile')) return 'risky_refactor';
   if (request.method === 'DELETE' && path.startsWith('/api/projects/')) return 'delete_files';
-  if (path.startsWith('/api/tasks/') && request.method === 'POST') return 'risky_refactor';
   return undefined;
 }
 
@@ -2131,6 +2163,10 @@ export function toProjectContract(plan: PlanResult, source = '', version?: numbe
 
 export function toProjectContractDelta(plan: PlanResult): ProjectContractDelta {
   const parsed = projectContractDeltaPlanSchema.parse(plan.contractDelta);
+  return normalizeProjectContractDelta(parsed);
+}
+
+function normalizeProjectContractDelta(parsed: z.infer<typeof projectContractDeltaPlanSchema>): ProjectContractDelta {
   return {
     ...parsed,
     summary: parsed.summary ?? undefined,

@@ -20,6 +20,7 @@ export type RealtimeConnectionMeta = {
 type Subscription = {
   id: number;
   taskId?: string;
+  chatThreadId?: string;
   handlers: RealtimeHandlers;
 };
 
@@ -29,16 +30,18 @@ class RealtimeConnectionManager {
   private nextId = 1;
   private readonly subscriptions = new Map<number, Subscription>();
   private readonly taskRefCounts = new Map<string, number>();
+  private readonly chatThreadRefCounts = new Map<string, number>();
   private globalRefCount = 0;
   private state: RealtimeConnectionState = 'idle';
   private lastMessageAt: string | undefined;
   private lastHeartbeatAt: string | undefined;
 
-  subscribe(taskId: string | undefined, handlers: RealtimeHandlers): () => void {
+  subscribe(taskId: string | undefined, handlers: RealtimeHandlers, chatThreadId?: string): () => void {
     const id = this.nextId++;
     this.subscriptions.set(id, {
       id,
       taskId,
+      chatThreadId,
       handlers
     });
 
@@ -48,6 +51,10 @@ class RealtimeConnectionManager {
       if (nextCount === 1) {
         this.sendControlMessage('subscribe', taskId);
       }
+    } else if (chatThreadId) {
+      const nextCount = (this.chatThreadRefCounts.get(chatThreadId) ?? 0) + 1;
+      this.chatThreadRefCounts.set(chatThreadId, nextCount);
+      if (nextCount === 1) this.sendControlMessage('subscribe', undefined, chatThreadId);
     } else {
       this.globalRefCount += 1;
       if (this.globalRefCount === 1) {
@@ -77,6 +84,15 @@ class RealtimeConnectionManager {
           this.sendControlMessage('unsubscribe', subscription.taskId);
         } else {
           this.taskRefCounts.set(subscription.taskId, nextCount);
+        }
+      } else if (subscription.chatThreadId) {
+        const currentCount = this.chatThreadRefCounts.get(subscription.chatThreadId) ?? 0;
+        const nextCount = Math.max(0, currentCount - 1);
+        if (nextCount === 0) {
+          this.chatThreadRefCounts.delete(subscription.chatThreadId);
+          this.sendControlMessage('unsubscribe', undefined, subscription.chatThreadId);
+        } else {
+          this.chatThreadRefCounts.set(subscription.chatThreadId, nextCount);
         }
       } else if (this.globalRefCount > 0) {
         this.globalRefCount -= 1;
@@ -119,7 +135,7 @@ class RealtimeConnectionManager {
         }
         this.notifyMetaChange();
         for (const subscription of this.subscriptions.values()) {
-          if (!matchesSubscription(subscription.taskId, message)) {
+          if (!matchesSubscription(subscription.taskId, message, subscription.chatThreadId)) {
             continue;
           }
           subscription.handlers.onMessage(message);
@@ -155,6 +171,9 @@ class RealtimeConnectionManager {
     for (const taskId of this.taskRefCounts.keys()) {
       this.sendControlMessage('subscribe', taskId);
     }
+    for (const chatThreadId of this.chatThreadRefCounts.keys()) {
+      this.sendControlMessage('subscribe', undefined, chatThreadId);
+    }
   }
 
   private scheduleReconnect() {
@@ -169,14 +188,15 @@ class RealtimeConnectionManager {
     }, 2000);
   }
 
-  private sendControlMessage(type: 'subscribe' | 'unsubscribe', taskId?: string) {
+  private sendControlMessage(type: 'subscribe' | 'unsubscribe', taskId?: string, chatThreadId?: string) {
     if (!this.socket || this.socket.readyState !== WebSocket.OPEN) {
       return;
     }
 
     this.socket.send(JSON.stringify({
       type,
-      taskId: taskId ?? null
+      taskId: taskId ?? null,
+      chatThreadId: chatThreadId ?? null
     }));
   }
 
@@ -222,20 +242,24 @@ class RealtimeConnectionManager {
   }
 }
 
-function matchesSubscription(taskId: string | undefined, message: RealtimeMessage): boolean {
+function matchesSubscription(taskId: string | undefined, message: RealtimeMessage, chatThreadId?: string): boolean {
   if (message.type !== 'audit_event') {
     return true;
   }
 
-  if (!taskId) {
+  if (!taskId && !chatThreadId) {
     return true;
   }
 
-  return message.event.taskId === taskId;
+  return taskId ? message.event.taskId === taskId : message.event.chatThreadId === chatThreadId;
 }
 
 const realtimeConnectionManager = new RealtimeConnectionManager();
 
 export function subscribeRealtime(taskId: string | undefined, handlers: RealtimeHandlers): () => void {
   return realtimeConnectionManager.subscribe(taskId, handlers);
+}
+
+export function subscribeChatRealtime(chatThreadId: string, handlers: RealtimeHandlers): () => void {
+  return realtimeConnectionManager.subscribe(undefined, handlers, chatThreadId);
 }

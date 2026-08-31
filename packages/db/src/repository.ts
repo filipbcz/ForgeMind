@@ -9,6 +9,7 @@ import {
   normalizeRunState,
   parseTaskRunState,
   redactSecrets,
+  requiresApproval,
   type AcceptanceEvidence,
   type AcceptanceEvidenceSource,
   type AcceptanceEvidenceStatus,
@@ -17,6 +18,10 @@ import {
   type ApprovalStatus,
   type ApprovalType,
   type AuditEvent,
+  type ChatApproval,
+  type ChatMessage,
+  type ChatRun,
+  type ChatThread,
   type ForgeTask,
   type IterationPhase,
   type ProjectImplementationStep,
@@ -45,7 +50,7 @@ import {
   type TaskCheckpoint,
   type TaskRunState
 } from '@forgemind/core';
-import { createHash } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { parseAgentConfigYaml } from '@forgemind/config';
 import type { JsonValue } from '@forgemind/shared';
 import { Prisma } from '@prisma/client';
@@ -55,6 +60,10 @@ import {
   toApproval,
   toAcceptanceEvidence,
   toAuditEvent,
+  toChatApproval,
+  toChatMessage,
+  toChatRun,
+  toChatThread,
   toPrismaJson,
   toProject,
   toProjectArchitectureVersion,
@@ -76,6 +85,81 @@ export interface UserSnapshot {
   email: string;
   name: string;
   role: 'owner' | 'operator';
+}
+
+export interface AuthSessionSnapshot {
+  tokenHash: string;
+  user: UserSnapshot;
+  createdAt: string;
+  expiresAt: string;
+  lastSeenAt: string;
+  revokedAt?: string;
+}
+
+export interface CreateChatThreadInput {
+  userId?: string;
+  title: string;
+  projectId?: string;
+  providerConnectionId?: string;
+  mode?: TaskMode;
+  repositoryOwner?: string;
+  repositoryName?: string;
+  baseBranch?: string;
+  contextSummary?: string;
+  continuedFromThreadId?: string;
+}
+
+const MAX_CHAT_CONTINUATION_CONTEXT_LENGTH = 40_000;
+
+export function buildChatContinuationContext(input: {
+  sourceThreadId: string;
+  sourceTitle: string;
+  previousSummary?: string | null;
+  messages: Array<{ role: string; content: string }>;
+}): string {
+  const sections = [
+    'Continuation context from an earlier ForgeMind chat.',
+    `Source thread: ${input.sourceTitle} (${input.sourceThreadId})`,
+    'Use this only as conversation background. Inspect the attached repository before making repository-specific claims.'
+  ];
+  const previousSummary = input.previousSummary?.trim();
+  if (previousSummary) {
+    sections.push(`Earlier context summary:\n${redactSecrets(previousSummary).slice(0, 6_000)}`);
+  }
+  const recentMessages = input.messages.slice(-20).map((message) => {
+    const role = message.role === 'assistant' ? 'Assistant' : message.role === 'system' ? 'System' : 'User';
+    return `${role}: ${redactSecrets(message.content.trim()).slice(0, 1_400)}`;
+  });
+  if (recentMessages.length > 0) sections.push(`Recent conversation:\n${recentMessages.join('\n\n')}`);
+  return sanitizePostgresText(sections.join('\n\n')).slice(0, MAX_CHAT_CONTINUATION_CONTEXT_LENGTH);
+}
+
+export interface UpdateChatThreadInput {
+  title?: string;
+  projectId?: string | null;
+  providerConnectionId?: string | null;
+  mode?: TaskMode;
+  repositoryOwner?: string | null;
+  repositoryName?: string | null;
+  baseBranch?: string | null;
+  branchName?: string | null;
+  status?: 'active' | 'archived';
+}
+
+export interface ChatThreadDetail {
+  thread: ChatThread;
+  messages: ChatMessage[];
+  runs: ChatRun[];
+  approvals: ChatApproval[];
+  events: AuditEvent[];
+}
+
+export interface ClaimedChatRun {
+  thread: ChatThread;
+  run: ChatRun;
+  messages: ChatMessage[];
+  project?: Project;
+  approvals: ChatApproval[];
 }
 
 export interface CreateProjectInput {
@@ -131,6 +215,20 @@ export interface ProjectRoadmapSnapshot {
   auditJobs: ProjectAuditJob[];
 }
 
+export interface ProjectImplementationStepReconciliationChange {
+  stepId: string;
+  taskId: string;
+  taskStatus: TaskStatus;
+  previousStatus: ProjectImplementationStepStatus;
+  status: ProjectImplementationStepStatus;
+}
+
+export interface ProjectImplementationStepReconciliationResult {
+  projectId: string;
+  examinedSteps: number;
+  updatedSteps: ProjectImplementationStepReconciliationChange[];
+}
+
 export interface ClaimedProjectAuditJob {
   job: ProjectAuditJob;
   project: Project;
@@ -181,6 +279,13 @@ export interface CreateProjectRoadmapCycleInput {
     dependsOnStepTitles: string[];
     validationFocus: ProjectImplementationStep['validationFocus'];
   }>;
+}
+
+export interface CreateManualProjectContractVersionInput {
+  projectId: string;
+  contract?: ProjectContract;
+  contractDelta?: ProjectContractDelta;
+  changeSummary: string;
 }
 
 export interface AppendProjectImplementationStepsInput {
@@ -387,6 +492,7 @@ const WORKER_EVENT_PREFIXES = [
   'provider_',
   'task_worker_interrupted',
   'task_failed',
+  'chat_',
   'project_audit_',
   'project_release_'
 ] as const;
@@ -414,6 +520,13 @@ const ROADMAP_STEP_CANCELLING_TASK_STATUSES: ReadonlySet<TaskStatus> = new Set([
   'provider_failed',
   'validation_failed'
 ]);
+
+function terminalImplementationStepStatus(taskStatus: TaskStatus): ProjectImplementationStepStatus | undefined {
+  if (taskStatus === 'completed') return 'completed';
+  if (taskStatus === 'waiting_for_capability') return 'waiting_for_capability';
+  if (ROADMAP_STEP_CANCELLING_TASK_STATUSES.has(taskStatus)) return 'cancelled';
+  return undefined;
+}
 const DEFAULT_QUEUE_MAX_ATTEMPTS = 3;
 const DEFAULT_QUEUE_BACKOFF_SECONDS = 30;
 const DEFAULT_AUDIT_JOB_MAX_ATTEMPTS = 3;
@@ -455,6 +568,82 @@ export class ForgeMindRepository {
 
   async getCurrentUser(): Promise<UserSnapshot> {
     return this.ensureLocalUser();
+  }
+
+  async bindGoogleIdentityToLocalUser(input: { subject: string; email: string; name: string }): Promise<UserSnapshot> {
+    const localUser = await this.ensureLocalUser();
+    const normalizedEmail = input.email.trim().toLowerCase();
+    const normalizedName = input.name.trim() || normalizedEmail;
+
+    const user = await this.prisma.$transaction(async (tx) => {
+      const subjectOwner = await tx.user.findUnique({ where: { googleSubject: input.subject } });
+      if (subjectOwner && subjectOwner.id !== localUser.id) {
+        throw new Error('This Google identity is already linked to another ForgeMind user.');
+      }
+
+      const emailOwner = await tx.user.findUnique({ where: { email: normalizedEmail } });
+      if (emailOwner && emailOwner.id !== localUser.id) {
+        throw new Error('This Google email is already linked to another ForgeMind user.');
+      }
+
+      return tx.user.update({
+        where: { id: localUser.id },
+        data: {
+          googleSubject: input.subject,
+          email: normalizedEmail,
+          name: normalizedName
+        }
+      });
+    });
+
+    return {
+      id: user.id,
+      email: user.email,
+      name: user.name,
+      role: user.role
+    };
+  }
+
+  async createAuthSession(input: { tokenHash: string; userId: string; expiresAt: string }): Promise<AuthSessionSnapshot> {
+    const session = await this.prisma.authSession.create({
+      data: {
+        tokenHash: input.tokenHash,
+        userId: input.userId,
+        expiresAt: new Date(input.expiresAt)
+      },
+      include: { user: true }
+    });
+    return toAuthSessionSnapshot(session);
+  }
+
+  async getAuthSession(tokenHash: string): Promise<AuthSessionSnapshot | undefined> {
+    const session = await this.prisma.authSession.findUnique({
+      where: { tokenHash },
+      include: { user: true }
+    });
+    return session ? toAuthSessionSnapshot(session) : undefined;
+  }
+
+  async touchAuthSession(tokenHash: string): Promise<void> {
+    await this.prisma.authSession.updateMany({
+      where: { tokenHash, revokedAt: null },
+      data: { lastSeenAt: new Date() }
+    });
+  }
+
+  async revokeAuthSession(tokenHash: string): Promise<boolean> {
+    const result = await this.prisma.authSession.updateMany({
+      where: { tokenHash, revokedAt: null },
+      data: { revokedAt: new Date() }
+    });
+    return result.count > 0;
+  }
+
+  async deleteExpiredAuthSessions(now = new Date()): Promise<number> {
+    const result = await this.prisma.authSession.deleteMany({
+      where: { expiresAt: { lte: now } }
+    });
+    return result.count;
   }
 
   async getGitHubConnection(userId = LOCAL_USER_ID): Promise<GitHubConnectionSnapshot | undefined> {
@@ -908,6 +1097,66 @@ export class ForgeMindRepository {
       ? versions.find((version) => version.id === project.currentContractVersionId)
       : versions.at(-1);
     return { projectId, current, versions };
+  }
+
+  async createManualProjectContractVersion(input: CreateManualProjectContractVersionInput): Promise<ProjectContractSnapshot> {
+    const changeSummary = input.changeSummary.trim();
+    if (!changeSummary) throw new Error('Project contract change summary is required.');
+
+    await this.prisma.$transaction(async (tx) => {
+      const project = await tx.project.findUnique({ where: { id: input.projectId } });
+      if (!project) throw new Error(`Project "${input.projectId}" not found.`);
+      const currentRecord = project.currentContractVersionId
+        ? await tx.projectContractVersion.findUnique({ where: { id: project.currentContractVersionId } })
+        : await tx.projectContractVersion.findFirst({ where: { projectId: input.projectId }, orderBy: { version: 'desc' } });
+      const expectedVersion = (currentRecord?.version ?? 0) + 1;
+      let contract: ProjectContract;
+
+      if (currentRecord) {
+        if (!input.contractDelta) {
+          throw new Error('An existing project contract can only be changed with an explicit contractDelta.');
+        }
+        const currentContract = toProjectContractVersion(currentRecord).contract;
+        contract = applyProjectContractDelta(currentContract, input.contractDelta).contract;
+      } else {
+        if (!input.contract) throw new Error('The initial project contract is required.');
+        if (input.contractDelta) throw new Error('The initial project contract cannot include contractDelta.');
+        contract = input.contract;
+      }
+      if (contract.version !== expectedVersion) {
+        throw new Error(`Project contract version ${contract.version} is invalid; expected ${expectedVersion}.`);
+      }
+
+      const specification = await tx.projectSpecificationVersion.findFirst({
+        where: { projectId: input.projectId },
+        orderBy: { version: 'desc' }
+      });
+      const created = await tx.projectContractVersion.create({
+        data: {
+          projectId: input.projectId,
+          specificationVersionId: specification?.id,
+          version: contract.version,
+          contractJson: toPrismaJson(contract as unknown as JsonValue),
+          contractDelta: input.contractDelta ? toPrismaJson(input.contractDelta as unknown as JsonValue) : undefined,
+          changeSummary,
+          source: 'manual_regeneration',
+          parentVersionId: currentRecord?.id
+        }
+      });
+      await tx.project.update({
+        where: { id: input.projectId },
+        data: {
+          projectContract: toPrismaJson(contract as unknown as JsonValue),
+          currentContractVersionId: created.id
+        }
+      });
+      await this.writeAuditTx(tx, {
+        actorType: 'agent', eventType: 'project_contract_version_created', projectId: input.projectId,
+        payload: { contractVersionId: created.id, version: contract.version, source: 'manual_regeneration', changeSummary }
+      });
+    });
+
+    return (await this.getProjectContracts(input.projectId))!;
   }
 
   async getProjectArchitectures(projectId: string): Promise<ProjectArchitectureSnapshot | undefined> {
@@ -1943,6 +2192,68 @@ export class ForgeMindRepository {
     return toProjectImplementationStep(updated);
   }
 
+  async reconcileProjectImplementationSteps(
+    projectId: string
+  ): Promise<ProjectImplementationStepReconciliationResult | undefined> {
+    const project = await this.prisma.project.findUnique({
+      where: { id: projectId },
+      select: { id: true }
+    });
+    if (!project) return undefined;
+
+    const steps = await this.prisma.projectImplementationStep.findMany({
+      where: { projectId },
+      include: { task: { select: { id: true, status: true, finishedAt: true } } },
+      orderBy: [{ cycleId: 'asc' }, { sequenceNumber: 'asc' }]
+    });
+    const changes = steps.flatMap((step) => {
+      if (!step.task) return [];
+      const status = terminalImplementationStepStatus(step.task.status);
+      if (!status || status === step.status) return [];
+      return [{
+        stepId: step.id,
+        taskId: step.task.id,
+        taskStatus: step.task.status,
+        previousStatus: step.status,
+        status,
+        completedAt: status === 'completed' ? (step.task.finishedAt ?? new Date()) : null
+      }];
+    });
+
+    const updatedSteps = await this.prisma.$transaction(async (tx) => {
+      const updated: ProjectImplementationStepReconciliationChange[] = [];
+      for (const change of changes) {
+        await tx.projectImplementationStep.update({
+          where: { id: change.stepId },
+          data: { status: change.status, completedAt: change.completedAt }
+        });
+        await this.writeAuditTx(tx, {
+          actorType: 'system',
+          eventType: 'project_implementation_step_status_reconciled',
+          projectId,
+          taskId: change.taskId,
+          payload: {
+            stepId: change.stepId,
+            taskStatus: change.taskStatus,
+            previousStatus: change.previousStatus,
+            status: change.status,
+            reason: 'linked_task_terminal_state'
+          }
+        });
+        updated.push({
+          stepId: change.stepId,
+          taskId: change.taskId,
+          taskStatus: change.taskStatus,
+          previousStatus: change.previousStatus,
+          status: change.status
+        });
+      }
+      return updated;
+    });
+
+    return { projectId, examinedSteps: steps.length, updatedSteps };
+  }
+
   async recordAcceptanceEvidence(input: RecordAcceptanceEvidenceInput): Promise<AcceptanceEvidence[]> {
     const [projectRecord, cycleRecord, stepRecord] = await Promise.all([
       this.prisma.project.findUnique({ where: { id: input.projectId } }),
@@ -2844,6 +3155,34 @@ export class ForgeMindRepository {
       }
     });
     return result.count === 1;
+  }
+
+  async isChatApiMutationAuthorized(input: {
+    runId: string;
+    userId: string;
+    type: ApprovalType;
+    method: string;
+    path: string;
+    bodyHash: string;
+  }): Promise<boolean> {
+    const run = await this.prisma.chatRun.findUnique({
+      where: { id: input.runId },
+      include: { thread: true, approvals: true }
+    });
+    if (!run || run.status !== 'running' || run.thread.userId !== input.userId) return false;
+    if (!requiresApproval(input.type, run.thread.mode)) return true;
+    return run.approvals.some((approval) => {
+      if (approval.type !== input.type || approval.status !== 'approved') return false;
+      const payload = approval.payloadJson;
+      if (!payload || typeof payload !== 'object' || Array.isArray(payload)) return false;
+      const mutation = (payload as { apiMutation?: unknown }).apiMutation;
+      if (!mutation || typeof mutation !== 'object' || Array.isArray(mutation)) return false;
+      const expected = mutation as { method?: unknown; path?: unknown; actorId?: unknown; bodyHash?: unknown };
+      return expected.method === input.method
+        && expected.path === input.path
+        && expected.actorId === input.userId
+        && expected.bodyHash === input.bodyHash;
+    });
   }
 
   async refreshProjectAuditClaim(auditJobId: string): Promise<boolean> {
@@ -4018,6 +4357,504 @@ export class ForgeMindRepository {
     });
   }
 
+  async listChatThreads(userId = LOCAL_USER_ID, includeArchived = false): Promise<ChatThread[]> {
+    const threads = await this.prisma.chatThread.findMany({
+      where: {
+        userId,
+        ...(includeArchived ? {} : { status: 'active' })
+      },
+      orderBy: [{ lastMessageAt: 'desc' }, { updatedAt: 'desc' }]
+    });
+    return threads.map(toChatThread);
+  }
+
+  async getChatThread(threadId: string, userId = LOCAL_USER_ID): Promise<ChatThread | undefined> {
+    const thread = await this.prisma.chatThread.findFirst({ where: { id: threadId, userId } });
+    return thread ? toChatThread(thread) : undefined;
+  }
+
+  async getChatThreadDetail(threadId: string, userId = LOCAL_USER_ID): Promise<ChatThreadDetail | undefined> {
+    const thread = await this.prisma.chatThread.findFirst({
+      where: { id: threadId, userId },
+      include: {
+        messages: { orderBy: { sequence: 'asc' } },
+        runs: { orderBy: { createdAt: 'asc' } },
+        approvals: { orderBy: { createdAt: 'asc' } },
+        auditLog: { orderBy: { createdAt: 'desc' }, take: 500 }
+      }
+    });
+    if (!thread) return undefined;
+    return {
+      thread: toChatThread(thread),
+      messages: thread.messages.map(toChatMessage),
+      runs: thread.runs.map(toChatRun),
+      approvals: thread.approvals.map(toChatApproval),
+      events: thread.auditLog.reverse().map(toAuditEvent)
+    };
+  }
+
+  async createChatThread(input: CreateChatThreadInput): Promise<ChatThread> {
+    const userId = input.userId ?? LOCAL_USER_ID;
+    const id = randomUUID();
+    const project = input.projectId
+      ? await this.prisma.project.findUnique({ where: { id: input.projectId } })
+      : undefined;
+    if (input.projectId && !project) throw new Error(`Project "${input.projectId}" not found.`);
+    if (input.providerConnectionId) {
+      const connection = await this.prisma.aiProviderConnection.findFirst({
+        where: { id: input.providerConnectionId, userId }
+      });
+      if (!connection) throw new Error(`AI provider connection "${input.providerConnectionId}" not found.`);
+    }
+    const repositoryOwner = input.repositoryOwner?.trim() || project?.githubOwner || null;
+    const repositoryName = input.repositoryName?.trim() || project?.githubRepo || null;
+    if (Boolean(repositoryOwner) !== Boolean(repositoryName)) {
+      throw new Error('Repository owner and name must be configured together.');
+    }
+    const thread = await this.prisma.chatThread.create({
+      data: {
+        id,
+        userId,
+        title: input.title.trim(),
+        projectId: project?.id,
+        providerConnectionId: input.providerConnectionId,
+        mode: input.mode ?? 'safe',
+        repositoryOwner,
+        repositoryName,
+        baseBranch: input.baseBranch?.trim() || project?.defaultBranch || (repositoryName ? 'main' : null),
+        branchName: repositoryName ? `chat/${id.slice(0, 8)}` : null,
+        contextSummary: input.contextSummary
+          ? sanitizePostgresText(redactSecrets(input.contextSummary)).slice(0, MAX_CHAT_CONTINUATION_CONTEXT_LENGTH)
+          : undefined
+      }
+    });
+    await this.writeAudit({
+      actorType: 'user',
+      actorId: userId,
+      eventType: input.continuedFromThreadId ? 'chat_thread_continued_with_repository' : 'chat_thread_created',
+      projectId: project?.id,
+      chatThreadId: thread.id,
+      payload: {
+        title: thread.title,
+        repository: repositoryOwner && repositoryName ? `${repositoryOwner}/${repositoryName}` : null,
+        continuedFromThreadId: input.continuedFromThreadId ?? null
+      }
+    });
+    return toChatThread(thread);
+  }
+
+  async continueChatThreadWithRepository(
+    sourceThreadId: string,
+    input: CreateChatThreadInput,
+    userId = LOCAL_USER_ID
+  ): Promise<ChatThread | undefined> {
+    const source = await this.prisma.chatThread.findFirst({
+      where: { id: sourceThreadId, userId },
+      include: { messages: { orderBy: { sequence: 'desc' }, take: 20 } }
+    });
+    if (!source) return undefined;
+    if (source.repositoryOwner || source.repositoryName) {
+      throw new Error('This chat thread already has a repository.');
+    }
+    const activeRuns = await this.prisma.chatRun.count({
+      where: { threadId: sourceThreadId, status: { in: ['queued', 'running', 'waiting_for_approval'] } }
+    });
+    if (activeRuns > 0) {
+      throw new Error('Wait for the active chat response or stop it before continuing with a repository.');
+    }
+    const project = input.projectId
+      ? await this.prisma.project.findUnique({ where: { id: input.projectId } })
+      : undefined;
+    if (input.projectId && !project) throw new Error(`Project "${input.projectId}" not found.`);
+    const repositoryOwner = input.repositoryOwner?.trim() || project?.githubOwner || undefined;
+    const repositoryName = input.repositoryName?.trim() || project?.githubRepo || undefined;
+    if (!repositoryOwner || !repositoryName) {
+      throw new Error('Select a project or GitHub repository before continuing.');
+    }
+
+    return this.createChatThread({
+      ...input,
+      userId,
+      providerConnectionId: input.providerConnectionId ?? source.providerConnectionId ?? undefined,
+      mode: input.mode ?? source.mode,
+      repositoryOwner,
+      repositoryName,
+      contextSummary: buildChatContinuationContext({
+        sourceThreadId: source.id,
+        sourceTitle: source.title,
+        previousSummary: source.contextSummary,
+        messages: [...source.messages].reverse()
+      }),
+      continuedFromThreadId: source.id
+    });
+  }
+
+  async updateChatThread(threadId: string, input: UpdateChatThreadInput, userId = LOCAL_USER_ID): Promise<ChatThread | undefined> {
+    const existing = await this.prisma.chatThread.findFirst({ where: { id: threadId, userId } });
+    if (!existing) return undefined;
+    const changesExecutionContext = input.projectId !== undefined
+      || input.providerConnectionId !== undefined
+      || input.repositoryOwner !== undefined
+      || input.repositoryName !== undefined
+      || input.baseBranch !== undefined
+      || input.branchName !== undefined;
+    if (changesExecutionContext) {
+      const activeRuns = await this.prisma.chatRun.count({
+        where: { threadId, status: { in: ['queued', 'running', 'waiting_for_approval'] } }
+      });
+      if (activeRuns > 0) throw new Error('Chat execution context cannot change while a run is active.');
+      const changesRepository = input.projectId !== undefined
+        || input.repositoryOwner !== undefined
+        || input.repositoryName !== undefined
+        || input.baseBranch !== undefined
+        || input.branchName !== undefined;
+      if (changesRepository) {
+        const messageCount = await this.prisma.chatMessage.count({ where: { threadId } });
+        if (messageCount > 0) throw new Error('Repository context cannot change after the conversation has started. Create a new thread instead.');
+      }
+    }
+    const project = typeof input.projectId === 'string'
+      ? await this.prisma.project.findUnique({ where: { id: input.projectId } })
+      : undefined;
+    if (typeof input.projectId === 'string' && !project) throw new Error(`Project "${input.projectId}" not found.`);
+    if (typeof input.providerConnectionId === 'string') {
+      const connection = await this.prisma.aiProviderConnection.findFirst({ where: { id: input.providerConnectionId, userId } });
+      if (!connection) throw new Error(`AI provider connection "${input.providerConnectionId}" not found.`);
+    }
+    const repositoryOwner = input.repositoryOwner !== undefined
+      ? input.repositoryOwner?.trim() || null
+      : project?.githubOwner ?? undefined;
+    const repositoryName = input.repositoryName !== undefined
+      ? input.repositoryName?.trim() || null
+      : project?.githubRepo ?? undefined;
+    const effectiveOwner = repositoryOwner === undefined ? existing.repositoryOwner : repositoryOwner;
+    const effectiveName = repositoryName === undefined ? existing.repositoryName : repositoryName;
+    if (Boolean(effectiveOwner) !== Boolean(effectiveName)) throw new Error('Repository owner and name must be configured together.');
+    const status = input.status;
+    if (status === 'archived') {
+      const activeRuns = await this.prisma.chatRun.count({ where: { threadId, status: { in: ['queued', 'running', 'waiting_for_approval'] } } });
+      if (activeRuns > 0) throw new Error('An active chat thread cannot be archived.');
+    }
+    const thread = await this.prisma.chatThread.update({
+      where: { id: threadId },
+      data: {
+        title: input.title?.trim(),
+        projectId: input.projectId,
+        providerConnectionId: input.providerConnectionId,
+        mode: input.mode,
+        repositoryOwner,
+        repositoryName,
+        baseBranch: input.baseBranch === undefined ? project?.defaultBranch : input.baseBranch?.trim() || null,
+        branchName: input.branchName === undefined ? undefined : input.branchName?.trim() || null,
+        status,
+        archivedAt: status === 'archived' ? new Date() : status === 'active' ? null : undefined
+      }
+    });
+    await this.writeAudit({
+      actorType: 'user', actorId: userId, eventType: 'chat_thread_updated', projectId: thread.projectId ?? undefined,
+      chatThreadId: thread.id, payload: { fields: Object.keys(input), status: thread.status }
+    });
+    return toChatThread(thread);
+  }
+
+  async deleteChatThread(threadId: string, userId = LOCAL_USER_ID): Promise<boolean> {
+    const thread = await this.prisma.chatThread.findFirst({ where: { id: threadId, userId } });
+    if (!thread) return false;
+    const activeRuns = await this.prisma.chatRun.count({ where: { threadId, status: { in: ['queued', 'running', 'waiting_for_approval'] } } });
+    if (activeRuns > 0) throw new Error('An active chat thread cannot be deleted.');
+    await this.prisma.chatThread.delete({ where: { id: threadId } });
+    return true;
+  }
+
+  async appendChatUserMessage(threadId: string, content: string, userId = LOCAL_USER_ID): Promise<{ message: ChatMessage; run: ChatRun }> {
+    const normalized = content.trim();
+    if (!normalized) throw new Error('Chat message cannot be empty.');
+    return this.prisma.$transaction(async (tx) => {
+      const thread = await tx.chatThread.findFirst({ where: { id: threadId, userId } });
+      if (!thread) throw new Error(`Chat thread "${threadId}" not found.`);
+      if (thread.status !== 'active') throw new Error('Messages cannot be sent to an archived chat thread.');
+      const activeRun = await tx.chatRun.findFirst({
+        where: { threadId, status: { in: ['queued', 'running', 'waiting_for_approval'] } }
+      });
+      if (activeRun) throw new Error('Wait for the active chat response or stop it before sending another message.');
+      const latestMessage = await tx.chatMessage.findFirst({ where: { threadId }, orderBy: { sequence: 'desc' } });
+      const run = await tx.chatRun.create({ data: { threadId, prompt: normalized, status: 'queued' } });
+      const message = await tx.chatMessage.create({
+        data: { threadId, runId: run.id, sequence: (latestMessage?.sequence ?? 0) + 1, role: 'user', content: normalized }
+      });
+      await tx.chatThread.update({ where: { id: threadId }, data: { lastMessageAt: message.createdAt } });
+      await this.writeAuditTx(tx, {
+        actorType: 'user', actorId: userId, eventType: 'chat_message_created', projectId: thread.projectId ?? undefined,
+        chatThreadId: thread.id, chatRunId: run.id, payload: { messageId: message.id, role: 'user' }
+      });
+      await this.writeAuditTx(tx, {
+        actorType: 'system', eventType: 'chat_run_queued', projectId: thread.projectId ?? undefined,
+        chatThreadId: thread.id, chatRunId: run.id, payload: { attempt: 0 }
+      });
+      return { message: toChatMessage(message), run: toChatRun(run) };
+    });
+  }
+
+  async recoverStuckChatRuns(claimTimeoutMinutes: number): Promise<number> {
+    const cutoff = new Date(Date.now() - Math.max(1, claimTimeoutMinutes) * 60_000);
+    const stale = await this.prisma.chatRun.findMany({
+      where: {
+        status: 'running',
+        OR: [{ heartbeatAt: { lt: cutoff } }, { heartbeatAt: null, claimedAt: { lt: cutoff } }]
+      },
+      include: { thread: true }
+    });
+    for (const run of stale) {
+      await this.prisma.$transaction(async (tx) => {
+        await tx.chatRun.update({
+          where: { id: run.id },
+          data: { status: 'queued', claimedAt: null, heartbeatAt: null, errorMessage: 'Previous worker execution was interrupted.' }
+        });
+        await this.writeAuditTx(tx, {
+          actorType: 'system', eventType: 'chat_run_recovered', projectId: run.thread.projectId ?? undefined,
+          chatThreadId: run.threadId, chatRunId: run.id, payload: { reason: 'stale_worker_claim' }
+        });
+      });
+    }
+    return stale.length;
+  }
+
+  async claimNextChatRun(): Promise<ClaimedChatRun | undefined> {
+    return this.prisma.$transaction(async (tx) => {
+      await tx.$queryRawUnsafe(WORKER_QUEUE_ADVISORY_LOCK_SQL);
+      const control = await tx.workerControl.findUnique({ where: { id: WORKER_QUEUE_CONTROL_ID } });
+      if (control?.queuePaused) return undefined;
+      const queued = await tx.chatRun.findFirst({
+        where: {
+          status: 'queued',
+          OR: [{ nextAttemptAt: null }, { nextAttemptAt: { lte: new Date() } }],
+          thread: { status: 'active' }
+        },
+        orderBy: { createdAt: 'asc' },
+        include: {
+          thread: { include: { project: true } },
+          approvals: { orderBy: { createdAt: 'asc' } }
+        }
+      });
+      if (!queued) return undefined;
+      const now = new Date();
+      const claimed = await tx.chatRun.update({
+        where: { id: queued.id },
+        data: {
+          status: 'running', attemptCount: { increment: 1 }, claimedAt: now, heartbeatAt: now,
+          startedAt: queued.startedAt ?? now, finishedAt: null, stopRequested: false, errorMessage: null
+        }
+      });
+      const messages = await tx.chatMessage.findMany({ where: { threadId: queued.threadId }, orderBy: { sequence: 'asc' } });
+      await this.writeAuditTx(tx, {
+        actorType: 'system', eventType: 'chat_run_claimed', projectId: queued.thread.projectId ?? undefined,
+        chatThreadId: queued.threadId, chatRunId: queued.id, payload: { attempt: claimed.attemptCount }
+      });
+      return {
+        thread: toChatThread(queued.thread),
+        run: toChatRun(claimed),
+        messages: messages.map(toChatMessage),
+        project: queued.thread.project ? toProject(queued.thread.project) : undefined,
+        approvals: queued.approvals.map(toChatApproval)
+      };
+    });
+  }
+
+  async refreshChatRunHeartbeat(runId: string): Promise<boolean> {
+    const updated = await this.prisma.chatRun.updateMany({ where: { id: runId, status: 'running' }, data: { heartbeatAt: new Date() } });
+    return updated.count === 1;
+  }
+
+  async isChatRunStopRequested(runId: string): Promise<boolean> {
+    const run = await this.prisma.chatRun.findUnique({ where: { id: runId }, select: { stopRequested: true, status: true } });
+    return Boolean(run?.stopRequested || run?.status === 'cancelled');
+  }
+
+  async updateChatProviderSession(input: { threadId: string; sessionId: string; provider: ProviderKind; model: string; connectionId?: string }): Promise<void> {
+    await this.prisma.chatThread.update({
+      where: { id: input.threadId },
+      data: {
+        providerSessionId: input.sessionId,
+        providerSessionProvider: input.provider,
+        providerSessionModel: input.model,
+        providerSessionConnectionId: input.connectionId,
+        providerSessionUpdatedAt: new Date()
+      }
+    });
+  }
+
+  async updateChatContextSummary(threadId: string, contextSummary: string): Promise<void> {
+    await this.prisma.chatThread.update({
+      where: { id: threadId },
+      data: { contextSummary: sanitizePostgresText(contextSummary).slice(0, 40_000) }
+    });
+  }
+
+  async completeChatRun(input: {
+    runId: string;
+    response: string;
+    provider: ProviderKind;
+    model: string;
+    inputTokens?: number;
+    outputTokens?: number;
+    totalTokens?: number;
+    cachedTokens?: number;
+    actualCostUsd?: number | null;
+    result?: JsonValue;
+  }): Promise<{ run: ChatRun; message: ChatMessage }> {
+    return this.prisma.$transaction(async (tx) => {
+      const existing = await tx.chatRun.findUnique({ where: { id: input.runId }, include: { thread: true } });
+      if (!existing) throw new Error(`Chat run "${input.runId}" not found.`);
+      const latestMessage = await tx.chatMessage.findFirst({ where: { threadId: existing.threadId }, orderBy: { sequence: 'desc' } });
+      const message = await tx.chatMessage.create({
+        data: {
+          threadId: existing.threadId,
+          runId: existing.id,
+          sequence: (latestMessage?.sequence ?? 0) + 1,
+          role: 'assistant',
+          content: sanitizePostgresText(input.response),
+          metadataJson: input.result === undefined ? undefined : toPrismaJson(redactSecrets(input.result))
+        }
+      });
+      const run = await tx.chatRun.update({
+        where: { id: existing.id },
+        data: {
+          status: 'succeeded', provider: input.provider, model: input.model,
+          inputTokens: input.inputTokens ?? 0, outputTokens: input.outputTokens ?? 0,
+          totalTokens: input.totalTokens ?? 0, cachedTokens: input.cachedTokens ?? 0,
+          actualCostUsd: input.actualCostUsd, responseSummary: sanitizePostgresText(input.response).slice(0, 2000),
+          resultJson: input.result === undefined ? undefined : toPrismaJson(redactSecrets(input.result)),
+          claimedAt: null, heartbeatAt: null, finishedAt: new Date(), errorMessage: null
+        }
+      });
+      await tx.chatThread.update({ where: { id: existing.threadId }, data: { lastMessageAt: message.createdAt } });
+      await this.writeAuditTx(tx, {
+        actorType: 'agent', eventType: 'chat_run_completed', projectId: existing.thread.projectId ?? undefined,
+        chatThreadId: existing.threadId, chatRunId: existing.id,
+        payload: { messageId: message.id, provider: input.provider, model: input.model, totalTokens: input.totalTokens ?? 0 }
+      });
+      return { run: toChatRun(run), message: toChatMessage(message) };
+    });
+  }
+
+  async failChatRun(runId: string, errorMessage: string, retryable = false): Promise<ChatRun | undefined> {
+    const existing = await this.prisma.chatRun.findUnique({ where: { id: runId }, include: { thread: true } });
+    if (!existing) return undefined;
+    const message = sanitizePostgresText(redactSecrets(errorMessage));
+    const shouldRetry = retryable && existing.attemptCount < 3;
+    const run = await this.prisma.chatRun.update({
+      where: { id: runId },
+      data: {
+        status: shouldRetry ? 'queued' : 'failed',
+        nextAttemptAt: shouldRetry ? new Date(Date.now() + existing.attemptCount * 30_000) : null,
+        claimedAt: null, heartbeatAt: null, finishedAt: shouldRetry ? null : new Date(), errorMessage: message
+      }
+    });
+    await this.writeAudit({
+      actorType: 'system', eventType: shouldRetry ? 'chat_run_retry_scheduled' : 'chat_run_failed',
+      projectId: existing.thread.projectId ?? undefined, chatThreadId: existing.threadId, chatRunId: existing.id,
+      payload: { errorMessage: message, attempt: existing.attemptCount }
+    });
+    return toChatRun(run);
+  }
+
+  async retryChatRun(runId: string, userId = LOCAL_USER_ID): Promise<ChatRun | undefined> {
+    const existing = await this.prisma.chatRun.findFirst({ where: { id: runId, thread: { userId } } });
+    if (!existing) return undefined;
+    if (!['failed', 'cancelled', 'interrupted'].includes(existing.status)) throw new Error(`Chat run cannot be retried from status "${existing.status}".`);
+    const run = await this.prisma.chatRun.update({
+      where: { id: runId },
+      data: { status: 'queued', nextAttemptAt: null, claimedAt: null, heartbeatAt: null, finishedAt: null, stopRequested: false, errorMessage: null }
+    });
+    await this.writeAudit({
+      actorType: 'user', actorId: userId, eventType: 'chat_run_retried', chatThreadId: run.threadId, chatRunId: run.id,
+      payload: { attempt: run.attemptCount }
+    });
+    return toChatRun(run);
+  }
+
+  async cancelChatRun(runId: string, userId = LOCAL_USER_ID): Promise<ChatRun | undefined> {
+    const existing = await this.prisma.chatRun.findFirst({ where: { id: runId, thread: { userId } } });
+    if (!existing) return undefined;
+    if (!['queued', 'running', 'waiting_for_approval'].includes(existing.status)) return toChatRun(existing);
+    const run = await this.prisma.chatRun.update({
+      where: { id: runId },
+      data: existing.status === 'running'
+        ? { stopRequested: true }
+        : { status: 'cancelled', stopRequested: true, finishedAt: new Date(), claimedAt: null, heartbeatAt: null }
+    });
+    await this.writeAudit({
+      actorType: 'user', actorId: userId, eventType: 'chat_run_cancel_requested', chatThreadId: run.threadId, chatRunId: run.id,
+      payload: { previousStatus: existing.status }
+    });
+    return toChatRun(run);
+  }
+
+  async finishCancelledChatRun(runId: string): Promise<ChatRun | undefined> {
+    const existing = await this.prisma.chatRun.findUnique({ where: { id: runId }, include: { thread: true } });
+    if (!existing) return undefined;
+    const run = await this.prisma.chatRun.update({
+      where: { id: runId },
+      data: { status: 'cancelled', stopRequested: true, claimedAt: null, heartbeatAt: null, finishedAt: new Date() }
+    });
+    await this.writeAudit({
+      actorType: 'system', eventType: 'chat_run_cancelled', projectId: existing.thread.projectId ?? undefined,
+      chatThreadId: existing.threadId, chatRunId: existing.id, payload: {}
+    });
+    return toChatRun(run);
+  }
+
+  async createChatApproval(input: {
+    threadId: string;
+    runId: string;
+    type: ApprovalType;
+    title: string;
+    description: string;
+    riskLevel: RiskLevel;
+    payload: JsonValue;
+  }): Promise<ChatApproval> {
+    const approval = await this.prisma.$transaction(async (tx) => {
+      const created = await tx.chatApproval.create({
+        data: {
+          threadId: input.threadId, runId: input.runId, type: input.type, requestedBy: 'agent',
+          title: input.title, description: input.description, riskLevel: input.riskLevel,
+          payloadJson: toPrismaJson(redactSecrets(input.payload))
+        }
+      });
+      await tx.chatRun.update({ where: { id: input.runId }, data: { status: 'waiting_for_approval', claimedAt: null, heartbeatAt: null } });
+      await this.writeAuditTx(tx, {
+        actorType: 'agent', eventType: 'chat_approval_requested', chatThreadId: input.threadId, chatRunId: input.runId,
+        payload: { approvalId: created.id, type: input.type, riskLevel: input.riskLevel }
+      });
+      return created;
+    });
+    return toChatApproval(approval);
+  }
+
+  async resolveChatApproval(approvalId: string, status: Extract<ApprovalStatus, 'approved' | 'rejected'>, userId = LOCAL_USER_ID): Promise<ChatApproval | undefined> {
+    return this.prisma.$transaction(async (tx) => {
+      const approval = await tx.chatApproval.findFirst({ where: { id: approvalId, thread: { userId } } });
+      if (!approval) return undefined;
+      if (approval.status !== 'pending') throw new Error(`Chat approval "${approvalId}" is already ${approval.status}.`);
+      const resolved = await tx.chatApproval.update({
+        where: { id: approvalId }, data: { status, approvedByUserId: userId, resolvedAt: new Date() }
+      });
+      if (status === 'rejected') {
+        await tx.chatRun.update({ where: { id: approval.runId }, data: { status: 'failed', errorMessage: 'Requested operation was rejected.', finishedAt: new Date() } });
+      } else {
+        const pending = await tx.chatApproval.count({ where: { runId: approval.runId, status: 'pending', id: { not: approval.id } } });
+        if (pending === 0) {
+          await tx.chatRun.update({ where: { id: approval.runId }, data: { status: 'queued', nextAttemptAt: null, errorMessage: null } });
+        }
+      }
+      await this.writeAuditTx(tx, {
+        actorType: 'user', actorId: userId, eventType: 'chat_approval_resolved', chatThreadId: approval.threadId, chatRunId: approval.runId,
+        payload: { approvalId, status }
+      });
+      return toChatApproval(resolved);
+    });
+  }
+
   async listApprovals(): Promise<Approval[]> {
     const approvals = await this.prisma.approval.findMany({
       orderBy: { createdAt: 'desc' }
@@ -4356,6 +5193,8 @@ export class ForgeMindRepository {
         eventType: input.eventType,
         projectId: input.projectId,
         taskId: input.taskId,
+        chatThreadId: input.chatThreadId,
+        chatRunId: input.chatRunId,
         payload: toPrismaJson(redactSecrets(input.payload))
       }
     });
@@ -4373,6 +5212,8 @@ export class ForgeMindRepository {
         eventType: input.eventType,
         projectId: input.projectId,
         taskId: input.taskId,
+        chatThreadId: input.chatThreadId,
+        chatRunId: input.chatRunId,
         payload: toPrismaJson(redactSecrets(input.payload))
       }
     });
@@ -4644,6 +5485,29 @@ function buildAIProviderConnectionName(provider: AIProviderConnectionKind, authM
   const providerName = provider === 'codex' ? 'Codex' : 'OpenAI';
   const authName = authMode === 'codex_oauth' ? 'OAuth' : 'API key';
   return `${providerName} ${authName} ${model}`.trim();
+}
+
+function toAuthSessionSnapshot(session: {
+  tokenHash: string;
+  createdAt: Date;
+  expiresAt: Date;
+  lastSeenAt: Date;
+  revokedAt: Date | null;
+  user: { id: string; email: string; name: string; role: 'owner' | 'operator' };
+}): AuthSessionSnapshot {
+  return {
+    tokenHash: session.tokenHash,
+    user: {
+      id: session.user.id,
+      email: session.user.email,
+      name: session.user.name,
+      role: session.user.role
+    },
+    createdAt: session.createdAt.toISOString(),
+    expiresAt: session.expiresAt.toISOString(),
+    lastSeenAt: session.lastSeenAt.toISOString(),
+    revokedAt: session.revokedAt?.toISOString()
+  };
 }
 
 export function deriveProjectCapabilities(

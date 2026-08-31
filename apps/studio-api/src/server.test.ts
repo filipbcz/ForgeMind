@@ -17,7 +17,11 @@ const guardedEnvNames = [
   'FORGEMIND_SENSITIVE_RATE_LIMIT_MAX',
   'FORGEMIND_SENSITIVE_RATE_LIMIT_WINDOW_MS',
   'FORGEMIND_REQUEST_BODY_LIMIT_BYTES',
-  'FORGEMIND_REQUEST_HEADER_LIMIT_BYTES'
+  'FORGEMIND_REQUEST_HEADER_LIMIT_BYTES',
+  'GOOGLE_OAUTH_CLIENT_ID',
+  'GOOGLE_OAUTH_CLIENT_SECRET',
+  'GOOGLE_OAUTH_CALLBACK_URL',
+  'FORGEMIND_GOOGLE_ALLOWED_EMAIL'
 ] as const;
 
 const originalEnv = new Map(guardedEnvNames.map((name) => [name, process.env[name]]));
@@ -118,6 +122,10 @@ describe('Studio API server', () => {
     process.env.FORGEMIND_CORS_ORIGINS = 'https://studio.example';
     process.env.FORGEMIND_SESSION_COOKIE_SECURE = 'true';
     process.env.FORGEMIND_AUTH_SESSION_SECRET = 'production-test-session-secret';
+    process.env.GOOGLE_OAUTH_CLIENT_ID = 'google-client-id';
+    process.env.GOOGLE_OAUTH_CLIENT_SECRET = 'google-client-secret';
+    process.env.GOOGLE_OAUTH_CALLBACK_URL = 'https://studio.example/api/auth/google/callback';
+    process.env.FORGEMIND_GOOGLE_ALLOWED_EMAIL = 'owner@example.com';
     app = await createApp();
 
     const allowed = await app.inject({

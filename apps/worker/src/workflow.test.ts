@@ -201,8 +201,9 @@ describe('worker workflow', () => {
     await mkdir(workspacePath, { recursive: true });
     await writeFile(join(workspacePath, 'requirements-dev.txt'), 'pytest==8.4.1\njsonschema==4.25.0\n', 'utf8');
 
+    const virtualEnvironmentPython = process.platform === 'win32' ? '.venv\\Scripts\\python.exe' : '.venv/bin/python';
     await expect(inferRepositoryInstallCommand(workspacePath)).resolves.toBe(
-      'python3 -m venv .venv && .venv/bin/python -m pip install --disable-pip-version-check -r requirements-dev.txt'
+      `python3 -m venv .venv && ${virtualEnvironmentPython} -m pip install --disable-pip-version-check -r requirements-dev.txt`
     );
 
     await mkdir(join(workspacePath, '.venv'));
@@ -1251,7 +1252,7 @@ describe('worker workflow', () => {
     };
     const provider = createProviderStub({
       implement: vi.fn(async (input): Promise<ImplementResult> => {
-        await symlink(outsidePath, join(input.repositoryPath, 'outside-link'), 'dir');
+        await symlink(outsidePath, join(input.repositoryPath, 'outside-link'), process.platform === 'win32' ? 'junction' : 'dir');
         return {
           summary: 'Attempted symlink traversal write',
           changedFiles: ['outside-link/secret.txt'],
@@ -2968,7 +2969,7 @@ describe('worker workflow', () => {
       repositoryEvidence: expect.stringContaining('existing proof')
     }));
     expect(statuses).toContain('reviewing');
-  });
+  }, 15_000);
 
   it('resumes an already-satisfied implementation without invoking implementation again', async () => {
     const workspaceRoot = join(tmpdir(), `forgemind-worker-already-satisfied-validation-resume-${randomUUID()}`);

@@ -15,6 +15,7 @@ for (const pattern of workspacePatterns) {
 }
 
 const failures = [];
+const npmExecutable = process.env.npm_execpath;
 
 for (const workspacePath of workspaces) {
   const packageJson = await readPackageJson(workspacePath);
@@ -25,11 +26,15 @@ for (const workspacePath of workspaces) {
   }
 
   const workspace = packageJson.name ?? relative(root, workspacePath);
-  const result = spawnSync('npm', ['run', 'test', '-w', workspace], {
+  const result = spawnSync(
+    npmExecutable ? process.execPath : (process.platform === 'win32' ? 'npm.cmd' : 'npm'),
+    npmExecutable ? [npmExecutable, 'run', 'test', '-w', workspace] : ['run', 'test', '-w', workspace],
+    {
     cwd: root,
     stdio: 'inherit',
     shell: false
-  });
+    }
+  );
 
   if (result.error) {
     console.error(`Workspace test command failed to start for ${workspace}: ${result.error.message}`);

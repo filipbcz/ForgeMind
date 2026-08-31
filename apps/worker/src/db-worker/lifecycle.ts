@@ -24,6 +24,8 @@ export async function runWorkspaceRetentionCleanup(
       .filter((task) => !['completed', 'cancelled', 'failed', 'ready_for_user_review'].includes(task.status))
       .map((task) => task.id)
   );
+  // Chat workspaces have their own lifecycle and must not be removed as expired task artifacts.
+  activeTaskIds.add('chat');
   activeTaskIds.add(currentTaskId);
   await cleanupExpiredWorkerArtifacts({
     workspaceRoot,

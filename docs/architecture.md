@@ -24,7 +24,9 @@ Primarni source of truth je PostgreSQL (packages/db/prisma/schema.prisma). Klico
 - task_runs: vykonove behy workeru (queued/running/succeeded/failed/cancelled).
 - task_iterations: detailni iterace (planning/implementation/validation/review) vcetne diff a validation payloadu.
 - approvals: rizikove rozhodnuti, ktera pozastavi workflow.
+- chat_threads, chat_messages, chat_runs a chat_approvals: perzistentni konverzace, jednotlive behy, provider session a chatova schvaleni.
 - audit_log: auditovatelny event stream pro stavove prechody, queue a GitHub operace.
+- auth_sessions: hashe nahodnych browser session tokenu, expirace a odvolani; vazba na overenou Google identitu uzivatele.
 - projects.project_architecture: omezena strukturovana pamet modulu, verejnych rozhrani, zavislosti, rozhodnuti, konvenci, technickeho dluhu a architektonickych validaci.
 - project_architecture_versions: nemenne architektonicke snapshoty vcetne databazovych schemat, zdrojove contract verze a tasku. Projekt, roadmap cyklus i task odkazuji na konkretni verzi.
 
@@ -39,10 +41,22 @@ Studio API pouziva repository + dispatch service:
 - /api/tasks/:id/queue, /api/tasks/:id/runs, /api/worker/status, /api/worker/events vraci operacni data nad persisted stavem.
 - /api/metrics vraci Prometheus-like text export operacnich metrik pro scraping.
 - /api/notifications/* drzi subscription/settings endpointy + VAPID public key bootstrap pro PushManager.
+- /api/chat/* spravuje vlakna, zpravy, retry/cancel a approvals. Detail vlakna vraci zpravy, behy, zmeny a auditni aktivitu.
 - /api/approvals/:id/approve po finalnim schvaleni automaticky obnovi task (retryTask start=true) a znovu ho enqueuje.
 - /api/webhooks/github overuje x-hub-signature-256 proti GITHUB_WEBHOOK_SECRET.
 
+### Autentizace a autorizace
+
+- Jediny interaktivni login je Google OAuth 2.0/OIDC authorization-code flow se `state`, PKCE a scopes `openid email profile`.
+- Google ucet musi mit overeny email a presne odpovidat `FORGEMIND_GOOGLE_ALLOWED_EMAIL`. Overena identita se navaze na existujiciho lokalniho ownera, takze migrace autentizace nemeni vlastnictvi projektu ani ulozenych integraci.
+- Browser dostane pouze nahodny `HttpOnly`, `SameSite=Lax` session token. PostgreSQL uchovava jen jeho SHA-256 hash; logout session odvola a restart API ji zachova.
+- Vsechny `/api/*` read i write endpointy vyzaduji platnou session. Verejne jsou pouze session bootstrap, start/callback Google OAuth a GitHub webhook, ktery ma vlastni HMAC autentizaci. `/health` zustava verejny pro orchestrator.
+- Citlive provider, GitHub, approval, queue-control a metrics operace navic vyzaduji roli `owner`. Browser mutations soucasne prochazeji origin, CSRF a podle rizika jednorazovym approval gate.
+- WebSocket upgrade overuje stejnou databazovou session a konkretni task/chat subscription dale kontroluje proti vlastnikovi.
+
 ## 4) Queue a worker runtime flow
+
+Chatovy worker pouziva stejnou globalni queue pause a pred claimem tasku zpracuje nejstarsi pripraveny `chat_run`. Kazde vlakno ma perzistentni workspace pod `workspace/chat/<thread-id>` a vlastni branch. Provider session se obnovi jen pri shode provideru, modelu a konkretniho ulozeneho pripojeni; jinak se kontext sestavi z PostgreSQL, projektoveho kontraktu a historie zprav. Aktivita, validace, chyby a approvals se zapisuji do `audit_log` s vazbou na vlakno a beh a pres WebSocket se posilaji pouze prihlasenemu klientovi. Stary heartbeat vrati preruseny beh do fronty nad stejnym workspace. Obecny task retention adresar `workspace/chat` nikdy neodstrani.
 
 Worker flow (apps/worker/src/db-worker.ts):
 
@@ -132,6 +146,7 @@ Aktivne vynucene policy vetve:
 | PostgreSQL queue, project contract, acceptance evidence, architecture versions | `implemented`, `tested` | `packages/db/prisma/schema.prisma`; `packages/db/src/repository.ts`; `packages/db/src/repository.task-run.test.ts`; `packages/core/src` |
 | GitHub adapter boundary | `implemented`, `tested` | `packages/github/src/index.ts`; `packages/github/src/index.test.ts` |
 | Provider adapter boundary | `implemented`, `tested` | `packages/providers/src/provider.ts`; `packages/providers/src/codex-provider.ts`; `packages/providers/src/openai-provider.test.ts`; `apps/worker/src/db-worker.test.ts` |
+| Persistent repository chat, realtime activity, retry and approvals | `implemented`, `tested` | `apps/mobile-pwa/src/ChatPanel.tsx`; `apps/studio-api/src/routes/chat-routes.ts`; `apps/worker/src/chat-worker.ts`; `packages/db/prisma/schema.prisma`; `apps/studio-api/src/chat-routes.test.ts`; `apps/worker/src/chat-worker.test.ts`; `packages/providers/src/chat-prompt.test.ts` |
 | Production verification of full platform behavior | `deferred` | `docs/roadmap-quality-implementation-plan.md`; `docs/deploy-raspberry.md` |
 
 ## 9) Monitoring metriky

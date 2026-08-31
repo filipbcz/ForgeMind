@@ -72,10 +72,17 @@ Keep these values unchanged during migration:
 - `FORGEMIND_CREDENTIAL_KEY`
 - provider, GitHub, webhook, and VAPID secrets
 
-Update public callback values to the tailnet HTTPS URL where applicable, for example:
+Configure Google authentication for the tailnet HTTPS URL. Create a Google OAuth client of type `Web application`, add the exact callback URI, and set:
 
 ```dotenv
-GITHUB_CALLBACK_URL=https://forgemind.tail50677a.ts.net/api/auth/github/callback
+FORGEMIND_AUTH_SESSION_SECRET=<long-random-value>
+FORGEMIND_SESSION_COOKIE_SECURE=true
+FORGEMIND_CORS_ORIGINS=https://forgemind.tail50677a.ts.net
+FORGEMIND_AUTH_RETURN_URL=https://forgemind.tail50677a.ts.net/
+GOOGLE_OAUTH_CLIENT_ID=<google-web-client-id>
+GOOGLE_OAUTH_CLIENT_SECRET=<google-web-client-secret>
+GOOGLE_OAUTH_CALLBACK_URL=https://forgemind.tail50677a.ts.net/api/auth/google/callback
+FORGEMIND_GOOGLE_ALLOWED_EMAIL=<authorized-google-email>
 ```
 
 ## 4. Create A Consistent OCI Backup

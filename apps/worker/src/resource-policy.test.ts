@@ -94,7 +94,7 @@ describe('worker resource policy', () => {
     expect(() => prepareResourcePolicyCommand('node --version', {
       ...basePolicy,
       diskLimitMb: 256
-    })).toThrow('disk quota is unsupported');
+    })).toThrow('unsupported on this worker runtime');
   });
 
   it('prevents network access from validation commands without relying on command text patterns', async () => {

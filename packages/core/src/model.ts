@@ -775,8 +775,91 @@ export interface AuditEvent {
   eventType: string;
   projectId?: string;
   taskId?: string;
+  chatThreadId?: string;
+  chatRunId?: string;
   payload: JsonValue;
   createdAt: IsoDateString;
+}
+
+export type ChatThreadStatus = 'active' | 'archived';
+export type ChatRunStatus = 'queued' | 'running' | 'waiting_for_approval' | 'succeeded' | 'failed' | 'cancelled' | 'interrupted';
+export type ChatMessageRole = 'user' | 'assistant' | 'system';
+
+export interface ChatThread {
+  id: string;
+  userId: string;
+  projectId?: string;
+  providerConnectionId?: string;
+  title: string;
+  status: ChatThreadStatus;
+  mode: TaskMode;
+  repositoryOwner?: string;
+  repositoryName?: string;
+  baseBranch?: string;
+  branchName?: string;
+  contextSummary?: string;
+  providerSessionId?: string;
+  providerSessionProvider?: ProviderKind;
+  providerSessionModel?: string;
+  providerSessionConnectionId?: string;
+  providerSessionUpdatedAt?: IsoDateString;
+  lastMessageAt?: IsoDateString;
+  archivedAt?: IsoDateString;
+  createdAt: IsoDateString;
+  updatedAt: IsoDateString;
+}
+
+export interface ChatMessage {
+  id: string;
+  threadId: string;
+  runId?: string;
+  sequence: number;
+  role: ChatMessageRole;
+  content: string;
+  metadata?: JsonValue;
+  createdAt: IsoDateString;
+}
+
+export interface ChatRun {
+  id: string;
+  threadId: string;
+  status: ChatRunStatus;
+  prompt: string;
+  provider?: ProviderKind;
+  model?: string;
+  attemptCount: number;
+  inputTokens: number;
+  outputTokens: number;
+  totalTokens: number;
+  cachedTokens: number;
+  actualCostUsd?: number;
+  errorMessage?: string;
+  responseSummary?: string;
+  result?: JsonValue;
+  stopRequested: boolean;
+  nextAttemptAt?: IsoDateString;
+  claimedAt?: IsoDateString;
+  heartbeatAt?: IsoDateString;
+  startedAt?: IsoDateString;
+  finishedAt?: IsoDateString;
+  createdAt: IsoDateString;
+  updatedAt: IsoDateString;
+}
+
+export interface ChatApproval {
+  id: string;
+  threadId: string;
+  runId: string;
+  type: ApprovalType;
+  status: ApprovalStatus;
+  requestedBy: 'agent' | 'system';
+  approvedByUserId?: string;
+  title: string;
+  description: string;
+  riskLevel: RiskLevel;
+  payload: JsonValue;
+  createdAt: IsoDateString;
+  resolvedAt?: IsoDateString;
 }
 
 export interface DiagnosticCorrelation {
