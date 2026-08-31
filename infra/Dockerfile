@@ -31,7 +31,7 @@ RUN npm run build
 
 FROM node:22-bookworm-slim AS runtime-base
 
-ARG CODEX_VERSION=0.142.5
+ARG CODEX_VERSION=0.151.0
 
 RUN apt-get update \
   && apt-get install -y --no-install-recommends \
