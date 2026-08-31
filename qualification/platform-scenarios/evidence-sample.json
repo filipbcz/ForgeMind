@@ -1,0 +1,100 @@
+{
+  "schemaVersion": 1,
+  "generatedFrom": "qualification/platform-scenarios/scenarios.mjs",
+  "note": "Scenario evidence is repeatable and redacted by construction",
+  "scenarioCount": 9,
+  "requiredAreas": [
+    "success",
+    "repair",
+    "restart",
+    "outage",
+    "approval_pause_resume",
+    "specification_change",
+    "audit_recovery",
+    "disk_exhaustion",
+    "database_restore"
+  ],
+  "scenarios": [
+    {
+      "id": "success-roadmap-step",
+      "area": "success",
+      "expectedStateCount": 9,
+      "expectedAuditEventCount": 9,
+      "evidenceArtifactCount": 5,
+      "recoveryStepCount": 3,
+      "definitionHash": "d4eecd02ea19b55a2da3ad790467d49a054c307c801c713d1c3d0c2baba71a57"
+    },
+    {
+      "id": "validation-repair",
+      "area": "repair",
+      "expectedStateCount": 8,
+      "expectedAuditEventCount": 6,
+      "evidenceArtifactCount": 4,
+      "recoveryStepCount": 3,
+      "definitionHash": "e497064e2eb92f6e250703ce12be8a78787bbb6e22af083a741eefb5bb54399f"
+    },
+    {
+      "id": "worker-restart-resume",
+      "area": "restart",
+      "expectedStateCount": 8,
+      "expectedAuditEventCount": 5,
+      "evidenceArtifactCount": 4,
+      "recoveryStepCount": 3,
+      "definitionHash": "6d282a27c8c7a64be8c0fb871998e0386d38cd97cd69bff7d9002b45311a44d7"
+    },
+    {
+      "id": "provider-and-github-outage",
+      "area": "outage",
+      "expectedStateCount": 8,
+      "expectedAuditEventCount": 6,
+      "evidenceArtifactCount": 4,
+      "recoveryStepCount": 3,
+      "definitionHash": "3b2896586a466c7fa4367570a3e996000564dbef76a51352f7b9da2c40852737"
+    },
+    {
+      "id": "approval-pause-resume",
+      "area": "approval_pause_resume",
+      "expectedStateCount": 9,
+      "expectedAuditEventCount": 6,
+      "evidenceArtifactCount": 4,
+      "recoveryStepCount": 3,
+      "definitionHash": "4869724d4da8171f7861d7d2100fb46e37137e6e98248e53bf6487eb0612ce6d"
+    },
+    {
+      "id": "specification-change-regeneration",
+      "area": "specification_change",
+      "expectedStateCount": 8,
+      "expectedAuditEventCount": 5,
+      "evidenceArtifactCount": 4,
+      "recoveryStepCount": 3,
+      "definitionHash": "fd60508164c3ef87a7c5ee6b227bcacbcfeade176cbf3a178955dd85bbdbf845"
+    },
+    {
+      "id": "manual-audit-recovery",
+      "area": "audit_recovery",
+      "expectedStateCount": 8,
+      "expectedAuditEventCount": 4,
+      "evidenceArtifactCount": 4,
+      "recoveryStepCount": 3,
+      "definitionHash": "584589d958564463bc1fd23a0a1d2f2dea044be2c3220b19b925e24b369cfbe6"
+    },
+    {
+      "id": "disk-exhaustion-artifact-bounds",
+      "area": "disk_exhaustion",
+      "expectedStateCount": 8,
+      "expectedAuditEventCount": 5,
+      "evidenceArtifactCount": 4,
+      "recoveryStepCount": 3,
+      "definitionHash": "af341aa10aa2d039433b6e24f89b712a7100663537ab3ea20bdf9f29f04b62e8"
+    },
+    {
+      "id": "database-restore-path",
+      "area": "database_restore",
+      "expectedStateCount": 7,
+      "expectedAuditEventCount": 3,
+      "evidenceArtifactCount": 4,
+      "recoveryStepCount": 3,
+      "definitionHash": "740dc3c48c5326c2606bbea52d7a93a178c643886e7e9419db0990384048811d"
+    }
+  ]
+}

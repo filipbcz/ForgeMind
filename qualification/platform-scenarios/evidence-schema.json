@@ -1,0 +1,143 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://forgemind.local/schemas/qualification-scenario-evidence.schema.json",
+  "title": "ForgeMind Platform Qualification Scenario Evidence",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schemaVersion",
+    "generatedFrom",
+    "note",
+    "scenarioCount",
+    "requiredAreas",
+    "scenarios"
+  ],
+  "properties": {
+    "schemaVersion": {
+      "const": 1
+    },
+    "generatedFrom": {
+      "const": "qualification/platform-scenarios/scenarios.mjs"
+    },
+    "note": {
+      "type": "string"
+    },
+    "scenarioCount": {
+      "type": "integer",
+      "const": 9
+    },
+    "requiredAreas": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      },
+      "minItems": 9,
+      "maxItems": 9,
+      "uniqueItems": true,
+      "allOf": [
+        {
+          "contains": {
+            "const": "success"
+          }
+        },
+        {
+          "contains": {
+            "const": "repair"
+          }
+        },
+        {
+          "contains": {
+            "const": "restart"
+          }
+        },
+        {
+          "contains": {
+            "const": "outage"
+          }
+        },
+        {
+          "contains": {
+            "const": "approval_pause_resume"
+          }
+        },
+        {
+          "contains": {
+            "const": "specification_change"
+          }
+        },
+        {
+          "contains": {
+            "const": "audit_recovery"
+          }
+        },
+        {
+          "contains": {
+            "const": "disk_exhaustion"
+          }
+        },
+        {
+          "contains": {
+            "const": "database_restore"
+          }
+        }
+      ]
+    },
+    "scenarios": {
+      "type": "array",
+      "minItems": 9,
+      "maxItems": 9,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "id",
+          "area",
+          "expectedStateCount",
+          "expectedAuditEventCount",
+          "evidenceArtifactCount",
+          "recoveryStepCount",
+          "definitionHash"
+        ],
+        "properties": {
+          "id": {
+            "type": "string",
+            "pattern": "^[a-z0-9-]+$"
+          },
+          "area": {
+            "enum": [
+              "success",
+              "repair",
+              "restart",
+              "outage",
+              "approval_pause_resume",
+              "specification_change",
+              "audit_recovery",
+              "disk_exhaustion",
+              "database_restore"
+            ]
+          },
+          "expectedStateCount": {
+            "type": "integer",
+            "minimum": 3
+          },
+          "expectedAuditEventCount": {
+            "type": "integer",
+            "minimum": 3
+          },
+          "evidenceArtifactCount": {
+            "type": "integer",
+            "minimum": 2
+          },
+          "recoveryStepCount": {
+            "type": "integer",
+            "minimum": 3
+          },
+          "definitionHash": {
+            "type": "string",
+            "pattern": "^[a-f0-9]{64}$"
+          }
+        }
+      }
+    }
+  }
+}
