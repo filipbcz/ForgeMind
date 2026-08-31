@@ -1782,6 +1782,10 @@ async function requireAuthorizedRequest(
   const approvalType = isMutationRequest(request) ? requiredRiskApprovalType(request) : undefined;
   if (approvalType) {
     const chatRunId = readSingleHeader(request.headers['x-forgemind-chat-run-id']);
+    const approvalId = readSingleHeader(request.headers['x-forgemind-approval-id']);
+    if (!chatRunId && !approvalId) {
+      return;
+    }
     if (chatRunId && await repository.isChatApiMutationAuthorized({
       runId: chatRunId,
       userId: currentUser.id,
@@ -1792,7 +1796,6 @@ async function requireAuthorizedRequest(
     })) {
       return;
     }
-    const approvalId = readSingleHeader(request.headers['x-forgemind-approval-id']);
     if (!approvalId) {
       return reply.code(403).send({ error: `Approved ${approvalType} approval required for this mutation.` });
     }

@@ -236,10 +236,33 @@ describe('Studio API routes', () => {
     await app.close();
   });
 
-  it('requires explicit approved approval before risky mutations execute', async () => {
+  it('allows an authenticated owner to execute an explicit risky mutation directly', async () => {
     const auth = createAuthService();
     const repository = {
       getCurrentUser: vi.fn(async () => ownerUser),
+      setWorkerQueuePaused: vi.fn(async () => ({ queuePaused: true, updatedAt: new Date().toISOString() })),
+      getWorkerStatus: vi.fn(async () => ({ state: 'idle', queuePaused: true, queuedTaskCount: 0, activeTaskCount: 0, updatedAt: new Date().toISOString() }))
+    };
+    const app = Fastify();
+    registerRoutes(app, repository as never, undefined, auth);
+
+    const response = await app.inject({
+      method: 'PUT',
+      url: '/api/worker/queue',
+      headers: createOwnerAuthenticatedHeaders(auth),
+      payload: { paused: true }
+    });
+
+    expect(response.statusCode).toBe(200);
+    expect(repository.setWorkerQueuePaused).toHaveBeenCalledWith(true);
+    await app.close();
+  });
+
+  it('requires explicit approval before a delegated chat mutation executes', async () => {
+    const auth = createAuthService();
+    const repository = {
+      getCurrentUser: vi.fn(async () => ownerUser),
+      isChatApiMutationAuthorized: vi.fn(async () => false),
       getApproval: vi.fn(),
       setWorkerQueuePaused: vi.fn()
     };
@@ -249,7 +272,7 @@ describe('Studio API routes', () => {
     const response = await app.inject({
       method: 'PUT',
       url: '/api/worker/queue',
-      headers: createOwnerAuthenticatedHeaders(auth),
+      headers: { ...createOwnerAuthenticatedHeaders(auth), 'x-forgemind-chat-run-id': 'run_1' },
       payload: { paused: true }
     });
 
