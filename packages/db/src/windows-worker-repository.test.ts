@@ -119,6 +119,32 @@ describe('WindowsWorkerRepository capability leases', () => {
     expect(tx.windowsExecutionLease.create).not.toHaveBeenCalled();
   });
 
+  it('rejects result evidence whose immutable identity differs from the persisted execution packet', async () => {
+    const digest = 'a'.repeat(64);
+    const packet = {
+      schemaVersion: 1, projectId: 'project_1', taskId: 'task_1', runId: 'run_1', checkId: 'check_1',
+      jobId: 'job_1', leaseId: 'lease_1', repository: 'owner/repo', sourceUrl: 'https://example.test/repo.git',
+      commitSha: digest, workspaceRoot: 'C:\\work', artifactRoot: 'C:\\artifacts',
+      check: { command: 'npm test', category: 'smoke', requiredCapabilities: ['windows'] },
+      requiredCapabilities: ['windows'], resourcePolicy: { timeoutSeconds: 60, maxLogBytes: 1024, maxArtifactBytes: 1024 },
+      expectedArtifacts: [], nonce: 'nonce_1', inputHash: digest
+    };
+    const tx: any = {
+      $queryRaw: vi.fn(async () => [{ jobId: 'job_1', projectId: 'project_1', taskId: 'task_1', runId: 'run_1', packet }]),
+      windowsExecutionJob: { updateMany: vi.fn() }, windowsExecutionLease: { update: vi.fn() }, workerDevice: { update: vi.fn() }
+    };
+    const prisma: any = { $transaction: vi.fn(async (work: (client: unknown) => unknown) => work(tx)) };
+    const accepted = await new WindowsWorkerRepository(prisma).submitResult('device_1', {
+      schemaVersion: 1, projectId: 'project_attacker', taskId: 'task_1', runId: 'run_1', checkId: 'check_1',
+      jobId: 'job_1', leaseId: 'lease_1', deviceId: 'device_1', sessionId: 'session_1', nonce: 'nonce_1',
+      inputHash: digest, commitSha: digest, observedCapabilities: [], toolVersions: [], status: 'succeeded',
+      startedAt: '2026-09-01T00:00:00.000Z', completedAt: '2026-09-01T00:01:00.000Z', summary: 'done', logHash: digest, artifacts: []
+    });
+    expect(accepted).toBe(false);
+    expect(tx.windowsExecutionJob.updateMany).not.toHaveBeenCalled();
+    expect(tx.windowsExecutionLease.update).not.toHaveBeenCalled();
+  });
+
   it.each([
     ['cancelSession', 'cancelled', 'cancelled'],
     ['closeSession', 'closed', 'released']

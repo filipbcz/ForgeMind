@@ -21,7 +21,7 @@ import { completeCodexOAuthBrowserLogin, readCodexOAuthBrowserLoginStatus, readC
 import { createTaskDispatchService } from './dispatch.js';
 import { sendBadRequest, sendNotFound } from './http.js';
 import { advanceRoadmapAfterTaskCapabilityWait, advanceRoadmapAfterTaskCompletion, buildRoadmapStepTaskPrompt, composeApprovedExtensionSpecification, startNextRoadmapStep } from '@forgemind/db';
-import type { AIProviderConnectionKind, AIProviderConnectionSecret, ForgeMindRepository } from '@forgemind/db';
+import type { AIProviderConnectionKind, AIProviderConnectionSecret, ForgeMindRepository, WindowsRunnerCredentialAdapter, WindowsWorkerRepository } from '@forgemind/db';
 import { parseGitHubWebhookPayload, projectGitHubWebhookEvent, verifyGitHubWebhookSignature } from './webhook.js';
 import type { NotificationService } from './notifications.js';
 import { ROADMAP_GENERATION_CONFIRMATION, activeProjectContractRequirements, applyProjectContractDelta, buildSpecificationChangeImpactReview, redactSecrets } from '@forgemind/core';
@@ -31,6 +31,7 @@ import { readSessionId, registerAuthRoutes } from './routes/auth-routes.js';
 import { registerNotificationRoutes } from './routes/notification-routes.js';
 import { registerChatRoutes } from './routes/chat-routes.js';
 import { registerWorkerRoutes } from './routes/worker-routes.js';
+import { registerWindowsRunnerRoutes } from './routes/windows-runner-routes.js';
 
 const validationProfileSchema = z.object({
   version: z.literal(1).default(1),
@@ -310,7 +311,7 @@ const githubBranchesQuerySchema = z.object({
   limit: z.coerce.number().int().min(1).max(200).optional().default(100)
 });
 
-export function registerRoutes(app: FastifyInstance, repository: ForgeMindRepository, notifications?: NotificationService, auth?: AuthService) {
+export function registerRoutes(app: FastifyInstance, repository: ForgeMindRepository, notifications?: NotificationService, auth?: AuthService, windowsRunner?: { credentials: WindowsRunnerCredentialAdapter; workers: WindowsWorkerRepository }) {
   const dispatcher = createTaskDispatchService(repository);
   const processedWebhookDeliveries = new Set<string>();
 
@@ -328,6 +329,7 @@ export function registerRoutes(app: FastifyInstance, repository: ForgeMindReposi
   app.get('/api/me', async () => repository.getCurrentUser());
 
   registerWorkerRoutes(app, repository);
+  if (windowsRunner) registerWindowsRunnerRoutes(app, repository, windowsRunner.credentials, windowsRunner.workers);
 
   app.get('/api/providers/status', async (_request) => {
     const githubConnection = await readGitHubConnection(repository);
@@ -1784,6 +1786,9 @@ async function requireAuthorizedRequest(
     const chatRunId = readSingleHeader(request.headers['x-forgemind-chat-run-id']);
     const approvalId = readSingleHeader(request.headers['x-forgemind-approval-id']);
     if (!chatRunId && !approvalId) {
+      if (isWindowsRunnerCredentialMutation(request)) {
+        return reply.code(403).send({ error: `Approved ${approvalType} approval required for this mutation.` });
+      }
       return;
     }
     if (chatRunId && await repository.isChatApiMutationAuthorized({
@@ -1810,6 +1815,11 @@ async function requireAuthorizedRequest(
   }
 }
 
+function isWindowsRunnerCredentialMutation(request: FastifyRequest): boolean {
+  const path = request.url.split('?')[0] ?? request.url;
+  return path.startsWith('/api/windows-runner/enrollments') || path.startsWith('/api/windows-runner/devices/');
+}
+
 function isProtectedApiRequest(request: FastifyRequest): boolean {
   if (request.method === 'OPTIONS') return false;
   const path = request.url.split('?')[0] ?? request.url;
@@ -1817,7 +1827,9 @@ function isProtectedApiRequest(request: FastifyRequest): boolean {
   return path !== '/api/auth/session'
     && path !== '/api/auth/google/login'
     && path !== '/api/auth/google/callback'
-    && path !== '/api/webhooks/github';
+    && path !== '/api/webhooks/github'
+    && path !== '/api/windows-runner/enroll'
+    && !path.startsWith('/api/windows-runner/device/');
 }
 
 function isMutationRequest(request: FastifyRequest): boolean {
@@ -1831,6 +1843,8 @@ function requiresOwnerRole(request: FastifyRequest): boolean {
     || path.startsWith('/api/github/')
     || path.startsWith('/api/providers/')
     || path.startsWith('/api/approvals')
+    || path.startsWith('/api/windows-runner/enrollments')
+    || path.startsWith('/api/windows-runner/devices/')
     || path.endsWith('/implementation-steps/reconcile')
     || (request.method === 'DELETE' && path.startsWith('/api/projects/'));
 }
@@ -1838,6 +1852,7 @@ function requiresOwnerRole(request: FastifyRequest): boolean {
 function requiredRiskApprovalType(request: FastifyRequest): ApprovalType | undefined {
   const path = request.url.split('?')[0] ?? request.url;
   if (path === '/api/worker/queue') return 'config_change';
+  if (path.startsWith('/api/windows-runner/enrollments') || path.startsWith('/api/windows-runner/devices/')) return 'config_change';
   if (path.startsWith('/api/github/')) return 'config_change';
   if (path.startsWith('/api/providers/connect') || path.startsWith('/api/providers/connections/') || path === '/api/providers/codex/oauth/complete') {
     return 'config_change';

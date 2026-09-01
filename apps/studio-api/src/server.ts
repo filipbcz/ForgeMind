@@ -1,5 +1,5 @@
 import cors from '@fastify/cors';
-import { createRepository, getPrismaClient } from '@forgemind/db';
+import { createRepository, getPrismaClient, WindowsRunnerCredentialAdapter, WindowsWorkerRepository } from '@forgemind/db';
 import { redactError } from '@forgemind/core';
 import type { AuditEvent } from '@forgemind/core';
 import Fastify from 'fastify';
@@ -74,11 +74,14 @@ export async function createApp() {
     runFirst: true
   });
 
-  const repository = createRepository(getPrismaClient());
+  const prisma = getPrismaClient();
+  const repository = createRepository(prisma);
   const notificationService = createNotificationService(repository, createWebPushDispatcher());
   const authService = createAuthService(repository);
   const realtime = registerRealtimeGateway(app, repository, authService);
-  registerRoutes(app, repository, notificationService, authService);
+  registerRoutes(app, repository, notificationService, authService, {
+    credentials: new WindowsRunnerCredentialAdapter(prisma), workers: new WindowsWorkerRepository(prisma)
+  });
 
   startTaskNotificationBridge(app, repository, notificationService, realtime);
 
