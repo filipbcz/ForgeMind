@@ -24,6 +24,41 @@ const leaseRow = {
 };
 
 describe('WindowsWorkerRepository capability leases', () => {
+  it('serializes concurrent evidence uploads so a conflicting upload cannot overwrite the first', async () => {
+    const digest = 'a'.repeat(64); let packet: any = { ...queuedPacket, leaseId: 'lease_1' }; let release: (() => void) | undefined;
+    let locked = false;
+    const tx: any = {
+      $queryRaw: vi.fn(async () => { if (locked) await new Promise<void>((resolve) => { release = resolve; }); locked = true; return [{ id: 'job_1' }]; }),
+      windowsExecutionLease: { findFirst: vi.fn(async () => ({ job: { packet } })) },
+      windowsExecutionJob: { update: vi.fn(async ({ data }: any) => { packet = data.packet; }) }
+    };
+    const prisma: any = { $transaction: vi.fn(async (work: (client: unknown) => unknown) => { try { return await work(tx); } finally { locked = false; release?.(); release = undefined; } }) };
+    const upload = (text: string) => ({ schemaVersion: 1 as const, jobId: 'job_1', leaseId: 'lease_1', inputHash: digest, commitSha: digest,
+      log: { text, sizeBytes: text.length, sha256: digest }, artifacts: [] });
+    const repository = new WindowsWorkerRepository(prisma);
+    expect(await Promise.all([repository.uploadEvidence('device_1', upload('first')), repository.uploadEvidence('device_1', upload('second'))]))
+      .toEqual(['accepted', 'conflict']);
+    expect((packet as any).evidenceUpload.log.text).toBe('first');
+  });
+
+  it('projects stale devices offline and only reports idle devices with a fresh active session as compatible', async () => {
+    const now = new Date('2026-09-01T12:00:00.000Z');
+    const device = (id: string, status: 'idle' | 'revoked', heartbeat: string, sessionStatus: 'active' | 'closed') => ({
+      id, platform: 'windows', runnerVersion: '1', displayName: id, status, capabilities: [{ key: 'windows' }],
+      probeEvidence: [{ capability: { key: 'windows' }, status: 'supported' }], lastHeartbeatAt: new Date(heartbeat),
+      sessions: [{ id: `${id}-session`, deviceId: id, status: sessionStatus, startedAt: now, expiresAt: new Date(now.getTime() + 60_000), lastHeartbeatAt: new Date(heartbeat), endedAt: null }]
+    });
+    const devices = [device('eligible', 'idle', '2026-09-01T11:59:50.000Z', 'active'), device('stale', 'idle', '2026-09-01T11:00:00.000Z', 'active'),
+      device('closed', 'idle', '2026-09-01T11:59:50.000Z', 'closed'), device('revoked', 'revoked', '2026-09-01T11:59:50.000Z', 'active')];
+    const prisma: any = { workerDevice: { findMany: vi.fn(async () => devices) }, windowsExecutionJob: { findMany: vi.fn(async () => [{
+      id: 'job_1', taskId: 'task_1', status: 'queued', requiredCapabilities: ['windows'], packet: queuedPacket
+    }]) } };
+    const readModel = await new WindowsWorkerRepository(prisma).readOperations(undefined, now);
+    expect(readModel.devices.find(({ id }) => id === 'stale')?.status).toBe('offline');
+    expect(readModel.devices.find(({ id }) => id === 'revoked')?.status).toBe('revoked');
+    expect(readModel.waitingValidations[0]?.compatibleDeviceIds).toEqual(['eligible']);
+  });
+
   it('returns an existing active lease for an idempotent claim without reserving another job', async () => {
     const tx: any = {
       $executeRaw: vi.fn(async () => 1),
@@ -137,7 +172,9 @@ describe('WindowsWorkerRepository capability leases', () => {
       commitSha: digest, workspaceRoot: 'C:\\work', artifactRoot: 'C:\\artifacts',
       check: { command: 'npm test', category: 'smoke', requiredCapabilities: ['windows'] },
       requiredCapabilities: ['windows'], resourcePolicy: { timeoutSeconds: 60, maxLogBytes: 1024, maxArtifactBytes: 1024 },
-      expectedArtifacts: [], nonce: 'nonce_1', inputHash: digest
+      expectedArtifacts: [], nonce: 'nonce_1', inputHash: digest,
+      evidenceUpload: { schemaVersion: 1, jobId: 'job_1', leaseId: 'lease_1', inputHash: digest, commitSha: digest,
+        log: { text: 'fixture passed', sizeBytes: 14, sha256: digest }, artifacts: [] }
     };
     const tx: any = {
       $queryRaw: vi.fn(async () => [{ jobId: 'job_1', projectId: 'project_1', taskId: 'task_1', runId: 'run_1', packet }]),
@@ -163,7 +200,9 @@ describe('WindowsWorkerRepository capability leases', () => {
       commitSha: digest, workspaceRoot: 'C:\\work', artifactRoot: 'C:\\artifacts',
       check: { command: 'fixture.exe --validate', category: 'smoke', requiredCapabilities: ['windows'] },
       requiredCapabilities: ['windows'], resourcePolicy: { timeoutSeconds: 60, maxLogBytes: 1024, maxArtifactBytes: 1024 },
-      expectedArtifacts: [], nonce: 'nonce_1', inputHash: digest
+      expectedArtifacts: [], nonce: 'nonce_1', inputHash: digest,
+      evidenceUpload: { schemaVersion: 1, jobId: 'job_1', leaseId: 'lease_1', inputHash: digest, commitSha: digest,
+        log: { text: 'fixture passed', sizeBytes: 14, sha256: digest }, artifacts: [] }
     };
     const checkpointUpdate = vi.fn(async () => ({ count: 1 }));
     const tx: any = {

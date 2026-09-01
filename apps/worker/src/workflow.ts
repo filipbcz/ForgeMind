@@ -772,6 +772,7 @@ export async function runWorkerTask(input: WorkerTaskInput): Promise<WorkerTaskR
             return;
           }
           if (activity.state === 'deferred') {
+            if (!validationCommitSha) throw new Error('Deferred validation requires an exact HEAD commit SHA.');
             await emitTaskActivity(input.hooks, {
               phase: 'validation',
               state: 'completed',

@@ -51,6 +51,7 @@ import type {
   WorkerEventApi,
   WorkerStatusApi
 } from './types.js';
+import type { WindowsWorkerOperationsReadModel } from '@forgemind/core';
 
 const inferredApiUrl =
   typeof window === 'undefined' || window.location.hostname === 'localhost'
@@ -62,6 +63,11 @@ export const API_URL = import.meta.env.VITE_API_URL ?? inferredApiUrl;
 export async function fetchAuthSession(): Promise<AuthSessionResponse> {
   return request<AuthSessionResponse>('/api/auth/session');
 }
+
+export const fetchWindowsOperations = (projectId?: string) => request<WindowsWorkerOperationsReadModel>(`/api/windows-runner/operations${projectId ? `?projectId=${encodeURIComponent(projectId)}` : ''}`);
+export const cancelWindowsJob = (jobId: string) => request<{ accepted: boolean }>(`/api/windows-runner/jobs/${jobId}/cancel`, { method: 'POST', body: '{}' });
+export const drainWindowsSession = (sessionId: string) => request<{ accepted: boolean }>(`/api/windows-runner/sessions/${sessionId}/drain`, { method: 'POST', body: '{}' });
+export const revokeWindowsDevice = (deviceId: string) => request<{ revoked: boolean }>(`/api/windows-runner/devices/${deviceId}/revoke`, { method: 'POST', body: '{}' });
 
 export async function startGoogleLogin(): Promise<AuthLoginStartResponse> {
   return request<AuthLoginStartResponse>('/api/auth/google/login', {

@@ -2,7 +2,7 @@ import type { FastifyInstance, FastifyReply, FastifyRequest } from 'fastify';
 import { createHash } from 'node:crypto';
 import { z } from 'zod';
 import type { ForgeMindRepository, WindowsRunnerCredentialAdapter, WindowsRunnerPrincipal, WindowsWorkerRepository } from '@forgemind/db';
-import { canonicalizeWorkerProbeEvidence, isWindowsExecutionResult } from '@forgemind/core';
+import { canonicalizeWorkerProbeEvidence, isWindowsExecutionResult, redactSecrets, WINDOWS_EVIDENCE_MAX_ARTIFACT_BYTES, WINDOWS_EVIDENCE_MAX_ARTIFACTS, WINDOWS_EVIDENCE_MAX_LOG_BYTES } from '@forgemind/core';
 
 const deviceParams = z.object({ deviceId: z.string().uuid() });
 const enrollment = z.object({ deviceId: z.string().uuid(), expiresInMinutes: z.number().int().min(1).max(60).default(10) });
@@ -32,6 +32,10 @@ const deviceRegistration = z.object({
 });
 const sessionControl = z.object({ sessionId: z.string().uuid() });
 const controlQuery = z.object({ sessionId: z.string().uuid(), leaseId: z.string().uuid().optional() });
+const sha = z.string().regex(/^[a-f0-9]{64}$/i);
+const evidenceUpload = z.object({ schemaVersion: z.literal(1), jobId: z.string().uuid(), leaseId: z.string().uuid(), inputHash: sha, commitSha: sha,
+  log: z.object({ text: z.string(), sizeBytes: z.number().int().nonnegative(), sha256: sha }), artifacts: z.array(z.object({ name: z.string().min(1).max(200),
+    relativePath: z.string().min(1).max(500), sizeBytes: z.number().int().nonnegative(), sha256: sha, contentBase64: z.string(), criterion: z.string().min(1).max(2000) })).max(WINDOWS_EVIDENCE_MAX_ARTIFACTS) });
 
 export function registerWindowsRunnerRoutes(app: FastifyInstance, repository: ForgeMindRepository, credentials: WindowsRunnerCredentialAdapter, workers: WindowsWorkerRepository) {
   app.post('/api/windows-runner/enrollments', async (request) => {
@@ -101,6 +105,28 @@ export function registerWindowsRunnerRoutes(app: FastifyInstance, repository: Fo
     await repository.writeAudit({ actorType: 'system', actorId: principal.deviceId, eventType: 'windows_runner_result_submitted', taskId: request.body.taskId, projectId: request.body.projectId, payload: { deviceId: principal.deviceId, jobId: request.body.jobId, leaseId: request.body.leaseId, status: request.body.status, commitSha: request.body.commitSha } });
     return { accepted: true };
   });
+  app.post('/api/windows-runner/device/evidence', { preHandler: runnerAuth(credentials), bodyLimit: WINDOWS_EVIDENCE_MAX_ARTIFACT_BYTES + WINDOWS_EVIDENCE_MAX_LOG_BYTES + 100_000 }, async (request, reply) => {
+    const principal = runnerPrincipal(request); const parsed = evidenceUpload.safeParse(request.body);
+    if (!parsed.success) return reply.code(400).send({ error: 'Invalid evidence upload.' });
+    const upload = parsed.data; const logBytes = Buffer.byteLength(upload.log.text); let artifactBytes = 0;
+    if (logBytes !== upload.log.sizeBytes || logBytes > WINDOWS_EVIDENCE_MAX_LOG_BYTES || createHash('sha256').update(upload.log.text).digest('hex') !== upload.log.sha256.toLowerCase()) return reply.code(400).send({ error: 'Log size or hash is invalid.' });
+    const forbidden = /(^|[\\/])(?:\.git|Users?|home|workspace)(?:[\\/]|$)|(?:^|[\\/])(?:\.env|environment)(?:\.|[\\/]|$)/i;
+    for (const artifact of upload.artifacts) { if (forbidden.test(artifact.relativePath) || artifact.relativePath.includes('..')) return reply.code(400).send({ error: 'Artifact path is prohibited.' });
+      const bytes = Buffer.from(artifact.contentBase64, 'base64'); artifactBytes += bytes.length;
+      if (bytes.length !== artifact.sizeBytes || createHash('sha256').update(bytes).digest('hex') !== artifact.sha256.toLowerCase()) return reply.code(400).send({ error: 'Artifact size or hash is invalid.' });
+      const decodedText = bytes.toString('utf8');
+      if (redactSecrets(decodedText) !== decodedText) return reply.code(400).send({ error: 'Artifact content contains secret-like values and must be redacted before hashing.' }); }
+    if (artifactBytes > WINDOWS_EVIDENCE_MAX_ARTIFACT_BYTES) return reply.code(413).send({ error: 'Artifact upload exceeds its limit.' });
+    const redacted = redactSecrets(upload);
+    if (JSON.stringify(redacted) !== JSON.stringify(upload)) return reply.code(400).send({ error: 'Evidence contains secret-like values and must be redacted before hashing.' });
+    const outcome = await workers.uploadEvidence(principal.deviceId, redacted);
+    return outcome === 'conflict' ? reply.code(409).send({ error: 'Evidence conflicts with the lease or an existing upload.' }) : { accepted: true, duplicate: outcome === 'duplicate' };
+  });
+  app.get('/api/windows-runner/operations', async (request) => workers.readOperations(z.object({ projectId: z.string().uuid().optional() }).parse(request.query).projectId));
+  app.post('/api/windows-runner/jobs/:jobId/cancel', async (request) => { const jobId = z.object({ jobId: z.string().uuid() }).parse(request.params).jobId; const accepted = await workers.cancelJob(jobId);
+    await repository.writeAudit({ actorType: 'user', eventType: 'windows_runner_job_cancelled', payload: { jobId, accepted } }); return { accepted }; });
+  app.post('/api/windows-runner/sessions/:sessionId/drain', async (request) => { const sessionId = z.object({ sessionId: z.string().uuid() }).parse(request.params).sessionId; await workers.drainSession(sessionId);
+    await repository.writeAudit({ actorType: 'user', eventType: 'windows_runner_session_draining', payload: { sessionId } }); return { accepted: true }; });
 }
 
 function runnerAuth(credentials: WindowsRunnerCredentialAdapter) {

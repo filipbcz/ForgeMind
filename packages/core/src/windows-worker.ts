@@ -138,6 +138,28 @@ export interface ExecutionArtifactResult {
   sha256: string;
 }
 
+export const WINDOWS_EVIDENCE_MAX_LOG_BYTES = 256_000;
+export const WINDOWS_EVIDENCE_MAX_ARTIFACT_BYTES = 10_000_000;
+export const WINDOWS_EVIDENCE_MAX_ARTIFACTS = 16;
+export const WINDOWS_DEVICE_OFFLINE_AFTER_MS = 30_000;
+
+export interface WindowsEvidenceUpload {
+  schemaVersion: WindowsWorkerSchemaVersion;
+  jobId: string;
+  leaseId: string;
+  inputHash: string;
+  commitSha: string;
+  log: { text: string; sizeBytes: number; sha256: string };
+  artifacts: Array<ExecutionArtifactResult & { contentBase64: string; criterion: string }>;
+}
+
+export interface WindowsWorkerOperationsReadModel {
+  schemaVersion: WindowsWorkerSchemaVersion;
+  devices: Array<WorkerDevice & { sessions: WorkerManualSession[] }>;
+  waitingValidations: Array<{ jobId: string; taskId: string; criterion?: string; requiredCapabilities: string[]; compatibleDeviceIds: string[] }>;
+  evidence: Array<{ jobId: string; taskId: string; checkId: string; criterion?: string; commitSha: string; log?: WindowsEvidenceUpload['log']; artifacts: Array<ExecutionArtifactResult & { criterion: string }> }>;
+}
+
 export interface ExecutionToolVersionEvidence {
   tool: string;
   version: string;

@@ -1,4 +1,4 @@
-import type { WorkerCapability, WorkerProbeEvidence } from '@forgemind/core';
+import type { WindowsEvidenceUpload, WorkerCapability, WorkerProbeEvidence } from '@forgemind/core';
 import type { RunnerCredential } from './credential-store.js';
 
 export interface RunnerControlState { deviceStatus: string; sessionStatus: string; leaseStatus?: string; jobStatus?: string }
@@ -23,6 +23,7 @@ export class WindowsRunnerTransport {
     return this.call<RunnerControlState>(`/api/windows-runner/device/control?${query}`, auth, undefined, 'GET');
   }
   drain(auth: RunnerCredential, sessionId: string) { return this.call('/api/windows-runner/device/session/drain', auth, { sessionId }); }
+  uploadEvidence(auth: RunnerCredential, input: WindowsEvidenceUpload) { return this.call<{ accepted: boolean; duplicate: boolean }>('/api/windows-runner/device/evidence', auth, input); }
   close(auth: RunnerCredential, sessionId: string) { return this.call('/api/windows-runner/device/session/close', auth, { sessionId }); }
   private async call<T = unknown>(path: string, auth?: RunnerCredential, body?: unknown, method = 'POST'): Promise<T> {
     const response = await this.request(new URL(path, this.baseUrl), {

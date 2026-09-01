@@ -1845,6 +1845,8 @@ function requiresOwnerRole(request: FastifyRequest): boolean {
     || path.startsWith('/api/approvals')
     || path.startsWith('/api/windows-runner/enrollments')
     || path.startsWith('/api/windows-runner/devices/')
+    || path.startsWith('/api/windows-runner/jobs/')
+    || path.startsWith('/api/windows-runner/sessions/')
     || path.endsWith('/implementation-steps/reconcile')
     || (request.method === 'DELETE' && path.startsWith('/api/projects/'));
 }
@@ -1853,6 +1855,7 @@ function requiredRiskApprovalType(request: FastifyRequest): ApprovalType | undef
   const path = request.url.split('?')[0] ?? request.url;
   if (path === '/api/worker/queue') return 'config_change';
   if (path.startsWith('/api/windows-runner/enrollments') || path.startsWith('/api/windows-runner/devices/')) return 'config_change';
+  if (path.startsWith('/api/windows-runner/jobs/') || path.startsWith('/api/windows-runner/sessions/')) return 'config_change';
   if (path.startsWith('/api/github/')) return 'config_change';
   if (path.startsWith('/api/providers/connect') || path.startsWith('/api/providers/connections/') || path === '/api/providers/codex/oauth/complete') {
     return 'config_change';

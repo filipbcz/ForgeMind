@@ -10,6 +10,22 @@ function probeEvidence(capability: { key: string; version?: string }, status: 's
 }
 
 describe('Windows runner enrollment API', () => {
+  it('accepts bounded hash-verified evidence idempotently and rejects prohibited paths', async () => {
+    const app = Fastify(); const deviceId = '11111111-1111-4111-8111-111111111111';
+    const credentials: any = { authenticate: vi.fn(async () => ({ deviceId })) }; const workers: any = { uploadEvidence: vi.fn(async () => 'duplicate') };
+    registerWindowsRunnerRoutes(app, {} as any, credentials, workers);
+    const text = 'fixture passed'; const content = Buffer.from('report');
+    const payload = { schemaVersion: 1, jobId: '22222222-2222-4222-8222-222222222222', leaseId: '33333333-3333-4333-8333-333333333333', inputHash: 'a'.repeat(64), commitSha: 'b'.repeat(64),
+      log: { text, sizeBytes: Buffer.byteLength(text), sha256: createHash('sha256').update(text).digest('hex') }, artifacts: [{ name: 'report', relativePath: 'results/report.txt', sizeBytes: content.length,
+        sha256: createHash('sha256').update(content).digest('hex'), contentBase64: content.toString('base64'), criterion: 'Fixture passes' }] };
+    const response = await app.inject({ method: 'POST', url: '/api/windows-runner/device/evidence', headers: { authorization: 'Bearer token' }, payload });
+    expect(response.statusCode).toBe(200); expect(response.json()).toEqual({ accepted: true, duplicate: true });
+    expect(workers.uploadEvidence).toHaveBeenCalledWith(deviceId, payload);
+    expect((await app.inject({ method: 'POST', url: '/api/windows-runner/device/evidence', headers: { authorization: 'Bearer token' }, payload: { ...payload, artifacts: [{ ...payload.artifacts[0], relativePath: '.git/config' }] } })).statusCode).toBe(400);
+    const secret = Buffer.from('token=ghp_abcdefghijklmnopqrstuvwxyz123456');
+    const secretArtifact = { ...payload.artifacts[0], sizeBytes: secret.length, sha256: createHash('sha256').update(secret).digest('hex'), contentBase64: secret.toString('base64') };
+    expect((await app.inject({ method: 'POST', url: '/api/windows-runner/device/evidence', headers: { authorization: 'Bearer token' }, payload: { ...payload, artifacts: [secretArtifact] } })).statusCode).toBe(400);
+  });
   it('rejects device operations without a scoped credential', async () => {
     const app = Fastify();
     const credentials: any = { authenticate: vi.fn(async () => undefined) };
