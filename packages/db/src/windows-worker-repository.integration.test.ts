@@ -26,7 +26,8 @@ const digest = 'a'.repeat(64);
 const integrationPacket = { schemaVersion: 1 as const, projectId: ids.project, taskId: ids.task, runId: ids.run, checkId: 'lease_test_check', jobId: ids.job,
   leaseId: 'pending', repository: 'owner/repo', sourceUrl: 'https://example.test/repo.git', commitSha: digest, workspaceRoot: 'C:\\work', artifactRoot: 'C:\\artifacts',
   check: { command: 'fixture.exe', category: 'smoke' as const, requiredCapabilities: ['windows'] }, requiredCapabilities: ['windows'],
-  resourcePolicy: { timeoutSeconds: 60, maxLogBytes: 1024, maxArtifactBytes: 1024 }, expectedArtifacts: [], nonce: 'pending', inputHash: digest };
+  resourcePolicy: { timeoutSeconds: 60, maxLogBytes: 1024, maxArtifactBytes: 1024 }, expectedArtifacts: [], nonce: 'pending', inputHash: digest,
+  executionAdapter: { kind: 'fixture' as const, profileId: 'fixture-validation-v1' } };
 let first: PrismaClient;
 let second: PrismaClient;
 let admin: PostgreSqlClient | undefined;

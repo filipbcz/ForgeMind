@@ -62,7 +62,8 @@ describe('Windows runner real transport and persistence flow', () => {
       schemaVersion: 1, projectId: ids.project, taskId: ids.task, runId: ids.run, checkId, jobId: ids.job, leaseId: 'pending', repository: 'owner/repo',
       sourceUrl: 'https://example.test/owner/repo.git', commitSha, workspaceRoot: 'C:\\fixture', artifactRoot: 'C:\\fixture\\artifacts',
       check: { command: 'fixture.exe --validate', category: 'smoke', requiredCapabilities: ['windows'] }, requiredCapabilities: ['windows'],
-      resourcePolicy: { timeoutSeconds: 30, maxLogBytes: 1024, maxArtifactBytes: 1024 }, expectedArtifacts: [], nonce: 'pending', inputHash
+      resourcePolicy: { timeoutSeconds: 30, maxLogBytes: 1024, maxArtifactBytes: 1024 }, expectedArtifacts: [], nonce: 'pending', inputHash,
+      executionAdapter: { kind: 'fixture', profileId: 'fixture-validation-v1' }
     } });
 
     const app = Fastify();

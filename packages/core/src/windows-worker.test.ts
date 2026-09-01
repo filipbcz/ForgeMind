@@ -12,6 +12,7 @@ const packet: WindowsExecutionPacket = {
   workspaceRoot: 'C:\\ForgeMind\\work', artifactRoot: 'C:\\ForgeMind\\artifacts',
   check: { command: 'fixture validate', category: 'smoke', requiredCapabilities: ['windows'] }, requiredCapabilities: ['windows'],
   resourcePolicy: { timeoutSeconds: 60, maxLogBytes: 1024, maxArtifactBytes: 2048 }, expectedArtifacts: [], nonce: 'nonce', inputHash: hash
+  , executionAdapter: { kind: 'fixture', profileId: 'fixture-validation-v1' }
 };
 
 describe('Windows worker shared contracts', () => {
@@ -61,5 +62,12 @@ describe('Windows worker shared contracts', () => {
     expect(isWindowsExecutionPacket({ ...packet, check: { ...packet.check, requiredCapabilities: ['unreal-engine-5.8'] } })).toBe(false);
     expect(isWindowsExecutionPacket({ ...packet, expectedArtifacts: [{ name: 'log', relativePath: '', required: true }] })).toBe(false);
     expect(isWindowsExecutionPacket({ ...packet, resourcePolicy: { ...packet.resourcePolicy, maxLogBytes: -1 } })).toBe(false);
+    const unrealAdapter = { kind: 'unreal' as const, profile: { kind: 'unreal-validation' as const, profileId: 'resave-packages', tool: 'unreal-editor-cmd' as const } };
+    expect(isWindowsExecutionPacket({ ...packet, executionAdapter: unrealAdapter })).toBe(false);
+    expect(isWindowsExecutionPacket({ ...packet, executionAdapter: unrealAdapter, unrealApprovalId: 'approval_1' })).toBe(true);
+    const { executionAdapter: _legacyAdapter, ...legacyPacket } = packet;
+    expect(isWindowsExecutionPacket(legacyPacket)).toBe(true);
+    expect(isWindowsExecutionPacket({ ...packet, executionAdapter: { kind: 'unreal', profile: { kind: 'fixture', profileId: 'resave-packages', tool: 'unreal-editor-cmd' } },
+      unrealApprovalId: 'approval_1' })).toBe(false);
   });
 });

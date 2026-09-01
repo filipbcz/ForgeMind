@@ -40,6 +40,9 @@ export interface WindowsRunnerControlState {
 }
 
 const asJson = (value: unknown): Prisma.InputJsonValue => value as Prisma.InputJsonValue;
+const sameCapabilitySet = (left: string[], right: string[]): boolean => left.length === right.length
+  && new Set(left).size === left.length && new Set(right).size === right.length
+  && left.every((capability) => right.includes(capability));
 
 /** Persistence boundary for the manually activated Windows validation executor. */
 export class WindowsWorkerRepository {
@@ -90,10 +93,37 @@ export class WindowsWorkerRepository {
 
   async enqueue(input: EnqueueWindowsExecutionInput): Promise<string> {
     const id = input.id ?? randomUUID();
-    await this.prisma.windowsExecutionJob.create({ data: {
-      id, projectId: input.projectId, taskId: input.taskId, runId: input.runId,
-      requiredCapabilities: asJson(input.requiredCapabilities), packet: asJson(input.packet)
-    } });
+    if (input.packet.jobId !== id || input.packet.taskId !== input.taskId || input.packet.projectId !== input.projectId
+      || input.packet.runId !== input.runId || !sameCapabilitySet(input.packet.requiredCapabilities, input.requiredCapabilities)
+      || !isWindowsExecutionPacket(input.packet) || !input.packet.executionAdapter) {
+      throw new Error('Windows execution enqueue identity is invalid.');
+    }
+    const executionAdapter = input.packet.executionAdapter;
+    await this.prisma.$transaction(async (tx) => {
+      if (executionAdapter.kind === 'unreal') {
+        const approval = await tx.approval.findFirst({
+          where: { id: input.packet.unrealApprovalId, taskId: input.taskId, status: 'approved' }
+        });
+        const payload = approval?.payloadJson;
+        const scoped = payload && typeof payload === 'object' && !Array.isArray(payload)
+          ? payload as Record<string, unknown> : undefined;
+        if (!approval?.approvedByUserId || !approval.resolvedAt
+          || scoped?.operation !== 'windows_unreal_validation'
+          || scoped.jobId !== id || scoped.checkId !== input.packet.checkId
+          || scoped.commitSha !== input.packet.commitSha || scoped.inputHash !== input.packet.inputHash) {
+          throw new Error('Unreal validation requires a separate approved record scoped to the exact execution packet.');
+        }
+        await tx.auditLog.create({ data: {
+          actorType: 'system', eventType: 'windows_unreal_approval_verified', projectId: input.projectId, taskId: input.taskId,
+          payload: { approvalId: approval.id, jobId: id, checkId: input.packet.checkId,
+            commitSha: input.packet.commitSha, inputHash: input.packet.inputHash }
+        } });
+      }
+      await tx.windowsExecutionJob.create({ data: {
+        id, projectId: input.projectId, taskId: input.taskId, runId: input.runId,
+        requiredCapabilities: asJson(input.requiredCapabilities), packet: asJson(input.packet)
+      } });
+    });
     return id;
   }
 
