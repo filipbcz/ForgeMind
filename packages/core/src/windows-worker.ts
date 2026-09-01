@@ -21,6 +21,16 @@ export interface WorkerProbeEvidence {
   metadata?: Record<string, JsonValue>;
 }
 
+export function canonicalizeWorkerProbeEvidence(evidence: Omit<WorkerProbeEvidence, 'schemaVersion' | 'evidenceHash' | 'metadata'>): string {
+  return JSON.stringify({
+    capability: evidence.capability,
+    status: evidence.status,
+    probedAt: evidence.probedAt,
+    probeVersion: evidence.probeVersion,
+    summary: evidence.summary
+  });
+}
+
 export type WorkerDeviceStatus = 'offline' | 'idle' | 'reserved' | 'running' | 'draining' | 'revoked';
 
 export interface WorkerDevice {

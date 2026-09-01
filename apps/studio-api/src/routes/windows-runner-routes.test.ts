@@ -1,6 +1,13 @@
 import Fastify from 'fastify';
+import { createHash } from 'node:crypto';
 import { describe, expect, it, vi } from 'vitest';
+import { canonicalizeWorkerProbeEvidence } from '@forgemind/core';
 import { registerWindowsRunnerRoutes } from './windows-runner-routes.js';
+
+function probeEvidence(capability: { key: string; version?: string }, status: 'supported' | 'unsupported' | 'error' = 'supported', overrides: Record<string, unknown> = {}) {
+  const evidence = { capability, status, probedAt: '2026-09-01T00:00:00.000Z', probeVersion: '1', summary: status === 'supported' ? 'Local probe succeeded.' : 'Local probe failed.' };
+  return { schemaVersion: 1, ...evidence, evidenceHash: createHash('sha256').update(canonicalizeWorkerProbeEvidence(evidence)).digest('hex'), ...overrides };
+}
 
 describe('Windows runner enrollment API', () => {
   it('rejects device operations without a scoped credential', async () => {
@@ -32,5 +39,44 @@ describe('Windows runner enrollment API', () => {
     expect(response.statusCode).toBe(200);
     expect(credentials.redeemEnrollment).toHaveBeenCalledWith('a'.repeat(32));
     expect(repository.writeAudit).not.toHaveBeenCalled();
+  });
+
+  it('binds probe publication and control actions to the authenticated device', async () => {
+    const app = Fastify();
+    const deviceId = '11111111-1111-4111-8111-111111111111';
+    const credentials: any = { authenticate: vi.fn(async () => ({ credentialId: 'credential_1', deviceId, scope: 'windows_runner:device_operations' })) };
+    const workers: any = {
+      registerDevice: vi.fn(async () => undefined),
+      getControlState: vi.fn(async () => ({ deviceStatus: 'idle', sessionStatus: 'active' })),
+      drainSession: vi.fn(async () => undefined)
+    };
+    registerWindowsRunnerRoutes(app, {} as any, credentials, workers);
+    const headers = { authorization: 'Bearer device-token' };
+    const evidence = probeEvidence({ key: 'windows' });
+    expect((await app.inject({ method: 'PUT', url: '/api/windows-runner/device', headers, payload: { runnerVersion: '0.1.0', displayName: 'Runner', capabilities: [{ key: 'windows' }], probeEvidence: [evidence] } })).statusCode).toBe(200);
+    expect(workers.registerDevice).toHaveBeenCalledWith(expect.objectContaining({ id: deviceId, capabilities: [{ key: 'windows' }], probeEvidence: [evidence] }));
+    const sessionId = '22222222-2222-4222-8222-222222222222';
+    expect((await app.inject({ method: 'POST', url: '/api/windows-runner/device/session/drain', headers, payload: { sessionId } })).statusCode).toBe(200);
+    expect(workers.getControlState).toHaveBeenCalledWith(deviceId, sessionId);
+    expect(workers.drainSession).toHaveBeenCalledWith(sessionId);
+  });
+
+  it.each([
+    ['missing evidence', [{ key: 'unreal-engine', version: '5.8' }], []],
+    ['unsuccessful evidence', [{ key: 'unreal-engine', version: '5.8' }], [{ schemaVersion: 1, capability: { key: 'unreal-engine', version: '5.8' }, status: 'unsupported', probedAt: '2026-09-01T00:00:00.000Z', probeVersion: '1', summary: 'Not installed.', evidenceHash: 'a'.repeat(64) }]],
+    ['mismatched evidence', [{ key: 'unreal-engine', version: '5.8' }], [{ schemaVersion: 1, capability: { key: 'windows' }, status: 'supported', probedAt: '2026-09-01T00:00:00.000Z', probeVersion: '1', summary: 'Windows detected.', evidenceHash: 'b'.repeat(64) }]],
+    ['duplicate evidence', [{ key: 'unreal-engine', version: '5.8' }], [
+      { schemaVersion: 1, capability: { key: 'unreal-engine', version: '5.8' }, status: 'supported', probedAt: '2026-09-01T00:00:00.000Z', probeVersion: '1', summary: 'Detected.', evidenceHash: 'c'.repeat(64) },
+      { schemaVersion: 1, capability: { key: 'unreal-engine', version: '5.8' }, status: 'supported', probedAt: '2026-09-01T00:00:01.000Z', probeVersion: '1', summary: 'Detected twice.', evidenceHash: 'd'.repeat(64) }
+    ]],
+    ['an invalid evidence hash', [{ key: 'unreal-engine', version: '5.8' }], [probeEvidence({ key: 'unreal-engine', version: '5.8' }, 'supported', { evidenceHash: 'e'.repeat(64) })]]
+  ])('rejects capability registration with %s', async (_name, capabilities, probeEvidence) => {
+    const app = Fastify();
+    const credentials: any = { authenticate: vi.fn(async () => ({ credentialId: 'credential_1', deviceId: '11111111-1111-4111-8111-111111111111', scope: 'windows_runner:device_operations' })) };
+    const workers: any = { registerDevice: vi.fn(async () => undefined) };
+    registerWindowsRunnerRoutes(app, {} as any, credentials, workers);
+    const response = await app.inject({ method: 'PUT', url: '/api/windows-runner/device', headers: { authorization: 'Bearer device-token' }, payload: { runnerVersion: '0.1.0', displayName: 'Runner', capabilities, probeEvidence } });
+    expect(response.statusCode).toBe(400);
+    expect(workers.registerDevice).not.toHaveBeenCalled();
   });
 });

@@ -1,0 +1,13 @@
+{
+  "name": "@forgemind/windows-runner",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "bin": { "forgemind-windows-runner": "dist/cli.js" },
+  "scripts": {
+    "build": "tsup src/cli.ts --format esm --target node22 --out-dir dist --clean --sourcemap",
+    "test": "vitest run"
+  },
+  "dependencies": { "@forgemind/core": "0.1.0" },
+  "devDependencies": { "tsup": "^8.5.0" }
+}

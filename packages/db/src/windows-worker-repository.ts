@@ -31,6 +31,13 @@ export interface ClaimedWindowsExecution {
   lease: WindowsExecutionLease;
 }
 
+export interface WindowsRunnerControlState {
+  deviceStatus: string;
+  sessionStatus: string;
+  leaseStatus?: string;
+  jobStatus?: string;
+}
+
 const asJson = (value: unknown): Prisma.InputJsonValue => value as Prisma.InputJsonValue;
 
 /** Persistence boundary for the manually activated Windows validation executor. */
@@ -50,6 +57,23 @@ export class WindowsWorkerRepository {
         probeEvidence: asJson(input.probeEvidence), metadata: input.metadata ?? {}
       }
     });
+  }
+
+  async getControlState(deviceId: string, sessionId: string, leaseId?: string): Promise<WindowsRunnerControlState | undefined> {
+    const session = await this.prisma.workerSession.findFirst({
+      where: { id: sessionId, deviceId },
+      include: { device: true }
+    });
+    if (!session) return undefined;
+    const lease = leaseId ? await this.prisma.windowsExecutionLease.findFirst({
+      where: { id: leaseId, sessionId, deviceId }, include: { job: true }
+    }) : undefined;
+    return {
+      deviceStatus: session.device.status,
+      sessionStatus: session.status,
+      leaseStatus: lease?.status,
+      jobStatus: lease?.job.status
+    };
   }
 
   async startManualSession(deviceId: string, expiresAt: Date): Promise<string> {
