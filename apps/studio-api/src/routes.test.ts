@@ -101,6 +101,9 @@ function stableJson(value: unknown): string {
 
 const mutatingEndpointInventory = [
   ['PUT', '/api/worker/queue'],
+  ['POST', '/api/windows-runner/enrollments'],
+  ['POST', '/api/windows-runner/devices/11111111-1111-4111-8111-111111111111/rotate'],
+  ['POST', '/api/windows-runner/devices/11111111-1111-4111-8111-111111111111/revoke'],
   ['POST', '/api/auth/logout'],
   ['POST', '/api/providers/models'],
   ['POST', '/api/providers/codex/oauth/start'],
@@ -279,6 +282,42 @@ describe('Studio API routes', () => {
     expect(response.statusCode).toBe(403);
     expect(response.json()).toEqual({ error: 'Approved config_change approval required for this mutation.' });
     expect(repository.setWorkerQueuePaused).not.toHaveBeenCalled();
+    await app.close();
+  });
+
+  it('requires an approved config change before creating a runner enrollment', async () => {
+    const auth = createAuthService();
+    const credentials = { createEnrollment: vi.fn() };
+    const repository = { getCurrentUser: vi.fn(async () => ownerUser) };
+    const app = Fastify();
+    registerRoutes(app, repository as never, undefined, auth, { credentials, workers: {} } as never);
+    const response = await app.inject({
+      method: 'POST', url: '/api/windows-runner/enrollments', headers: createOwnerAuthenticatedHeaders(auth),
+      payload: { deviceId: '11111111-1111-4111-8111-111111111111', expiresInMinutes: 10 }
+    });
+    expect(response.statusCode).toBe(403);
+    expect(response.json()).toEqual({ error: 'Approved config_change approval required for this mutation.' });
+    expect(credentials.createEnrollment).not.toHaveBeenCalled();
+    await app.close();
+  });
+
+  it('creates a runner enrollment after consuming its mutation-bound approval', async () => {
+    const auth = createAuthService();
+    const body = { deviceId: '11111111-1111-4111-8111-111111111111', expiresInMinutes: 10 };
+    const credentials = { createEnrollment: vi.fn(async () => ({ enrollmentId: 'enrollment_1', code: 'one-time-code', expiresAt: new Date().toISOString() })) };
+    const repository = {
+      getCurrentUser: vi.fn(async () => ownerUser),
+      getApproval: vi.fn(async () => approvedRiskApproval('config_change', 'approval_enroll_1', { method: 'POST', path: '/api/windows-runner/enrollments', body })),
+      consumeRiskApproval: vi.fn(async () => true)
+    };
+    const app = Fastify();
+    registerRoutes(app, repository as never, undefined, auth, { credentials, workers: {} } as never);
+    const response = await app.inject({
+      method: 'POST', url: '/api/windows-runner/enrollments', headers: withRiskApproval(createOwnerAuthenticatedHeaders(auth), 'approval_enroll_1'), payload: body
+    });
+    expect(response.statusCode).toBe(200);
+    expect(credentials.createEnrollment).toHaveBeenCalledWith(body.deviceId, expect.any(Date));
+    expect(repository.consumeRiskApproval).toHaveBeenCalledWith('approval_enroll_1');
     await app.close();
   });
 

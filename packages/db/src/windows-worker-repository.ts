@@ -1,8 +1,9 @@
 import { randomUUID } from 'node:crypto';
 import type { Prisma, PrismaClient } from '@prisma/client';
+import { isWindowsExecutionPacket } from '@forgemind/core';
 import type {
   WorkerCapability, WorkerProbeEvidence, WindowsExecutionJob, WindowsExecutionLease,
-  WindowsExecutionPacket
+  WindowsExecutionPacket, WindowsExecutionResult
 } from '@forgemind/core';
 
 type TransactionClient = Omit<PrismaClient, '$connect' | '$disconnect' | '$on' | '$transaction' | '$use' | '$extends'>;
@@ -71,7 +72,7 @@ export class WindowsWorkerRepository {
     return id;
   }
 
-  async claimCompatible(sessionId: string, leaseSeconds: number, requestId: string): Promise<ClaimedWindowsExecution | undefined> {
+  async claimCompatible(sessionId: string, leaseSeconds: number, requestId: string, deviceId?: string): Promise<ClaimedWindowsExecution | undefined> {
     if (!Number.isInteger(leaseSeconds) || leaseSeconds <= 0) throw new Error('Lease duration must be a positive integer.');
     return this.prisma.$transaction(async (tx) => {
       // Serialize only retries from this session; request ids are not global credentials.
@@ -86,7 +87,7 @@ export class WindowsWorkerRepository {
         FROM "worker_sessions" s
         JOIN "worker_devices" d ON d."id" = s."device_id"
         WHERE s."id" = ${sessionId} AND s."status" = 'active' AND s."expires_at" > CURRENT_TIMESTAMP
-          AND d."status" = 'idle'
+          AND d."status" = 'idle' AND (${deviceId ?? null}::text IS NULL OR d."id" = ${deviceId ?? null})
         FOR UPDATE OF s, d
       `;
       const session = sessions[0];
@@ -122,13 +123,14 @@ export class WindowsWorkerRepository {
     });
   }
 
-  async heartbeat(sessionId: string, leaseId: string | undefined, leaseSeconds: number): Promise<boolean> {
+  async heartbeat(sessionId: string, leaseId: string | undefined, leaseSeconds: number, deviceId?: string): Promise<boolean> {
     if (!Number.isInteger(leaseSeconds) || leaseSeconds <= 0) throw new Error('Lease duration must be a positive integer.');
     const now = new Date();
     return this.prisma.$transaction(async (tx) => {
       const sessions = await tx.$queryRaw<Array<{ id: string; device_id: string }>>`
         SELECT "id", "device_id" FROM "worker_sessions"
         WHERE "id" = ${sessionId} AND "status" IN ('active', 'draining') AND "expires_at" > ${now}
+          AND (${deviceId ?? null}::text IS NULL OR "device_id" = ${deviceId ?? null})
         FOR UPDATE
       `;
       const session = sessions[0];
@@ -144,6 +146,30 @@ export class WindowsWorkerRepository {
       }
       // Recovery locks leases before devices; heartbeat must use the same order.
       await tx.workerDevice.update({ where: { id: session.device_id }, data: { lastHeartbeatAt: now } });
+      return true;
+    });
+  }
+
+  async submitResult(deviceId: string, result: WindowsExecutionResult): Promise<boolean> {
+    return this.prisma.$transaction(async (tx) => {
+      const leases = await tx.$queryRaw<Array<{ jobId: string; projectId: string; taskId: string; runId: string; packet: Prisma.JsonValue }>>`
+        SELECT l."job_id" AS "jobId", j."project_id" AS "projectId", j."task_id" AS "taskId", j."run_id" AS "runId", j."packet"
+        FROM "windows_execution_leases" l JOIN "windows_execution_jobs" j ON j."id" = l."job_id"
+        WHERE l."id" = ${result.leaseId} AND l."job_id" = ${result.jobId} AND l."device_id" = ${deviceId}
+          AND l."session_id" = ${result.sessionId} AND l."nonce" = ${result.nonce} AND l."status" = 'active'
+        FOR UPDATE OF l, j`;
+      const persisted = leases[0];
+      if (!persisted || !isWindowsExecutionPacket(persisted.packet)) return false;
+      const packet = persisted.packet;
+      if (persisted.projectId !== result.projectId || persisted.taskId !== result.taskId || persisted.runId !== result.runId
+        || packet.projectId !== result.projectId || packet.taskId !== result.taskId || packet.runId !== result.runId
+        || packet.checkId !== result.checkId || packet.jobId !== result.jobId || packet.leaseId !== result.leaseId
+        || packet.nonce !== result.nonce || packet.inputHash !== result.inputHash || packet.commitSha !== result.commitSha) return false;
+      const status = result.status === 'succeeded' ? 'succeeded' : result.status === 'cancelled' ? 'cancelled' : 'failed';
+      const updated = await tx.windowsExecutionJob.updateMany({ where: { id: result.jobId, status: { in: ['leased', 'running'] } }, data: { status } });
+      if (updated.count !== 1) return false;
+      await tx.windowsExecutionLease.update({ where: { id: result.leaseId }, data: { status: result.status === 'cancelled' ? 'cancelled' : 'released', releasedAt: new Date() } });
+      await tx.workerDevice.update({ where: { id: deviceId }, data: { status: 'idle' } });
       return true;
     });
   }
