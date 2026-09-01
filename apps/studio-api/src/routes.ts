@@ -24,7 +24,7 @@ import { advanceRoadmapAfterTaskCapabilityWait, advanceRoadmapAfterTaskCompletio
 import type { AIProviderConnectionKind, AIProviderConnectionSecret, ForgeMindRepository, WindowsRunnerCredentialAdapter, WindowsWorkerRepository } from '@forgemind/db';
 import { parseGitHubWebhookPayload, projectGitHubWebhookEvent, verifyGitHubWebhookSignature } from './webhook.js';
 import type { NotificationService } from './notifications.js';
-import { ROADMAP_GENERATION_CONFIRMATION, activeProjectContractRequirements, applyProjectContractDelta, buildSpecificationChangeImpactReview, redactSecrets } from '@forgemind/core';
+import { ROADMAP_GENERATION_CONFIRMATION, activeProjectContractRequirements, applyProjectContractDelta, buildSpecificationChangeImpactReview, hasCompleteCurrentQualificationEvidence, redactSecrets } from '@forgemind/core';
 import type { ApprovalType, ProviderConnectionRuntimeStatus } from '@forgemind/core';
 import type { Project, ProjectArchitectureUpdate, ProjectContract, ProjectContractDelta, TaskMode } from '@forgemind/core';
 import { readSessionId, registerAuthRoutes } from './routes/auth-routes.js';
@@ -1159,6 +1159,7 @@ export function registerRoutes(app: FastifyInstance, repository: ForgeMindReposi
       if (!project.projectContract) {
         return reply.code(409).send({ error: 'A project contract is required before the final audit can start.' });
       }
+      const projectContract = project.projectContract;
       const cycle = [...roadmap.cycles].sort((left, right) => right.cycleNumber - left.cycleNumber)[0];
       if (!cycle) return reply.code(409).send({ error: 'The project does not have a roadmap cycle to audit.' });
       if (cycle.status === 'completed' || cycle.status === 'awaiting_extension_approval') {
@@ -1168,6 +1169,21 @@ export function registerRoutes(app: FastifyInstance, repository: ForgeMindReposi
       if (cycleSteps.length === 0 || cycleSteps.some((step) => step.status !== 'completed')) {
         return reply.code(409).send({ error: 'All implementation steps must be completed before the final audit can start.' });
       }
+      const currentCommitSha = project.projectMemory?.baseCommitSha;
+      const qualificationEvidence = roadmap.evidence.filter((evidence) =>
+        evidence.cycleId === cycle.id
+        && evidence.contractVersion === projectContract.version
+        && evidence.source !== 'repository_audit'
+        && evidence.status === 'passed'
+        && evidence.commitSha === currentCommitSha
+      );
+      if (!currentCommitSha || !hasCompleteCurrentQualificationEvidence(qualificationEvidence, {
+        cycleId: cycle.id,
+        contractVersion: projectContract.version,
+        commitSha: currentCommitSha
+      })) {
+        return reply.code(409).send({ error: 'Current qualification evidence is required before the final audit can start.' });
+      }
       const latestCompletedStep = [...cycleSteps]
         .filter((step) => step.taskId)
         .sort((left, right) => right.sequenceNumber - left.sequenceNumber)[0];
@@ -1175,7 +1191,13 @@ export function registerRoutes(app: FastifyInstance, repository: ForgeMindReposi
         projectId: id,
         cycleId: cycle.id,
         triggerTaskId: latestCompletedStep?.taskId,
-        requirementIds: activeProjectContractRequirements(project.projectContract).map((requirement) => requirement.id)
+        requirementIds: activeProjectContractRequirements(projectContract).map((requirement) => requirement.id),
+        manualRequest: {
+          contractVersion: projectContract.version,
+          commitSha: currentCommitSha,
+          qualificationEvidenceIds: qualificationEvidence.map((evidence) => evidence.id),
+          completedStepIds: cycleSteps.map((step) => step.id)
+        }
       });
       if (!audit.enqueued) {
         return reply.code(409).send({ error: 'The final project audit is already queued or no newer completed work is available to audit.' });

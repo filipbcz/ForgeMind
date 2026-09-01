@@ -1,15 +1,21 @@
 import {
   activeProjectContractRequirements,
   applyProjectContractDelta,
+  BOREK_FILIP_UNREAL_PROFILE_ID,
   createBlockedRunState,
   createFailedRunState,
   createRunningRunState,
   createRetryScheduledRunState,
   createWaitingRunState,
+  hasCompleteCurrentQualificationEvidence,
+  isWindowsExecutionPacket,
+  listCurrentManualBorekFilipEvidence,
+  WINDOWS_DEVICE_OFFLINE_AFTER_MS,
   normalizeRunState,
   parseTaskRunState,
   redactSecrets,
   requiresApproval,
+  toManualFinalAuditResultStatus,
   type AcceptanceEvidence,
   type AcceptanceEvidenceSource,
   type AcceptanceEvidenceStatus,
@@ -2737,19 +2743,89 @@ export class ForgeMindRepository {
     return { enqueued: true };
   }
 
-  async enqueueProjectAudit(input: { projectId: string; cycleId: string; triggerTaskId?: string; requirementIds: string[] }): Promise<{ enqueued: boolean; job: ProjectAuditJob }> {
+  async enqueueProjectAudit(input: {
+    projectId: string;
+    cycleId: string;
+    triggerTaskId?: string;
+    requirementIds: string[];
+    manualRequest?: { contractVersion: number; commitSha: string; qualificationEvidenceIds: string[]; completedStepIds: string[] };
+  }): Promise<{ enqueued: boolean; job: ProjectAuditJob }> {
     return this.prisma.$transaction(async (tx) => {
       await tx.$queryRawUnsafe(WORKER_QUEUE_ADVISORY_LOCK_SQL);
+      if (input.manualRequest) {
+        await tx.$queryRawUnsafe('SELECT "id" FROM "projects" WHERE "id" = $1 FOR UPDATE', input.projectId);
+        await tx.$queryRawUnsafe('SELECT "id" FROM "project_roadmap_cycles" WHERE "project_id" = $1 ORDER BY "cycle_number" FOR UPDATE', input.projectId);
+        await tx.$queryRawUnsafe('SELECT "id" FROM "project_implementation_steps" WHERE "cycle_id" = $1 ORDER BY "sequence_number" FOR UPDATE', input.cycleId);
+        await tx.$queryRawUnsafe('SELECT "id" FROM "acceptance_evidence" WHERE "cycle_id" = $1 ORDER BY "id" FOR UPDATE', input.cycleId);
+      }
       const [cycle, project] = await Promise.all([
         tx.projectRoadmapCycle.findUnique({ where: { id: input.cycleId } }),
         tx.project.findUnique({ where: { id: input.projectId } })
       ]);
       if (!cycle || cycle.projectId !== input.projectId) throw new Error('Project audit references an unknown roadmap cycle.');
-      const contract = project ? toProject(project).projectContract : undefined;
+      const currentProject = project ? toProject(project) : undefined;
+      const contract = currentProject?.projectContract;
       const knownRequirementIds = new Set(contract?.requirements.map((requirement) => requirement.id) ?? []);
       const requirementIds = Array.from(new Set(input.requirementIds));
       if (!contract || requirementIds.length === 0 || requirementIds.some((id) => !knownRequirementIds.has(id))) {
         throw new Error('Project audit must reference requirements from the active project contract.');
+      }
+      if (input.manualRequest) {
+        const [latestCycle, currentSteps, evidenceRecords] = await Promise.all([
+          tx.projectRoadmapCycle.findFirst({
+            where: { projectId: input.projectId },
+            orderBy: { cycleNumber: 'desc' }
+          }),
+          tx.projectImplementationStep.findMany({ where: { cycleId: input.cycleId } }),
+          tx.acceptanceEvidence.findMany({ where: { id: { in: input.manualRequest.qualificationEvidenceIds } } })
+        ]);
+        const currentStepIds = currentSteps.map((step) => step.id).sort();
+        const requestedStepIds = [...new Set(input.manualRequest.completedStepIds)].sort();
+        const requestedEvidenceIds = [...new Set(input.manualRequest.qualificationEvidenceIds)].sort();
+        const foundEvidenceIds = evidenceRecords.map((evidence) => evidence.id).sort();
+        const mappedEvidence = evidenceRecords.map(toAcceptanceEvidence);
+        const borekEvidence = listCurrentManualBorekFilipEvidence(mappedEvidence, {
+          cycleId: input.cycleId,
+          contractVersion: input.manualRequest.contractVersion,
+          commitSha: input.manualRequest.commitSha
+        }).sort((left, right) => left.id.localeCompare(right.id));
+        let verifiedManualBorekFilip = false;
+        for (const evidence of borekEvidence) {
+          const windowsExecutionJobId = evidence.payload.windowsExecutionJobId;
+          const approvalId = evidence.payload.approvalId;
+          if (typeof windowsExecutionJobId !== 'string' || typeof approvalId !== 'string') continue;
+          await tx.$queryRawUnsafe('SELECT "id" FROM "windows_execution_jobs" WHERE "id" = $1 FOR UPDATE', windowsExecutionJobId);
+          await tx.$queryRawUnsafe('SELECT "id" FROM "approvals" WHERE "id" = $1 FOR UPDATE', approvalId);
+          const [executionJob, approval] = await Promise.all([
+            tx.windowsExecutionJob.findUnique({
+              where: { id: windowsExecutionJobId },
+              include: { leases: { include: { session: true, device: true } } }
+            }),
+            tx.approval.findUnique({ where: { id: approvalId } })
+          ]);
+          verifiedManualBorekFilip = isVerifiedManualBorekFilipExecution(
+            executionJob, approval, input.projectId, input.manualRequest.commitSha
+          );
+          if (verifiedManualBorekFilip) break;
+        }
+        const snapshotIsCurrent =
+          latestCycle?.id === input.cycleId
+          && cycle.status === 'active'
+          && contract.version === input.manualRequest.contractVersion
+          && currentProject?.projectMemory?.baseCommitSha === input.manualRequest.commitSha
+          && currentSteps.length > 0
+          && currentSteps.every((step) => step.status === 'completed')
+          && JSON.stringify(currentStepIds) === JSON.stringify(requestedStepIds)
+          && JSON.stringify(foundEvidenceIds) === JSON.stringify(requestedEvidenceIds)
+          && hasCompleteCurrentQualificationEvidence(mappedEvidence, {
+            cycleId: input.cycleId,
+            contractVersion: input.manualRequest.contractVersion,
+            commitSha: input.manualRequest.commitSha
+          })
+          && verifiedManualBorekFilip;
+        if (!snapshotIsCurrent) {
+          throw new Error('Manual final audit request no longer matches the current project state and qualification evidence.');
+        }
       }
 
       const existing = await tx.projectAuditJob.findUnique({ where: { cycleId: input.cycleId } });
@@ -2800,8 +2876,17 @@ export class ForgeMindRepository {
         taskId: input.triggerTaskId,
         payload: { auditJobId: job.id, cycleId: input.cycleId, requirementIds }
       });
+      if (input.manualRequest) {
+        await this.writeAuditTx(tx, {
+          actorType: 'user',
+          eventType: 'project_audit_requested',
+          projectId: input.projectId,
+          taskId: input.triggerTaskId,
+          payload: { auditJobId: job.id, cycleId: input.cycleId, ...input.manualRequest }
+        });
+      }
       return { enqueued: true, job: toProjectAuditJob(job) };
-    });
+    }, { isolationLevel: Prisma.TransactionIsolationLevel.Serializable });
   }
 
   async claimNextProjectAudit(): Promise<ClaimedProjectAuditJob | undefined> {
@@ -2892,7 +2977,12 @@ export class ForgeMindRepository {
         eventType: `project_audit_${status}`,
         projectId: job.projectId,
         taskId: job.triggerTaskId ?? undefined,
-        payload: { auditJobId, cycleId: job.cycleId, errorMessage: errorMessage ?? null }
+        payload: {
+          auditJobId,
+          cycleId: job.cycleId,
+          resultStatus: toManualFinalAuditResultStatus(status),
+          errorMessage: errorMessage ?? null
+        }
       });
     });
     return { retryScheduled: false };
@@ -5508,6 +5598,78 @@ function toAuthSessionSnapshot(session: {
     lastSeenAt: session.lastSeenAt.toISOString(),
     revokedAt: session.revokedAt?.toISOString()
   };
+}
+
+export function isVerifiedManualBorekFilipExecution(
+  executionJob: {
+    id: string; projectId: string; taskId: string; status: string; packet: unknown;
+    leases?: Array<{
+      id: string; deviceId: string; sessionId: string; status: string; claimedAt: Date; releasedAt: Date | null;
+      session: { id: string; deviceId: string; startedAt: Date; expiresAt: Date; lastHeartbeatAt: Date };
+      device: { id: string; capabilities: unknown; probeEvidence: unknown };
+    }>;
+  } | null | undefined,
+  approval: {
+    id: string; taskId: string; status: string; approvedByUserId: string | null;
+    resolvedAt: Date | null; payloadJson: unknown;
+  } | null | undefined,
+  projectId: string,
+  commitSha: string
+): boolean {
+  if (!executionJob || !approval || !isWindowsExecutionPacket(executionJob.packet)) return false;
+  const packet = executionJob.packet;
+  const payload = approval.payloadJson;
+  const scoped = payload && typeof payload === 'object' && !Array.isArray(payload)
+    ? payload as Record<string, unknown>
+    : undefined;
+  const provenance = executionJob.leases?.some((lease) => {
+    const capabilities = Array.isArray(lease.device.capabilities) ? lease.device.capabilities : [];
+    const probeEvidence = Array.isArray(lease.device.probeEvidence) ? lease.device.probeEvidence : [];
+    const hasCapability = (key: string) => capabilities.some((item) =>
+      item && typeof item === 'object' && !Array.isArray(item) && (item as Record<string, unknown>).key === key
+    );
+    const hasSuccessfulProbe = (key: string) => probeEvidence.some((item) => {
+      if (!item || typeof item !== 'object' || Array.isArray(item)) return false;
+      const record = item as Record<string, unknown>;
+      const capability = record.capability;
+      return record.status === 'supported' && capability && typeof capability === 'object' && !Array.isArray(capability)
+        && (capability as Record<string, unknown>).key === key;
+    });
+    return lease.id === packet.leaseId
+      && lease.status === 'released'
+      && Boolean(lease.releasedAt)
+      && lease.deviceId === lease.device.id
+      && lease.sessionId === lease.session.id
+      && lease.session.deviceId === lease.device.id
+      && approval.resolvedAt !== null
+      && approval.resolvedAt <= lease.claimedAt
+      && lease.claimedAt >= lease.session.startedAt
+      && lease.claimedAt <= lease.session.expiresAt
+      && lease.session.lastHeartbeatAt.getTime() >= lease.claimedAt.getTime() - WINDOWS_DEVICE_OFFLINE_AFTER_MS
+      && hasCapability('windows')
+      && hasCapability('unreal-engine-5.8')
+      && hasSuccessfulProbe('windows')
+      && hasSuccessfulProbe('unreal-engine-5.8');
+  });
+  return Boolean(
+    executionJob.projectId === projectId
+    && executionJob.status === 'succeeded'
+    && packet.commitSha === commitSha
+    && packet.executionAdapter?.kind === 'unreal'
+    && packet.executionAdapter.profile.profileId === BOREK_FILIP_UNREAL_PROFILE_ID
+    && packet.jobId === executionJob.id
+    && packet.unrealApprovalId === approval.id
+    && provenance
+    && approval.taskId === executionJob.taskId
+    && approval.status === 'approved'
+    && approval.approvedByUserId
+    && approval.resolvedAt
+    && scoped?.operation === 'windows_unreal_validation'
+    && scoped.jobId === executionJob.id
+    && scoped.checkId === packet.checkId
+    && scoped.commitSha === packet.commitSha
+    && scoped.inputHash === packet.inputHash
+  );
 }
 
 export function deriveProjectCapabilities(

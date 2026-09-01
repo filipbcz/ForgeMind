@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from 'vitest';
-import { ForgeMindRepository, mergeProjectArchitecture, sameProjectContractSemantics } from './repository.js';
+import { ForgeMindRepository, isVerifiedManualBorekFilipExecution, mergeProjectArchitecture, sameProjectContractSemantics } from './repository.js';
 
 function createMockPrisma() {
   let queuePaused = false;
@@ -250,6 +250,99 @@ function createMockPrisma() {
 }
 
 describe('ForgeMindRepository task runs', () => {
+  it('accepts BOREK-FILIP evidence only from the exact successful approved Unreal execution', () => {
+    const digest = 'a'.repeat(64);
+    const packet = {
+      schemaVersion: 1, projectId: 'project_1', taskId: 'task_1', runId: 'run_1', checkId: 'check_1',
+      jobId: 'job_1', leaseId: 'lease_1', repository: 'owner/repo', sourceUrl: 'https://example.test/repo.git',
+      commitSha: digest, workspaceRoot: 'C:\\work', artifactRoot: 'C:\\artifacts', nonce: 'nonce_1', inputHash: digest,
+      check: { command: 'UnrealEditor-Cmd.exe', category: 'smoke', requiredCapabilities: ['windows', 'unreal-engine-5.8'] },
+      requiredCapabilities: ['windows', 'unreal-engine-5.8'],
+      resourcePolicy: { timeoutSeconds: 60, maxLogBytes: 1024, maxArtifactBytes: 1024 }, expectedArtifacts: [],
+      executionAdapter: { kind: 'unreal', profile: { kind: 'unreal-validation', profileId: 'borek-filip', tool: 'unreal-editor-cmd' } },
+      unrealApprovalId: 'approval_1'
+    };
+    const claimedAt = new Date('2026-09-01T12:00:00.000Z');
+    const job = {
+      id: 'job_1', projectId: 'project_1', taskId: 'task_1', status: 'succeeded', packet,
+      leases: [{
+        id: 'lease_1', deviceId: 'device_1', sessionId: 'session_1', status: 'released', claimedAt,
+        releasedAt: new Date('2026-09-01T12:01:00.000Z'),
+        session: { id: 'session_1', deviceId: 'device_1', startedAt: new Date('2026-09-01T11:59:00.000Z'),
+          expiresAt: new Date('2026-09-01T13:00:00.000Z'), lastHeartbeatAt: claimedAt },
+        device: { id: 'device_1', capabilities: [{ key: 'windows' }, { key: 'unreal-engine-5.8' }], probeEvidence: [
+          { capability: { key: 'windows' }, status: 'supported' },
+          { capability: { key: 'unreal-engine-5.8' }, status: 'supported' }
+        ] }
+      }]
+    };
+    const approval = {
+      id: 'approval_1', taskId: 'task_1', status: 'approved', approvedByUserId: 'owner_1',
+      resolvedAt: new Date('2026-09-01T11:58:00.000Z'),
+      payloadJson: { operation: 'windows_unreal_validation', jobId: 'job_1', checkId: 'check_1', commitSha: digest, inputHash: digest }
+    };
+
+    expect(isVerifiedManualBorekFilipExecution(job, approval, 'project_1', digest)).toBe(true);
+    expect(isVerifiedManualBorekFilipExecution(
+      { ...job, packet: { ...packet, executionAdapter: { kind: 'fixture', profileId: 'fixture-validation-v1' } } },
+      approval, 'project_1', digest
+    )).toBe(false);
+    expect(isVerifiedManualBorekFilipExecution(job, { ...approval, approvedByUserId: null }, 'project_1', digest)).toBe(false);
+    expect(isVerifiedManualBorekFilipExecution(
+      job, { ...approval, resolvedAt: new Date('2026-09-01T12:00:01.000Z') }, 'project_1', digest
+    )).toBe(false);
+    expect(isVerifiedManualBorekFilipExecution(
+      { ...job, packet: { ...packet, executionAdapter: { ...packet.executionAdapter, profile: { ...packet.executionAdapter.profile, profileId: 'other-project' } } } },
+      approval, 'project_1', digest
+    )).toBe(false);
+    expect(isVerifiedManualBorekFilipExecution(
+      { ...job, leases: job.leases.map((lease) => ({ ...lease, device: { ...lease.device, probeEvidence: [] } })) },
+      approval, 'project_1', digest
+    )).toBe(false);
+  });
+
+  it('rejects a stale manual final audit snapshot inside the enqueue transaction', async () => {
+    const { prisma } = createMockPrisma();
+    const now = new Date();
+    prisma.project.findUnique.mockResolvedValue({
+      id: 'project_1', name: 'Demo', slug: 'demo', githubOwner: null, githubRepo: null, defaultBranch: 'main',
+      configYaml: null, brief: null, projectContract: {
+        version: 2, summary: 'Changed contract', invariants: [], prohibitedSubstitutes: [], releaseCriteria: [],
+        requirements: [{ id: 'REQ-DEMO', title: 'Demo', description: 'Demo', acceptanceCriteria: ['Done'], status: 'active' }]
+      }, currentContractVersionId: 'contract_2',
+      projectMemory: { version: 1, baseCommitSha: 'def5678', recentWork: [], updatedAt: now.toISOString() },
+      projectArchitecture: null, currentArchitectureVersionId: null, validationProfile: null,
+      planningSessionId: null, planningSessionProvider: null, planningSessionModel: null,
+      planningSessionConnectionId: null, planningSessionUpdatedAt: null, autoCreatePullRequest: true,
+      autoMergePullRequest: false, autoCompleteTask: false, allowSafeOperationsWithoutApproval: false,
+      defaultTaskMode: 'safe', aiProviderConnectionId: null, isActive: true, createdAt: now, updatedAt: now
+    });
+    prisma.projectRoadmapCycle = {
+      findUnique: vi.fn(async () => ({ id: 'cycle_1', projectId: 'project_1', status: 'active' })),
+      findFirst: vi.fn(async () => ({ id: 'cycle_1', projectId: 'project_1', cycleNumber: 1, status: 'active' }))
+    };
+    prisma.projectImplementationStep.findMany = vi.fn(async () => [{ id: 'step_1', status: 'completed' }]);
+    prisma.acceptanceEvidence.findMany = vi.fn(async () => []);
+    prisma.projectAuditJob.findUnique = vi.fn();
+    prisma.projectAuditJob.upsert = vi.fn();
+    const repository = new ForgeMindRepository(prisma);
+
+    await expect(repository.enqueueProjectAudit({
+      projectId: 'project_1', cycleId: 'cycle_1', requirementIds: ['REQ-DEMO'],
+      manualRequest: {
+        contractVersion: 1, commitSha: 'abc1234', qualificationEvidenceIds: ['evidence_1'], completedStepIds: ['step_1']
+      }
+    })).rejects.toThrow('no longer matches the current project state');
+    expect(prisma.projectAuditJob.upsert).not.toHaveBeenCalled();
+    expect(prisma.$transaction).toHaveBeenCalledWith(expect.any(Function), { isolationLevel: 'Serializable' });
+    expect(prisma.$queryRawUnsafe).toHaveBeenCalledWith(
+      expect.stringContaining('FROM "projects"'), 'project_1'
+    );
+    expect(prisma.$queryRawUnsafe).toHaveBeenCalledWith(
+      expect.stringContaining('FROM "acceptance_evidence"'), 'cycle_1'
+    );
+  });
+
   it('compares regenerated contract semantics independently from source metadata', () => {
     const contract = {
       version: 2,
