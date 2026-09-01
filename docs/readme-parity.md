@@ -1,6 +1,6 @@
 # README Parity Checklist
 
-Posledni aktualizace: 2026-08-19
+Posledni aktualizace: 2026-09-01
 
 Tento dokument mapuje hlavni pozadavky z README na skutecnou implementaci, executable test evidence nebo vedome odlozeni. Pouziva pouze tyto statusy:
 
@@ -27,6 +27,8 @@ Tento dokument mapuje hlavni pozadavky z README na skutecnou implementaci, execu
 | Representative pipeline coverage (API -> worker -> GitHub adapter -> mobile read model payload) | `implemented` | `tested` | `deferred` | `apps/studio-api/src/routes.test.ts`; `apps/worker/src/mvp-scenario.test.ts` |
 | Versioned project contract, capability evidence, release audit, and completion gate | `implemented` | `tested` | `deferred` | `packages/core/src`; `packages/db/src`; `apps/worker/src/db-worker.ts`; `apps/studio-api/src/routes.ts`; `apps/worker/src/db-worker.test.ts`; `apps/studio-api/src/routes.test.ts`; `docs/roadmap-quality-implementation-plan.md` |
 | ARM64 Raspberry Pi deployment workflow for ForgeMind platform | `implemented` | `deferred` | `deferred` | `.github/workflows/deploy-raspberry.yml`; `infra/docker-compose.raspberry.yml`; `docs/deploy-raspberry.md` |
+| vNext Windows validation control plane + manual CLI + safe fixture executor + pinned Unreal adapter | `implemented` | `tested` | `deferred` | `packages/core/src/windows-worker.ts`; `apps/studio-api/src/routes/windows-runner-routes.ts`; `apps/windows-runner/src`; `packages/db/src/windows-worker-repository.ts`; `apps/studio-api/src/routes/windows-runner-routes.integration.test.ts`; `apps/windows-runner/src/*.test.ts` |
+| Realna BOREK-FILIP Unreal validace | `deferred` | `deferred` | `deferred` | Ceka na lokalni manualni session, samostatny approval dlouhe prace, pinned/probed Unreal tooling a realnou evidence; fixture test ji nenahrazuje |
 
 ## 2) Vedome odlozene mimo MVP
 
@@ -37,6 +39,8 @@ Tyto body odpovidaji README sekci "Co neni cilem MVP" a zustavaji `deferred`:
 - plne autonomni rozhodovani bez schvalovani
 - vlastni trenovani modelu
 - komplexni multi-user enterprise sprava prav
+
+Puvodni MVP nepocital s Windows workerem. vNext uzce omezeny validation executor je nyni `implemented` a repository toky jsou `tested`, ale nejde o obecny Windows/Delphi worker ani autonomniho agenta. Jeho produkcni rollout a BOREK-FILIP jsou stale `deferred`.
 
 Automaticky deploy samotne platformy ForgeMind na Raspberry Pi je provozni CI/CD funkce platformy a v tomto checklistu je oznacena pouze jako `implemented`, protoze repozitar obsahuje workflow a runbook. Produkcni overeni zustava `deferred`, dokud neni dolozeno rizenym produkcnim overenim. Tato platformni CI/CD funkce neznamena automaticky produkcni deploy projektu, nad kterymi ForgeMind pracuje; ten zustava mimo MVP a pod explicitnim approval workflow.
 

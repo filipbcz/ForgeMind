@@ -22,6 +22,9 @@ Statusy v tomto dokumentu maji stejny vyznam jako v `docs/readme-parity.md`: `im
 | Worker policy: repeated error, max iterations, provider failure, approval stop | `implemented`, `tested` | `apps/worker/src/db-worker.ts`; `apps/worker/src/workflow.ts`; `apps/worker/src/db-worker.test.ts`; `apps/worker/src/workflow.test.ts` |
 | GitHub webhook `x-hub-signature-256` verification | `implemented`, `tested` | `apps/studio-api/src/webhook.ts`; `apps/studio-api/src/webhook.test.ts`; `apps/studio-api/src/routes.test.ts` |
 | Persistent GitHub credential encryption | `implemented`, `tested` | `packages/db/src/credentials.ts`; `packages/db/src/repository.ts`; `apps/studio-api/src/routes.ts`; `apps/studio-api/src/routes.test.ts` |
+| Windows runner enrollment auth, manual session a outbound-only API transport | `implemented`, `tested` | `packages/db/src/windows-runner-credentials.ts`; `apps/studio-api/src/routes/windows-runner-routes.ts`; `apps/windows-runner/src/transport.ts`; `packages/db/src/windows-runner-credentials.test.ts`; `apps/studio-api/src/routes/windows-runner-routes.integration.test.ts` |
+| Windows typed fixture/Unreal execution, canonical path policy, cancel a bounded/redacted evidence | `implemented`, `tested` | `apps/windows-runner/src/fixture-executor.ts`; `apps/windows-runner/src/unreal-adapter.ts`; `apps/windows-runner/src/fixture-executor.test.ts`; `apps/windows-runner/src/unreal-adapter.test.ts`; `apps/studio-api/src/routes/windows-runner-routes.test.ts` |
+| BOREK-FILIP Unreal production verification | `deferred` | Musi vzniknout realnou lokalni rucni session po samostatnem approval a uspesnem probe; fixture evidence ji nenahrazuje |
 | Central secret redaction across all provider output and logs | `deferred` | Future roadmap step "Redact Secrets From Logs Audits And Provider Output" |
 | Production verification of these controls | `deferred` | Future controlled production verification in `docs/roadmap-quality-implementation-plan.md` |
 
@@ -100,7 +103,15 @@ Doporucene doplneni pred produkci:
 - provider/model
 - operation phase
 
-## 9) Done criteria pro security krok
+## 9) Windows runner security boundary
+
+1. Credential identifikuje konkretni enrolled device a neni univerzalni sdileny produkcni secret. Runner pouziva pouze odchozi Studio API volani; nema inbound port ani prime databazove spojeni.
+2. Aktivace je rucni a session je casove omezena. Capability lease vyzaduje cerstvy heartbeat, aktivni manualni session a odpovidajici uspesny lokalni probe.
+3. Execution packet je vazan na exact commit SHA a verzovane shared schema. Executor neni obecny remote shell a smi volat pouze typovane adaptery s kanonickou kontrolou executable, working directory a argument paths.
+4. Runner nesmi planovat, implementovat, pushovat, mergovat, vytvaret PR, deployovat, pouzivat Docker runtime, automatizovat UAC/restart ani menit security konfiguraci. Logy a artefakty jsou omezene, redigovane a hashovane pred pripojenim k acceptance evidence.
+5. Realna BOREK-FILIP validace a finalni audit jsou `deferred` a human-triggered. Produkcni status se nesmi odvodit z fixture testu ani textove capability konfigurace bez lokalni probe evidence.
+
+## 10) Done criteria pro security krok
 
 Krok je povazovan za hotovy, pokud:
 1. Tento dokument odpovida aktualnimu runtime chovani API a workeru.

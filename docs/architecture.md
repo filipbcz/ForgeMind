@@ -9,6 +9,7 @@ Statusy v tomto dokumentu maji stejny vyznam jako v `docs/readme-parity.md`: `im
 - apps/studio-api: REST orchestrator pro projekty, tasky, approvals, worker status/events, webhooky.
 - apps/mobile-pwa: mobilni PWA pro task lifecycle, queue a approval akce.
 - apps/worker: worker process (single run nebo daemon polling), ktery claimuje queue joby a provadi workflow.
+- apps/windows-runner: rucne aktivovany, odchozim API komunikujici validation executor pro presny commit SHA; spousti jen typovane fixture/Unreal adaptery a nema planovaci, implementacni ani delivery roli.
 - packages/db: Prisma schema + repository vrstva, zdroj pravdy pro task state, queue, runs, approvals a audit.
 - packages/core: domenove typy, limity, policy a stavovy automat.
 - packages/providers: AIProvider kontrakt a implementace provideru.
@@ -130,6 +131,15 @@ Aktivne vynucene policy vetve:
 - GitHub adapter je zapojen pres packages/github.
 - Provider vrstva je zapojena pres packages/providers.
 - Worker i API sdileji domenove typy z packages/core.
+- Windows runner sdili verzovane execution, device, session a evidence schema z `packages/core/src/windows-worker.ts`; Studio API persistuje a pronajima joby pres `packages/db/src/windows-worker-repository.ts`. Runner nema prime PostgreSQL spojeni ani inbound port.
+
+### Windows validation control plane a executor
+
+1. Studio API provadi enrollment/auth, manualni session, heartbeat, capability-aware lease, cancel, bounded artifact/log upload a result reconciliation v `apps/studio-api/src/routes/windows-runner-routes.ts`.
+2. Job packet je vazan na presny commit SHA, nonce, input hash, schema version, workspace root a artifact root. Lease a audit persistence zustava na serveru; nejde o presun celeho tasku do obecne worker fronty.
+3. `apps/windows-runner/src/cli.ts` vola API pouze odchozimi requesty. Executor prijima jen verzovane prikazy podporovanych adapteru; `fixture-executor.ts` kryje bezpecny qualification tok a `unreal-adapter.ts` vyzaduje kanonicky executable, kompletni ordered argument vector, working directory a containment vsech absolutnich argument paths.
+4. Fake-runner integracni tok transportu, lease, auth, auditu, cancelu a result reconciliation je `tested` v `apps/studio-api/src/routes/windows-runner-routes.integration.test.ts`; runner a adapter policy jsou `tested` v `apps/windows-runner/src/*.test.ts`.
+5. Produkcni Windows/Unreal overeni je `deferred`. BOREK-FILIP se smi validovat jen v lokalni rucni session po samostatnem schvaleni dlouhe Unreal prace a uspesnem lokalnim probe pripnuteho toolingu. Fixture evidence neni produkcni Unreal evidence a finalni audit zustava rucni.
 
 ## 7) Aktualni omezeni
 
@@ -147,6 +157,8 @@ Aktivne vynucene policy vetve:
 | GitHub adapter boundary | `implemented`, `tested` | `packages/github/src/index.ts`; `packages/github/src/index.test.ts` |
 | Provider adapter boundary | `implemented`, `tested` | `packages/providers/src/provider.ts`; `packages/providers/src/codex-provider.ts`; `packages/providers/src/openai-provider.test.ts`; `apps/worker/src/db-worker.test.ts` |
 | Persistent repository chat, realtime activity, retry and approvals | `implemented`, `tested` | `apps/mobile-pwa/src/ChatPanel.tsx`; `apps/studio-api/src/routes/chat-routes.ts`; `apps/worker/src/chat-worker.ts`; `packages/db/prisma/schema.prisma`; `apps/studio-api/src/chat-routes.test.ts`; `apps/worker/src/chat-worker.test.ts`; `packages/providers/src/chat-prompt.test.ts` |
+| Windows validation control plane, manual CLI runner, fixture executor a pinned Unreal adapter | `implemented`, `tested`; production `deferred` | `packages/core/src/windows-worker.ts`; `apps/studio-api/src/routes/windows-runner-routes.ts`; `apps/windows-runner/src`; `packages/db/src/windows-worker-repository.ts`; `apps/studio-api/src/routes/windows-runner-routes.integration.test.ts`; `apps/windows-runner/src/*.test.ts` |
+| Rucni BOREK-FILIP Unreal validace a manualni finalni audit | `deferred` | Budouci rucne spoustene roadmap kroky; produkcni evidence v repozitari zatim neexistuje |
 | Production verification of full platform behavior | `deferred` | `docs/roadmap-quality-implementation-plan.md`; `docs/deploy-raspberry.md` |
 
 ## 9) Monitoring metriky

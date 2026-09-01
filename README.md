@@ -1562,6 +1562,15 @@ Aktualni stav tohoto repozitare:
 - Produkcni overeni realneho GitHubu, realneho providera a nasazene PWA je `deferred`.
 - Automaticky merge do `main` a automaticky produkcni deploy projektu spravovanych ForgeMindem zustavaji `deferred` a mimo MVP scope.
 
+### Windows validation worker (vNext)
+
+- `implemented`: uzce omezeny Windows CLI runner, odchozi Studio API transport, manualni session, capability probe, lease/cancel/result flow, bezpecny fixture executor, upload logu a artefaktu a pinned Unreal command adapter jsou v `apps/windows-runner/src`, `apps/studio-api/src/routes/windows-runner-routes.ts`, `packages/core/src/windows-worker.ts` a `packages/db/src/windows-worker-repository.ts`.
+- `tested`: schema a policy testy jsou v `packages/core/src/windows-worker.test.ts`; runner testy v `apps/windows-runner/src/*.test.ts`; API a fake-runner tok v `apps/studio-api/src/routes/windows-runner-routes.test.ts` a `apps/studio-api/src/routes/windows-runner-routes.integration.test.ts`; persistence lease toku v `packages/db/src/windows-worker-repository.test.ts` a `packages/db/src/windows-worker-repository.integration.test.ts`.
+- `production-verified`: zadna cast Windows/Unreal rollout zatim tento status nema.
+- `deferred`: realna BOREK-FILIP Unreal validace vyzaduje lokalni rucni session, samostatne schvaleni dlouhe Unreal prace a lokalne pripnute/probed tooling. Jeji provedeni i manualni finalni audit jsou dalsi rucne spoustene kroky; fixture ani staticka evidence je nenahrazuji.
+
+Windows runner je pouze validacni executor pro presny commit SHA a verzovane schema z `packages/core`. Neni obecny remote shell: nesmi planovat ani implementovat, pouzivat Git push, merge, PR nebo deploy, pristupovat primo do databaze, provozovat Docker, bezet bezobsluzne jako sluzba ani menit UAC, restart nebo security konfiguraci.
+
 Autoritativni release validace pro MVP delta:
 
 - `npm run build`
