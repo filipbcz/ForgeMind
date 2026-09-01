@@ -18,7 +18,7 @@ describe('WindowsRunnerCredentialAdapter', () => {
     expect(result.credential).toHaveLength(43);
     expect(tx.$executeRaw).toHaveBeenCalledTimes(1);
     expect(tx.auditLog.create).toHaveBeenCalledWith({ data: expect.objectContaining({
-      actorType: 'worker', actorId: 'device_1', eventType: 'windows_runner_enrolled',
+      actorType: 'system', actorId: 'device_1', eventType: 'windows_runner_enrolled',
       payload: { deviceId: 'device_1', scope: WINDOWS_RUNNER_SCOPE }
     }) });
   });

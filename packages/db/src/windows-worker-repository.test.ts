@@ -1,6 +1,14 @@
 import { describe, expect, it, vi } from 'vitest';
 import { WindowsWorkerRepository } from './windows-worker-repository.js';
 
+const packetDigest = 'a'.repeat(64);
+const queuedPacket = {
+  schemaVersion: 1, projectId: 'project_1', taskId: 'task_1', runId: 'run_1', checkId: 'check_1', jobId: 'job_1', leaseId: 'pending',
+  repository: 'owner/repo', sourceUrl: 'https://example.test/repo.git', commitSha: packetDigest, workspaceRoot: 'C:\\work', artifactRoot: 'C:\\artifacts',
+  check: { command: 'npm test', category: 'smoke', requiredCapabilities: ['windows'] }, requiredCapabilities: ['windows'],
+  resourcePolicy: { timeoutSeconds: 60, maxLogBytes: 1024, maxArtifactBytes: 1024 }, expectedArtifacts: [], nonce: 'pending', inputHash: packetDigest
+};
+
 const leaseRow = {
   id: 'lease_1', jobId: 'job_1', deviceId: 'device_1', sessionId: 'session_1', status: 'active',
   claimedAt: new Date('2026-08-31T12:00:00Z'), expiresAt: new Date('2099-08-31T12:01:00Z'), nonce: 'request_1',
@@ -35,14 +43,16 @@ describe('WindowsWorkerRepository capability leases', () => {
       windowsExecutionLease: {
         findUnique: vi.fn().mockResolvedValueOnce(null).mockResolvedValueOnce(leaseRow), create: vi.fn(async () => undefined)
       },
-      windowsExecutionJob: { update: vi.fn(async () => undefined) },
+      windowsExecutionJob: { findUniqueOrThrow: vi.fn(async () => ({ packet: queuedPacket })), update: vi.fn(async () => undefined) },
       workerDevice: { update: vi.fn(async () => undefined) }
     };
     const prisma: any = { $transaction: vi.fn(async (work: (client: unknown) => unknown) => work(tx)) };
     const claim = await new WindowsWorkerRepository(prisma).claimCompatible('session_1', 60, 'request_1');
     expect(claim?.job.id).toBe('job_1');
     expect(tx.windowsExecutionLease.create).toHaveBeenCalledTimes(1);
-    expect(tx.windowsExecutionJob.update).toHaveBeenCalledWith({ where: { id: 'job_1' }, data: { status: 'leased' } });
+    expect(tx.windowsExecutionJob.update).toHaveBeenCalledWith({
+      where: { id: 'job_1' }, data: { status: 'leased', packet: { ...queuedPacket, leaseId: expect.any(String), nonce: 'request_1' } }
+    });
   });
 
   it('requeues leased work but expires running work during crash recovery', async () => {
@@ -143,6 +153,45 @@ describe('WindowsWorkerRepository capability leases', () => {
     expect(accepted).toBe(false);
     expect(tx.windowsExecutionJob.updateMany).not.toHaveBeenCalled();
     expect(tx.windowsExecutionLease.update).not.toHaveBeenCalled();
+  });
+
+  it('reconciles only the exact deferred check and queues one resume after a successful result', async () => {
+    const digest = 'b'.repeat(64);
+    const packet = {
+      schemaVersion: 1, projectId: 'project_1', taskId: 'task_1', runId: 'run_1', checkId: 'validation:windows',
+      jobId: 'job_1', leaseId: 'lease_1', repository: 'owner/repo', sourceUrl: 'https://example.test/repo.git',
+      commitSha: digest, workspaceRoot: 'C:\\work', artifactRoot: 'C:\\artifacts',
+      check: { command: 'fixture.exe --validate', category: 'smoke', requiredCapabilities: ['windows'] },
+      requiredCapabilities: ['windows'], resourcePolicy: { timeoutSeconds: 60, maxLogBytes: 1024, maxArtifactBytes: 1024 },
+      expectedArtifacts: [], nonce: 'nonce_1', inputHash: digest
+    };
+    const checkpointUpdate = vi.fn(async () => ({ count: 1 }));
+    const tx: any = {
+      $queryRaw: vi.fn(async () => [{ jobId: 'job_1', projectId: 'project_1', taskId: 'task_1', runId: 'run_1', packet }]),
+      taskCheckpoint: {
+        findUnique: vi.fn()
+          .mockResolvedValueOnce({ status: 'completed', inputHash: digest, outputJson: { deferred: true, command: 'fixture.exe --validate', commitSha: 'c'.repeat(64) } })
+          .mockResolvedValue({ status: 'completed', inputHash: digest, outputJson: { deferred: true, command: 'fixture.exe --validate', commitSha: digest } }),
+        updateMany: checkpointUpdate
+      },
+      task: { findUnique: vi.fn(async () => ({ id: 'task_1', status: 'waiting_for_capability' })), update: vi.fn(async () => undefined) },
+      taskRun: { findUnique: vi.fn(async () => ({ provider: 'codex', model: 'test' })), create: vi.fn(async () => undefined) },
+      taskQueueJob: { count: vi.fn(async () => 0), create: vi.fn(async () => undefined) },
+      projectImplementationStep: { updateMany: vi.fn(async () => ({ count: 1 })) },
+      windowsExecutionJob: { updateMany: vi.fn(async () => ({ count: 1 })) },
+      windowsExecutionLease: { update: vi.fn(async () => undefined) }, workerDevice: { update: vi.fn(async () => undefined) }
+    };
+    const prisma: any = { $transaction: vi.fn(async (work: (client: unknown) => unknown) => work(tx)) };
+    const result = { schemaVersion: 1 as const, projectId: 'project_1', taskId: 'task_1', runId: 'run_1', checkId: 'validation:windows', jobId: 'job_1', leaseId: 'lease_1',
+      deviceId: 'device_1', sessionId: 'session_1', nonce: 'nonce_1', inputHash: digest, commitSha: digest, observedCapabilities: [], toolVersions: [], status: 'succeeded' as const,
+      startedAt: '2026-09-01T00:00:00.000Z', completedAt: '2026-09-01T00:01:00.000Z', summary: 'fixture passed', logHash: digest, artifacts: [] };
+
+    const repository = new WindowsWorkerRepository(prisma);
+    expect(await repository.submitResult('device_1', result)).toBe(false);
+    expect(tx.windowsExecutionJob.updateMany).not.toHaveBeenCalled();
+    expect(await repository.submitResult('device_1', result)).toBe(true);
+    expect(checkpointUpdate).toHaveBeenCalledWith(expect.objectContaining({ where: expect.objectContaining({ taskId: 'task_1', key: 'validation:windows', inputHash: digest }) }));
+    expect(tx.taskQueueJob.create).toHaveBeenCalledWith({ data: expect.objectContaining({ taskId: 'task_1', reason: 'windows_validation_completed' }) });
   });
 
   it.each([

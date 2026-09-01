@@ -32,7 +32,7 @@ export class WindowsRunnerCredentialAdapter {
       if (rows.length !== 1) throw new Error('Enrollment code is invalid, expired, or already used.');
       const deviceId = rows[0]!.deviceId;
       await tx.$executeRaw`INSERT INTO "worker_credentials" ("id", "device_id", "token_hash", "scope") VALUES (${randomUUID()}, ${deviceId}, ${hash(credential)}, ${WINDOWS_RUNNER_SCOPE})`;
-      await this.writeAudit(tx, 'worker', 'windows_runner_enrolled', { deviceId, scope: WINDOWS_RUNNER_SCOPE }, deviceId);
+      await this.writeAudit(tx, 'system', 'windows_runner_enrolled', { deviceId, scope: WINDOWS_RUNNER_SCOPE }, deviceId);
       return { deviceId, credential };
     });
   }
@@ -69,7 +69,7 @@ export class WindowsRunnerCredentialAdapter {
 
   private async writeAudit(
     tx: Pick<Prisma.TransactionClient, 'auditLog'>,
-    actorType: 'user' | 'worker',
+    actorType: 'user' | 'system',
     eventType: string,
     payload: Prisma.InputJsonValue,
     actorId?: string

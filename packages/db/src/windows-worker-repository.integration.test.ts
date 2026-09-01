@@ -22,6 +22,11 @@ interface PostgreSqlClient {
   end(): Promise<void>;
 }
 const ids = { user: 'lease_test_user', project: 'lease_test_project', task: 'lease_test_task', run: 'lease_test_run', device: 'lease_test_device', session: 'lease_test_session', job: 'lease_test_job' };
+const digest = 'a'.repeat(64);
+const integrationPacket = { schemaVersion: 1 as const, projectId: ids.project, taskId: ids.task, runId: ids.run, checkId: 'lease_test_check', jobId: ids.job,
+  leaseId: 'pending', repository: 'owner/repo', sourceUrl: 'https://example.test/repo.git', commitSha: digest, workspaceRoot: 'C:\\work', artifactRoot: 'C:\\artifacts',
+  check: { command: 'fixture.exe', category: 'smoke' as const, requiredCapabilities: ['windows'] }, requiredCapabilities: ['windows'],
+  resourcePolicy: { timeoutSeconds: 60, maxLogBytes: 1024, maxArtifactBytes: 1024 }, expectedArtifacts: [], nonce: 'pending', inputHash: digest };
 let first: PrismaClient;
 let second: PrismaClient;
 let admin: PostgreSqlClient | undefined;
@@ -63,6 +68,7 @@ describeDatabase('WindowsWorkerRepository PostgreSQL concurrency', () => {
     await first.$executeRaw`INSERT INTO "windows_execution_jobs" ("id", "project_id", "task_id", "run_id", "status", "required_capabilities", "packet")
       VALUES (${ids.job}, ${ids.project}, ${ids.task}, ${ids.run}, 'queued', '["windows"]', '{}')
       ON CONFLICT ("id") DO UPDATE SET "status" = 'queued'`;
+    await first.windowsExecutionJob.update({ where: { id: ids.job }, data: { packet: integrationPacket } });
     await first.$executeRaw`DELETE FROM "windows_execution_leases" WHERE "job_id" = ${ids.job}`;
   }, integrationHookTimeoutMs);
 

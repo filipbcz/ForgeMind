@@ -2,7 +2,7 @@ import { randomUUID } from 'node:crypto';
 import type { Prisma, PrismaClient } from '@prisma/client';
 import { isWindowsExecutionPacket } from '@forgemind/core';
 import type {
-  WorkerCapability, WorkerProbeEvidence, WindowsExecutionJob, WindowsExecutionLease,
+  ProviderKind, WorkerCapability, WorkerProbeEvidence, WindowsExecutionJob, WindowsExecutionLease,
   WindowsExecutionPacket, WindowsExecutionResult
 } from '@forgemind/core';
 
@@ -115,7 +115,14 @@ export class WindowsWorkerRepository {
         id: leaseId, jobId: selected.job_id, deviceId: session.device_id, sessionId,
         expiresAt, nonce: requestId
       } });
-      await tx.windowsExecutionJob.update({ where: { id: selected.job_id }, data: { status: 'leased' } });
+      const selectedJob = await tx.windowsExecutionJob.findUniqueOrThrow({ where: { id: selected.job_id } });
+      const selectedPacket = selectedJob.packet;
+      if (!isWindowsExecutionPacket(selectedPacket)) throw new Error('Queued execution job contains an invalid packet.');
+      const leasedPacket = selectedPacket as unknown as WindowsExecutionPacket;
+      await tx.windowsExecutionJob.update({
+        where: { id: selected.job_id },
+        data: { status: 'leased', packet: asJson({ ...leasedPacket, leaseId, nonce: requestId }) }
+      });
       await tx.workerDevice.update({ where: { id: session.device_id }, data: { status: 'reserved' } });
       const created = await this.readClaimByNonce(tx, sessionId, requestId);
       if (!created) throw new Error('New execution lease could not be read back.');
@@ -165,9 +172,50 @@ export class WindowsWorkerRepository {
         || packet.projectId !== result.projectId || packet.taskId !== result.taskId || packet.runId !== result.runId
         || packet.checkId !== result.checkId || packet.jobId !== result.jobId || packet.leaseId !== result.leaseId
         || packet.nonce !== result.nonce || packet.inputHash !== result.inputHash || packet.commitSha !== result.commitSha) return false;
+      let resume: { taskId: string; provider: ProviderKind; model: string } | undefined;
+      if (result.status === 'succeeded') {
+        const [checkpoint, task, sourceRun] = await Promise.all([
+          tx.taskCheckpoint.findUnique({ where: { taskId_key: { taskId: result.taskId, key: result.checkId } } }),
+          tx.task.findUnique({ where: { id: result.taskId } }),
+          tx.taskRun.findUnique({ where: { id: result.runId } })
+        ]);
+        const deferred = checkpoint?.outputJson;
+        if (!checkpoint || checkpoint.status !== 'completed' || checkpoint.inputHash !== result.inputHash
+          || !deferred || typeof deferred !== 'object' || Array.isArray(deferred)
+          || deferred.deferred !== true || deferred.command !== packet.check.command || deferred.commitSha !== result.commitSha
+          || !task || task.status !== 'waiting_for_capability' || !sourceRun) return false;
+        const activeQueueJobs = await tx.taskQueueJob.count({ where: { taskId: task.id, status: { in: ['pending', 'claimed'] } } });
+        if (activeQueueJobs !== 0) return false;
+        resume = { taskId: task.id, provider: sourceRun.provider, model: sourceRun.model };
+      }
       const status = result.status === 'succeeded' ? 'succeeded' : result.status === 'cancelled' ? 'cancelled' : 'failed';
       const updated = await tx.windowsExecutionJob.updateMany({ where: { id: result.jobId, status: { in: ['leased', 'running'] } }, data: { status } });
-      if (updated.count !== 1) return false;
+      if (updated.count !== 1) throw new Error('Execution job changed while its result was being reconciled.');
+      if (result.status === 'succeeded') {
+        const reconciled = await tx.taskCheckpoint.updateMany({
+          where: {
+            taskId: result.taskId, key: result.checkId, inputHash: result.inputHash, status: 'completed',
+            AND: [
+              { outputJson: { path: ['deferred'], equals: true } },
+              { outputJson: { path: ['command'], equals: packet.check.command } },
+              { outputJson: { path: ['commitSha'], equals: result.commitSha } }
+            ]
+          },
+          data: { outputJson: asJson({
+            evidenceVersion: 1, deferred: false, command: packet.check.command, exitCode: 0,
+            stdout: result.summary, stderr: '', passed: true, commitSha: result.commitSha,
+            inputHash: result.inputHash, logHash: result.logHash, artifacts: result.artifacts
+          }) }
+        });
+        if (reconciled.count !== 1) throw new Error('Deferred validation evidence changed while its result was being reconciled.');
+
+        const taskId = resume!.taskId;
+        const now = new Date();
+        await tx.task.update({ where: { id: taskId }, data: { status: 'submitted', waitingForCapabilities: [], startedAt: now, finishedAt: null } });
+        await tx.projectImplementationStep.updateMany({ where: { taskId, status: 'waiting_for_capability' }, data: { status: 'running', completedAt: null } });
+        await tx.taskRun.create({ data: { taskId, provider: resume!.provider, model: resume!.model, status: 'queued' } });
+        await tx.taskQueueJob.create({ data: { taskId, reason: 'windows_validation_completed', status: 'pending', nextAttemptAt: now } });
+      }
       await tx.windowsExecutionLease.update({ where: { id: result.leaseId }, data: { status: result.status === 'cancelled' ? 'cancelled' : 'released', releasedAt: new Date() } });
       await tx.workerDevice.update({ where: { id: deviceId }, data: { status: 'idle' } });
       return true;
