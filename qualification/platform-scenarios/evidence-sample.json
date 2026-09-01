@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "generatedFrom": "qualification/platform-scenarios/scenarios.mjs",
   "note": "Scenario evidence is repeatable and redacted by construction",
-  "scenarioCount": 9,
+  "scenarioCount": 10,
   "requiredAreas": [
     "success",
     "repair",
@@ -12,6 +12,7 @@
     "specification_change",
     "audit_recovery",
     "disk_exhaustion",
+    "windows_validation_fixture",
     "database_restore"
   ],
   "scenarios": [
@@ -86,6 +87,15 @@
       "evidenceArtifactCount": 4,
       "recoveryStepCount": 3,
       "definitionHash": "af341aa10aa2d039433b6e24f89b712a7100663537ab3ea20bdf9f29f04b62e8"
+    },
+    {
+      "id": "windows-validation-fixture-flow",
+      "area": "windows_validation_fixture",
+      "expectedStateCount": 8,
+      "expectedAuditEventCount": 5,
+      "evidenceArtifactCount": 4,
+      "recoveryStepCount": 3,
+      "definitionHash": "f13f3fae6497c41fe1ceb0d0085f51d32f2429dc26319838c3cac07ee475a20f"
     },
     {
       "id": "database-restore-path",

@@ -16,6 +16,7 @@ The command prints deterministic JSON evidence with per-scenario definition hash
 - Diagnostic exports must pass through central redaction before attachment.
 - Artifacts should be bounded transcripts, state timelines, record counts, hashes, and audit event identifiers.
 - Real runs must reference exact commits. Scenario definitions are stable and versioned in `qualification/platform-scenarios/scenarios.mjs`.
+- Fixture scenario evidence cannot unlock final audit by itself; the same revision must also have a passed BOREK-FILIP Unreal artifact backed by its exact successful Windows execution, the canonical `borek-filip` profile, manual device/session and probe provenance, and separate human approval resolved before the execution lease was claimed.
 - Manual final audit remains a user action after qualification evidence exists.
 
 ## Scenario catalog
@@ -91,3 +92,11 @@ Expected states: restored previous schema, forward migrations applied, readable 
 Expected audit events: restore start, migration validation completion, restore verification.
 
 Recovery procedure: restore into an isolated database only; run the forward-only migration validator before workers start; start API first, verify read paths, then resume workers after queue and audit counts are consistent.
+
+### windows-validation-fixture-flow
+
+Expected states: enrolled runner, active manual session, current probe evidence, exact-commit fixture lease, running fixture, succeeded fixture, reconciled evidence, resumed deferred validation.
+
+Expected audit events: enrollment redemption, manual session start, execution lease, result submission, evidence reconciliation.
+
+Recovery procedure: keep validation deferred without a fresh session and probe; expire stale leases before manual reactivation; rerun only the bounded fixture for the same exact commit and reconcile once.

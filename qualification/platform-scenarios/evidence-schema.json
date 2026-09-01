@@ -24,17 +24,22 @@
     },
     "scenarioCount": {
       "type": "integer",
-      "const": 9
+      "const": 10
     },
     "requiredAreas": {
       "type": "array",
       "items": {
         "type": "string"
       },
-      "minItems": 9,
-      "maxItems": 9,
+      "minItems": 10,
+      "maxItems": 10,
       "uniqueItems": true,
       "allOf": [
+        {
+          "contains": {
+            "const": "windows_validation_fixture"
+          }
+        },
         {
           "contains": {
             "const": "success"
@@ -84,8 +89,8 @@
     },
     "scenarios": {
       "type": "array",
-      "minItems": 9,
-      "maxItems": 9,
+      "minItems": 10,
+      "maxItems": 10,
       "items": {
         "type": "object",
         "additionalProperties": false,
@@ -113,6 +118,7 @@
               "specification_change",
               "audit_recovery",
               "disk_exhaustion",
+              "windows_validation_fixture",
               "database_restore"
             ]
           },

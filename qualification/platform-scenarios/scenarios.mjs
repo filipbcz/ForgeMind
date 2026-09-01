@@ -7,6 +7,7 @@ export const requiredScenarioAreas = [
   'specification_change',
   'audit_recovery',
   'disk_exhaustion',
+  'windows_validation_fixture',
   'database_restore'
 ];
 
@@ -298,6 +299,41 @@ export const qualificationScenarios = [
       'Stop new claims by pausing the queue if free space is below the operator threshold.',
       'Remove only disposable workspace and artifact cache paths documented for the environment.',
       'Resume the queue and retry the affected task from the latest persisted checkpoint.'
+    ]
+  },
+  {
+    id: 'windows-validation-fixture-flow',
+    area: 'windows_validation_fixture',
+    title: 'Windows validation fixture completes through the outbound runner flow',
+    objective: 'Verify the bounded fixture path covers manual session activation, exact-commit leasing, execution, and evidence reconciliation.',
+    activation: 'Manually activate a runner session and submit the versioned safe fixture validation job for an exact commit.',
+    expectedStates: [
+      'runner:enrolled',
+      'manual_session:active',
+      'probe_evidence:current',
+      'fixture_job:leased_for_exact_commit',
+      'fixture_job:running',
+      'fixture_job:succeeded',
+      'fixture_evidence:reconciled',
+      'deferred_validation:resumed_once'
+    ],
+    expectedAuditEvents: [
+      'windows_runner_enrollment_redeemed',
+      'windows_runner_session_started',
+      'windows_execution_leased',
+      'windows_runner_result_submitted',
+      'windows_execution_evidence_reconciled'
+    ],
+    evidenceArtifacts: [
+      'exact commit execution packet',
+      'successful capability probe record',
+      'bounded fixture log and artifact manifest',
+      'reconciled validation checkpoint'
+    ],
+    recoveryProcedure: [
+      'Leave the validation deferred when no fresh manual session and successful probe are available.',
+      'Expire any stale lease before manually activating a new runner session.',
+      'Repeat only the fixture validation for the same exact commit and reconcile its evidence once.'
     ]
   },
   {

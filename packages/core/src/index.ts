@@ -1,4 +1,5 @@
 export * from './limits.js';
+export * from './final-audit.js';
 export * from './model.js';
 export * from './policy.js';
 export * from './provider.js';

@@ -4,7 +4,7 @@ import { createHash, randomUUID } from 'node:crypto';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, expect, it, vi } from 'vitest';
-import { ROADMAP_GENERATION_CONFIRMATION } from '@forgemind/core';
+import { REQUIRED_QUALIFICATION_SCENARIOS, ROADMAP_GENERATION_CONFIRMATION } from '@forgemind/core';
 import type { AIProvider, CostEstimateResult, ImplementInput, ImplementResult, PlanInput, PlanResult, ReviewInput, ReviewResult } from '@forgemind/providers';
 import type { GitHubAdapter } from '@forgemind/github';
 import { createAuthService } from './auth.js';
@@ -1140,19 +1140,33 @@ describe('Studio API routes', () => {
         title: 'Demo', description: 'Done', acceptanceCriteria: ['Done'], requirementIds: ['REQ-DEMO'],
         deliverables: ['Demo'], dependsOnStepTitles: [], validationFocus: [], status: 'completed', taskId: 'task_1'
       }],
-      evidence: [], capabilities: [], auditJobs: []
+      evidence: [{
+        id: 'evidence_1', cycleId: 'cycle_1', contractVersion: 1, source: 'artifact', status: 'passed', commitSha: 'abc1234',
+        payload: {
+          schemaVersion: 1, generatedFrom: 'qualification/platform-scenarios/scenarios.mjs',
+          scenarioCount: REQUIRED_QUALIFICATION_SCENARIOS.length,
+          scenarios: REQUIRED_QUALIFICATION_SCENARIOS.map((scenario) => ({ ...scenario }))
+        }
+      }, {
+        id: 'evidence_borek', cycleId: 'cycle_1', contractVersion: 1, source: 'artifact', status: 'passed', commitSha: 'abc1234',
+        payload: {
+          validationKind: 'borek-filip-unreal', executionAdapterKind: 'unreal', manuallyApproved: true,
+          fixture: false, windowsExecutionJobId: 'job_1', approvalId: 'approval_1'
+        }
+      }], capabilities: [], auditJobs: []
     };
     const repository = {
       getCurrentUser: vi.fn(async () => ownerUser),
       getProject: vi.fn(async () => ({
-        id: 'project_1', name: 'Project',
+        id: 'project_1', name: 'Project', projectMemory: { version: 1, baseCommitSha: 'abc1234', recentWork: [], updatedAt: '' },
         projectContract: {
           version: 1, summary: 'Demo', invariants: [], prohibitedSubstitutes: [], releaseCriteria: ['Ready'],
           requirements: [{ id: 'REQ-DEMO', title: 'Demo', description: 'Demo works.', acceptanceCriteria: ['Done'], status: 'active' }]
         }
       })),
       getProjectRoadmap: vi.fn(async () => roadmap),
-      enqueueProjectAudit: vi.fn(async () => ({ enqueued: true, job: { id: 'audit_1' } }))
+      enqueueProjectAudit: vi.fn(async () => ({ enqueued: true, job: { id: 'audit_1' } })),
+      writeAudit: vi.fn(async () => undefined)
     };
     const app = Fastify();
     const auth = createAuthService();
@@ -1163,7 +1177,11 @@ describe('Studio API routes', () => {
 
     expect(response.statusCode).toBe(200);
     expect(repository.enqueueProjectAudit).toHaveBeenCalledWith({
-      projectId: 'project_1', cycleId: 'cycle_1', triggerTaskId: 'task_1', requirementIds: ['REQ-DEMO']
+      projectId: 'project_1', cycleId: 'cycle_1', triggerTaskId: 'task_1', requirementIds: ['REQ-DEMO'],
+      manualRequest: {
+        contractVersion: 1, commitSha: 'abc1234',
+        qualificationEvidenceIds: ['evidence_1', 'evidence_borek'], completedStepIds: ['step_1']
+      }
     });
     await app.close();
   });
@@ -1172,7 +1190,7 @@ describe('Studio API routes', () => {
     const repository = {
       getCurrentUser: vi.fn(async () => ownerUser),
       getProject: vi.fn(async () => ({
-        id: 'project_1',
+        id: 'project_1', projectMemory: { version: 1, baseCommitSha: 'abc1234', recentWork: [], updatedAt: '' },
         projectContract: {
           version: 1, summary: 'Demo', invariants: [], prohibitedSubstitutes: [], releaseCriteria: ['Ready'],
           requirements: [{ id: 'REQ-DEMO', title: 'Demo', description: 'Demo works.', acceptanceCriteria: ['Done'], status: 'active' }]
@@ -1194,6 +1212,47 @@ describe('Studio API routes', () => {
 
     expect(response.statusCode).toBe(409);
     expect(repository.enqueueProjectAudit).not.toHaveBeenCalled();
+    await app.close();
+  });
+
+  it('rejects a manual final audit without qualification evidence for the current project state', async () => {
+    const repository = {
+      getCurrentUser: vi.fn(async () => ownerUser),
+      getProject: vi.fn(async () => ({
+        id: 'project_1',
+        projectContract: {
+          version: 2, summary: 'Demo', invariants: [], prohibitedSubstitutes: [], releaseCriteria: ['Ready'],
+          requirements: [{ id: 'REQ-DEMO', title: 'Demo', description: 'Demo works.', acceptanceCriteria: ['Done'], status: 'active' }]
+        }
+      })),
+      getProjectRoadmap: vi.fn(async () => ({
+        projectId: 'project_1',
+        cycles: [{ id: 'cycle_2', projectId: 'project_1', cycleNumber: 2, objective: 'Demo', status: 'active' }],
+        steps: [{ id: 'step_2', cycleId: 'cycle_2', sequenceNumber: 1, status: 'completed', taskId: 'task_2' }],
+        evidence: [{
+          id: 'failed_evidence', cycleId: 'cycle_2', contractVersion: 2, source: 'artifact', status: 'failed', commitSha: 'abc1234',
+          payload: {
+            schemaVersion: 1, generatedFrom: 'qualification/platform-scenarios/scenarios.mjs',
+            scenarioCount: REQUIRED_QUALIFICATION_SCENARIOS.length,
+            scenarios: REQUIRED_QUALIFICATION_SCENARIOS.map((scenario) => ({ ...scenario }))
+          }
+        }],
+        capabilities: [], auditJobs: []
+      })),
+      enqueueProjectAudit: vi.fn(),
+      writeAudit: vi.fn()
+    };
+    const app = Fastify();
+    const auth = createAuthService();
+    const headers = createOwnerAuthenticatedHeaders(auth);
+    registerRoutes(app, repository as never, undefined, auth);
+
+    const response = await app.inject({ method: 'POST', url: '/api/projects/project_1/audit/start', headers });
+
+    expect(response.statusCode).toBe(409);
+    expect(response.json().error).toContain('Current qualification evidence');
+    expect(repository.enqueueProjectAudit).not.toHaveBeenCalled();
+    expect(repository.writeAudit).not.toHaveBeenCalled();
     await app.close();
   });
 
