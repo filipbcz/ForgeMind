@@ -9,7 +9,7 @@
     { "path": "./packages/db" },
     { "path": "./apps/studio-api" },
     { "path": "./apps/worker" },
+    { "path": "./apps/windows-runner" },
     { "path": "./apps/mobile-pwa" }
   ]
 }
-
