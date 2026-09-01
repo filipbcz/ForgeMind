@@ -110,6 +110,10 @@ export interface ExpectedExecutionArtifact {
   required: boolean;
 }
 
+export type WindowsExecutionAdapter =
+  | { kind: 'fixture'; profileId: string }
+  | { kind: 'unreal'; profile: { kind: 'unreal-validation'; profileId: string; tool: 'unreal-editor-cmd' | 'build-bat' | 'automation-tool' | 'project-script' } };
+
 export interface WindowsExecutionPacket {
   schemaVersion: WindowsWorkerSchemaVersion;
   projectId: string;
@@ -129,6 +133,10 @@ export interface WindowsExecutionPacket {
   expectedArtifacts: ExpectedExecutionArtifact[];
   nonce: string;
   inputHash: string;
+  /** Selects the only typed adapter allowed to interpret this packet; check.command is evidence metadata, not a remote-shell dispatch mechanism. */
+  executionAdapter?: WindowsExecutionAdapter;
+  /** Required for Unreal jobs and bound to this exact job/check/commit/input by the control plane. */
+  unrealApprovalId?: string;
 }
 
 export interface ExecutionArtifactResult {
@@ -247,12 +255,23 @@ const isArtifactResult = (value: unknown): value is ExecutionArtifactResult => i
   && isNonEmpty(value.relativePath) && Number.isInteger(value.sizeBytes) && (value.sizeBytes as number) >= 0 && isSha256(value.sha256);
 const isToolVersion = (value: unknown): value is ExecutionToolVersionEvidence => isRecord(value) && isNonEmpty(value.tool)
   && isNonEmpty(value.version) && (value.driverVersion === undefined || isNonEmpty(value.driverVersion));
+const isExecutionAdapter = (value: unknown): value is WindowsExecutionAdapter => isRecord(value) && (
+  (value.kind === 'fixture' && isNonEmpty(value.profileId))
+  || (value.kind === 'unreal' && isRecord(value.profile) && value.profile.kind === 'unreal-validation'
+    && isNonEmpty(value.profile.profileId)
+    && ['unreal-editor-cmd', 'build-bat', 'automation-tool', 'project-script'].includes(value.profile.tool as string))
+);
 
 export function isWindowsExecutionPacket(value: unknown): value is WindowsExecutionPacket {
   if (!isRecord(value) || value.schemaVersion !== WINDOWS_WORKER_SCHEMA_VERSION) return false;
   const required = ['projectId', 'taskId', 'runId', 'checkId', 'jobId', 'leaseId', 'repository', 'sourceUrl', 'workspaceRoot', 'artifactRoot', 'nonce'];
   if (!required.every((key) => isNonEmpty(value[key])) || !isSha256(value.commitSha) || !isSha256(value.inputHash)) return false;
   if (!areCapabilityKeys(value.requiredCapabilities)) return false;
+  // Missing identity remains readable for schema-v1 jobs persisted before typed adapter dispatch was introduced.
+  // The enqueue boundary requires it for every new job.
+  if (value.executionAdapter !== undefined && !isExecutionAdapter(value.executionAdapter)) return false;
+  if (isRecord(value.executionAdapter) && value.executionAdapter.kind === 'unreal' && !isNonEmpty(value.unrealApprovalId)) return false;
+  if (value.unrealApprovalId !== undefined && !isNonEmpty(value.unrealApprovalId)) return false;
   if (!isRecord(value.check) || !isNonEmpty(value.check.command)
     || !checkCategories.includes(value.check.category as ValidationCheckCategory)
     || !areCapabilityKeys(value.check.requiredCapabilities)
