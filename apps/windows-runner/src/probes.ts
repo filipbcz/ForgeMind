@@ -5,6 +5,10 @@ import { canonicalizeWorkerProbeEvidence, type WorkerCapability, type WorkerProb
 export interface CapabilityProbe { capability: WorkerCapability; executable?: string; args?: readonly string[] }
 export interface ProbeResult { capabilities: WorkerCapability[]; evidence: WorkerProbeEvidence[] }
 
+export const unrealCapabilityProbe = (executable: string, version: string): CapabilityProbe => ({
+  capability: { key: 'unreal', version, metadata: { executable } }, executable, args: ['-version']
+});
+
 export async function runCapabilityProbes(probes: readonly CapabilityProbe[], now = new Date()): Promise<ProbeResult> {
   const evidence = await Promise.all(probes.map(async (probe): Promise<WorkerProbeEvidence> => {
     let status: WorkerProbeEvidence['status'] = 'supported'; let summary = 'Local platform probe succeeded.';

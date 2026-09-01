@@ -31,6 +31,7 @@ for (const workspacePath of workspaces) {
     npmExecutable ? [npmExecutable, 'run', 'test', '-w', workspace] : ['run', 'test', '-w', workspace],
     {
     cwd: root,
+    env: { ...process.env, NODE_ENV: 'development' },
     stdio: 'inherit',
     shell: false
     }
