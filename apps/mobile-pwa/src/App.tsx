@@ -65,6 +65,10 @@ import {
   fetchTasks,
   fetchWorkerEvents,
   fetchWorkerStatus,
+  fetchWindowsOperations,
+  cancelWindowsJob,
+  drainWindowsSession,
+  revokeWindowsDevice,
   generateProjectRoadmap as generateProjectRoadmapRequest,
   logout as logoutRequest,
   resolveApproval as resolveApprovalRequest,
@@ -329,6 +333,10 @@ function AuthenticatedApp({ auth }: { auth: AuthSessionResponse }) {
   });
   const workerStatusQuery = useQuery({ queryKey: ['worker-status'], queryFn: fetchWorkerStatus, refetchInterval: globalPollInterval, retry: 1 });
   const workerEventsQuery = useQuery({ queryKey: ['worker-events'], queryFn: () => fetchWorkerEvents(8), refetchInterval: globalPollInterval, retry: 1 });
+  const windowsOperationsQuery = useQuery({ queryKey: ['windows-operations'], queryFn: () => fetchWindowsOperations(), refetchInterval: globalPollInterval, retry: 1 });
+  const cancelWindowsJobMutation = useMutation({ mutationFn: cancelWindowsJob, onSuccess: () => queryClient.invalidateQueries({ queryKey: ['windows-operations'] }) });
+  const drainWindowsSessionMutation = useMutation({ mutationFn: drainWindowsSession, onSuccess: () => queryClient.invalidateQueries({ queryKey: ['windows-operations'] }) });
+  const revokeWindowsDeviceMutation = useMutation({ mutationFn: revokeWindowsDevice, onSuccess: () => queryClient.invalidateQueries({ queryKey: ['windows-operations'] }) });
 
   const projects = projectsQuery.data ?? [];
   const tasks = tasksQuery.data ?? [];
@@ -946,6 +954,16 @@ function AuthenticatedApp({ auth }: { auth: AuthSessionResponse }) {
         </header>
 
         {hasApiError ? <div className="error-banner">API není dostupné, zobrazuji lokální fallback.</div> : null}
+        <section className="project-operational-overview" aria-label="Windows validation workers">
+          <div className="operational-state"><span>Windows validace</span><strong>{windowsOperationsQuery.data?.devices.length ?? 0} zařízení</strong>
+            {(windowsOperationsQuery.data?.devices ?? []).map((device) => <div key={device.id}><p>{device.displayName}: {device.status} · {device.capabilities.map((capability) => capability.key).join(', ') || 'bez schopností'}</p>
+              {device.sessions.find((session) => ['active', 'draining'].includes(session.status)) ? <button type="button" onClick={() => drainWindowsSessionMutation.mutate(device.sessions.find((session) => ['active', 'draining'].includes(session.status))!.id)}>Drain</button> : null}
+              <button type="button" disabled={device.status === 'revoked'} onClick={() => revokeWindowsDeviceMutation.mutate(device.id)}>Revoke</button></div>)}</div>
+          <div className="operational-blockers"><span>Čekající schopnosti</span>{(windowsOperationsQuery.data?.waitingValidations ?? []).map((job) => <p key={job.jobId}>{job.criterion ?? job.taskId}: {job.requiredCapabilities.join(', ')} · {job.compatibleDeviceIds.length} kompatibilní
+            <button type="button" onClick={() => cancelWindowsJobMutation.mutate(job.jobId)}>Cancel</button></p>)}</div>
+          <div className="operational-blockers"><span>Výsledné artefakty</span>{(windowsOperationsQuery.data?.evidence ?? []).map((item) => <div key={item.jobId}><strong>{item.criterion ?? item.checkId}</strong><small>{item.commitSha.slice(0, 12)} · log {item.log?.sizeBytes ?? 0} B</small>
+            {item.artifacts.map((artifact) => <p key={artifact.sha256}>{artifact.name} · {artifact.sizeBytes} B · {artifact.sha256.slice(0, 12)}</p>)}</div>)}</div>
+        </section>
         {workerQueueControlMutation.error ? (
           <div className="error-banner">Změna stavu fronty selhala: {workerQueueControlMutation.error.message}</div>
         ) : null}

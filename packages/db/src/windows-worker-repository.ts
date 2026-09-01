@@ -1,10 +1,11 @@
 import { randomUUID } from 'node:crypto';
 import type { Prisma, PrismaClient } from '@prisma/client';
-import { isWindowsExecutionPacket } from '@forgemind/core';
+import { isWindowsExecutionPacket, WINDOWS_DEVICE_OFFLINE_AFTER_MS } from '@forgemind/core';
 import type {
   ProviderKind, WorkerCapability, WorkerProbeEvidence, WindowsExecutionJob, WindowsExecutionLease,
   WindowsExecutionPacket, WindowsExecutionResult
 } from '@forgemind/core';
+import type { WindowsEvidenceUpload, WindowsWorkerOperationsReadModel } from '@forgemind/core';
 
 type TransactionClient = Omit<PrismaClient, '$connect' | '$disconnect' | '$on' | '$transaction' | '$use' | '$extends'>;
 
@@ -94,6 +95,61 @@ export class WindowsWorkerRepository {
       requiredCapabilities: asJson(input.requiredCapabilities), packet: asJson(input.packet)
     } });
     return id;
+  }
+
+  async uploadEvidence(deviceId: string, upload: WindowsEvidenceUpload): Promise<'accepted' | 'duplicate' | 'conflict'> {
+    return this.prisma.$transaction(async (tx) => {
+      const locked = await tx.$queryRaw<Array<{ id: string }>>`
+        SELECT j."id" FROM "windows_execution_jobs" j
+        JOIN "windows_execution_leases" l ON l."job_id" = j."id"
+        WHERE j."id" = ${upload.jobId} AND l."id" = ${upload.leaseId} AND l."device_id" = ${deviceId} AND l."status" = 'active'
+        FOR UPDATE OF j, l`;
+      if (locked.length !== 1) return 'conflict';
+      const lease = await tx.windowsExecutionLease.findFirst({ where: { id: upload.leaseId, jobId: upload.jobId, deviceId, status: 'active' }, include: { job: true } });
+      if (!lease || !isWindowsExecutionPacket(lease.job.packet)) return 'conflict';
+      const packet = lease.job.packet;
+      if (packet.inputHash !== upload.inputHash || packet.commitSha !== upload.commitSha) return 'conflict';
+      const existing = (packet as unknown as { evidenceUpload?: WindowsEvidenceUpload }).evidenceUpload;
+      if (existing) return JSON.stringify(existing) === JSON.stringify(upload) ? 'duplicate' : 'conflict';
+      const packetWithEvidence = Object.assign({}, packet as WindowsExecutionPacket, { evidenceUpload: upload });
+      await tx.windowsExecutionJob.update({ where: { id: upload.jobId }, data: { packet: asJson(packetWithEvidence) } });
+      return 'accepted';
+    });
+  }
+
+  async readOperations(projectId?: string, now = new Date()): Promise<WindowsWorkerOperationsReadModel> {
+    const [devices, jobs] = await Promise.all([
+      this.prisma.workerDevice.findMany({ include: { sessions: { orderBy: { startedAt: 'desc' }, take: 5 } }, orderBy: { displayName: 'asc' } }),
+      this.prisma.windowsExecutionJob.findMany({ where: projectId ? { projectId } : undefined, orderBy: { createdAt: 'desc' }, take: 100 })
+    ]);
+    const heartbeatCutoff = now.getTime() - WINDOWS_DEVICE_OFFLINE_AFTER_MS;
+    const mappedDevices = devices.map((device) => ({ schemaVersion: 1 as const, id: device.id, platform: 'windows' as const, runnerVersion: device.runnerVersion,
+      displayName: device.displayName, status: device.status !== 'revoked' && (!device.lastHeartbeatAt || device.lastHeartbeatAt.getTime() < heartbeatCutoff) ? 'offline' as const : device.status,
+      capabilities: device.capabilities as unknown as WorkerCapability[],
+      probeEvidence: device.probeEvidence as unknown as WorkerProbeEvidence[],
+      lastHeartbeatAt: device.lastHeartbeatAt?.toISOString(), sessions: device.sessions.map((session) => ({ schemaVersion: 1 as const, id: session.id,
+        deviceId: session.deviceId, status: session.status, startedAt: session.startedAt.toISOString(), expiresAt: session.expiresAt.toISOString(),
+        lastHeartbeatAt: session.lastHeartbeatAt.toISOString(), endedAt: session.endedAt?.toISOString() })) }));
+    return { schemaVersion: 1, devices: mappedDevices, waitingValidations: jobs.filter((job) => job.status === 'queued').map((job) => {
+      const packet = job.packet as unknown as WindowsExecutionPacket; const required = job.requiredCapabilities as string[];
+      return { jobId: job.id, taskId: job.taskId, criterion: packet.check?.criterion, requiredCapabilities: required,
+        compatibleDeviceIds: mappedDevices.filter((device) => device.status === 'idle'
+          && device.sessions.some((session) => session.status === 'active' && Date.parse(session.expiresAt) > now.getTime() && Date.parse(session.lastHeartbeatAt) >= heartbeatCutoff)
+          && required.every((key) => device.capabilities.some((capability) => capability.key === key)
+          && device.probeEvidence.some((evidence) => evidence.capability.key === key && evidence.status === 'supported'))).map((device) => device.id) };
+    }), evidence: jobs.flatMap((job) => { const packet = job.packet as unknown as WindowsExecutionPacket & { evidenceUpload?: WindowsEvidenceUpload };
+      return packet.evidenceUpload ? [{ jobId: job.id, taskId: job.taskId, checkId: packet.checkId, criterion: packet.check.criterion,
+        commitSha: packet.commitSha, log: packet.evidenceUpload.log, artifacts: packet.evidenceUpload.artifacts.map(({ contentBase64: _content, ...artifact }) => artifact) }] : []; }) };
+  }
+
+  async cancelJob(jobId: string): Promise<boolean> {
+    return this.prisma.$transaction(async (tx) => {
+      const leases = await tx.windowsExecutionLease.findMany({ where: { jobId, status: 'active' } });
+      await tx.windowsExecutionLease.updateMany({ where: { jobId, status: 'active' }, data: { status: 'cancelled', releasedAt: new Date() } });
+      const changed = await tx.windowsExecutionJob.updateMany({ where: { id: jobId, status: { in: ['queued', 'leased', 'running'] } }, data: { status: 'cancelled' } });
+      await tx.workerDevice.updateMany({ where: { id: { in: leases.map((lease) => lease.deviceId) }, status: { in: ['reserved', 'running'] } }, data: { status: 'idle' } });
+      return changed.count === 1;
+    });
   }
 
   async claimCompatible(sessionId: string, leaseSeconds: number, requestId: string, deviceId?: string): Promise<ClaimedWindowsExecution | undefined> {
@@ -196,6 +252,12 @@ export class WindowsWorkerRepository {
         || packet.projectId !== result.projectId || packet.taskId !== result.taskId || packet.runId !== result.runId
         || packet.checkId !== result.checkId || packet.jobId !== result.jobId || packet.leaseId !== result.leaseId
         || packet.nonce !== result.nonce || packet.inputHash !== result.inputHash || packet.commitSha !== result.commitSha) return false;
+      const evidence = (packet as WindowsExecutionPacket & { evidenceUpload?: WindowsEvidenceUpload }).evidenceUpload;
+      if (!evidence || evidence.log.sha256.toLowerCase() !== result.logHash.toLowerCase()
+        || evidence.artifacts.length !== result.artifacts.length
+        || result.artifacts.some((artifact) => !evidence.artifacts.some((uploaded) => uploaded.name === artifact.name
+          && uploaded.relativePath === artifact.relativePath && uploaded.sizeBytes === artifact.sizeBytes
+          && uploaded.sha256.toLowerCase() === artifact.sha256.toLowerCase()))) return false;
       let resume: { taskId: string; provider: ProviderKind; model: string } | undefined;
       if (result.status === 'succeeded') {
         const [checkpoint, task, sourceRun] = await Promise.all([

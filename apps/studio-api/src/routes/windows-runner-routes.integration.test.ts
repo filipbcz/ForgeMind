@@ -3,6 +3,7 @@ import { PrismaClient } from '@prisma/client';
 import { createRequire } from 'node:module';
 import { readFileSync, readdirSync } from 'node:fs';
 import path from 'node:path';
+import { createHash } from 'node:crypto';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { ForgeMindRepository, WindowsRunnerCredentialAdapter, WindowsWorkerRepository } from '@forgemind/db';
 import { registerWindowsRunnerRoutes } from './windows-runner-routes.js';
@@ -76,9 +77,12 @@ describe('Windows runner real transport and persistence flow', () => {
     const claim = (await app.inject({ method: 'POST', url: '/api/windows-runner/device/lease', headers, payload: { sessionId, requestId: 'fake-runner-request' } })).json();
     expect(claim.job.id).toBe(ids.job);
     expect((await app.inject({ method: 'POST', url: '/api/windows-runner/device/heartbeat', headers, payload: { sessionId, leaseId: claim.lease.id } })).statusCode).toBe(200);
+    const logText = 'fixture passed'; const logHash = createHash('sha256').update(logText).digest('hex');
+    expect((await app.inject({ method: 'POST', url: '/api/windows-runner/device/evidence', headers, payload: { schemaVersion: 1, jobId: ids.job, leaseId: claim.lease.id,
+      inputHash, commitSha, log: { text: logText, sizeBytes: Buffer.byteLength(logText), sha256: logHash }, artifacts: [] } })).statusCode).toBe(200);
     const result = { schemaVersion: 1, projectId: ids.project, taskId: ids.task, runId: ids.run, checkId, jobId: ids.job, leaseId: claim.lease.id, deviceId: ids.device,
       sessionId, nonce: 'fake-runner-request', inputHash, commitSha, observedCapabilities: [{ key: 'windows' }], toolVersions: [], status: 'succeeded',
-      startedAt: '2026-09-01T00:00:00.000Z', completedAt: '2026-09-01T00:00:01.000Z', summary: 'fixture passed', logHash: 'd'.repeat(64), artifacts: [] };
+      startedAt: '2026-09-01T00:00:00.000Z', completedAt: '2026-09-01T00:00:01.000Z', summary: 'fixture passed', logHash, artifacts: [] };
     expect((await app.inject({ method: 'POST', url: '/api/windows-runner/device/result', headers, payload: result })).statusCode).toBe(200);
     expect((await app.inject({ method: 'POST', url: '/api/windows-runner/device/result', headers, payload: result })).statusCode).toBe(409);
 
