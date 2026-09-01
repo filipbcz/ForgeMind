@@ -17,8 +17,12 @@ describeWindows('installed Windows runner entry point', () => {
 function execute(executable: string, args: string[]): Promise<{ code: number | null; stderr: string }> {
   return new Promise((resolveResult, reject) => {
     execFile(executable, args, { windowsHide: true }, (error, _stdout, stderr) => {
-      if (error && typeof error.code !== 'number') return reject(error);
-      resolveResult({ code: error?.code ?? 0, stderr });
+      if (error) {
+        if (typeof error.code !== 'number') return reject(error);
+        resolveResult({ code: error.code, stderr });
+        return;
+      }
+      resolveResult({ code: 0, stderr });
     });
   });
 }

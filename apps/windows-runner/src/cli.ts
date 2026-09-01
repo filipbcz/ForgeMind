@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 import { createInterface } from 'node:readline/promises';
+import { release as osRelease } from 'node:os';
 import { stdin, stdout } from 'node:process';
 import { pathToFileURL } from 'node:url';
 import { WindowsCredentialStore } from './credential-store.js';
@@ -45,7 +46,7 @@ export async function main(args = process.argv.slice(2)): Promise<void> {
     stdout.write(`Enrolled device ${credential.deviceId}.\n`); return;
   }
   const auth = await store.load(); if (!auth) throw new Error('Runner is not enrolled.');
-  const probes = await runCapabilityProbes([{ capability: { key: 'windows', version: process.getSystemVersion?.() } }]);
+  const probes = await runCapabilityProbes([{ capability: { key: 'windows', version: osRelease() } }]);
   if (parsed.command === 'probe') {
     await transport.publishDevice(auth, { runnerVersion: RUNNER_VERSION, displayName: process.env.COMPUTERNAME ?? 'Windows runner', capabilities: probes.capabilities, probeEvidence: probes.evidence });
     stdout.write(`${JSON.stringify(probes.evidence, null, 2)}\n`); return;
