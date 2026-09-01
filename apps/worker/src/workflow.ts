@@ -724,6 +724,7 @@ export async function runWorkerTask(input: WorkerTaskInput): Promise<WorkerTaskR
       }
       if (!resumeValidationPlanRevision) {
         const validationInputHash = await collectValidationInputHash(git, workspacePath);
+        const validationCommitSha = await resolveHeadSha(git);
         await input.hooks?.onIterationStarted?.({
           phase: 'validation',
           prompt: summarizeValidationChecks(validationChecks),
@@ -789,6 +790,7 @@ export async function runWorkerTask(input: WorkerTaskInput): Promise<WorkerTaskR
                 evidenceVersion: 1,
                 deferred: true,
                 command: activity.command,
+                commitSha: validationCommitSha,
                 category: activity.category ?? null,
                 criterion: activity.criterion ?? null,
                 rationale: activity.rationale ?? null,

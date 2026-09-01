@@ -34,7 +34,7 @@ export function registerWindowsRunnerRoutes(app: FastifyInstance, repository: Fo
   app.post('/api/windows-runner/device/session', { preHandler: runnerAuth(credentials) }, async (request) => {
     const principal = runnerPrincipal(request); const input = session.parse(request.body);
     const sessionId = await workers.startManualSession(principal.deviceId, new Date(Date.now() + input.expiresInMinutes * 60_000));
-    await repository.writeAudit({ actorType: 'worker', actorId: principal.deviceId, eventType: 'windows_runner_session_started', payload: { deviceId: principal.deviceId, sessionId } });
+    await repository.writeAudit({ actorType: 'system', actorId: principal.deviceId, eventType: 'windows_runner_session_started', payload: { deviceId: principal.deviceId, sessionId } });
     return { sessionId };
   });
   app.post('/api/windows-runner/device/heartbeat', { preHandler: runnerAuth(credentials) }, async (request, reply) => {
@@ -51,7 +51,7 @@ export function registerWindowsRunnerRoutes(app: FastifyInstance, repository: Fo
     if (!isWindowsExecutionResult(request.body) || request.body.deviceId !== principal.deviceId) return reply.code(400).send({ error: 'Invalid execution result.' });
     const accepted = await workers.submitResult(principal.deviceId, request.body);
     if (!accepted) return reply.code(409).send({ error: 'Execution lease is not active for this device.' });
-    await repository.writeAudit({ actorType: 'worker', actorId: principal.deviceId, eventType: 'windows_runner_result_submitted', taskId: request.body.taskId, projectId: request.body.projectId, payload: { deviceId: principal.deviceId, jobId: request.body.jobId, leaseId: request.body.leaseId, status: request.body.status, commitSha: request.body.commitSha } });
+    await repository.writeAudit({ actorType: 'system', actorId: principal.deviceId, eventType: 'windows_runner_result_submitted', taskId: request.body.taskId, projectId: request.body.projectId, payload: { deviceId: principal.deviceId, jobId: request.body.jobId, leaseId: request.body.leaseId, status: request.body.status, commitSha: request.body.commitSha } });
     return { accepted: true };
   });
 }
