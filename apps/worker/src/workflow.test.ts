@@ -185,6 +185,16 @@ function createGitHubStub(overrides: Partial<GitHubAdapter> = {}): GitHubAdapter
   };
 }
 
+async function initializeCommittedWorkspace(workspaceRoot: string, taskId: string): Promise<void> {
+  const workspacePath = join(workspaceRoot, taskId);
+  await mkdir(workspacePath, { recursive: true });
+  const git = simpleGit({ baseDir: workspacePath });
+  await git.init();
+  await git.addConfig('user.name', 'ForgeMind Worker Test');
+  await git.addConfig('user.email', 'worker@example.test');
+  await git.raw(['commit', '--allow-empty', '-m', 'Initial validation baseline']);
+}
+
 describe('worker workflow', () => {
   it('uses task-specific validation without a configured command baseline', async () => {
     const workspaceRoot = join(tmpdir(), `forgemind-worker-task-validation-${randomUUID()}`);
@@ -1399,6 +1409,7 @@ describe('worker workflow', () => {
   it('keeps an authoritative resume validation plan and adds checks from a correction implementation', async () => {
     const workspaceRoot = join(tmpdir(), `forgemind-worker-correction-authoritative-validation-${randomUUID()}`);
     const task = { ...demoTask, id: `task_${randomUUID()}` };
+    await initializeCommittedWorkspace(workspaceRoot, task.id);
     const mergePullRequest = vi.fn(async () => ({
       merged: true,
       sha: 'merge-sha',
@@ -2518,6 +2529,8 @@ describe('worker workflow', () => {
 
   it('defers an artifact consumer when its platform-specific producer was deferred', async () => {
     const workspaceRoot = join(tmpdir(), `forgemind-worker-deferred-artifact-${randomUUID()}`);
+    const task = { ...demoTask, id: `task_${randomUUID()}` };
+    await initializeCommittedWorkspace(workspaceRoot, task.id);
     const projectWithoutVerify = {
       ...demoProject,
       configYaml: noGitProjectConfig.replace('commands:\n  verify: "node --version"\n', 'commands: {}\n')
@@ -2570,7 +2583,7 @@ describe('worker workflow', () => {
 
     const result = await runWorkerTask({
       project: projectWithoutVerify,
-      task: { ...demoTask, id: `task_${randomUUID()}` },
+      task,
       provider,
       workspaceRoot
     });
