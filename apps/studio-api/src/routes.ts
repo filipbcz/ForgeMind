@@ -1688,6 +1688,7 @@ function isProtectedApiRequest(request: FastifyRequest): boolean {
     && path !== '/api/auth/google/callback'
     && path !== '/api/webhooks/github'
     && path !== '/api/windows-runner/enroll'
+    && path !== '/api/windows-runner/device'
     && !path.startsWith('/api/windows-runner/device/');
 }
 

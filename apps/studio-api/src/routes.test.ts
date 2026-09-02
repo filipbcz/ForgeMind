@@ -236,6 +236,30 @@ describe('Studio API routes', () => {
     await app.close();
   });
 
+  it('routes the exact Windows device endpoint through runner authentication instead of Google authentication', async () => {
+    const credentials = { authenticate: vi.fn(async () => undefined) };
+    const app = Fastify();
+    registerRoutes(
+      app,
+      { getCurrentUser: vi.fn() } as never,
+      undefined,
+      createAuthService(),
+      { credentials: credentials as never, workers: {} as never }
+    );
+
+    const response = await app.inject({
+      method: 'PUT',
+      url: '/api/windows-runner/device',
+      headers: { authorization: 'Bearer runner-token' },
+      payload: {}
+    });
+
+    expect(response.statusCode).toBe(403);
+    expect(response.json()).toEqual({ error: 'Runner credential is invalid or revoked.' });
+    expect(credentials.authenticate).toHaveBeenCalledWith('runner-token');
+    await app.close();
+  });
+
   it('allows an authenticated owner to execute an explicit risky mutation directly', async () => {
     const auth = createAuthService();
     const repository = {
