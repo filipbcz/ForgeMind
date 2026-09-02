@@ -8,26 +8,19 @@ export type TaskStatus =
   | 'draft'
   | 'submitted'
   | 'planning'
-  | 'waiting_for_plan_approval'
   | 'creating_github_issue'
   | 'creating_branch'
   | 'running_ai'
   | 'validating'
   | 'reviewing'
   | 'improving'
-  | 'needs_approval'
   | 'creating_pr'
   | 'ready_for_user_review'
   | 'completed'
   | 'failed'
   | 'cancelled'
-  | 'budget_exceeded'
-  | 'iteration_limit_reached'
-  | 'repeated_error_detected'
-  | 'approval_rejected'
   | 'provider_failed'
-  | 'validation_failed'
-  | 'waiting_for_capability';
+  | 'validation_failed';
 
 export type RunStatus =
   | 'queued'
@@ -42,18 +35,11 @@ export type RunStatus =
 export type RunWaitingReason =
   | 'inactive_worker'
   | 'paused_queue'
-  | 'unavailable_capability'
-  | 'approval_required'
   | 'retry_backoff';
 
 export type RunBlockedReason =
   | 'validation_failed'
   | 'provider_failed'
-  | 'approval_rejected'
-  | 'budget_exceeded'
-  | 'iteration_limit_reached'
-  | 'repeated_error_detected'
-  | 'worker_limit'
   | 'manual_review_required'
   | 'unknown';
 
@@ -69,7 +55,6 @@ export interface WaitingRunState {
   status: 'waiting';
   reason: RunWaitingReason;
   detail?: string;
-  requiredCapabilities?: string[];
   nextAttemptAt?: IsoDateString;
 }
 
@@ -116,14 +101,13 @@ export function createRunningRunState(detail?: string): RunningRunState {
 
 export function createWaitingRunState(
   reason: RunWaitingReason,
-  input: { detail?: string; requiredCapabilities?: string[]; nextAttemptAt?: IsoDateString } = {}
+  input: { detail?: string; nextAttemptAt?: IsoDateString } = {}
 ): WaitingRunState {
   return {
     version: 1,
     status: 'waiting',
     reason,
     ...(input.detail ? { detail: input.detail } : {}),
-    ...(input.requiredCapabilities?.length ? { requiredCapabilities: input.requiredCapabilities } : {}),
     ...(input.nextAttemptAt ? { nextAttemptAt: input.nextAttemptAt } : {})
   };
 }
@@ -161,7 +145,6 @@ export function createFailedRunState(reason?: RunBlockedReason, detail?: string)
 export function normalizeRunState(status: RunStatus, input: {
   reason?: RunWaitingReason | RunBlockedReason;
   detail?: string;
-  requiredCapabilities?: string[];
   nextAttemptAt?: IsoDateString;
 } = {}): TaskRunState {
   if (status === 'running') return createRunningRunState(input.detail);
@@ -188,9 +171,6 @@ export function parseTaskRunState(value: JsonValue | undefined, fallback: TaskRu
     if (!isRunWaitingReason(record.reason)) return fallback;
     return createWaitingRunState(record.reason, {
       detail,
-      requiredCapabilities: Array.isArray(record.requiredCapabilities)
-        ? record.requiredCapabilities.filter((item): item is string => typeof item === 'string')
-        : undefined,
       nextAttemptAt: typeof record.nextAttemptAt === 'string' ? record.nextAttemptAt : undefined
     });
   }
@@ -223,11 +203,6 @@ export function getRunStateDetail(state: TaskRunState): string | undefined {
   if (state.status === 'waiting') {
     if (state.reason === 'inactive_worker') return 'Waiting for an active worker.';
     if (state.reason === 'paused_queue') return 'Waiting because the worker queue is paused.';
-    if (state.reason === 'unavailable_capability') {
-      const suffix = state.requiredCapabilities?.length ? `: ${state.requiredCapabilities.join(', ')}` : '.';
-      return `Waiting for unavailable capability${suffix}`;
-    }
-    if (state.reason === 'approval_required') return 'Waiting for approval.';
     return 'Waiting for retry backoff.';
   }
   if (state.status === 'retry_scheduled') return 'Retry is scheduled after backoff.';
@@ -240,19 +215,12 @@ export function getRunStateDetail(state: TaskRunState): string | undefined {
 function isRunWaitingReason(value: unknown): value is RunWaitingReason {
   return value === 'inactive_worker'
     || value === 'paused_queue'
-    || value === 'unavailable_capability'
-    || value === 'approval_required'
     || value === 'retry_backoff';
 }
 
 function isRunBlockedReason(value: unknown): value is RunBlockedReason {
   return value === 'validation_failed'
     || value === 'provider_failed'
-    || value === 'approval_rejected'
-    || value === 'budget_exceeded'
-    || value === 'iteration_limit_reached'
-    || value === 'repeated_error_detected'
-    || value === 'worker_limit'
     || value === 'manual_review_required'
     || value === 'unknown';
 }
@@ -262,7 +230,6 @@ export type IterationPhase =
   | 'implementation'
   | 'validation'
   | 'review'
-  | 'approval'
   | 'pr_creation';
 
 export type TaskActivityPhase =
@@ -289,37 +256,6 @@ export interface TaskActivity {
   metadata?: JsonValue;
 }
 
-export type ApprovalType =
-  | 'budget_increase'
-  | 'continue_after_iteration_limit'
-  | 'new_dependency'
-  | 'risky_refactor'
-  | 'database_migration'
-  | 'config_change'
-  | 'deploy_staging'
-  | 'deploy_production'
-  | 'merge_pr'
-  | 'delete_files'
-  | 'github_workflow_change'
-  | 'systemd_change'
-  | 'nginx_config_change'
-  | 'write_outside_repo';
-
-export type ApprovalStatus = 'pending' | 'approved' | 'rejected' | 'cancelled';
-
-export type RiskLevel = 'low' | 'medium' | 'high' | 'critical';
-
-export interface Limits {
-  maxIterations: number;
-  maxRuntimeMinutes: number;
-  maxChangedFiles: number;
-  maxDiffLines: number;
-  maxRepeatedErrorCount: number;
-  maxBudgetUsd?: number;
-  softBudgetThresholdPercent?: number;
-  hardBudgetThresholdPercent?: number;
-}
-
 export interface Project {
   id: string;
   name: string;
@@ -334,7 +270,6 @@ export interface Project {
   projectMemory?: ProjectMemory;
   projectArchitecture?: ProjectArchitecture;
   currentArchitectureVersionId?: string;
-  validationProfile?: ProjectValidationProfile;
   planningSessionId?: string;
   planningSessionProvider?: ProviderKind;
   planningSessionModel?: string;
@@ -343,7 +278,6 @@ export interface Project {
   autoCreatePullRequest?: boolean;
   autoMergePullRequest?: boolean;
   autoCompleteTask?: boolean;
-  allowSafeOperationsWithoutApproval?: boolean;
   defaultTaskMode?: TaskMode;
   aiProviderConnectionId?: string;
   isActive: boolean;
@@ -352,17 +286,6 @@ export interface Project {
 }
 
 export type ValidationCheckCategory = 'setup' | 'build' | 'database' | 'api' | 'browser' | 'smoke';
-
-export interface ProjectValidationProfile {
-  version: 1;
-  enabled: boolean;
-  dockerComposeFiles: string[];
-  dockerComposeServices: string[];
-  requiredEnvironmentVariables: string[];
-  migrationCommands: string[];
-  readinessCommands: string[];
-  commandTimeoutMinutes: number;
-}
 
 export type TaskCheckpointStatus = 'started' | 'completed' | 'failed';
 
@@ -431,7 +354,6 @@ export interface ProjectArchitecture {
   conventions: string[];
   dependencyRules: string[];
   knownDebt: string[];
-  validationCommands: string[];
   updatedAt: IsoDateString;
 }
 
@@ -444,7 +366,6 @@ export interface ProjectArchitectureUpdate {
   dependencyRules?: string[];
   knownDebt?: string[];
   resolvedDebt?: string[];
-  validationCommands?: string[];
 }
 
 export type ProjectArchitectureVersionSource =
@@ -611,7 +532,7 @@ export type ProjectRoadmapCycleStatus =
   | 'verifying'
   | 'partial'
   | 'blocked'
-  | 'awaiting_extension_approval'
+  | 'awaiting_extension_decision'
   | 'completed';
 
 export type ProjectAuditJobStatus = 'pending' | 'claimed' | 'succeeded' | 'blocked' | 'failed';
@@ -632,7 +553,7 @@ export interface ProjectAuditJob {
   finishedAt?: IsoDateString;
 }
 
-export type ProjectImplementationStepStatus = 'pending' | 'running' | 'waiting_for_capability' | 'completed' | 'cancelled';
+export type ProjectImplementationStepStatus = 'pending' | 'running' | 'completed' | 'cancelled';
 
 export interface ProjectRoadmapCycle {
   id: string;
@@ -698,7 +619,6 @@ export interface ForgeTask {
   prompt: string;
   mode: TaskMode;
   status: TaskStatus;
-  waitingForCapabilities?: string[];
   deferredValidationCapabilities?: string[];
   githubIssueNumber?: number;
   githubIssueUrl?: string;
@@ -711,8 +631,6 @@ export interface ForgeTask {
   providerSessionModel?: string;
   providerSessionConnectionId?: string;
   providerSessionUpdatedAt?: IsoDateString;
-  maxIterations: number;
-  maxBudgetUsd: number;
   createdAt: IsoDateString;
   updatedAt: IsoDateString;
   startedAt?: IsoDateString;
@@ -753,21 +671,6 @@ export interface TaskIteration {
   createdAt: IsoDateString;
 }
 
-export interface Approval {
-  id: string;
-  taskId: string;
-  type: ApprovalType;
-  status: ApprovalStatus;
-  requestedBy: 'system' | 'agent' | 'user';
-  approvedByUserId?: string;
-  title: string;
-  description: string;
-  riskLevel: RiskLevel;
-  payload: JsonValue;
-  createdAt: IsoDateString;
-  resolvedAt?: IsoDateString;
-}
-
 export interface AuditEvent {
   id: string;
   actorType: 'user' | 'agent' | 'system' | 'github';
@@ -782,7 +685,7 @@ export interface AuditEvent {
 }
 
 export type ChatThreadStatus = 'active' | 'archived';
-export type ChatRunStatus = 'queued' | 'running' | 'waiting_for_approval' | 'succeeded' | 'failed' | 'cancelled' | 'interrupted';
+export type ChatRunStatus = 'queued' | 'running' | 'succeeded' | 'failed' | 'cancelled' | 'interrupted';
 export type ChatMessageRole = 'user' | 'assistant' | 'system';
 
 export interface ChatThread {
@@ -844,22 +747,6 @@ export interface ChatRun {
   finishedAt?: IsoDateString;
   createdAt: IsoDateString;
   updatedAt: IsoDateString;
-}
-
-export interface ChatApproval {
-  id: string;
-  threadId: string;
-  runId: string;
-  type: ApprovalType;
-  status: ApprovalStatus;
-  requestedBy: 'agent' | 'system';
-  approvedByUserId?: string;
-  title: string;
-  description: string;
-  riskLevel: RiskLevel;
-  payload: JsonValue;
-  createdAt: IsoDateString;
-  resolvedAt?: IsoDateString;
 }
 
 export interface DiagnosticCorrelation {

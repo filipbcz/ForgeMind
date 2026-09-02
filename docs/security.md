@@ -7,11 +7,11 @@ Statusy v tomto dokumentu maji stejny vyznam jako v `docs/readme-parity.md`: `im
 ## 1) Security baseline (plati vzdy)
 
 1. Worker nesmi bezet jako root a nesmi pouzivat sudo.
-2. Automaticky deploy do produkce a automaticky merge do main jsou mimo scope MVP.
-3. Rizikove zmeny musi byt zastaveny do stavu needs_approval.
-4. Secrets nesmi byt zapisovany do promptu, logu, issue, PR ani audit payloadu.
-5. Kazdy task musi mit provozni limity: iterace, runtime, diff, pocet souboru a opakovane chyby.
-6. Worker smi zapisovat pouze do vyhrazenych workspace cest.
+2. Runtime approval gate se nepouziva; vsechny ForgeMind API operace ale vyzaduji autentizaci a autorizaci.
+3. Secrets nesmi byt zapisovany do promptu, logu, issue, PR ani audit payloadu.
+4. AI navrzene prikazy worker obsahove nefiltruje. Jejich opravneni vymezuje provozni ucet, kontejner a hostitel.
+5. Kazdy task musi byt auditovatelny a obnovitelny z phase checkpointu.
+6. Worker workspace a persistentni runtime data musi mit dedikovane provozni cesty.
 
 ## 2) Security status a evidence
 
@@ -19,7 +19,7 @@ Statusy v tomto dokumentu maji stejny vyznam jako v `docs/readme-parity.md`: `im
 | --- | --- | --- |
 | Worker service identity and systemd sandboxing profile | `implemented` | `infra/systemd/forgemind-worker.service`; `docs/deploy-oci.md`; `docs/deploy-raspberry.md` |
 | PostgreSQL queue claim/recovery/retry semantika | `implemented`, `tested` | `packages/db/src/repository.ts`; `packages/db/src/repository.task-run.test.ts`; `apps/worker/src/db-worker.test.ts` |
-| Worker policy: repeated error, max iterations, provider failure, approval stop | `implemented`, `tested` | `apps/worker/src/db-worker.ts`; `apps/worker/src/workflow.ts`; `apps/worker/src/db-worker.test.ts`; `apps/worker/src/workflow.test.ts` |
+| Worker feedback loop, phase retry a provider failure handling | `implemented`, `tested` | `apps/worker/src/db-worker.ts`; `apps/worker/src/workflow.ts`; `apps/worker/src/db-worker.test.ts`; `apps/worker/src/workflow.test.ts` |
 | GitHub webhook `x-hub-signature-256` verification | `implemented`, `tested` | `apps/studio-api/src/webhook.ts`; `apps/studio-api/src/webhook.test.ts`; `apps/studio-api/src/routes.test.ts` |
 | Persistent GitHub credential encryption | `implemented`, `tested` | `packages/db/src/credentials.ts`; `packages/db/src/repository.ts`; `apps/studio-api/src/routes.ts`; `apps/studio-api/src/routes.test.ts` |
 | Windows runner enrollment auth, manual session a outbound-only API transport | `implemented`, `tested` | `packages/db/src/windows-runner-credentials.ts`; `apps/studio-api/src/routes/windows-runner-routes.ts`; `apps/windows-runner/src/transport.ts`; `packages/db/src/windows-runner-credentials.test.ts`; `apps/studio-api/src/routes/windows-runner-routes.integration.test.ts` |
@@ -55,18 +55,14 @@ Statusy v tomto dokumentu maji stejny vyznam jako v `docs/readme-parity.md`: `im
 4. Retention policy (MVP doporuceni):
 - failed runs: uchovat 14 dni
 - succeeded runs: uchovat 7 dni
-- approvals/audit: uchovat 90 dni
+- audit a historicke approval zaznamy: uchovat 90 dni
 
-## 5) Validation command sandbox
+## 5) Validation command execution
 
-1. Validation command nesmi byt libovolny shell text bez kontroly.
-2. Allowlist politika prikazu z projektove konfigurace je `deferred`; aktualni implementace ma konzervativni guard pro vybrane zakazane patterns a workspace scope.
-3. Zakazane command patterns:
-- sudo
-- rm -rf /
-- curl|bash vzdalenych skriptu
-- write operace mimo repo/workspace
-4. Pri poruseni pravidla musi worker skoncit ve failed/provider_failed podle typu chyby a zapsat audit event.
+1. Autoritativni prikazy vraci pouze implementacni AI po provedeni zmen.
+2. Worker nepouziva allowlist, pattern guard, network guard ani workspace-path filtr prikazu.
+3. Bezpecnostni hranici poskytuje neprivilegovany ucet, kontejner/systemd profil, opravneni souboroveho systemu a scopes ulozenych integraci.
+4. Toto rozdeleni je zamerne: orchestrace nesmi menit vyznam AI validace, provoz ji ale nesmi spoustet jako root ani s nepotrebnymi secrets.
 
 ## 6) systemd hardening profil
 
@@ -116,4 +112,4 @@ Doporucene doplneni pred produkci:
 Krok je povazovan za hotovy, pokud:
 1. Tento dokument odpovida aktualnimu runtime chovani API a workeru.
 2. Je zde jasne oddeleno co je `implemented`, `tested`, `production-verified` a `deferred`.
-3. Systemd, secrets, sandbox a retention maji konkretni provozni pravidla.
+3. Systemd, secrets, neprivilegovane vykonavani a retention maji konkretni provozni pravidla.

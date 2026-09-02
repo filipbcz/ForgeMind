@@ -40,16 +40,16 @@ describe('Windows runner real transport and persistence flow', () => {
     if (adminConnected) { await admin.query(`DROP SCHEMA IF EXISTS ${quote(schema)} CASCADE`); await admin.end(); }
   }, 60_000);
 
-  it('enrolls, requires a manual session, leases, heartbeats, reconciles evidence, and resumes once', async () => {
+  it('enrolls, requires a manual session, leases, heartbeats, and reconciles evidence without restarting the task', async () => {
     const ids = {
       user: '11111111-1111-4111-8111-111111111111', project: '22222222-2222-4222-8222-222222222222',
       task: '33333333-3333-4333-8333-333333333333', run: '44444444-4444-4444-8444-444444444444',
       device: '55555555-5555-4555-8555-555555555555', job: '66666666-6666-4666-8666-666666666666'
     };
-    const commitSha = 'a'.repeat(64); const inputHash = 'b'.repeat(64); const checkId = 'validation:windows-fixture';
+    const commitSha = 'a'.repeat(40); const inputHash = 'b'.repeat(64); const checkId = 'validation:windows-fixture';
     await prisma.user.create({ data: { id: ids.user, email: 'fake-runner@invalid.local', name: 'Fake Runner' } });
     await prisma.project.create({ data: { id: ids.project, name: 'Fake Runner', slug: `fake-runner-${process.pid}` } });
-    await prisma.task.create({ data: { id: ids.task, projectId: ids.project, createdByUserId: ids.user, title: 'Fixture', prompt: 'Fixture', status: 'waiting_for_capability', waitingForCapabilities: ['windows'] } });
+    await prisma.task.create({ data: { id: ids.task, projectId: ids.project, createdByUserId: ids.user, title: 'Fixture', prompt: 'Fixture', status: 'completed' } });
     await prisma.taskRun.create({ data: { id: ids.run, taskId: ids.task, provider: 'codex', model: 'test', status: 'succeeded' } });
     await prisma.taskCheckpoint.create({ data: { taskId: ids.task, taskRunId: ids.run, key: checkId, phase: 'validation', status: 'completed', inputHash,
       outputJson: { evidenceVersion: 1, deferred: true, command: 'fixture.exe --validate', commitSha } } });
@@ -62,8 +62,7 @@ describe('Windows runner real transport and persistence flow', () => {
       schemaVersion: 1, projectId: ids.project, taskId: ids.task, runId: ids.run, checkId, jobId: ids.job, leaseId: 'pending', repository: 'owner/repo',
       sourceUrl: 'https://example.test/owner/repo.git', commitSha, workspaceRoot: 'C:\\fixture', artifactRoot: 'C:\\fixture\\artifacts',
       check: { command: 'fixture.exe --validate', category: 'smoke', requiredCapabilities: ['windows'] }, requiredCapabilities: ['windows'],
-      resourcePolicy: { timeoutSeconds: 30, maxLogBytes: 1024, maxArtifactBytes: 1024 }, expectedArtifacts: [], nonce: 'pending', inputHash,
-      executionAdapter: { kind: 'fixture', profileId: 'fixture-validation-v1' }
+      resourcePolicy: { timeoutSeconds: 30, maxLogBytes: 1024, maxArtifactBytes: 1024 }, expectedArtifacts: [], nonce: 'pending', inputHash
     } });
 
     const app = Fastify();
@@ -88,8 +87,7 @@ describe('Windows runner real transport and persistence flow', () => {
     expect((await app.inject({ method: 'POST', url: '/api/windows-runner/device/result', headers, payload: result })).statusCode).toBe(409);
 
     expect(await prisma.windowsExecutionJob.findUniqueOrThrow({ where: { id: ids.job } })).toMatchObject({ status: 'succeeded' });
-    expect(await prisma.task.findUniqueOrThrow({ where: { id: ids.task } })).toMatchObject({ status: 'submitted' });
-    expect(await prisma.taskQueueJob.count({ where: { taskId: ids.task, reason: 'windows_validation_completed' } })).toBe(1);
-    expect((await prisma.taskCheckpoint.findUniqueOrThrow({ where: { taskId_key: { taskId: ids.task, key: checkId } } })).outputJson).toMatchObject({ deferred: false, commitSha, inputHash, passed: true });
+    expect(await prisma.task.findUniqueOrThrow({ where: { id: ids.task } })).toMatchObject({ status: 'completed' });
+    expect(await prisma.taskQueueJob.count({ where: { taskId: ids.task } })).toBe(0);
   }, 30_000);
 });

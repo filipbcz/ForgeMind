@@ -29,9 +29,9 @@ describe('validation runner', () => {
     expect(context).toContain('Exit code: 2');
   });
 
-  it('installs development dependencies for npm ci validation', () => {
-    expect(normalizeValidationCommandForEnvironment('npm ci')).toBe('npm ci --include=dev');
-    expect(normalizeValidationCommandForEnvironment('npm ci && npm test')).toBe('npm ci --include=dev && npm test');
+  it('preserves validation commands proposed by AI', () => {
+    expect(normalizeValidationCommandForEnvironment('npm ci')).toBe('npm ci');
+    expect(normalizeValidationCommandForEnvironment('npm ci && npm test')).toBe('npm ci && npm test');
     expect(normalizeValidationCommandForEnvironment('npm ci --include=dev')).toBe('npm ci --include=dev');
     expect(normalizeValidationCommandForEnvironment('npm ci --omit=dev')).toBe('npm ci --omit=dev');
     expect(normalizeValidationCommandForEnvironment('npm ci --production')).toBe('npm ci --production');
@@ -74,7 +74,6 @@ describe('validation runner', () => {
       undefined,
       10,
       controller.signal,
-      undefined,
       (termination) => {
         terminations.push(termination);
       }
@@ -109,100 +108,23 @@ describe('validation runner', () => {
     }));
   });
 
-  it('rejects validation command paths that traverse workspace symlinks outside the workspace', async () => {
+  it('executes AI commands even when a legacy filesystem policy would have rejected their paths', async () => {
     const workspacePath = await mkdtemp(join(tmpdir(), 'forgemind-validation-workspace-'));
     const outsidePath = await mkdtemp(join(tmpdir(), 'forgemind-validation-outside-'));
     await writeFile(join(outsidePath, 'secret.txt'), 'secret\n', 'utf8');
     await symlink(outsidePath, join(workspacePath, 'outside-link'), process.platform === 'win32' ? 'junction' : 'dir');
 
     const result = await runValidationChecks(
-      [{ kind: 'command', command: 'cat outside-link/secret.txt' }],
+      [{ kind: 'command', command: `node -e "process.stdout.write(require('node:fs').readFileSync('outside-link/secret.txt','utf8'))"` }],
       workspacePath,
       undefined,
       new Map(),
       undefined,
-      undefined,
-      undefined,
-      { workspacePath, forbiddenPaths: [] }
+      undefined
     );
 
-    expect(result.passed).toBe(false);
-    expect(result.stderr).toContain('filesystem isolation policy');
-    expect(result.stderr).toContain('outside_workspace');
-  });
-
-  it('rejects validation command access to the Docker socket', async () => {
-    const workspacePath = await mkdtemp(join(tmpdir(), 'forgemind-validation-docker-'));
-
-    const result = await runValidationChecks(
-      [{ kind: 'command', command: 'cat /var/run/docker.sock' }],
-      workspacePath,
-      undefined,
-      new Map(),
-      undefined,
-      undefined,
-      undefined,
-      { workspacePath, forbiddenPaths: [] }
-    );
-
-    expect(result.passed).toBe(false);
-    expect(result.stderr).toContain('filesystem isolation policy');
-    expect(result.stderr).toContain('/var/run/docker.sock');
-  });
-
-  it('rejects validation command access to configured secret paths', async () => {
-    const workspacePath = await mkdtemp(join(tmpdir(), 'forgemind-validation-secret-'));
-    await mkdir(join(workspacePath, '.secrets'));
-    await writeFile(join(workspacePath, '.secrets', 'token'), 'secret\n', 'utf8');
-    await writeFile(join(workspacePath, '.env'), 'TOKEN=secret\n', 'utf8');
-
-    const result = await runValidationChecks(
-      [
-        { kind: 'command', command: 'cat .secrets/token' },
-        { kind: 'command', command: 'cat .env' }
-      ],
-      workspacePath,
-      undefined,
-      new Map(),
-      undefined,
-      undefined,
-      undefined,
-      { workspacePath, forbiddenPaths: ['.secrets'] }
-    );
-
-    expect(result.passed).toBe(false);
-    expect(result.stderr).toContain('filesystem isolation policy');
-    expect(result.stderr).toContain('forbidden_path');
-
-    const bareSecretsResult = await runValidationChecks(
-      [{ kind: 'command', command: 'ls .secrets' }],
-      workspacePath,
-      undefined,
-      new Map(),
-      undefined,
-      undefined,
-      undefined,
-      { workspacePath, forbiddenPaths: ['.secrets'] }
-    );
-
-    expect(bareSecretsResult.passed).toBe(false);
-    expect(bareSecretsResult.stderr).toContain('filesystem isolation policy');
-    expect(bareSecretsResult.stderr).toContain('forbidden_path');
-
-    const dotEnvResult = await runValidationChecks(
-      [{ kind: 'command', command: 'cat .env' }],
-      workspacePath,
-      undefined,
-      new Map(),
-      undefined,
-      undefined,
-      undefined,
-      { workspacePath, forbiddenPaths: ['.env'] }
-    );
-
-    expect(dotEnvResult.passed).toBe(false);
-    expect(dotEnvResult.stderr).toContain('filesystem isolation policy');
-    expect(dotEnvResult.stderr).toContain('forbidden_path');
+    expect(result.passed).toBe(true);
+    expect(result.stdout).toContain('secret');
   });
 
   it('isolates validation from control-plane secrets and permits explicit workspace overrides', async () => {
@@ -264,32 +186,24 @@ describe('validation runner', () => {
     expect(result.stdout).toContain('validation was skipped');
   });
 
-  it('defers checks that require unavailable worker capabilities while running portable checks', async () => {
+  it('executes platform-specific commands and reports the real process failure', async () => {
     const cwd = await mkdtemp(join(tmpdir(), 'forgemind-validation-capabilities-'));
     const activities: string[] = [];
     const result = await runValidationChecks([
       {
         kind: 'command',
         command: 'UnrealEditor.exe Flying.uproject -run=Automation',
-        criterion: 'Win64 Unreal shell starts.',
-        requiredCapabilities: ['windows', 'unreal-engine-5.8']
+        criterion: 'Win64 Unreal shell starts.'
       },
       { kind: 'command', command: 'node --version', criterion: 'Portable tooling is available.' }
     ], cwd, (activity) => {
       activities.push(activity.state);
-    }, new Map(), undefined, undefined, new Set(['linux']));
+    });
 
-    expect(result.passed).toBe(true);
+    expect(result.passed).toBe(false);
     expect(result.executedCheckCount).toBe(1);
-    expect(result.deferredChecks).toEqual([
-      expect.objectContaining({
-        criterion: 'Win64 Unreal shell starts.',
-        requiredCapabilities: ['windows', 'unreal-engine-5.8'],
-        missingCapabilities: ['windows', 'unreal-engine-5.8']
-      })
-    ]);
-    expect(activities).toContain('deferred');
-    expect(result.stdout).toContain('[missing-capabilities] windows, unreal-engine-5.8');
+    expect(activities).not.toContain('deferred');
+    expect(result.failingCommand).toContain('UnrealEditor.exe');
   });
 
   it('executes quoted inline JavaScript containing arrow functions', async () => {
@@ -407,28 +321,48 @@ describe('validation runner', () => {
     expect(await readFile(join(cwd, 'executed.txt'), 'utf8')).toBe('fresh');
   });
 
-  it('rejects shell output redirection outside quoted arguments', () => {
-    expect(() => assertAllowedValidationCommand('node --version > version.txt')).toThrow(
-      'Validation command is not allowed'
-    );
+  it('accepts shell composition and output redirection proposed by AI', () => {
+    expect(() => assertAllowedValidationCommand('node --version > version.txt && npm test')).not.toThrow();
   });
 
-  it('returns a rejected validation command as a recoverable failed check', async () => {
+  it('returns the complete process error as a recoverable failed check', async () => {
     const cwd = await mkdtemp(join(tmpdir(), 'forgemind-validation-policy-'));
-    const command = 'python3 -m json.tool schema.json >/dev/null';
+    const command = `node -e "console.error('EXACT_PROCESS_ERROR');process.exit(9)"`;
 
     const result = await runValidationChecks([{ kind: 'command', command }], cwd);
 
     expect(result.passed).toBe(false);
     expect(result.failingCommand).toBe(command);
-    expect(result.exitCode).toBe(1);
-    expect(result.stderr).toBe(`Validation command is not allowed: ${command}`);
+    expect(result.exitCode).toBe(9);
+    expect(result.stderr).toContain('EXACT_PROCESS_ERROR');
   });
 
-  it('rejects mutable operating-system package installation during validation', () => {
-    expect(() => assertAllowedValidationCommand('apt-get install -y cmake')).toThrow(
-      'Validation command is not allowed'
-    );
+  it('continues after a failed check only when AI requests complete feedback', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'forgemind-validation-feedback-'));
+    const result = await runValidationChecks([
+      {
+        kind: 'command',
+        command: `node -e "console.error('FIRST_FAILURE');process.exit(3)"`,
+        shell: 'system',
+        continueOnFailure: true
+      },
+      {
+        kind: 'command',
+        command: `node -e "console.log('SECOND_RESULT')"`,
+        shell: 'system',
+        continueOnFailure: false
+      }
+    ], cwd);
+
+    expect(result.passed).toBe(false);
+    expect(result.checkResults).toHaveLength(2);
+    expect(result.stdout).toContain('FIRST_FAILURE');
+    expect(result.stdout).toContain('SECOND_RESULT');
+  });
+
+  it('accepts dependency and operating-system installation commands proposed by AI', () => {
+    expect(() => assertAllowedValidationCommand('apt-get update && apt-get install -y cmake')).not.toThrow();
+    expect(() => assertAllowedValidationCommand('npm install')).not.toThrow();
   });
 
   it.runIf(process.platform === 'win32')('executes PowerShell-style command checks on Windows', async () => {
@@ -437,7 +371,12 @@ describe('validation runner', () => {
 
     const result = await runValidationCommand(
       "Test-Path .\\SANITY_CHECK.md; $text = (Get-Content -Raw .\\SANITY_CHECK.md).Trim(); (($text -split '(?<=[.!?])\\s+').Where({ $_.Trim().Length -gt 0 })).Count",
-      cwd
+      cwd,
+      undefined,
+      10,
+      undefined,
+      undefined,
+      'powershell'
     );
 
     expect(result.passed).toBe(true);
@@ -453,6 +392,7 @@ describe('validation runner', () => {
         {
           kind: 'command',
           command: "Test-Path .\\SANITY_CHECK.md; $text = (Get-Content -Raw .\\SANITY_CHECK.md).Trim(); (($text -split '(?<=[.!?])\\s+').Where({ $_.Trim().Length -gt 0 })).Count",
+          shell: 'powershell',
           criterion: 'Soubor existuje a ma dve vety.',
           rationale: 'Regression test for Windows validation shell selection.'
         }

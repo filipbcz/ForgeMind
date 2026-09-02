@@ -54,11 +54,15 @@ describe('WindowsRunnerCredentialAdapter', () => {
     const auditFailure = new Error('audit unavailable');
     const tx: any = {
       $executeRaw: vi.fn(async () => 1),
+      workerDevice: { upsert: vi.fn(async () => undefined) },
       auditLog: { create: vi.fn(async () => { throw auditFailure; }) }
     };
     const prisma = transactionalPrisma(tx);
     await expect(new WindowsRunnerCredentialAdapter(prisma).createEnrollment('device_1', new Date('2099-01-01T00:00:00Z'))).rejects.toBe(auditFailure);
     expect(tx.$executeRaw).toHaveBeenCalledTimes(1);
+    expect(tx.workerDevice.upsert).toHaveBeenCalledWith(expect.objectContaining({
+      where: { id: 'device_1' }, create: expect.objectContaining({ status: 'offline', runnerVersion: 'pending-enrollment' })
+    }));
     expect(prisma.$transaction).toHaveBeenCalledTimes(1);
   });
 

@@ -21,5 +21,5 @@ export * from './mappers.js';
 export * from './roadmap.js';
 export * from './repository.js';
 export * from './specification.js';
-export * from './windows-worker-repository.js';
 export * from './windows-runner-credentials.js';
+export * from './windows-worker-repository.js';

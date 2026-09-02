@@ -20,29 +20,18 @@ import type { AuthService } from './auth.js';
 import { completeCodexOAuthBrowserLogin, readCodexOAuthBrowserLoginStatus, readCodexOAuthStatus, resolveCodexHome, startCodexOAuthBrowserLogin } from './codex-oauth.js';
 import { createTaskDispatchService } from './dispatch.js';
 import { sendBadRequest, sendNotFound } from './http.js';
-import { advanceRoadmapAfterTaskCapabilityWait, advanceRoadmapAfterTaskCompletion, buildRoadmapStepTaskPrompt, composeApprovedExtensionSpecification, startNextRoadmapStep } from '@forgemind/db';
+import { advanceRoadmapAfterTaskCompletion, buildRoadmapStepTaskPrompt, composeApprovedExtensionSpecification, startNextRoadmapStep } from '@forgemind/db';
 import type { AIProviderConnectionKind, AIProviderConnectionSecret, ForgeMindRepository, WindowsRunnerCredentialAdapter, WindowsWorkerRepository } from '@forgemind/db';
 import { parseGitHubWebhookPayload, projectGitHubWebhookEvent, verifyGitHubWebhookSignature } from './webhook.js';
 import type { NotificationService } from './notifications.js';
-import { ROADMAP_GENERATION_CONFIRMATION, activeProjectContractRequirements, applyProjectContractDelta, buildSpecificationChangeImpactReview, hasCompleteCurrentQualificationEvidence, redactSecrets } from '@forgemind/core';
-import type { ApprovalType, ProviderConnectionRuntimeStatus } from '@forgemind/core';
+import { ROADMAP_GENERATION_CONFIRMATION, activeProjectContractRequirements, applyProjectContractDelta, buildSpecificationChangeImpactReview, redactSecrets } from '@forgemind/core';
+import type { ProviderConnectionRuntimeStatus } from '@forgemind/core';
 import type { Project, ProjectArchitectureUpdate, ProjectContract, ProjectContractDelta, TaskMode } from '@forgemind/core';
 import { readSessionId, registerAuthRoutes } from './routes/auth-routes.js';
 import { registerNotificationRoutes } from './routes/notification-routes.js';
 import { registerChatRoutes } from './routes/chat-routes.js';
 import { registerWorkerRoutes } from './routes/worker-routes.js';
 import { registerWindowsRunnerRoutes } from './routes/windows-runner-routes.js';
-
-const validationProfileSchema = z.object({
-  version: z.literal(1).default(1),
-  enabled: z.boolean().default(false),
-  dockerComposeFiles: z.array(z.string().trim().min(1)).max(8).default([]),
-  dockerComposeServices: z.array(z.string().trim().min(1)).max(32).default([]),
-  requiredEnvironmentVariables: z.array(z.string().trim().regex(/^[A-Z_][A-Z0-9_]*$/)).max(32).default([]),
-  migrationCommands: z.array(z.string().trim().min(1)).max(16).default([]),
-  readinessCommands: z.array(z.string().trim().min(1)).max(16).default([]),
-  commandTimeoutMinutes: z.number().int().min(1).max(60).default(10)
-});
 
 const projectSchema = z.object({
   name: z.string().min(2),
@@ -52,11 +41,9 @@ const projectSchema = z.object({
   defaultBranch: z.string().min(1).default('main'),
   configYaml: z.string().optional(),
   brief: z.string().min(20).optional(),
-  validationProfile: validationProfileSchema.optional(),
   autoCreatePullRequest: z.boolean().optional().default(true),
   autoMergePullRequest: z.boolean().optional().default(false),
   autoCompleteTask: z.boolean().optional().default(false),
-  allowSafeOperationsWithoutApproval: z.boolean().optional().default(false),
   defaultTaskMode: z.enum(['safe', 'auto', 'full_auto']).optional().default('safe'),
   aiProviderConnectionId: z.string().min(1).nullable().optional(),
   repositoryMode: z.enum(['existing', 'create']).optional().default('existing'),
@@ -64,7 +51,7 @@ const projectSchema = z.object({
   branchName: z.string().min(1).optional(),
   repositoryPrivate: z.boolean().optional().default(true),
   repositoryDescription: z.string().max(280).optional()
-});
+}).strict();
 
 const updateProjectSchema = projectSchema.partial().extend({
   brief: z.string().trim().min(20).nullable().optional(),
@@ -72,14 +59,12 @@ const updateProjectSchema = projectSchema.partial().extend({
     baseSpecificationVersion: z.number().int().positive().optional(),
     baseSpecificationHash: z.string().trim().min(1).optional()
   }).optional(),
-  validationProfile: validationProfileSchema.nullable().optional(),
   autoCreatePullRequest: z.boolean().optional(),
   autoMergePullRequest: z.boolean().optional(),
   autoCompleteTask: z.boolean().optional(),
-  allowSafeOperationsWithoutApproval: z.boolean().optional(),
   defaultTaskMode: z.enum(['safe', 'auto', 'full_auto']).optional(),
   isActive: z.boolean().optional()
-});
+}).strict();
 
 const specificationReviewSchema = z.object({
   brief: z.string().trim().min(20).nullable()
@@ -102,9 +87,7 @@ const createTaskSchema = z.object({
   scopeFiles: z.array(z.string().min(1)).max(50).optional().default([]),
   acceptanceCriteria: z.array(z.string().min(1)).max(30).optional().default([]),
   runtimeSummary: z.string().max(500).optional(),
-  mode: z.enum(['safe', 'auto', 'full_auto']).optional(),
-  maxIterations: z.number().int().min(1).max(50).default(10),
-  maxBudgetUsd: z.number().min(0).max(100).default(2)
+  mode: z.enum(['safe', 'auto', 'full_auto']).optional()
 });
 
 const idParamsSchema = z.object({
@@ -220,11 +203,10 @@ const architectureUpdatePlanSchema = z.object({
   dependencyRules: z.array(z.string().trim().min(1)),
   knownDebt: z.array(z.string().trim().min(1)),
   resolvedDebt: z.array(z.string().trim().min(1)),
-  validationCommands: z.array(z.string().trim().min(1))
 });
 
-const roadmapExtensionApprovalSchema = z.object({
-  approved: z.boolean(),
+const roadmapExtensionDecisionSchema = z.object({
+  accepted: z.boolean(),
   cycleId: z.string().min(1).optional(),
   objectiveOverride: z.string().min(20).optional()
 });
@@ -311,7 +293,13 @@ const githubBranchesQuerySchema = z.object({
   limit: z.coerce.number().int().min(1).max(200).optional().default(100)
 });
 
-export function registerRoutes(app: FastifyInstance, repository: ForgeMindRepository, notifications?: NotificationService, auth?: AuthService, windowsRunner?: { credentials: WindowsRunnerCredentialAdapter; workers: WindowsWorkerRepository }) {
+export function registerRoutes(
+  app: FastifyInstance,
+  repository: ForgeMindRepository,
+  notifications?: NotificationService,
+  auth?: AuthService,
+  windowsRunner?: { credentials: WindowsRunnerCredentialAdapter; workers: WindowsWorkerRepository }
+) {
   const dispatcher = createTaskDispatchService(repository);
   const processedWebhookDeliveries = new Set<string>();
 
@@ -893,11 +881,9 @@ export function registerRoutes(app: FastifyInstance, repository: ForgeMindReposi
           defaultBranch: githubRepository?.defaultBranch ?? input.defaultBranch,
           configYaml: input.configYaml,
           brief: input.brief,
-          validationProfile: input.validationProfile,
           autoCreatePullRequest: input.autoCreatePullRequest,
           autoMergePullRequest: input.autoMergePullRequest,
           autoCompleteTask: input.autoCompleteTask,
-          allowSafeOperationsWithoutApproval: input.allowSafeOperationsWithoutApproval,
           defaultTaskMode: input.defaultTaskMode,
           aiProviderConnectionId: input.aiProviderConnectionId
         })
@@ -1159,30 +1145,14 @@ export function registerRoutes(app: FastifyInstance, repository: ForgeMindReposi
       if (!project.projectContract) {
         return reply.code(409).send({ error: 'A project contract is required before the final audit can start.' });
       }
-      const projectContract = project.projectContract;
       const cycle = [...roadmap.cycles].sort((left, right) => right.cycleNumber - left.cycleNumber)[0];
       if (!cycle) return reply.code(409).send({ error: 'The project does not have a roadmap cycle to audit.' });
-      if (cycle.status === 'completed' || cycle.status === 'awaiting_extension_approval') {
+      if (cycle.status === 'completed' || cycle.status === 'awaiting_extension_decision') {
         return reply.code(409).send({ error: 'The latest roadmap cycle is already completed and audited.' });
       }
       const cycleSteps = roadmap.steps.filter((step) => step.cycleId === cycle.id);
       if (cycleSteps.length === 0 || cycleSteps.some((step) => step.status !== 'completed')) {
         return reply.code(409).send({ error: 'All implementation steps must be completed before the final audit can start.' });
-      }
-      const currentCommitSha = project.projectMemory?.baseCommitSha;
-      const qualificationEvidence = roadmap.evidence.filter((evidence) =>
-        evidence.cycleId === cycle.id
-        && evidence.contractVersion === projectContract.version
-        && evidence.source !== 'repository_audit'
-        && evidence.status === 'passed'
-        && evidence.commitSha === currentCommitSha
-      );
-      if (!currentCommitSha || !hasCompleteCurrentQualificationEvidence(qualificationEvidence, {
-        cycleId: cycle.id,
-        contractVersion: projectContract.version,
-        commitSha: currentCommitSha
-      })) {
-        return reply.code(409).send({ error: 'Current qualification evidence is required before the final audit can start.' });
       }
       const latestCompletedStep = [...cycleSteps]
         .filter((step) => step.taskId)
@@ -1191,13 +1161,7 @@ export function registerRoutes(app: FastifyInstance, repository: ForgeMindReposi
         projectId: id,
         cycleId: cycle.id,
         triggerTaskId: latestCompletedStep?.taskId,
-        requirementIds: activeProjectContractRequirements(projectContract).map((requirement) => requirement.id),
-        manualRequest: {
-          contractVersion: projectContract.version,
-          commitSha: currentCommitSha,
-          qualificationEvidenceIds: qualificationEvidence.map((evidence) => evidence.id),
-          completedStepIds: cycleSteps.map((step) => step.id)
-        }
+        requirementIds: activeProjectContractRequirements(project.projectContract).map((requirement) => requirement.id)
       });
       if (!audit.enqueued) {
         return reply.code(409).send({ error: 'The final project audit is already queued or no newer completed work is available to audit.' });
@@ -1382,7 +1346,7 @@ export function registerRoutes(app: FastifyInstance, repository: ForgeMindReposi
   app.post('/api/projects/:id/extension/decision', async (request, reply) => {
     try {
       const { id } = idParamsSchema.parse(request.params);
-      const input = roadmapExtensionApprovalSchema.parse(request.body ?? {});
+      const input = roadmapExtensionDecisionSchema.parse(request.body ?? {});
       const project = await repository.getProject(id);
       if (!project) {
         return sendNotFound(reply, `Project "${id}" not found`);
@@ -1400,7 +1364,7 @@ export function registerRoutes(app: FastifyInstance, repository: ForgeMindReposi
         return reply.code(400).send({ error: 'No roadmap cycle exists for this project.' });
       }
 
-      if (!input.approved) {
+      if (!input.accepted) {
         await repository.updateProjectRoadmapCycleStatus(cycle.id, 'completed');
         return (await repository.getProjectRoadmap(id))!;
       }
@@ -1409,19 +1373,19 @@ export function registerRoutes(app: FastifyInstance, repository: ForgeMindReposi
       if (specifications?.versions.some((version) => version.sourceCycleId === cycle.id)) {
         return roadmap;
       }
-      if (cycle.status !== 'awaiting_extension_approval') {
-        return reply.code(409).send({ error: 'The selected roadmap cycle is not awaiting extension approval.' });
+      if (cycle.status !== 'awaiting_extension_decision') {
+        return reply.code(409).send({ error: 'The selected roadmap cycle is not awaiting an extension decision.' });
       }
 
       const objective = input.objectiveOverride?.trim() || cycle.extensionProposal?.trim();
       if (!objective) {
-        return reply.code(400).send({ error: 'There is no approved extension proposal to expand into implementation steps.' });
+        return reply.code(400).send({ error: 'There is no accepted extension proposal to expand into implementation steps.' });
       }
 
       const currentSpecification = specifications?.current.fullSpecification ?? project.brief ?? project.name;
       const nextSpecification = composeApprovedExtensionSpecification(currentSpecification, objective);
       if (!project.projectContract) {
-        throw new Error('A current project contract is required before an extension can be approved. Regenerate the roadmap first.');
+        throw new Error('A current project contract is required before an extension can be accepted. Regenerate the roadmap first.');
       }
       const planning = await generateRoadmapPlan(repository, project, objective, nextSpecification, project.projectContract);
       let plan = planning.plan;
@@ -1464,7 +1428,7 @@ export function registerRoutes(app: FastifyInstance, repository: ForgeMindReposi
         architectureUpdate,
         approvedExtension: {
           sourceCycleId: cycle.id,
-          changeSummary: `Approved extension for roadmap cycle ${cycle.cycleNumber + 1}.`
+          changeSummary: `Accepted extension for roadmap cycle ${cycle.cycleNumber + 1}.`
         },
         steps: stepBlueprints
       });
@@ -1494,9 +1458,7 @@ export function registerRoutes(app: FastifyInstance, repository: ForgeMindReposi
           projectId: input.projectId,
           title: input.title,
           prompt: buildTaskPrompt(input),
-          mode: resolveTaskMode(input.mode, project.defaultTaskMode),
-          maxIterations: input.maxIterations,
-          maxBudgetUsd: input.maxBudgetUsd
+          mode: resolveTaskMode(input.mode, project.defaultTaskMode)
         })
       );
     } catch (error) {
@@ -1568,14 +1530,6 @@ export function registerRoutes(app: FastifyInstance, repository: ForgeMindReposi
           return reply.code(409).send({ error: `Pull request #${existingTask.pullRequestNumber} is not merged.` });
         }
       }
-      if (existingTask.waitingForCapabilities?.length) {
-        const task = await repository.waitTaskForCapabilities(id, existingTask.waitingForCapabilities, {
-          source: 'user',
-          pullRequestMerged: true
-        });
-        await advanceRoadmapAfterTaskCapabilityWait(repository, id);
-        return task;
-      }
       const task = await repository.transitionTask(id, 'completed', { source: 'user' });
       await repository.recordCompletedTaskProjectMemory({ taskId: id });
       const roadmapAdvance = await advanceRoadmapAfterTaskCompletion(repository, id);
@@ -1587,7 +1541,7 @@ export function registerRoutes(app: FastifyInstance, repository: ForgeMindReposi
         );
         await repository.setProjectRoadmapCycleExtensionProposal(roadmapAdvance.completedCycle.id, {
           proposal: extensionProposal,
-          status: 'awaiting_extension_approval'
+          status: 'awaiting_extension_decision'
         });
       }
 
@@ -1637,86 +1591,6 @@ export function registerRoutes(app: FastifyInstance, repository: ForgeMindReposi
     const task = await repository.getTask(id);
     if (!task) return sendNotFound(reply, `Task "${id}" not found`);
     return repository.getTaskUsage(id);
-  });
-
-  app.get('/api/approvals', async () => repository.listApprovals());
-
-  app.get('/api/approvals/:id', async (request, reply) => {
-    const { id } = idParamsSchema.parse(request.params);
-    const approval = await repository.getApproval(id);
-    return approval ? approval : sendNotFound(reply, `Approval "${id}" not found`);
-  });
-
-  app.post('/api/approvals/:id/approve', async (request, reply) => {
-    try {
-      const { id } = idParamsSchema.parse(request.params);
-      const existingApproval = await repository.getApproval(id);
-      if (!existingApproval) {
-        return sendNotFound(reply, `Approval "${id}" not found`);
-      }
-      if (existingApproval.status !== 'pending') {
-        return reply.code(409).send({ error: 'Only a pending approval can be approved.' });
-      }
-      const approval = await repository.resolveApproval(id, 'approved');
-      if (!approval) {
-        return sendNotFound(reply, `Approval "${id}" not found`);
-      }
-
-      // Resume paused task only after the last pending approval is resolved.
-      const pendingTaskApprovals = (await repository.listApprovals()).filter(
-        (item) => item.taskId === approval.taskId && item.status === 'pending'
-      );
-      if (pendingTaskApprovals.length === 0) {
-        const task = await repository.getTask(approval.taskId);
-        if (task?.status === 'needs_approval') {
-          const resumed = await repository.retryTask(approval.taskId, true);
-          if (resumed) {
-            await dispatcher.enqueueTask(resumed.id, 'task_retried');
-          }
-        }
-      }
-
-      return approval;
-    } catch (error) {
-      return sendBadRequest(reply, error);
-    }
-  });
-
-  app.post('/api/approvals/:id/reject', async (request, reply) => {
-    try {
-      const { id } = idParamsSchema.parse(request.params);
-      const existingApproval = await repository.getApproval(id);
-      if (!existingApproval) {
-        return sendNotFound(reply, `Approval "${id}" not found`);
-      }
-      if (existingApproval.status !== 'pending') {
-        return reply.code(409).send({ error: 'Only a pending approval can be rejected.' });
-      }
-      const approval = await repository.resolveApproval(id, 'rejected');
-      return approval ? approval : sendNotFound(reply, `Approval "${id}" not found`);
-    } catch (error) {
-      return sendBadRequest(reply, error);
-    }
-  });
-
-  app.post('/api/approvals/:id/comment', async (request, reply) => {
-    try {
-      const { id } = idParamsSchema.parse(request.params);
-      const approval = await repository.getApproval(id);
-      if (!approval) return sendNotFound(reply, `Approval "${id}" not found`);
-      const body = commentSchema.parse(request.body);
-      const currentUser = await repository.getCurrentUser();
-      const audit = await repository.writeAudit({
-        actorType: 'user',
-        actorId: currentUser.id,
-        eventType: 'approval_commented',
-        taskId: approval.taskId,
-        payload: { approvalId: id, comment: body.comment }
-      });
-      return reply.code(201).send(audit);
-    } catch (error) {
-      return sendBadRequest(reply, error);
-    }
   });
 
   app.post('/api/webhooks/github', { config: { rawBody: true } }, async (request, reply) => {
@@ -1803,43 +1677,6 @@ async function requireAuthorizedRequest(
     return reply.code(403).send({ error: 'Owner role required for this mutation.' });
   }
 
-  const approvalType = isMutationRequest(request) ? requiredRiskApprovalType(request) : undefined;
-  if (approvalType) {
-    const chatRunId = readSingleHeader(request.headers['x-forgemind-chat-run-id']);
-    const approvalId = readSingleHeader(request.headers['x-forgemind-approval-id']);
-    if (!chatRunId && !approvalId) {
-      if (isWindowsRunnerCredentialMutation(request)) {
-        return reply.code(403).send({ error: `Approved ${approvalType} approval required for this mutation.` });
-      }
-      return;
-    }
-    if (chatRunId && await repository.isChatApiMutationAuthorized({
-      runId: chatRunId,
-      userId: currentUser.id,
-      type: approvalType,
-      method: request.method,
-      path: request.url.split('?')[0] ?? request.url,
-      bodyHash: hashApiMutationBody(request.body ?? null)
-    })) {
-      return;
-    }
-    if (!approvalId) {
-      return reply.code(403).send({ error: `Approved ${approvalType} approval required for this mutation.` });
-    }
-    const approval = await repository.getApproval(approvalId);
-    if (!approval || approval.type !== approvalType || approval.status !== 'approved' || !approvalMatchesMutation(approval.payload, request, currentUser.id)) {
-      return reply.code(403).send({ error: `Approved ${approvalType} approval required for this mutation.` });
-    }
-    const consumed = await repository.consumeRiskApproval(approvalId);
-    if (!consumed) {
-      return reply.code(403).send({ error: `Approved ${approvalType} approval required for this mutation.` });
-    }
-  }
-}
-
-function isWindowsRunnerCredentialMutation(request: FastifyRequest): boolean {
-  const path = request.url.split('?')[0] ?? request.url;
-  return path.startsWith('/api/windows-runner/enrollments') || path.startsWith('/api/windows-runner/devices/');
 }
 
 function isProtectedApiRequest(request: FastifyRequest): boolean {
@@ -1864,69 +1701,13 @@ function requiresOwnerRole(request: FastifyRequest): boolean {
     || path === '/api/worker/queue'
     || path.startsWith('/api/github/')
     || path.startsWith('/api/providers/')
-    || path.startsWith('/api/approvals')
-    || path.startsWith('/api/windows-runner/enrollments')
-    || path.startsWith('/api/windows-runner/devices/')
-    || path.startsWith('/api/windows-runner/jobs/')
-    || path.startsWith('/api/windows-runner/sessions/')
+    || path.startsWith('/api/windows-runner/')
     || path.endsWith('/implementation-steps/reconcile')
     || (request.method === 'DELETE' && path.startsWith('/api/projects/'));
 }
 
-function requiredRiskApprovalType(request: FastifyRequest): ApprovalType | undefined {
-  const path = request.url.split('?')[0] ?? request.url;
-  if (path === '/api/worker/queue') return 'config_change';
-  if (path.startsWith('/api/windows-runner/enrollments') || path.startsWith('/api/windows-runner/devices/')) return 'config_change';
-  if (path.startsWith('/api/windows-runner/jobs/') || path.startsWith('/api/windows-runner/sessions/')) return 'config_change';
-  if (path.startsWith('/api/github/')) return 'config_change';
-  if (path.startsWith('/api/providers/connect') || path.startsWith('/api/providers/connections/') || path === '/api/providers/codex/oauth/complete') {
-    return 'config_change';
-  }
-  if (path.endsWith('/implementation-steps/reconcile')) return 'risky_refactor';
-  if (request.method === 'DELETE' && path.startsWith('/api/projects/')) return 'delete_files';
-  return undefined;
-}
-
 function readSingleHeader(value: string | string[] | undefined): string | undefined {
   return Array.isArray(value) ? value[0] : value;
-}
-
-function approvalMatchesMutation(payload: unknown, request: FastifyRequest, actorId: string): boolean {
-  if (!payload || typeof payload !== 'object' || Array.isArray(payload)) {
-    return false;
-  }
-  const apiMutation = (payload as { apiMutation?: unknown }).apiMutation;
-  if (!apiMutation || typeof apiMutation !== 'object' || Array.isArray(apiMutation)) {
-    return false;
-  }
-  const expected = {
-    method: request.method,
-    path: request.url.split('?')[0] ?? request.url,
-    actorId,
-    bodyHash: hashApiMutationBody(request.body ?? null)
-  };
-  const actual = apiMutation as Partial<typeof expected>;
-  return actual.method === expected.method
-    && actual.path === expected.path
-    && actual.actorId === expected.actorId
-    && actual.bodyHash === expected.bodyHash;
-}
-
-function hashApiMutationBody(body: unknown): string {
-  return createHash('sha256').update(stableJson(body)).digest('hex');
-}
-
-function stableJson(value: unknown): string {
-  if (value === null || typeof value !== 'object') {
-    return JSON.stringify(value);
-  }
-  if (Array.isArray(value)) {
-    return `[${value.map(stableJson).join(',')}]`;
-  }
-  const entries = Object.entries(value as Record<string, unknown>)
-    .filter(([, item]) => item !== undefined)
-    .sort(([left], [right]) => left.localeCompare(right));
-  return `{${entries.map(([key, item]) => `${JSON.stringify(key)}:${stableJson(item)}`).join(',')}}`;
 }
 
 function buildTaskPrompt(input: z.infer<typeof createTaskSchema>): string {

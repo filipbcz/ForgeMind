@@ -5,7 +5,11 @@ import type { ForgeMindRepository, WindowsRunnerCredentialAdapter, WindowsRunner
 import { canonicalizeWorkerProbeEvidence, isWindowsExecutionResult, redactSecrets, WINDOWS_EVIDENCE_MAX_ARTIFACT_BYTES, WINDOWS_EVIDENCE_MAX_ARTIFACTS, WINDOWS_EVIDENCE_MAX_LOG_BYTES } from '@forgemind/core';
 
 const deviceParams = z.object({ deviceId: z.string().uuid() });
-const enrollment = z.object({ deviceId: z.string().uuid(), expiresInMinutes: z.number().int().min(1).max(60).default(10) });
+const enrollment = z.object({
+  deviceId: z.string().uuid(),
+  displayName: z.string().trim().min(1).max(200).default('Windows runner'),
+  expiresInMinutes: z.number().int().min(1).max(60).default(10)
+});
 const redeem = z.object({ code: z.string().min(32).max(128) });
 const session = z.object({ expiresInMinutes: z.number().int().min(1).max(720) });
 const heartbeat = z.object({ sessionId: z.string().uuid(), leaseId: z.string().uuid().optional(), leaseSeconds: z.number().int().min(15).max(300).default(60) });
@@ -33,14 +37,15 @@ const deviceRegistration = z.object({
 const sessionControl = z.object({ sessionId: z.string().uuid() });
 const controlQuery = z.object({ sessionId: z.string().uuid(), leaseId: z.string().uuid().optional() });
 const sha = z.string().regex(/^[a-f0-9]{64}$/i);
-const evidenceUpload = z.object({ schemaVersion: z.literal(1), jobId: z.string().uuid(), leaseId: z.string().uuid(), inputHash: sha, commitSha: sha,
+const gitCommitSha = z.string().regex(/^(?:[a-f0-9]{40}|[a-f0-9]{64})$/i);
+const evidenceUpload = z.object({ schemaVersion: z.literal(1), jobId: z.string().uuid(), leaseId: z.string().uuid(), inputHash: sha, commitSha: gitCommitSha,
   log: z.object({ text: z.string(), sizeBytes: z.number().int().nonnegative(), sha256: sha }), artifacts: z.array(z.object({ name: z.string().min(1).max(200),
     relativePath: z.string().min(1).max(500), sizeBytes: z.number().int().nonnegative(), sha256: sha, contentBase64: z.string(), criterion: z.string().min(1).max(2000) })).max(WINDOWS_EVIDENCE_MAX_ARTIFACTS) });
 
 export function registerWindowsRunnerRoutes(app: FastifyInstance, repository: ForgeMindRepository, credentials: WindowsRunnerCredentialAdapter, workers: WindowsWorkerRepository) {
   app.post('/api/windows-runner/enrollments', async (request) => {
     const input = enrollment.parse(request.body);
-    return credentials.createEnrollment(input.deviceId, new Date(Date.now() + input.expiresInMinutes * 60_000));
+    return credentials.createEnrollment(input.deviceId, new Date(Date.now() + input.expiresInMinutes * 60_000), input.displayName);
   });
   app.post('/api/windows-runner/enroll', async (request, reply) => {
     try {
@@ -100,10 +105,46 @@ export function registerWindowsRunnerRoutes(app: FastifyInstance, repository: Fo
   app.post('/api/windows-runner/device/result', { preHandler: runnerAuth(credentials) }, async (request, reply) => {
     const principal = runnerPrincipal(request);
     if (!isWindowsExecutionResult(request.body) || request.body.deviceId !== principal.deviceId) return reply.code(400).send({ error: 'Invalid execution result.' });
-    const accepted = await workers.submitResult(principal.deviceId, request.body);
-    if (!accepted) return reply.code(409).send({ error: 'Execution lease is not active for this device.' });
+    const outcome = await workers.submitResult(principal.deviceId, request.body);
+    if (!outcome.accepted || !outcome.packet) return reply.code(409).send({ error: 'Execution lease is not active for this device.' });
+    let evidenceRecorded = false;
+    const context = outcome.packet.evidenceContext;
+    if (context) {
+      try {
+        await repository.recordAcceptanceEvidence({
+          projectId: request.body.projectId,
+          cycleId: context.cycleId,
+          stepId: context.stepId,
+          taskId: request.body.taskId,
+          taskRunId: request.body.runId,
+          requirementIds: context.requirementIds,
+          criterion: outcome.packet.check.criterion ?? outcome.packet.check.command,
+          source: 'artifact',
+          status: request.body.status === 'succeeded' ? 'passed' : 'failed',
+          evidenceIdentity: `windows:${request.body.jobId}`,
+          contractVersion: context.contractVersion,
+          commitSha: request.body.commitSha,
+          command: outcome.packet.check.command,
+          exitCode: request.body.exitCode,
+          payload: {
+            platform: 'windows',
+            deviceId: principal.deviceId,
+            summary: request.body.summary,
+            logHash: request.body.logHash,
+            artifacts: request.body.artifacts.map((artifact) => ({ ...artifact }))
+          }
+        });
+        evidenceRecorded = true;
+      } catch (error) {
+        await repository.writeAudit({
+          actorType: 'system', actorId: principal.deviceId, eventType: 'windows_runner_evidence_record_failed',
+          taskId: request.body.taskId, projectId: request.body.projectId,
+          payload: { jobId: request.body.jobId, errorMessage: error instanceof Error ? error.message : String(error) }
+        });
+      }
+    }
     await repository.writeAudit({ actorType: 'system', actorId: principal.deviceId, eventType: 'windows_runner_result_submitted', taskId: request.body.taskId, projectId: request.body.projectId, payload: { deviceId: principal.deviceId, jobId: request.body.jobId, leaseId: request.body.leaseId, status: request.body.status, commitSha: request.body.commitSha } });
-    return { accepted: true };
+    return { accepted: true, evidenceRecorded };
   });
   app.post('/api/windows-runner/device/evidence', { preHandler: runnerAuth(credentials), bodyLimit: WINDOWS_EVIDENCE_MAX_ARTIFACT_BYTES + WINDOWS_EVIDENCE_MAX_LOG_BYTES + 100_000 }, async (request, reply) => {
     const principal = runnerPrincipal(request); const parsed = evidenceUpload.safeParse(request.body);

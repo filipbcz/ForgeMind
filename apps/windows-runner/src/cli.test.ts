@@ -9,6 +9,6 @@ describe('Windows runner CLI parsing', () => {
     [['session', 'start', '--minutes', '30', '--api-url', 'https://forgemind.test'], { command: 'session-start', apiUrl: 'https://forgemind.test', minutes: 30 }],
     [['session', 'drain', '--api-url', 'https://forgemind.test', '--session-id', 'session-1'], { command: 'session-drain', apiUrl: 'https://forgemind.test', sessionId: 'session-1' }]
   ])('parses documented command %j', (args, expected) => {
-    expect(parseCliArgs(args as string[])).toEqual(expected);
+    expect(parseCliArgs(args as string[])).toMatchObject(expected);
   });
 });

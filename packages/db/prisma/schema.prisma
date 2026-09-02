@@ -22,26 +22,19 @@ enum TaskStatus {
   draft
   submitted
   planning
-  waiting_for_plan_approval
   creating_github_issue
   creating_branch
   running_ai
   validating
   reviewing
   improving
-  needs_approval
   creating_pr
   ready_for_user_review
   completed
   failed
   cancelled
-  budget_exceeded
-  iteration_limit_reached
-  repeated_error_detected
-  approval_rejected
   provider_failed
   validation_failed
-  waiting_for_capability
 }
 
 enum ProviderKind {
@@ -105,39 +98,7 @@ enum IterationPhase {
   implementation
   validation
   review
-  approval
   pr_creation
-}
-
-enum ApprovalType {
-  budget_increase
-  continue_after_iteration_limit
-  new_dependency
-  risky_refactor
-  database_migration
-  config_change
-  deploy_staging
-  deploy_production
-  merge_pr
-  delete_files
-  github_workflow_change
-  systemd_change
-  nginx_config_change
-  write_outside_repo
-}
-
-enum ApprovalStatus {
-  pending
-  approved
-  rejected
-  cancelled
-}
-
-enum RiskLevel {
-  low
-  medium
-  high
-  critical
 }
 
 enum AuditActorType {
@@ -160,7 +121,6 @@ enum ChatThreadStatus {
 enum ChatRunStatus {
   queued
   running
-  waiting_for_approval
   succeeded
   failed
   cancelled
@@ -184,13 +144,11 @@ model User {
   updatedAt     DateTime @updatedAt @map("updated_at")
 
   tasks                     Task[]
-  approvals                 Approval[]
   notificationSettings      NotificationSettings?
   notificationSubscriptions NotificationSubscription[]
   githubConnection          GitHubConnection?
   aiProviderConnections     AiProviderConnection[]
   chatThreads               ChatThread[]
-  approvedChatApprovals     ChatApproval[]
   authSessions              AuthSession[]
 
   @@map("users")
@@ -225,7 +183,6 @@ model Project {
   projectMemory                      Json?         @map("project_memory")
   projectArchitecture                Json?         @map("project_architecture")
   currentArchitectureVersionId       String?       @unique @map("current_architecture_version_id")
-  validationProfile                  Json?         @map("validation_profile")
   planningSessionId                  String?       @map("planning_session_id")
   planningSessionProvider            ProviderKind? @map("planning_session_provider")
   planningSessionModel               String?       @map("planning_session_model")
@@ -234,7 +191,6 @@ model Project {
   autoCreatePullRequest              Boolean       @default(true) @map("auto_create_pull_request")
   autoMergePullRequest               Boolean       @default(false) @map("auto_merge_pull_request")
   autoCompleteTask                   Boolean       @default(false) @map("auto_complete_task")
-  allowSafeOperationsWithoutApproval Boolean       @default(false) @map("allow_safe_operations_without_approval")
   defaultTaskMode                    TaskMode      @default(safe) @map("default_task_mode")
   aiProviderConnectionId             String?       @map("ai_provider_connection_id")
   isActive                           Boolean       @default(true) @map("is_active")
@@ -264,7 +220,7 @@ enum ProjectRoadmapCycleStatus {
   verifying
   partial
   blocked
-  awaiting_extension_approval
+  awaiting_extension_decision
   completed
 }
 
@@ -286,7 +242,6 @@ enum ProjectAuditJobStatus {
 enum ProjectImplementationStepStatus {
   pending
   running
-  waiting_for_capability
   completed
   cancelled
 }
@@ -387,7 +342,6 @@ model ChatThread {
   providerConnection AiProviderConnection? @relation(fields: [providerConnectionId], references: [id], onDelete: SetNull)
   messages           ChatMessage[]
   runs               ChatRun[]
-  approvals          ChatApproval[]
   auditLog           AuditLog[]
 
   @@index([userId, status, updatedAt])
@@ -422,7 +376,6 @@ model ChatRun {
 
   thread    ChatThread     @relation(fields: [threadId], references: [id], onDelete: Cascade)
   messages  ChatMessage[]
-  approvals ChatApproval[]
   auditLog  AuditLog[]
 
   @@index([status, nextAttemptAt, createdAt])
@@ -449,37 +402,11 @@ model ChatMessage {
   @@map("chat_messages")
 }
 
-model ChatApproval {
-  id               String         @id @default(uuid())
-  threadId         String         @map("thread_id")
-  runId            String         @map("run_id")
-  type             ApprovalType
-  status           ApprovalStatus @default(pending)
-  requestedBy      String         @map("requested_by")
-  approvedByUserId String?        @map("approved_by_user_id")
-  title            String
-  description      String
-  riskLevel        RiskLevel      @map("risk_level")
-  payloadJson      Json           @map("payload_json")
-  createdAt        DateTime       @default(now()) @map("created_at")
-  resolvedAt       DateTime?      @map("resolved_at")
-
-  thread         ChatThread @relation(fields: [threadId], references: [id], onDelete: Cascade)
-  run            ChatRun    @relation(fields: [runId], references: [id], onDelete: Cascade)
-  approvedByUser User?      @relation(fields: [approvedByUserId], references: [id])
-
-  @@index([threadId, status])
-  @@index([runId, status])
-  @@map("chat_approvals")
-}
-
 model NotificationSettings {
   id               String   @id @default(uuid())
   userId           String   @unique @map("user_id")
   pushEnabled      Boolean  @default(false) @map("push_enabled")
-  approvalRequests Boolean  @default(true) @map("approval_requests")
   taskUpdates      Boolean  @default(true) @map("task_updates")
-  budgetAlerts     Boolean  @default(true) @map("budget_alerts")
   createdAt        DateTime @default(now()) @map("created_at")
   updatedAt        DateTime @updatedAt @map("updated_at")
 
@@ -512,7 +439,6 @@ model Task {
   prompt                         String
   mode                           TaskMode      @default(safe)
   status                         TaskStatus    @default(draft)
-  waitingForCapabilities         Json          @default("[]") @map("waiting_for_capabilities")
   deferredValidationCapabilities Json          @default("[]") @map("deferred_validation_capabilities")
   githubIssueNumber              Int?          @map("github_issue_number")
   githubIssueUrl                 String?       @map("github_issue_url")
@@ -525,8 +451,6 @@ model Task {
   providerSessionModel           String?       @map("provider_session_model")
   providerSessionConnectionId    String?       @map("provider_session_connection_id")
   providerSessionUpdatedAt       DateTime?     @map("provider_session_updated_at")
-  maxIterations                  Int           @default(10) @map("max_iterations")
-  maxBudgetUsd                   Decimal       @default(2.00) @map("max_budget_usd") @db.Decimal(10, 2)
   createdAt                      DateTime      @default(now()) @map("created_at")
   updatedAt                      DateTime      @updatedAt @map("updated_at")
   startedAt                      DateTime?     @map("started_at")
@@ -536,7 +460,6 @@ model Task {
   createdByUser              User                         @relation(fields: [createdByUserId], references: [id])
   taskRuns                   TaskRun[]
   queueJobs                  TaskQueueJob[]
-  approvals                  Approval[]
   providerUsage              ProviderUsage[]
   auditLog                   AuditLog[]
   roadmapSteps               ProjectImplementationStep[]
@@ -564,8 +487,8 @@ model WorkerDevice {
   createdAt         DateTime           @default(now()) @map("created_at")
   updatedAt         DateTime           @updatedAt @map("updated_at")
 
-  sessions WorkerSession[]
-  leases   WindowsExecutionLease[]
+  sessions    WorkerSession[]
+  leases      WindowsExecutionLease[]
   enrollments WorkerEnrollment[]
   credentials WorkerCredential[]
 
@@ -581,6 +504,7 @@ model WorkerEnrollment {
   usedAt    DateTime? @map("used_at")
   createdAt DateTime  @default(now()) @map("created_at")
   device WorkerDevice @relation(fields: [deviceId], references: [id], onDelete: Cascade)
+
   @@index([deviceId, expiresAt])
   @@map("worker_enrollments")
 }
@@ -593,6 +517,7 @@ model WorkerCredential {
   createdAt DateTime  @default(now()) @map("created_at")
   revokedAt DateTime? @map("revoked_at")
   device WorkerDevice @relation(fields: [deviceId], references: [id], onDelete: Cascade)
+
   @@index([deviceId, revokedAt])
   @@map("worker_credentials")
 }
@@ -637,16 +562,16 @@ model WindowsExecutionJob {
 }
 
 model WindowsExecutionLease {
-  id          String               @id @default(uuid())
-  schemaVersion Int                @default(1) @map("schema_version")
-  jobId       String               @map("job_id")
-  deviceId    String               @map("device_id")
-  sessionId   String               @map("session_id")
-  status      ExecutionLeaseStatus @default(active)
-  claimedAt   DateTime             @default(now()) @map("claimed_at")
-  expiresAt   DateTime             @map("expires_at")
-  nonce       String
-  releasedAt  DateTime?            @map("released_at")
+  id            String               @id @default(uuid())
+  schemaVersion Int                  @default(1) @map("schema_version")
+  jobId         String               @map("job_id")
+  deviceId      String               @map("device_id")
+  sessionId     String               @map("session_id")
+  status        ExecutionLeaseStatus @default(active)
+  claimedAt     DateTime             @default(now()) @map("claimed_at")
+  expiresAt     DateTime             @map("expires_at")
+  nonce         String
+  releasedAt    DateTime?            @map("released_at")
 
   job     WindowsExecutionJob @relation(fields: [jobId], references: [id], onDelete: Cascade)
   device  WorkerDevice       @relation(fields: [deviceId], references: [id], onDelete: Cascade)
@@ -951,27 +876,6 @@ model TaskIteration {
 
   @@unique([taskRunId, iterationNumber, phase])
   @@map("task_iterations")
-}
-
-model Approval {
-  id               String         @id @default(uuid())
-  taskId           String         @map("task_id")
-  type             ApprovalType
-  status           ApprovalStatus @default(pending)
-  requestedBy      String         @map("requested_by")
-  approvedByUserId String?        @map("approved_by_user_id")
-  title            String
-  description      String
-  riskLevel        RiskLevel      @map("risk_level")
-  payloadJson      Json           @map("payload_json")
-  createdAt        DateTime       @default(now()) @map("created_at")
-  resolvedAt       DateTime?      @map("resolved_at")
-
-  task           Task  @relation(fields: [taskId], references: [id])
-  approvedByUser User? @relation(fields: [approvedByUserId], references: [id])
-
-  @@index([taskId, status])
-  @@map("approvals")
 }
 
 model ProviderUsage {

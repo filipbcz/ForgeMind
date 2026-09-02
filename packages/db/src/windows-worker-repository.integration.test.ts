@@ -26,8 +26,7 @@ const digest = 'a'.repeat(64);
 const integrationPacket = { schemaVersion: 1 as const, projectId: ids.project, taskId: ids.task, runId: ids.run, checkId: 'lease_test_check', jobId: ids.job,
   leaseId: 'pending', repository: 'owner/repo', sourceUrl: 'https://example.test/repo.git', commitSha: digest, workspaceRoot: 'C:\\work', artifactRoot: 'C:\\artifacts',
   check: { command: 'fixture.exe', category: 'smoke' as const, requiredCapabilities: ['windows'] }, requiredCapabilities: ['windows'],
-  resourcePolicy: { timeoutSeconds: 60, maxLogBytes: 1024, maxArtifactBytes: 1024 }, expectedArtifacts: [], nonce: 'pending', inputHash: digest,
-  executionAdapter: { kind: 'fixture' as const, profileId: 'fixture-validation-v1' } };
+  resourcePolicy: { timeoutSeconds: 60, maxLogBytes: 1024, maxArtifactBytes: 1024 }, expectedArtifacts: [], nonce: 'pending', inputHash: digest };
 let first: PrismaClient;
 let second: PrismaClient;
 let admin: PostgreSqlClient | undefined;
@@ -55,7 +54,7 @@ describeDatabase('WindowsWorkerRepository PostgreSQL concurrency', () => {
       VALUES (${ids.project}, 'Lease test', 'lease-test-project', 'main', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
       ON CONFLICT ("id") DO NOTHING`;
     await first.$executeRaw`INSERT INTO "tasks" ("id", "project_id", "created_by_user_id", "title", "prompt", "status", "created_at", "updated_at")
-      VALUES (${ids.task}, ${ids.project}, ${ids.user}, 'Lease test', 'Lease test', 'waiting_for_capability', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+      VALUES (${ids.task}, ${ids.project}, ${ids.user}, 'Lease test', 'Lease test', 'completed', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
       ON CONFLICT ("id") DO NOTHING`;
     await first.$executeRaw`INSERT INTO "task_runs" ("id", "task_id", "provider", "model", "status")
       VALUES (${ids.run}, ${ids.task}, 'codex', 'test', 'queued') ON CONFLICT ("id") DO NOTHING`;
@@ -106,22 +105,22 @@ describeDatabase('WindowsWorkerRepository PostgreSQL concurrency', () => {
     const lease = await first.windowsExecutionLease.findUniqueOrThrow({ where: { id: claim!.lease.id } });
     const job = await first.windowsExecutionJob.findUniqueOrThrow({ where: { id: ids.job } });
     expect(heartbeat
-      ? lease.status === 'active' && job.status === 'leased'
+      ? lease.status === 'active' && job.status === 'running'
       : lease.status === 'expired' && job.status === 'queued').toBe(true);
   });
 
-  it('does not claim a queued job after its task leaves waiting_for_capability', async () => {
+  it('does not claim a queued job after its task is cancelled', async () => {
     await first.windowsExecutionLease.deleteMany({ where: { jobId: ids.job } });
     await first.windowsExecutionJob.update({ where: { id: ids.job }, data: { status: 'queued' } });
     await first.workerDevice.update({ where: { id: ids.device }, data: { status: 'idle' } });
-    await first.task.update({ where: { id: ids.task }, data: { status: 'completed' } });
+    await first.task.update({ where: { id: ids.task }, data: { status: 'cancelled' } });
     const claim = await new WindowsWorkerRepository(first).claimCompatible(ids.session, 60, 'stale_task_request');
     expect(claim).toBeUndefined();
     expect(await first.windowsExecutionLease.count({ where: { jobId: ids.job } })).toBe(0);
   });
 
   it('returns deterministically when a session retries a terminal lease nonce', async () => {
-    await first.task.update({ where: { id: ids.task }, data: { status: 'waiting_for_capability' } });
+    await first.task.update({ where: { id: ids.task }, data: { status: 'completed' } });
     await first.windowsExecutionJob.update({ where: { id: ids.job }, data: { status: 'queued' } });
     await first.workerDevice.update({ where: { id: ids.device }, data: { status: 'idle' } });
     const repository = new WindowsWorkerRepository(first);
@@ -136,7 +135,7 @@ describeDatabase('WindowsWorkerRepository PostgreSQL concurrency', () => {
 
   it('keeps an unexpired draining session and device draining when its lease expires', async () => {
     await first.windowsExecutionLease.deleteMany({ where: { jobId: ids.job } });
-    await first.task.update({ where: { id: ids.task }, data: { status: 'waiting_for_capability' } });
+    await first.task.update({ where: { id: ids.task }, data: { status: 'completed' } });
     await first.workerSession.update({ where: { id: ids.session }, data: { status: 'active', expiresAt: new Date(Date.now() + 600_000) } });
     await first.windowsExecutionJob.update({ where: { id: ids.job }, data: { status: 'queued' } });
     await first.workerDevice.update({ where: { id: ids.device }, data: { status: 'idle' } });

@@ -1,11 +1,8 @@
 import type {
-  ApprovalApi,
-  ApprovalSummary,
   AuthLoginStartResponse,
   AuthSessionResponse,
   AssignProjectRepositoryRequest,
   AuditEventApi,
-  ChatApprovalApi,
   ChatMessageApi,
   ChatRunApi,
   ChatThreadApi,
@@ -120,10 +117,6 @@ export async function retryChatRun(runId: string): Promise<ChatRunApi> {
 
 export async function cancelChatRun(runId: string): Promise<ChatRunApi> {
   return request<ChatRunApi>(`/api/chat/runs/${runId}/cancel`, { method: 'POST', body: '{}' });
-}
-
-export async function resolveChatApproval(approvalId: string, decision: 'approve' | 'reject'): Promise<ChatApprovalApi> {
-  return request<ChatApprovalApi>(`/api/chat/approvals/${approvalId}/${decision}`, { method: 'POST', body: '{}' });
 }
 
 export function buildWebSocketUrl(taskId?: string): string {
@@ -323,11 +316,6 @@ export async function fetchWorkerEvents(limit = 8): Promise<WorkerEventApi[]> {
   return request<WorkerEventApi[]>(`/api/worker/events?limit=${limit}`);
 }
 
-export async function fetchApprovals(): Promise<ApprovalSummary[]> {
-  const approvals = await request<ApprovalApi[]>('/api/approvals');
-  return approvals.map(toApprovalSummary);
-}
-
 export async function fetchProviderStatus(): Promise<ProviderStatusApi> {
   return request<ProviderStatusApi>('/api/providers/status');
 }
@@ -494,12 +482,35 @@ export async function completeTask(taskId: string): Promise<TaskSummary> {
   return toTaskSummary(task);
 }
 
-export async function resolveApproval(id: string, status: 'approved' | 'rejected'): Promise<ApprovalSummary> {
-  const approval = await request<ApprovalApi>(`/api/approvals/${id}/${status === 'approved' ? 'approve' : 'reject'}`, {
+export async function fetchWindowsWorkerOperations(projectId?: string): Promise<WindowsWorkerOperationsReadModel> {
+  const query = projectId ? `?projectId=${encodeURIComponent(projectId)}` : '';
+  return request<WindowsWorkerOperationsReadModel>(`/api/windows-runner/operations${query}`);
+}
+
+export async function cancelWindowsValidation(jobId: string): Promise<{ accepted: boolean }> {
+  return request<{ accepted: boolean }>(`/api/windows-runner/jobs/${jobId}/cancel`, {
     method: 'POST',
     body: '{}'
   });
-  return toApprovalSummary(approval);
+}
+
+export async function drainWindowsWorkerSession(sessionId: string): Promise<{ accepted: boolean }> {
+  return request<{ accepted: boolean }>(`/api/windows-runner/sessions/${sessionId}/drain`, {
+    method: 'POST',
+    body: '{}'
+  });
+}
+
+export async function createWindowsRunnerEnrollment(input: {
+  deviceId: string;
+  displayName: string;
+  expiresInMinutes?: number;
+}): Promise<{ enrollmentId: string; code: string; expiresAt: string }> {
+  return request('/api/windows-runner/enrollments', { method: 'POST', body: JSON.stringify(input) });
+}
+
+export async function revokeWindowsRunner(deviceId: string): Promise<{ deviceId: string; revoked: boolean }> {
+  return request(`/api/windows-runner/devices/${deviceId}/revoke`, { method: 'POST', body: '{}' });
 }
 
 function summarizeProjects(projects: ProjectApi[], tasks: TaskApi[]): ProjectSummary[] {
@@ -522,33 +533,14 @@ export function toTaskSummary(task: TaskApi): TaskSummary {
     currentStep: currentStep(task.status),
     mode: task.mode,
     iterations: 0,
-    maxIterations: task.maxIterations,
     updatedAt: task.updatedAt,
     branchName: task.branchName,
     issueUrl: task.githubIssueUrl,
     pullRequestUrl: task.pullRequestUrl,
-    waitingForCapabilities: task.waitingForCapabilities,
     deferredValidationCapabilities: task.deferredValidationCapabilities,
     plan: task.status === 'draft' ? [] : ['Create issue and branch', 'Run provider', 'Validate result', 'Prepare draft PR'],
     testResult: task.status === 'draft' ? 'Not started' : 'See worker log',
     diffSummary: task.status === 'draft' ? 'No changes' : 'See diff summary'
-  };
-}
-
-function toApprovalSummary(approval: ApprovalApi): ApprovalSummary {
-  const payload = approval.payload && typeof approval.payload === 'object' ? (approval.payload as Record<string, unknown>) : {};
-  const touchedFiles = Array.isArray(payload.touchedFiles) ? payload.touchedFiles.map(String) : [];
-
-  return {
-    id: approval.id,
-    taskId: approval.taskId,
-    title: approval.title,
-    reason: approval.description,
-    risk: String(payload.risk ?? approval.description),
-    status: approval.status,
-    riskLevel: approval.riskLevel,
-    touchedFiles,
-    recommendation: String(payload.recommendation ?? 'Review the requested action before approving.')
   };
 }
 
@@ -557,26 +549,19 @@ function currentStep(status: TaskApi['status']): string {
     draft: 'Ready to submit',
     submitted: 'Queued for worker',
     planning: 'Worker is planning',
-    waiting_for_plan_approval: 'Waiting for plan approval',
     creating_github_issue: 'Creating GitHub issue',
     creating_branch: 'Creating branch',
     running_ai: 'Provider is running',
     validating: 'Validation is running',
     reviewing: 'Review is running',
     improving: 'Applying safe improvements',
-    needs_approval: 'Waiting for approval',
     creating_pr: 'Creating draft PR',
     ready_for_user_review: 'Ready for review',
     completed: 'Completed',
     failed: 'Failed',
     cancelled: 'Cancelled',
-    budget_exceeded: 'Budget exceeded',
-    iteration_limit_reached: 'Iteration limit reached',
-    repeated_error_detected: 'Repeated error detected',
-    approval_rejected: 'Approval rejected',
     provider_failed: 'Provider failed',
-    validation_failed: 'Validation failed',
-    waiting_for_capability: 'Waiting for a capable worker'
+    validation_failed: 'Validation failed'
   };
   return labels[status];
 }

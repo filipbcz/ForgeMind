@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
-import { ROADMAP_GENERATION_CONFIRMATION, getRunStateDetail, getRunStateLabel } from '@forgemind/core';
+import { ROADMAP_GENERATION_CONFIRMATION, getRunStateDetail, getRunStateLabel, type WindowsWorkerOperationsReadModel } from '@forgemind/core';
 import {
   AlertTriangle,
   Activity,
@@ -30,6 +30,8 @@ import {
 } from 'lucide-react';
 import {
   assignProjectRepository as assignProjectRepositoryRequest,
+  cancelWindowsValidation,
+  createWindowsRunnerEnrollment,
   cancelTask as cancelTaskRequest,
   completeTask as completeTaskRequest,
   connectGitHubAdapter,
@@ -55,7 +57,6 @@ import {
   fetchProviderModels,
   fetchProviderStatus,
   fetchNotificationVapidPublicKey,
-  fetchApprovals,
   fetchAuthSession,
   fetchProjects,
   fetchTaskDiff,
@@ -65,19 +66,17 @@ import {
   fetchTasks,
   fetchWorkerEvents,
   fetchWorkerStatus,
-  fetchWindowsOperations,
-  cancelWindowsJob,
-  drainWindowsSession,
-  revokeWindowsDevice,
+  fetchWindowsWorkerOperations,
   generateProjectRoadmap as generateProjectRoadmapRequest,
   logout as logoutRequest,
-  resolveApproval as resolveApprovalRequest,
   retryTask as retryTaskRequest,
   retryProjectAudit,
+  revokeWindowsRunner,
   reviewProjectSpecificationChange,
   startProjectAudit,
   startGoogleLogin,
   setWorkerQueuePaused,
+  drainWindowsWorkerSession,
   startNextProjectRoadmapStep,
   subscribeNotification,
   startTask as startTaskRequest,
@@ -87,7 +86,6 @@ import {
 } from './api.js';
 import { subscribeForPushNotifications, unsubscribeFromPushNotifications } from './pwa.js';
 import type {
-  ApprovalSummary,
   AssignProjectRepositoryRequest,
   AuthSessionResponse,
   AuditEventApi,
@@ -127,6 +125,7 @@ import type { RealtimeConnectionMeta, RealtimeConnectionState } from './realtime
 import { summarizeProjectOperationalOverview, summarizeProjectProgress } from './project-progress.js';
 import type { ProjectOperationalAction } from './project-progress.js';
 import {
+  activityWorkflowStage,
   currentExecutionEntries,
   resolveCurrentActivity,
   sanitizeProviderActivityDetail
@@ -153,28 +152,19 @@ export {
 } from './project-roadmap-domain.js';
 export type { ProjectItemStatusFilter } from './project-roadmap-domain.js';
 
-type View = 'tasks' | 'chat' | 'new-task' | 'approvals' | 'projects' | 'settings';
+type View = 'tasks' | 'chat' | 'new-task' | 'projects' | 'settings';
 type RealtimeUiState = 'connected' | 'reconnecting' | 'fallback';
 
 const terminalStatuses = new Set<TaskSummary['status']>([
   'completed',
   'failed',
   'cancelled',
-  'budget_exceeded',
-  'iteration_limit_reached',
-  'repeated_error_detected',
-  'approval_rejected',
   'provider_failed',
-  'validation_failed',
-  'waiting_for_capability'
+  'validation_failed'
 ]);
 
 const errorStatuses = new Set<TaskSummary['status']>([
   'failed',
-  'budget_exceeded',
-  'iteration_limit_reached',
-  'repeated_error_detected',
-  'approval_rejected',
   'provider_failed',
   'validation_failed'
 ]);
@@ -188,60 +178,45 @@ const activeStatuses = new Set<TaskSummary['status']>([
   'validating',
   'reviewing',
   'improving',
-  'creating_pr',
-  'needs_approval'
+  'creating_pr'
 ]);
 
 const statusLabels: Record<TaskSummary['status'], string> = {
   draft: 'Draft',
   submitted: 'Queued',
   planning: 'Planning',
-  waiting_for_plan_approval: 'Plan approval',
   creating_github_issue: 'Creating issue',
   creating_branch: 'Creating branch',
   running_ai: 'Running AI',
   validating: 'Validating',
   reviewing: 'Reviewing',
   improving: 'Improving',
-  needs_approval: 'Needs approval',
   creating_pr: 'Creating PR',
   ready_for_user_review: 'Ready for review',
   completed: 'Completed',
   failed: 'Failed',
   cancelled: 'Cancelled',
-  budget_exceeded: 'Budget exceeded',
-  iteration_limit_reached: 'Iteration limit',
-  repeated_error_detected: 'Repeated error',
-  approval_rejected: 'Approval rejected',
   provider_failed: 'Provider failed',
-  validation_failed: 'Validation failed',
-  waiting_for_capability: 'Waiting for environment'
+  validation_failed: 'Validation failed'
 };
 
 const statusIcons: Record<TaskSummary['status'], typeof Clock3> = {
   draft: Clock3,
   submitted: Clock3,
   planning: LayoutList,
-  waiting_for_plan_approval: ShieldCheck,
   creating_github_issue: Github,
   creating_branch: GitBranch,
   running_ai: GitBranch,
   validating: ClipboardCheck,
   reviewing: ClipboardCheck,
   improving: RefreshCw,
-  needs_approval: AlertTriangle,
   creating_pr: ClipboardCheck,
   ready_for_user_review: CheckCircle2,
   completed: CheckCircle2,
   failed: XCircle,
   cancelled: XCircle,
-  budget_exceeded: AlertTriangle,
-  iteration_limit_reached: AlertTriangle,
-  repeated_error_detected: AlertTriangle,
-  approval_rejected: XCircle,
   provider_failed: XCircle,
-  validation_failed: XCircle,
-  waiting_for_capability: Clock3
+  validation_failed: XCircle
 };
 
 export function App() {
@@ -299,11 +274,10 @@ function AuthenticatedApp({ auth }: { auth: AuthSessionResponse }) {
   const [globalRealtimeMeta, setGlobalRealtimeMeta] = useState<RealtimeConnectionMeta>({ state: 'idle' });
   const [taskRealtimeMeta, setTaskRealtimeMeta] = useState<RealtimeConnectionMeta>({ state: 'idle' });
 
-  const globalPollInterval = globalRealtimeState === 'connected' ? false : 15000;
+  const globalPollInterval = globalRealtimeState === 'connected' ? 30000 : 15000;
 
   const projectsQuery = useQuery({ queryKey: ['projects'], queryFn: fetchProjects, retry: 1 });
   const tasksQuery = useQuery({ queryKey: ['tasks'], queryFn: fetchTasks, refetchInterval: globalPollInterval, retry: 1 });
-  const approvalsQuery = useQuery({ queryKey: ['approvals'], queryFn: fetchApprovals, refetchInterval: globalPollInterval, retry: 1 });
   const notificationSettingsQuery = useQuery({
     queryKey: ['notification-settings'],
     queryFn: fetchNotificationSettings,
@@ -333,14 +307,16 @@ function AuthenticatedApp({ auth }: { auth: AuthSessionResponse }) {
   });
   const workerStatusQuery = useQuery({ queryKey: ['worker-status'], queryFn: fetchWorkerStatus, refetchInterval: globalPollInterval, retry: 1 });
   const workerEventsQuery = useQuery({ queryKey: ['worker-events'], queryFn: () => fetchWorkerEvents(8), refetchInterval: globalPollInterval, retry: 1 });
-  const windowsOperationsQuery = useQuery({ queryKey: ['windows-operations'], queryFn: () => fetchWindowsOperations(), refetchInterval: globalPollInterval, retry: 1 });
-  const cancelWindowsJobMutation = useMutation({ mutationFn: cancelWindowsJob, onSuccess: () => queryClient.invalidateQueries({ queryKey: ['windows-operations'] }) });
-  const drainWindowsSessionMutation = useMutation({ mutationFn: drainWindowsSession, onSuccess: () => queryClient.invalidateQueries({ queryKey: ['windows-operations'] }) });
-  const revokeWindowsDeviceMutation = useMutation({ mutationFn: revokeWindowsDevice, onSuccess: () => queryClient.invalidateQueries({ queryKey: ['windows-operations'] }) });
+  const windowsOperationsQuery = useQuery({
+    queryKey: ['windows-worker-operations'],
+    queryFn: () => fetchWindowsWorkerOperations(),
+    enabled: view === 'settings',
+    refetchInterval: view === 'settings' ? globalPollInterval : false,
+    retry: 1
+  });
 
   const projects = projectsQuery.data ?? [];
   const tasks = tasksQuery.data ?? [];
-  const approvals = approvalsQuery.data ?? [];
   const notificationSettings = notificationSettingsQuery.data;
   const providerStatus = providerStatusQuery.data;
   const githubAdapterStatus = githubAdapterStatusQuery.data;
@@ -374,7 +350,7 @@ function AuthenticatedApp({ auth }: { auth: AuthSessionResponse }) {
 
   const { selectedTask, setSelectedTaskId } = useSelectedTask(tasks);
   const selectedTaskIsActive = activeStatuses.has(selectedTask?.status ?? 'draft');
-  const selectedTaskPollInterval = selectedTaskIsActive ? (taskRealtimeState === 'connected' ? false : 15000) : false;
+  const selectedTaskPollInterval = selectedTaskIsActive ? (taskRealtimeState === 'connected' ? 30000 : 15000) : false;
   const taskProjectRoadmapQuery = useQuery({
     queryKey: ['projects', selectedTask?.projectId, 'roadmap'],
     queryFn: () => fetchProjectRoadmap(selectedTask?.projectId ?? ''),
@@ -421,7 +397,6 @@ function AuthenticatedApp({ auth }: { auth: AuthSessionResponse }) {
         const event = message.event;
 
         queryClient.invalidateQueries({ queryKey: ['tasks'] });
-        queryClient.invalidateQueries({ queryKey: ['approvals'] });
         queryClient.invalidateQueries({ queryKey: ['worker-status'] });
         queryClient.invalidateQueries({ queryKey: ['worker-events'] });
 
@@ -452,7 +427,6 @@ function AuthenticatedApp({ auth }: { auth: AuthSessionResponse }) {
       onClose: () => {
         setGlobalRealtimeState('reconnecting');
         queryClient.invalidateQueries({ queryKey: ['tasks'] });
-        queryClient.invalidateQueries({ queryKey: ['approvals'] });
         queryClient.invalidateQueries({ queryKey: ['worker-status'] });
         queryClient.invalidateQueries({ queryKey: ['worker-events'] });
       },
@@ -543,14 +517,12 @@ function AuthenticatedApp({ auth }: { auth: AuthSessionResponse }) {
     };
   }, [queryClient, selectedTask?.id, selectedTask?.projectId]);
 
-  const pendingApprovals = approvals.filter((approval) => approval.status === 'pending');
   const activeTasks = tasks.filter((task) => !terminalStatuses.has(task.status));
-  const hasApiError = Boolean(projectsQuery.error || tasksQuery.error || approvalsQuery.error);
+  const hasApiError = Boolean(projectsQuery.error || tasksQuery.error);
 
   function invalidateTaskData(taskId?: string) {
     queryClient.invalidateQueries({ queryKey: ['tasks'] });
     queryClient.invalidateQueries({ queryKey: ['projects'] });
-    queryClient.invalidateQueries({ queryKey: ['approvals'] });
     if (taskId) {
       queryClient.invalidateQueries({ queryKey: ['tasks', taskId] });
       queryClient.invalidateQueries({ queryKey: ['tasks', taskId, 'logs'] });
@@ -719,11 +691,6 @@ function AuthenticatedApp({ auth }: { auth: AuthSessionResponse }) {
     }
   });
 
-  const resolveApprovalMutation = useMutation({
-    mutationFn: ({ id, status }: { id: string; status: 'approved' | 'rejected' }) => resolveApprovalRequest(id, status),
-    onSuccess: () => invalidateTaskData(selectedTask?.id)
-  });
-
   const subscribeNotificationsMutation = useMutation({
     mutationFn: async () => {
       const publicKey = await fetchNotificationVapidPublicKey();
@@ -757,6 +724,26 @@ function AuthenticatedApp({ auth }: { auth: AuthSessionResponse }) {
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['notification-settings'] });
     }
+  });
+
+  const cancelWindowsValidationMutation = useMutation({
+    mutationFn: cancelWindowsValidation,
+    onSuccess: () => queryClient.invalidateQueries({ queryKey: ['windows-worker-operations'] })
+  });
+
+  const drainWindowsWorkerSessionMutation = useMutation({
+    mutationFn: drainWindowsWorkerSession,
+    onSuccess: () => queryClient.invalidateQueries({ queryKey: ['windows-worker-operations'] })
+  });
+
+  const createWindowsRunnerEnrollmentMutation = useMutation({
+    mutationFn: createWindowsRunnerEnrollment,
+    onSuccess: () => queryClient.invalidateQueries({ queryKey: ['windows-worker-operations'] })
+  });
+
+  const revokeWindowsRunnerMutation = useMutation({
+    mutationFn: revokeWindowsRunner,
+    onSuccess: () => queryClient.invalidateQueries({ queryKey: ['windows-worker-operations'] })
   });
 
   const providerConnectMutation = useMutation({
@@ -831,9 +818,7 @@ function AuthenticatedApp({ auth }: { auth: AuthSessionResponse }) {
       scopeFiles,
       acceptanceCriteria,
       runtimeSummary: String(formData.get('runtimeSummary') || '').trim() || undefined,
-      mode: String(formData.get('mode')) as CreateTaskRequest['mode'],
-      maxBudgetUsd: Number(formData.get('maxBudgetUsd') || 2),
-      maxIterations: Number(formData.get('maxIterations') || 10)
+      mode: String(formData.get('mode')) as CreateTaskRequest['mode']
     };
     createTaskMutation.mutate(input);
   }
@@ -911,7 +896,6 @@ function AuthenticatedApp({ auth }: { auth: AuthSessionResponse }) {
         <NavButton active={view === 'tasks'} icon={LayoutList} label="Tasks" onClick={() => setView('tasks')} />
         <NavButton active={view === 'chat'} icon={MessageSquare} label="AI Chat" onClick={() => setView('chat')} />
         <NavButton active={view === 'new-task'} icon={Plus} label="New task" onClick={() => setView('new-task')} />
-        <NavButton active={view === 'approvals'} icon={ShieldCheck} label={`Approvals ${pendingApprovals.length}`} onClick={() => setView('approvals')} />
         <NavButton active={view === 'projects'} icon={FolderPlus} label="Projects" onClick={() => setView('projects')} />
         <NavButton active={view === 'settings'} icon={Settings} label="Settings" onClick={() => setView('settings')} />
       </aside>
@@ -954,16 +938,6 @@ function AuthenticatedApp({ auth }: { auth: AuthSessionResponse }) {
         </header>
 
         {hasApiError ? <div className="error-banner">API není dostupné, zobrazuji lokální fallback.</div> : null}
-        <section className="project-operational-overview" aria-label="Windows validation workers">
-          <div className="operational-state"><span>Windows validace</span><strong>{windowsOperationsQuery.data?.devices.length ?? 0} zařízení</strong>
-            {(windowsOperationsQuery.data?.devices ?? []).map((device) => <div key={device.id}><p>{device.displayName}: {device.status} · {device.capabilities.map((capability) => capability.key).join(', ') || 'bez schopností'}</p>
-              {device.sessions.find((session) => ['active', 'draining'].includes(session.status)) ? <button type="button" onClick={() => drainWindowsSessionMutation.mutate(device.sessions.find((session) => ['active', 'draining'].includes(session.status))!.id)}>Drain</button> : null}
-              <button type="button" disabled={device.status === 'revoked'} onClick={() => revokeWindowsDeviceMutation.mutate(device.id)}>Revoke</button></div>)}</div>
-          <div className="operational-blockers"><span>Čekající schopnosti</span>{(windowsOperationsQuery.data?.waitingValidations ?? []).map((job) => <p key={job.jobId}>{job.criterion ?? job.taskId}: {job.requiredCapabilities.join(', ')} · {job.compatibleDeviceIds.length} kompatibilní
-            <button type="button" onClick={() => cancelWindowsJobMutation.mutate(job.jobId)}>Cancel</button></p>)}</div>
-          <div className="operational-blockers"><span>Výsledné artefakty</span>{(windowsOperationsQuery.data?.evidence ?? []).map((item) => <div key={item.jobId}><strong>{item.criterion ?? item.checkId}</strong><small>{item.commitSha.slice(0, 12)} · log {item.log?.sizeBytes ?? 0} B</small>
-            {item.artifacts.map((artifact) => <p key={artifact.sha256}>{artifact.name} · {artifact.sizeBytes} B · {artifact.sha256.slice(0, 12)}</p>)}</div>)}</div>
-        </section>
         {workerQueueControlMutation.error ? (
           <div className="error-banner">Změna stavu fronty selhala: {workerQueueControlMutation.error.message}</div>
         ) : null}
@@ -975,7 +949,6 @@ function AuthenticatedApp({ auth }: { auth: AuthSessionResponse }) {
           <section className="workspace">
             <div className="task-list" aria-label="Seznam tasků">
               <MetricRow label="Aktivní tasky" value={String(activeTasks.length)} />
-              <MetricRow label="Čekající approvals" value={String(pendingApprovals.length)} tone={pendingApprovals.length ? 'warning' : 'ok'} />
               <MetricRow label="Worker events" value={String(workerEventsQuery.data?.length ?? 0)} />
               <div className="timeline" aria-label="Worker feed">
                 {(workerEventsQuery.data ?? []).slice(0, 4).map((event) => (
@@ -1033,31 +1006,6 @@ function AuthenticatedApp({ auth }: { auth: AuthSessionResponse }) {
         ) : null}
 
         {view === 'new-task' ? <NewTaskForm projects={projects} saving={createTaskMutation.isPending} onSubmit={createTask} /> : null}
-
-        {view === 'approvals' ? (
-          <section className="approval-grid">
-            {pendingApprovals.length === 0 ? <div className="empty-state approval-section-heading">Žádné schválení nečeká.</div> : null}
-            {pendingApprovals.map((approval) => (
-              <ApprovalPanel
-                key={approval.id}
-                approval={approval}
-                tasks={tasks}
-                resolving={resolveApprovalMutation.isPending}
-                onResolve={(id, status) => resolveApprovalMutation.mutate({ id, status })}
-              />
-            ))}
-            {approvals.some((approval) => approval.status !== 'pending') ? <h2 className="approval-section-heading">Historie</h2> : null}
-            {approvals.filter((approval) => approval.status !== 'pending').map((approval) => (
-              <ApprovalPanel
-                key={approval.id}
-                approval={approval}
-                tasks={tasks}
-                resolving={resolveApprovalMutation.isPending}
-                onResolve={(id, status) => resolveApprovalMutation.mutate({ id, status })}
-              />
-            ))}
-          </section>
-        ) : null}
 
         {view === 'projects' ? (
           <ProjectsPanel
@@ -1204,6 +1152,15 @@ function AuthenticatedApp({ auth }: { auth: AuthSessionResponse }) {
             onSubscribeNotifications={() => subscribeNotificationsMutation.mutate()}
             onUnsubscribeNotifications={() => unsubscribeNotificationsMutation.mutate()}
             onUpdateNotificationSettings={(input) => updateNotificationSettingsMutation.mutate(input)}
+            windowsOperations={windowsOperationsQuery.data}
+            windowsOperationsLoading={windowsOperationsQuery.isLoading}
+            windowsOperationsBusy={cancelWindowsValidationMutation.isPending || drainWindowsWorkerSessionMutation.isPending || createWindowsRunnerEnrollmentMutation.isPending || revokeWindowsRunnerMutation.isPending}
+            windowsOperationsError={windowsOperationsQuery.error ? formatUiError(windowsOperationsQuery.error) : createWindowsRunnerEnrollmentMutation.error ? formatUiError(createWindowsRunnerEnrollmentMutation.error) : revokeWindowsRunnerMutation.error ? formatUiError(revokeWindowsRunnerMutation.error) : undefined}
+            windowsEnrollment={createWindowsRunnerEnrollmentMutation.data}
+            onCreateWindowsRunnerEnrollment={(displayName) => createWindowsRunnerEnrollmentMutation.mutate({ deviceId: crypto.randomUUID(), displayName, expiresInMinutes: 10 })}
+            onCancelWindowsValidation={(jobId) => cancelWindowsValidationMutation.mutate(jobId)}
+            onDrainWindowsWorkerSession={(sessionId) => drainWindowsWorkerSessionMutation.mutate(sessionId)}
+            onRevokeWindowsRunner={(deviceId) => revokeWindowsRunnerMutation.mutate(deviceId)}
           />
         ) : null}
       </main>
@@ -1212,7 +1169,6 @@ function AuthenticatedApp({ auth }: { auth: AuthSessionResponse }) {
         <NavButton compact active={view === 'tasks'} icon={LayoutList} label="Tasks" onClick={() => setView('tasks')} />
         <NavButton compact active={view === 'chat'} icon={MessageSquare} label="Chat" onClick={() => setView('chat')} />
         <NavButton compact active={view === 'new-task'} icon={Plus} label="New" onClick={() => setView('new-task')} />
-        <NavButton compact active={view === 'approvals'} icon={ShieldCheck} label="Approve" onClick={() => setView('approvals')} />
         <NavButton compact active={view === 'projects'} icon={FolderPlus} label="Projects" onClick={() => setView('projects')} />
         <NavButton compact active={view === 'settings'} icon={Settings} label="Settings" onClick={() => setView('settings')} />
       </nav>
@@ -1223,7 +1179,6 @@ function AuthenticatedApp({ auth }: { auth: AuthSessionResponse }) {
 function viewTitle(view: View) {
   if (view === 'chat') return 'AI Chat';
   if (view === 'new-task') return 'Nový úkol';
-  if (view === 'approvals') return 'Schválení';
   if (view === 'projects') return 'Projekty';
   if (view === 'settings') return 'Nastavení';
   return 'Přehled tasků';
@@ -1589,12 +1544,16 @@ interface TaskActivityEntry {
 function TaskActivityPanel(props: {
   task: TaskSummary;
   taskId: string;
+  currentRunId?: string;
   logs: AuditEventApi[];
   realtimeState: RealtimeUiState;
 }) {
   const entries = useMemo(() => collectTaskActivityEntries(props.logs, props.taskId), [props.logs, props.taskId]);
   const taskIsActive = activeStatuses.has(props.task.status);
-  const executionEntries = useMemo(() => currentExecutionEntries(entries), [entries]);
+  const executionEntries = useMemo(
+    () => currentExecutionEntries(entries, props.currentRunId),
+    [entries, props.currentRunId]
+  );
   const latest = resolveCurrentActivity(executionEntries, props.task.updatedAt, taskIsActive);
   const [now, setNow] = useState(Date.now());
   useEffect(() => {
@@ -1689,13 +1648,13 @@ function TaskDetail(props: {
   onComplete: (taskId: string) => void;
 }) {
   const project = props.projects.find((item) => item.id === props.task.projectId);
-  const canRetry = (terminalStatuses.has(props.task.status) && props.task.status !== 'waiting_for_capability') || props.task.status === 'ready_for_user_review';
+  const canRetry = terminalStatuses.has(props.task.status) || props.task.status === 'ready_for_user_review';
   const canCancel = !terminalStatuses.has(props.task.status) && props.task.status !== 'ready_for_user_review';
   const canComplete = props.task.status === 'ready_for_user_review';
   const latestRun = props.usage?.runs.at(-1);
   const latestError = resolveLatestTaskError(props.task.status, props.logs, latestRun);
   const queueLabel = formatQueueLabel(props.task, props.queue);
-  const workflowItems = buildTaskWorkflow(props.task, props.logs);
+  const workflowItems = buildTaskWorkflow(props.task, props.logs, latestRun?.id);
   const projectProgress = summarizeProjectProgress(props.roadmap, props.task.id);
   const ProjectProgressIcon = projectProgress.tone === 'completed'
     ? CheckCircle2
@@ -1721,7 +1680,7 @@ function TaskDetail(props: {
 
       <div className="task-overview-grid">
         <MetricBlock label="Aktualni krok" value={props.task.currentStep || statusLabels[props.task.status]} />
-        <MetricBlock label="Pokusy" value={`${latestRun?.iterationCount ?? props.task.iterations}/${props.task.maxIterations}`} />
+        <MetricBlock label="Pokusy" value={String(latestRun?.iterationCount ?? props.task.iterations)} />
         <MetricBlock label="Zmeny" value={`${props.diff?.filesChanged ?? 0} souboru, +${props.diff?.insertions ?? 0} -${props.diff?.deletions ?? 0}`} />
         <MetricBlock
           label="Cena"
@@ -1747,19 +1706,6 @@ function TaskDetail(props: {
           <div>
             <strong>Akci nelze provést</strong>
             <pre>{props.actionError}</pre>
-          </div>
-        </section>
-      ) : null}
-
-      {props.task.status === 'waiting_for_capability' ? (
-        <section className="task-capability-wait" role="status">
-          <Clock3 size={20} />
-          <div>
-            <strong>Validace ceka na vhodne prostredi</strong>
-            <p>
-              Zdrojove zmeny byly predany. Task bude automaticky obnoven, jakmile se pripoji worker se schopnostmi:{' '}
-              {(props.task.waitingForCapabilities ?? []).join(', ') || 'nespecifikovano'}.
-            </p>
           </div>
         </section>
       ) : null}
@@ -1806,6 +1752,7 @@ function TaskDetail(props: {
         <TaskActivityPanel
           task={props.task}
           taskId={props.task.id}
+          currentRunId={latestRun?.id}
           logs={props.logs}
           realtimeState={props.realtimeState}
         />
@@ -1904,7 +1851,7 @@ interface WorkflowStageTiming {
   attemptCount: number;
 }
 
-function buildTaskWorkflow(task: TaskSummary, logs: AuditEventApi[]): TaskWorkflowItem[] {
+function buildTaskWorkflow(task: TaskSummary, logs: AuditEventApi[], currentRunId?: string): TaskWorkflowItem[] {
   const stages = [
     { id: 'prepare', label: 'Příprava', detail: 'Zařazení tasku a vytvoření plánu', icon: LayoutList },
     { id: 'github', label: 'GitHub', detail: 'Issue a pracovní branch', icon: GitBranch },
@@ -1917,20 +1864,13 @@ function buildTaskWorkflow(task: TaskSummary, logs: AuditEventApi[]): TaskWorkfl
     draft: 0,
     submitted: 0,
     planning: 0,
-    waiting_for_plan_approval: 0,
     creating_github_issue: 1,
     creating_branch: 1,
     running_ai: 2,
     improving: 2,
-    needs_approval: 2,
     provider_failed: 2,
-    budget_exceeded: 2,
-    iteration_limit_reached: 2,
-    repeated_error_detected: 2,
-    approval_rejected: 2,
     validating: 3,
     validation_failed: 3,
-    waiting_for_capability: 3,
     reviewing: 4,
     creating_pr: 5,
     ready_for_user_review: 5,
@@ -1941,9 +1881,9 @@ function buildTaskWorkflow(task: TaskSummary, logs: AuditEventApi[]): TaskWorkfl
   const failed = terminalStatuses.has(task.status)
     && task.status !== 'completed'
     && task.status !== 'cancelled'
-    && task.status !== 'waiting_for_capability';
+    ;
   const activities = collectTaskActivityEntries(logs, task.id);
-  const executionActivities = currentExecutionEntries(activities);
+  const executionActivities = currentExecutionEntries(activities, currentRunId);
   const latestExecutionActivity = executionActivities.at(-1);
   const latestActivityAt = latestExecutionActivity ? Date.parse(latestExecutionActivity.createdAt) : Number.NaN;
   const taskUpdatedAt = Date.parse(task.updatedAt);
@@ -1958,18 +1898,22 @@ function buildTaskWorkflow(task: TaskSummary, logs: AuditEventApi[]): TaskWorkfl
     if (task.status === 'completed') state = 'completed';
     if (failed && index === currentStage) state = 'failed';
     if (task.status === 'cancelled' && index === currentStage) state = 'failed';
-    const stageActivities = activities.filter((activity) => activityWorkflowStage(activity) === index);
     const executionStageActivities = executionActivities.filter((activity) => activityWorkflowStage(activity) === index);
-    const stageTiming = summarizeWorkflowStageTiming(activities, index);
-    const latestSuccessfulActivity = [...stageActivities].reverse().find((activity) => activity.state === 'completed');
+    const stageTiming = summarizeWorkflowStageTiming(executionActivities, index);
+    const latestSuccessfulActivity = [...executionStageActivities].reverse().find((activity) => activity.state === 'completed');
     const latestFailedExecution = [...executionStageActivities].reverse().find((activity) => activity.state === 'failed');
     const latestStageActivity = index === currentStage
       ? executionStageActivities.at(-1)
       : index < currentStage
-        ? latestSuccessfulActivity ?? stageActivities.at(-1)
+        ? latestSuccessfulActivity ?? executionStageActivities.at(-1)
         : undefined;
-    const activityDetail = latestStageActivity
-      ? formatWorkflowStageDetail(latestStageActivity, stageTiming, index)
+    const phaseAdvancedWithoutCompletion = index < currentStage
+      && latestStageActivity
+      && latestStageActivity.state !== 'completed';
+    const activityDetail = phaseAdvancedWithoutCompletion
+      ? `${stage.label} dokončena v aktuálním běhu`
+      : latestStageActivity
+        ? formatWorkflowStageDetail(latestStageActivity, stageTiming, index)
       : latestFailedExecution
         ? formatPreviousAttemptFailure(latestFailedExecution, latestExecutionActivity)
         : undefined;
@@ -1977,7 +1921,12 @@ function buildTaskWorkflow(task: TaskSummary, logs: AuditEventApi[]): TaskWorkfl
     return {
       ...stage,
       state,
-      detail: activityDetail ?? (index === currentStage ? statusLabels[task.status] : stage.detail)
+      detail: activityDetail
+        ?? (index < currentStage && executionActivities.length > 0
+          ? `${stage.label} dokončena v aktuálním běhu`
+          : index === currentStage
+            ? statusLabels[task.status]
+            : stage.detail)
     };
   });
 }
@@ -2045,18 +1994,6 @@ function formatPreviousAttemptFailure(
     ? `; čeká na pokus ${currentActivity.attempt}`
     : '; čeká na nový průchod';
   return `${failedAttempt} selhal${nextAttempt}`;
-}
-
-function activityWorkflowStage(activity: TaskActivityEntry): number {
-  if (activity.phase === 'workspace' || activity.phase === 'planning') return 0;
-  if (
-    activity.phase === 'github'
-    && (activity.operation === 'create_issue' || activity.operation === 'create_branch')
-  ) return 1;
-  if (activity.phase === 'implementation') return 2;
-  if (activity.phase === 'validation') return 3;
-  if (activity.phase === 'review') return 4;
-  return 5;
 }
 
 function inferWorkflowStageFromLogs(logs: AuditEventApi[]): number {
@@ -2298,7 +2235,7 @@ function toTaskActivityEntry(event: AuditEventApi): TaskActivityEntry | undefine
     const failedStatus = terminalStatuses.has(status)
       && status !== 'completed'
       && status !== 'cancelled'
-      && status !== 'waiting_for_capability';
+      ;
     return {
       id: event.id,
       createdAt: event.createdAt,
@@ -2380,7 +2317,7 @@ function auditTaskRunId(payload: Record<string, unknown>): string | undefined {
 
 function statusActivityPhase(status: TaskSummary['status']): string {
   if (status === 'creating_github_issue' || status === 'creating_branch') return 'github';
-  if (status === 'validating' || status === 'validation_failed' || status === 'waiting_for_capability') return 'validation';
+  if (status === 'validating' || status === 'validation_failed') return 'validation';
   if (status === 'reviewing') return 'review';
   if (status === 'creating_pr' || status === 'ready_for_user_review') return 'git';
   if (status === 'running_ai' || status === 'improving') return 'implementation';
@@ -2598,77 +2535,11 @@ function NewTaskForm({ projects, saving, onSubmit }: { projects: ProjectSummary[
         Runtime summary (volitelné)
         <textarea name="runtimeSummary" rows={3} placeholder="Krátké provozní omezení, dependency kontext, očekávané guardrails." />
       </label>
-      <label>
-        Max. rozpočet
-        <input name="maxBudgetUsd" type="number" min="0" step="0.5" defaultValue="2" />
-      </label>
-      <label>
-        Max. iterací
-        <input name="maxIterations" type="number" min="1" max="50" defaultValue="10" />
-      </label>
       <button className="primary-action wide" type="submit" disabled={saving || projects.length === 0}>
         <Smartphone size={18} />
         Vytvořit task
       </button>
     </form>
-  );
-}
-
-function ApprovalPanel(props: {
-  approval: ApprovalSummary;
-  tasks: TaskSummary[];
-  resolving: boolean;
-  onResolve: (id: string, status: 'approved' | 'rejected') => void;
-}) {
-  const task = props.tasks.find((item) => item.id === props.approval.taskId);
-  return (
-    <article className="approval-panel">
-      <div className="approval-heading">
-        <span className={`badge risk-${props.approval.riskLevel}`}>{props.approval.riskLevel}</span>
-        <span className={`badge ${props.approval.status}`}>{props.approval.status}</span>
-      </div>
-      <h2>{props.approval.title}</h2>
-      <p className="muted">{task?.title ?? props.approval.taskId}</p>
-      <dl>
-        <div>
-          <dt>Důvod</dt>
-          <dd>{props.approval.reason}</dd>
-        </div>
-        <div>
-          <dt>Riziko</dt>
-          <dd>{props.approval.risk}</dd>
-        </div>
-        <div>
-          <dt>Doporučení</dt>
-          <dd>{props.approval.recommendation}</dd>
-        </div>
-      </dl>
-      <div className="file-strip">
-        {props.approval.touchedFiles.map((file) => (
-          <span key={file}>{file}</span>
-        ))}
-      </div>
-      <div className="actions">
-        <button
-          className="primary-action"
-          type="button"
-          disabled={props.approval.status !== 'pending' || props.resolving}
-          onClick={() => props.onResolve(props.approval.id, 'approved')}
-        >
-          <CheckCircle2 size={18} />
-          Schválit
-        </button>
-        <button
-          className="danger-action"
-          type="button"
-          disabled={props.approval.status !== 'pending' || props.resolving}
-          onClick={() => props.onResolve(props.approval.id, 'rejected')}
-        >
-          <XCircle size={18} />
-          Zamítnout
-        </button>
-      </div>
-    </article>
   );
 }
 
@@ -2849,18 +2720,8 @@ export function ProjectsPanel(props: {
   const [autoCreatePullRequest, setAutoCreatePullRequest] = useState(selectedProject?.autoCreatePullRequest ?? true);
   const [autoMergePullRequest, setAutoMergePullRequest] = useState(selectedProject?.autoMergePullRequest ?? false);
   const [autoCompleteTask, setAutoCompleteTask] = useState(selectedProject?.autoCompleteTask ?? false);
-  const [allowSafeOperationsWithoutApproval, setAllowSafeOperationsWithoutApproval] = useState(
-    selectedProject?.allowSafeOperationsWithoutApproval ?? false
-  );
   const [defaultTaskMode, setDefaultTaskMode] = useState<CreateTaskRequest['mode']>(selectedProject?.defaultTaskMode ?? 'safe');
   const [aiProviderConnectionId, setAiProviderConnectionId] = useState(selectedProject?.aiProviderConnectionId ?? '');
-  const [validationProfileEnabled, setValidationProfileEnabled] = useState(selectedProject?.validationProfile?.enabled ?? false);
-  const [dockerComposeFiles, setDockerComposeFiles] = useState((selectedProject?.validationProfile?.dockerComposeFiles ?? []).join('\n'));
-  const [dockerComposeServices, setDockerComposeServices] = useState((selectedProject?.validationProfile?.dockerComposeServices ?? []).join('\n'));
-  const [requiredEnvironmentVariables, setRequiredEnvironmentVariables] = useState((selectedProject?.validationProfile?.requiredEnvironmentVariables ?? []).join('\n'));
-  const [migrationCommands, setMigrationCommands] = useState((selectedProject?.validationProfile?.migrationCommands ?? []).join('\n'));
-  const [readinessCommands, setReadinessCommands] = useState((selectedProject?.validationProfile?.readinessCommands ?? []).join('\n'));
-  const [validationTimeoutMinutes, setValidationTimeoutMinutes] = useState(selectedProject?.validationProfile?.commandTimeoutMinutes ?? 10);
   const [deleteConfirmation, setDeleteConfirmation] = useState('');
   const [deleteGitHubRepository, setDeleteGitHubRepository] = useState(false);
   const [selectedProjectRoadmapView, setSelectedProjectRoadmapView] = useState<ProjectRoadmapView>('roadmap');
@@ -2880,7 +2741,7 @@ export function ProjectsPanel(props: {
   const canStartNextRoadmapStep = Boolean(
     latestCycle?.status === 'active'
     && cycleSteps.some((step) => step.status === 'pending' && !step.taskId)
-    && !cycleSteps.some((step) => step.status === 'running' || step.status === 'waiting_for_capability')
+    && !cycleSteps.some((step) => step.status === 'running')
   );
   const canStartAudit = canStartProjectAudit(latestCycle, cycleSteps, latestAuditJob);
   const roadmapUsesOlderBrief = Boolean(
@@ -2904,25 +2765,15 @@ export function ProjectsPanel(props: {
     setAutoCreatePullRequest(selectedProject?.autoCreatePullRequest ?? true);
     setAutoMergePullRequest(selectedProject?.autoMergePullRequest ?? false);
     setAutoCompleteTask(selectedProject?.autoCompleteTask ?? false);
-    setAllowSafeOperationsWithoutApproval(selectedProject?.allowSafeOperationsWithoutApproval ?? false);
     setDefaultTaskMode(selectedProject?.defaultTaskMode ?? 'safe');
     setAiProviderConnectionId(selectedProject?.aiProviderConnectionId ?? '');
-    setValidationProfileEnabled(selectedProject?.validationProfile?.enabled ?? false);
-    setDockerComposeFiles((selectedProject?.validationProfile?.dockerComposeFiles ?? []).join('\n'));
-    setDockerComposeServices((selectedProject?.validationProfile?.dockerComposeServices ?? []).join('\n'));
-    setRequiredEnvironmentVariables((selectedProject?.validationProfile?.requiredEnvironmentVariables ?? []).join('\n'));
-    setMigrationCommands((selectedProject?.validationProfile?.migrationCommands ?? []).join('\n'));
-    setReadinessCommands((selectedProject?.validationProfile?.readinessCommands ?? []).join('\n'));
-    setValidationTimeoutMinutes(selectedProject?.validationProfile?.commandTimeoutMinutes ?? 10);
   }, [
     selectedProject?.id,
     selectedProject?.autoCreatePullRequest,
     selectedProject?.autoMergePullRequest,
     selectedProject?.autoCompleteTask,
-    selectedProject?.allowSafeOperationsWithoutApproval,
     selectedProject?.defaultTaskMode,
-    selectedProject?.aiProviderConnectionId,
-    selectedProject?.validationProfile
+    selectedProject?.aiProviderConnectionId
   ]);
 
   useEffect(() => {
@@ -3169,19 +3020,8 @@ export function ProjectsPanel(props: {
                   autoCreatePullRequest,
                   autoMergePullRequest,
                   autoCompleteTask,
-                  allowSafeOperationsWithoutApproval,
                   defaultTaskMode,
-                  aiProviderConnectionId: aiProviderConnectionId || null,
-                  validationProfile: {
-                    version: 1,
-                    enabled: validationProfileEnabled,
-                    dockerComposeFiles: parseProjectValidationLines(dockerComposeFiles),
-                    dockerComposeServices: parseProjectValidationLines(dockerComposeServices),
-                    requiredEnvironmentVariables: parseProjectValidationLines(requiredEnvironmentVariables),
-                    migrationCommands: parseProjectValidationLines(migrationCommands),
-                    readinessCommands: parseProjectValidationLines(readinessCommands),
-                    commandTimeoutMinutes: validationTimeoutMinutes
-                  }
+                  aiProviderConnectionId: aiProviderConnectionId || null
                 });
               }}
             >
@@ -3227,49 +3067,6 @@ export function ProjectsPanel(props: {
               <label className="toggle-row wide">
                 <input
                   type="checkbox"
-                  checked={validationProfileEnabled}
-                  onChange={(event) => setValidationProfileEnabled(event.target.checked)}
-                />
-                <span>
-                  <strong>Pripravit validacni prostredi projektu</strong>
-                  <small>Worker spusti nakonfigurovane Docker sluzby, migrace a readiness kontroly pred AI validaci.</small>
-                </span>
-              </label>
-              {validationProfileEnabled ? (
-                <>
-                  <label className="wide">
-                    Docker Compose soubory
-                    <textarea rows={2} value={dockerComposeFiles} onChange={(event) => setDockerComposeFiles(event.target.value)} placeholder="docker-compose.yml" />
-                    <small>Relativni cesty v repozitari, jedna na radek.</small>
-                  </label>
-                  <label className="wide">
-                    Docker sluzby
-                    <textarea rows={2} value={dockerComposeServices} onChange={(event) => setDockerComposeServices(event.target.value)} placeholder={'postgres\napi'} />
-                    <small>Prazdne pole spusti vsechny sluzby z compose souboru.</small>
-                  </label>
-                  <label className="wide">
-                    Povinne promenne prostredi
-                    <textarea rows={2} value={requiredEnvironmentVariables} onChange={(event) => setRequiredEnvironmentVariables(event.target.value)} placeholder="TEST_DATABASE_URL" />
-                    <small>Ukladaji se pouze nazvy; hodnoty zustavaji v runtime secrets.</small>
-                  </label>
-                  <label className="wide">
-                    Migracni prikazy
-                    <textarea rows={3} value={migrationCommands} onChange={(event) => setMigrationCommands(event.target.value)} placeholder="npm run db:migrate" />
-                    <small>Spusti se po priprave Docker sluzeb a pred validacnimi prikazy AI.</small>
-                  </label>
-                  <label className="wide">
-                    Readiness kontroly
-                    <textarea rows={3} value={readinessCommands} onChange={(event) => setReadinessCommands(event.target.value)} placeholder="npm run test:health" />
-                  </label>
-                  <label>
-                    Timeout prikazu v minutach
-                    <input type="number" min={1} max={60} value={validationTimeoutMinutes} onChange={(event) => setValidationTimeoutMinutes(Number(event.target.value))} />
-                  </label>
-                </>
-              ) : null}
-              <label className="toggle-row wide">
-                <input
-                  type="checkbox"
                   checked={autoMergePullRequest}
                   disabled={!autoCreatePullRequest}
                   onChange={(event) => {
@@ -3295,23 +3092,11 @@ export function ProjectsPanel(props: {
                   <small>Task se oznaci jako completed pouze kdyz GitHub potvrdi merge.</small>
                 </span>
               </label>
-              <label className="toggle-row wide">
-                <input
-                  type="checkbox"
-                  checked={allowSafeOperationsWithoutApproval}
-                  onChange={(event) => setAllowSafeOperationsWithoutApproval(event.target.checked)}
-                />
-                <span>
-                  <strong>Bez schvaleni bezpecnych operaci</strong>
-                  <small>Rizikove operace, merge, mazani, migrace a systemove zmeny zustavaji chranene.</small>
-                </span>
-              </label>
               {props.automationUpdateError ? <div className="error-banner wide">{props.automationUpdateError}</div> : null}
               {props.automationUpdated
                 && autoCreatePullRequest === selectedProject.autoCreatePullRequest
                 && autoMergePullRequest === selectedProject.autoMergePullRequest
                 && autoCompleteTask === selectedProject.autoCompleteTask
-                && allowSafeOperationsWithoutApproval === selectedProject.allowSafeOperationsWithoutApproval
                 && defaultTaskMode === selectedProject.defaultTaskMode ? (
                 <div className="success-banner wide">Automatizace byla ulozena.</div>
               ) : null}
@@ -3489,23 +3274,23 @@ export function ProjectsPanel(props: {
                                 <pre>{cycle.extensionProposal}</pre>
                               </div>
                             </div>
-                            {isLatest && cycle.status === 'awaiting_extension_approval' ? (
+                            {isLatest && cycle.status === 'awaiting_extension_decision' ? (
                               <div className="actions">
                                 <button
                                   className="primary-action"
                                   type="button"
                                   disabled={props.decidingExtension}
-                                  onClick={() => props.onDecideExtension(selectedProject.id, { approved: true, cycleId: cycle.id })}
+                                  onClick={() => props.onDecideExtension(selectedProject.id, { accepted: true, cycleId: cycle.id })}
                                 >
-                                  Schválit
+                                  Přijmout rozšíření
                                 </button>
                                 <button
                                   className="secondary-action"
                                   type="button"
                                   disabled={props.decidingExtension}
-                                  onClick={() => props.onDecideExtension(selectedProject.id, { approved: false, cycleId: cycle.id })}
+                                  onClick={() => props.onDecideExtension(selectedProject.id, { accepted: false, cycleId: cycle.id })}
                                 >
-                                  Zamítnout
+                                  Nepřijmout
                                 </button>
                               </div>
                             ) : null}
@@ -3714,10 +3499,6 @@ export function ProjectsPanel(props: {
   );
 }
 
-function parseProjectValidationLines(value: string): string[] {
-  return value.split(/\r?\n/).map((item) => item.trim()).filter(Boolean);
-}
-
 function SettingsPanel({
   githubAdapterStatus,
   githubAdapterLoading,
@@ -3743,7 +3524,16 @@ function SettingsPanel({
   notificationsError,
   onSubscribeNotifications,
   onUnsubscribeNotifications,
-  onUpdateNotificationSettings
+  onUpdateNotificationSettings,
+  windowsOperations,
+  windowsOperationsLoading,
+  windowsOperationsBusy,
+  windowsOperationsError,
+  windowsEnrollment,
+  onCreateWindowsRunnerEnrollment,
+  onCancelWindowsValidation,
+  onDrainWindowsWorkerSession,
+  onRevokeWindowsRunner
 }: {
   githubAdapterStatus?: GitHubAdapterStatusApi;
   githubAdapterLoading: boolean;
@@ -3770,6 +3560,15 @@ function SettingsPanel({
   onSubscribeNotifications: () => void;
   onUnsubscribeNotifications: () => void;
   onUpdateNotificationSettings: (input: Partial<NotificationSettingsApi['settings']>) => void;
+  windowsOperations?: WindowsWorkerOperationsReadModel;
+  windowsOperationsLoading: boolean;
+  windowsOperationsBusy: boolean;
+  windowsOperationsError?: string;
+  windowsEnrollment?: { enrollmentId: string; code: string; expiresAt: string };
+  onCreateWindowsRunnerEnrollment: (displayName: string) => void;
+  onCancelWindowsValidation: (jobId: string) => void;
+  onDrainWindowsWorkerSession: (sessionId: string) => void;
+  onRevokeWindowsRunner: (deviceId: string) => void;
 }) {
   const [providerForm, setProviderForm] = useState<ProviderConnectRequest>({
     connectionId: undefined,
@@ -3787,6 +3586,7 @@ function SettingsPanel({
     token: '',
     apiBaseUrl: ''
   });
+  const [windowsRunnerName, setWindowsRunnerName] = useState('Windows runner');
   const currentProviderModelOptions = providerModels?.provider === providerForm.provider
     && providerModels.connectionId === providerForm.connectionId
     && !providerModels.loginId
@@ -3896,6 +3696,67 @@ function SettingsPanel({
 
   return (
     <section className="settings-grid">
+      <article className="project-row">
+        <div className="wide">
+          <h2>Windows validační worker</h2>
+          <p>Dodatečné platformní ověření dokončených tasků. Implementační frontu neblokuje.</p>
+        </div>
+        {windowsOperationsLoading ? <p className="wide">Načítám stav Windows workerů...</p> : null}
+        {windowsOperationsError ? <div className="error-banner wide">{windowsOperationsError}</div> : null}
+        <MetricBlock label="Zařízení" value={String(windowsOperations?.devices.length ?? 0)} />
+        <MetricBlock label="Čekající kontroly" value={String(windowsOperations?.waitingValidations.length ?? 0)} />
+        <MetricBlock label="Důkazy" value={String(windowsOperations?.evidence.length ?? 0)} />
+        <label className="wide">
+          Název nového zařízení
+          <input value={windowsRunnerName} maxLength={200} onChange={(event) => setWindowsRunnerName(event.target.value)} />
+        </label>
+        <div className="actions wide">
+          <button type="button" className="primary-action" disabled={windowsOperationsBusy || !windowsRunnerName.trim()} onClick={() => onCreateWindowsRunnerEnrollment(windowsRunnerName.trim())}>
+            <Plus size={16} /> Vytvořit enrollment kód
+          </button>
+        </div>
+        {windowsEnrollment ? (
+          <div className="success-banner wide">
+            <strong>Jednorázový kód: <code>{windowsEnrollment.code}</code></strong>
+            <p>Platí do {new Date(windowsEnrollment.expiresAt).toLocaleString()}. Na Windows spusťte runner s příkazem <code>enroll</code> a kód vložte do terminálu.</p>
+          </div>
+        ) : null}
+        {windowsOperations?.devices.map((device) => {
+          const activeSession = device.sessions.find((session) => session.status === 'active' || session.status === 'draining');
+          return (
+            <div className="wide settings-operation-row" key={device.id}>
+              <div>
+                <strong>{device.displayName}</strong>
+                <p>{device.status} · {device.runnerVersion} · {device.capabilities.map((capability) => capability.key).join(', ') || 'bez capability'}</p>
+              </div>
+              <div className="actions">
+                {activeSession ? (
+                  <button type="button" className="secondary-action" disabled={windowsOperationsBusy || activeSession.status === 'draining'} onClick={() => onDrainWindowsWorkerSession(activeSession.id)}>
+                    <Pause size={16} /> Odvodnit relaci
+                  </button>
+                ) : null}
+                <button type="button" className="danger-action" disabled={windowsOperationsBusy || device.status === 'revoked'} onClick={() => onRevokeWindowsRunner(device.id)}>
+                  <Ban size={16} /> Odvolat
+                </button>
+              </div>
+            </div>
+          );
+        })}
+        {windowsOperations?.waitingValidations.map((validation) => (
+          <div className="wide settings-operation-row" key={validation.jobId}>
+            <div>
+              <strong>{validation.criterion ?? 'Windows validace'}</strong>
+              <p>{validation.requiredCapabilities.join(', ')} · kompatibilní zařízení: {validation.compatibleDeviceIds.length}</p>
+            </div>
+            <button type="button" className="danger-action" disabled={windowsOperationsBusy} onClick={() => onCancelWindowsValidation(validation.jobId)}>
+              <Ban size={16} /> Zrušit
+            </button>
+          </div>
+        ))}
+        {!windowsOperationsLoading && !windowsOperationsError && windowsOperations?.devices.length === 0 ? (
+          <p className="wide">Není připojen žádný Windows worker.</p>
+        ) : null}
+      </article>
       <article className="project-row">
         <div>
           <h2>GitHub adapter</h2>
@@ -4229,18 +4090,6 @@ function SettingsPanel({
               </button>
             </div>
             <div className="actions">
-              <button
-                className="secondary-action"
-                type="button"
-                onClick={() =>
-                  onUpdateNotificationSettings({
-                    approvalRequests: !notificationSettings.settings.approvalRequests
-                  })
-                }
-                disabled={notificationsBusy}
-              >
-                Approval alerts: {notificationSettings.settings.approvalRequests ? 'ON' : 'OFF'}
-              </button>
               <button
                 className="secondary-action"
                 type="button"

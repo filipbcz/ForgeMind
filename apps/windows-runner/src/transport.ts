@@ -1,8 +1,8 @@
-import type { WindowsEvidenceUpload, WorkerCapability, WorkerProbeEvidence } from '@forgemind/core';
+import type { WindowsEvidenceUpload, WindowsExecutionJob, WindowsExecutionLease, WindowsExecutionResult, WorkerCapability, WorkerProbeEvidence } from '@forgemind/core';
 import type { RunnerCredential } from './credential-store.js';
 
 export interface RunnerControlState { deviceStatus: string; sessionStatus: string; leaseStatus?: string; jobStatus?: string }
-export interface LeaseClaim { job: unknown; lease: { id: string } | null }
+export interface LeaseClaim { job: WindowsExecutionJob | null; lease: WindowsExecutionLease | null }
 
 /** Outbound-only HTTPS control-plane client. It never opens a listening socket. */
 export class WindowsRunnerTransport {
@@ -24,6 +24,7 @@ export class WindowsRunnerTransport {
   }
   drain(auth: RunnerCredential, sessionId: string) { return this.call('/api/windows-runner/device/session/drain', auth, { sessionId }); }
   uploadEvidence(auth: RunnerCredential, input: WindowsEvidenceUpload) { return this.call<{ accepted: boolean; duplicate: boolean }>('/api/windows-runner/device/evidence', auth, input); }
+  submitResult(auth: RunnerCredential, input: WindowsExecutionResult) { return this.call<{ accepted: boolean }>('/api/windows-runner/device/result', auth, input); }
   close(auth: RunnerCredential, sessionId: string) { return this.call('/api/windows-runner/device/session/close', auth, { sessionId }); }
   private async call<T = unknown>(path: string, auth?: RunnerCredential, body?: unknown, method = 'POST'): Promise<T> {
     const response = await this.request(new URL(path, this.baseUrl), {

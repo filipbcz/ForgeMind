@@ -17,11 +17,11 @@ vi.stubGlobal('fetch', vi.fn(async (_url: string, init?: RequestInit) => {
       summary: 'Impl summary',
       changedFiles: ['OPENAI_IMPLEMENTATION.md'],
       diffStat: { filesChanged: 1, insertions: 5, deletions: 0 },
-      requestedApprovals: [],
+      validationChecks: [{ kind: 'command', command: 'node --version' }],
       fileUpdates: [{ path: 'OPENAI_IMPLEMENTATION.md', content: '# OpenAI implementation\n' }]
     });
-  } else if (body.includes('Review only the supplied ForgeMind review packet')) {
-    content = JSON.stringify({ summary: 'Review summary', blockers: [], safeImprovements: [], riskyChanges: [] });
+  } else if (body.includes('Inspect the current repository in read-only mode')) {
+    content = JSON.stringify({ verdict: 'satisfied', summary: 'Review summary', blockers: [], criterionResults: [] });
   }
 
   return {
@@ -51,10 +51,6 @@ workflow:
   auto_push: false
 ai: {}
 limits: {}
-commands: {}
-approval: {}
-sandbox:
-  allow_network: true
 github: {}`,
   isActive: true,
   createdAt: new Date().toISOString(),
@@ -69,8 +65,6 @@ const demoTask: ForgeTask = {
   prompt: 'Simulate an OpenAI implementation and validate the worker lifecycle.',
   mode: 'safe',
   status: 'submitted',
-  maxIterations: 10,
-  maxBudgetUsd: 2,
   createdAt: new Date().toISOString(),
   updatedAt: new Date().toISOString()
 };
@@ -85,7 +79,6 @@ describe('worker workflow with OpenAI provider', () => {
       project: demoProject,
       task: demoTask,
       providerKind: 'openai',
-      verifyCommand: 'node --version',
       workspaceRoot
     });
 

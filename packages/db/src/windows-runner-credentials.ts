@@ -12,10 +12,24 @@ export interface WindowsRunnerPrincipal { credentialId: string; deviceId: string
 export class WindowsRunnerCredentialAdapter {
   constructor(private readonly prisma: PrismaClient) {}
 
-  async createEnrollment(deviceId: string, expiresAt: Date): Promise<{ enrollmentId: string; code: string; expiresAt: string }> {
+  async createEnrollment(deviceId: string, expiresAt: Date, displayName = 'Windows runner'): Promise<{ enrollmentId: string; code: string; expiresAt: string }> {
     const code = token();
     const enrollmentId = randomUUID();
     await this.prisma.$transaction(async (tx) => {
+      await tx.workerDevice.upsert({
+        where: { id: deviceId },
+        create: {
+          id: deviceId,
+          platform: 'windows',
+          runnerVersion: 'pending-enrollment',
+          displayName,
+          status: 'offline',
+          capabilities: [],
+          probeEvidence: [],
+          metadata: {}
+        },
+        update: { displayName }
+      });
       await tx.$executeRaw`INSERT INTO "worker_enrollments" ("id", "device_id", "code_hash", "expires_at") VALUES (${enrollmentId}, ${deviceId}, ${hash(code)}, ${expiresAt})`;
       await this.writeAudit(tx, 'user', 'windows_runner_enrollment_created', { deviceId, enrollmentId, expiresAt: expiresAt.toISOString() });
     });

@@ -13,13 +13,12 @@ function createRepository() {
     createChatThread: vi.fn(async (input: Record<string, unknown>) => ({ id: threadId, ...input })),
     continueChatThreadWithRepository: vi.fn(async (_id: string, input: Record<string, unknown>) => ({ id: threadId, ...input })),
     getChatThread: vi.fn(async () => ({ id: threadId, title: 'Repository chat' })),
-    getChatThreadDetail: vi.fn(async () => ({ thread: { id: threadId }, messages: [], runs: [], approvals: [], events: [] })),
+    getChatThreadDetail: vi.fn(async () => ({ thread: { id: threadId }, messages: [], runs: [], events: [] })),
     updateChatThread: vi.fn(async (_id: string, input: Record<string, unknown>) => ({ id: threadId, ...input })),
     deleteChatThread: vi.fn(async () => true),
     appendChatUserMessage: vi.fn(async () => ({ message: { id: 'message_1' }, run: { id: runId, status: 'queued' } })),
     retryChatRun: vi.fn(async () => ({ id: runId, status: 'queued' })),
-    cancelChatRun: vi.fn(async () => ({ id: runId, status: 'cancelled' })),
-    resolveChatApproval: vi.fn(async (_id: string, status: string) => ({ id: approvalId, status }))
+    cancelChatRun: vi.fn(async () => ({ id: runId, status: 'cancelled' }))
   };
 }
 
@@ -102,15 +101,13 @@ describe('chat routes', () => {
     await app.close();
   });
 
-  it('resumes runs after approvals and exposes retry and cancellation', async () => {
+  it('does not expose approval routes and still exposes retry and cancellation', async () => {
     const repository = createRepository();
     const app = Fastify();
     registerChatRoutes(app, repository as never);
 
     const approved = await app.inject({ method: 'POST', url: `/api/chat/approvals/${approvalId}/approve` });
-    expect(approved.statusCode).toBe(200);
-    expect(repository.resolveChatApproval).toHaveBeenCalledWith(approvalId, 'approved', 'user_1');
-
+    expect(approved.statusCode).toBe(404);
     expect((await app.inject({ method: 'POST', url: `/api/chat/runs/${runId}/retry` })).statusCode).toBe(200);
     expect((await app.inject({ method: 'POST', url: `/api/chat/runs/${runId}/cancel` })).statusCode).toBe(200);
     await app.close();

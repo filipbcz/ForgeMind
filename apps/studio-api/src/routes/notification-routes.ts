@@ -18,9 +18,7 @@ const notificationSubscriptionSchema = z.object({
 
 const notificationSettingsSchema = z.object({
   pushEnabled: z.boolean().optional(),
-  approvalRequests: z.boolean().optional(),
-  taskUpdates: z.boolean().optional(),
-  budgetAlerts: z.boolean().optional()
+  taskUpdates: z.boolean().optional()
 });
 
 export function registerNotificationRoutes(app: FastifyInstance, repository: ForgeMindRepository, notifications?: NotificationService) {

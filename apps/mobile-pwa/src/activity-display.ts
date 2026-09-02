@@ -5,15 +5,28 @@ export interface ActivityDisplayEntry {
   runId?: string;
 }
 
-export function currentExecutionEntries<T extends ActivityDisplayEntry>(entries: T[]): T[] {
-  const latestRunId = [...entries].reverse().find((entry) => entry.runId)?.runId;
+export function activityWorkflowStage(activity: { phase: string; operation?: string }): number {
+  if (activity.phase === 'workspace' || activity.phase === 'planning') return 0;
+  if (activity.phase === 'github') {
+    return !activity.operation || activity.operation === 'create_issue' || activity.operation === 'create_branch'
+      ? 1
+      : 5;
+  }
+  if (activity.phase === 'implementation') return 2;
+  if (activity.phase === 'validation') return 3;
+  if (activity.phase === 'review') return 4;
+  return 5;
+}
+
+export function currentExecutionEntries<T extends ActivityDisplayEntry>(entries: T[], currentRunId?: string): T[] {
+  const latestRunId = currentRunId ?? [...entries].reverse().find((entry) => entry.runId)?.runId;
   if (!latestRunId) {
     return entries;
   }
 
   const runStart = entries.find((entry) => entry.runId === latestRunId);
   if (!runStart) {
-    return entries;
+    return currentRunId ? [] : entries;
   }
 
   const runStartAt = Date.parse(runStart.createdAt);

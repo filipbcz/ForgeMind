@@ -91,7 +91,7 @@ Roadmap cyklus muze prejit do `completed` pouze tehdy, kdyz jsou vsechny require
 4. Worker implementuje pouze aktualni work item.
 5. AI navrhne minimalni validacni prikazy; worker posoudi policy a prikazy skutecne spusti.
 6. Review zkontroluje pouze diff, regresni rizika a splneni work itemu.
-7. Po zelenych GitHub checks muze dojit k merge a task/work item se oznaci jako completed.
+7. Po uspesne AI-navrzene validaci a review muze dojit k merge a task/work item se oznaci jako completed.
 8. Jakmile jsou work itemy requirementu hotove, capability prejde do `verifying`.
 9. Novy read-only audit porovna aktualni repozitar, kontrakt a duveryhodne dukazy.
 10. `satisfied`: requirement se uzavre. `partial`: vytvori se pouze gap work itemy. `blocked`: fronta se zastavi pro tento requirement a GUI ukaze duvod.
@@ -135,7 +135,7 @@ Akceptace:
 Stav: HOTOVO
 
 - [x] Pridat tabulku `acceptance_evidence` a odpovidajici core typy.
-- [x] Ukladat jednotlive vysledky validacnich prikazu a GitHub checks s task/run/commit vazbou.
+- [x] Ukladat jednotlive vysledky AI-navrzenych validacnich prikazu s task/run/commit vazbou.
 - [x] Vytvorit read model capability stavu bez AI volani.
 - [x] Vyloucit dukaz z jine verze kontraktu.
 - [x] Pri repository auditu potvrdit, ze auditni evidence odpovida aktualnimu commitu; realizovano v etape 3 pres read-only workspace `HEAD` a `commitSha` evidenci.

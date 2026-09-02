@@ -4,7 +4,7 @@ import { createHash, randomUUID } from 'node:crypto';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, expect, it, vi } from 'vitest';
-import { REQUIRED_QUALIFICATION_SCENARIOS, ROADMAP_GENERATION_CONFIRMATION } from '@forgemind/core';
+import { ROADMAP_GENERATION_CONFIRMATION } from '@forgemind/core';
 import type { AIProvider, CostEstimateResult, ImplementInput, ImplementResult, PlanInput, PlanResult, ReviewInput, ReviewResult } from '@forgemind/providers';
 import type { GitHubAdapter } from '@forgemind/github';
 import { createAuthService } from './auth.js';
@@ -101,9 +101,6 @@ function stableJson(value: unknown): string {
 
 const mutatingEndpointInventory = [
   ['PUT', '/api/worker/queue'],
-  ['POST', '/api/windows-runner/enrollments'],
-  ['POST', '/api/windows-runner/devices/11111111-1111-4111-8111-111111111111/rotate'],
-  ['POST', '/api/windows-runner/devices/11111111-1111-4111-8111-111111111111/revoke'],
   ['POST', '/api/auth/logout'],
   ['POST', '/api/providers/models'],
   ['POST', '/api/providers/codex/oauth/start'],
@@ -261,13 +258,14 @@ describe('Studio API routes', () => {
     await app.close();
   });
 
-  it('requires explicit approval before a delegated chat mutation executes', async () => {
+  it('allows an authenticated delegated chat mutation without a second approval gate', async () => {
     const auth = createAuthService();
     const repository = {
       getCurrentUser: vi.fn(async () => ownerUser),
       isChatApiMutationAuthorized: vi.fn(async () => false),
       getApproval: vi.fn(),
-      setWorkerQueuePaused: vi.fn()
+      setWorkerQueuePaused: vi.fn(async () => ({ queuePaused: true, updatedAt: new Date().toISOString() })),
+      getWorkerStatus: vi.fn(async () => ({ state: 'idle', queuePaused: true, queuedTaskCount: 0, activeTaskCount: 0, updatedAt: new Date().toISOString() }))
     };
     const app = Fastify();
     registerRoutes(app, repository as never, undefined, auth);
@@ -279,49 +277,13 @@ describe('Studio API routes', () => {
       payload: { paused: true }
     });
 
-    expect(response.statusCode).toBe(403);
-    expect(response.json()).toEqual({ error: 'Approved config_change approval required for this mutation.' });
-    expect(repository.setWorkerQueuePaused).not.toHaveBeenCalled();
-    await app.close();
-  });
-
-  it('requires an approved config change before creating a runner enrollment', async () => {
-    const auth = createAuthService();
-    const credentials = { createEnrollment: vi.fn() };
-    const repository = { getCurrentUser: vi.fn(async () => ownerUser) };
-    const app = Fastify();
-    registerRoutes(app, repository as never, undefined, auth, { credentials, workers: {} } as never);
-    const response = await app.inject({
-      method: 'POST', url: '/api/windows-runner/enrollments', headers: createOwnerAuthenticatedHeaders(auth),
-      payload: { deviceId: '11111111-1111-4111-8111-111111111111', expiresInMinutes: 10 }
-    });
-    expect(response.statusCode).toBe(403);
-    expect(response.json()).toEqual({ error: 'Approved config_change approval required for this mutation.' });
-    expect(credentials.createEnrollment).not.toHaveBeenCalled();
-    await app.close();
-  });
-
-  it('creates a runner enrollment after consuming its mutation-bound approval', async () => {
-    const auth = createAuthService();
-    const body = { deviceId: '11111111-1111-4111-8111-111111111111', expiresInMinutes: 10 };
-    const credentials = { createEnrollment: vi.fn(async () => ({ enrollmentId: 'enrollment_1', code: 'one-time-code', expiresAt: new Date().toISOString() })) };
-    const repository = {
-      getCurrentUser: vi.fn(async () => ownerUser),
-      getApproval: vi.fn(async () => approvedRiskApproval('config_change', 'approval_enroll_1', { method: 'POST', path: '/api/windows-runner/enrollments', body })),
-      consumeRiskApproval: vi.fn(async () => true)
-    };
-    const app = Fastify();
-    registerRoutes(app, repository as never, undefined, auth, { credentials, workers: {} } as never);
-    const response = await app.inject({
-      method: 'POST', url: '/api/windows-runner/enrollments', headers: withRiskApproval(createOwnerAuthenticatedHeaders(auth), 'approval_enroll_1'), payload: body
-    });
     expect(response.statusCode).toBe(200);
-    expect(credentials.createEnrollment).toHaveBeenCalledWith(body.deviceId, expect.any(Date));
-    expect(repository.consumeRiskApproval).toHaveBeenCalledWith('approval_enroll_1');
+    expect(repository.isChatApiMutationAuthorized).not.toHaveBeenCalled();
+    expect(repository.setWorkerQueuePaused).toHaveBeenCalledWith(true);
     await app.close();
   });
 
-  it('accepts an authorized chat-run delegation for a protected mutation', async () => {
+  it('does not consult legacy approval authorization for chat-run delegation', async () => {
     const auth = createAuthService();
     const repository = {
       getCurrentUser: vi.fn(async () => ownerUser),
@@ -340,9 +302,7 @@ describe('Studio API routes', () => {
     });
 
     expect(response.statusCode).toBe(200);
-    expect(repository.isChatApiMutationAuthorized).toHaveBeenCalledWith(expect.objectContaining({
-      runId: 'run_1', userId: ownerUser.id, type: 'config_change', method: 'PUT', path: '/api/worker/queue'
-    }));
+    expect(repository.isChatApiMutationAuthorized).not.toHaveBeenCalled();
     expect(repository.setWorkerQueuePaused).toHaveBeenCalledWith(true);
     await app.close();
   });
@@ -384,7 +344,7 @@ describe('Studio API routes', () => {
     await app.close();
   });
 
-  it('rejects risky approvals that are not bound to the exact mutation', async () => {
+  it('ignores legacy risk-approval headers and authorizes by the authenticated owner', async () => {
     const auth = createAuthService();
     const repository = {
       getCurrentUser: vi.fn(async () => ownerUser),
@@ -403,7 +363,8 @@ describe('Studio API routes', () => {
         return undefined;
       }),
       consumeRiskApproval: vi.fn(),
-      setWorkerQueuePaused: vi.fn()
+      setWorkerQueuePaused: vi.fn(async () => ({ queuePaused: true, updatedAt: new Date().toISOString() })),
+      getWorkerStatus: vi.fn(async () => ({ state: 'idle', queuePaused: true, queuedTaskCount: 0, activeTaskCount: 0, updatedAt: new Date().toISOString() }))
     };
     const app = Fastify();
     const headers = createOwnerAuthenticatedHeaders(auth);
@@ -422,13 +383,14 @@ describe('Studio API routes', () => {
       payload: { paused: true }
     });
 
-    expect(wrongBodyResponse.statusCode).toBe(403);
-    expect(wrongActorResponse.statusCode).toBe(403);
-    expect(repository.setWorkerQueuePaused).not.toHaveBeenCalled();
+    expect(wrongBodyResponse.statusCode).toBe(200);
+    expect(wrongActorResponse.statusCode).toBe(200);
+    expect(repository.getApproval).not.toHaveBeenCalled();
+    expect(repository.setWorkerQueuePaused).toHaveBeenCalledTimes(2);
     await app.close();
   });
 
-  it('rejects reused risky approval ids after successful execution', async () => {
+  it('does not consume legacy risk-approval ids', async () => {
     const auth = createAuthService();
     const repository = {
       getCurrentUser: vi.fn(async () => ownerUser),
@@ -473,12 +435,14 @@ describe('Studio API routes', () => {
     });
 
     expect(firstResponse.statusCode).toBe(200);
-    expect(secondResponse.statusCode).toBe(403);
-    expect(repository.setWorkerQueuePaused).toHaveBeenCalledOnce();
+    expect(secondResponse.statusCode).toBe(200);
+    expect(repository.getApproval).not.toHaveBeenCalled();
+    expect(repository.consumeRiskApproval).not.toHaveBeenCalled();
+    expect(repository.setWorkerQueuePaused).toHaveBeenCalledTimes(2);
     await app.close();
   });
 
-  it('rejects non-owner principals for approval mutations before resolving approvals', async () => {
+  it('does not expose task approval mutations', async () => {
     const operator = { id: 'user_1', email: 'operator@example.com', name: 'Operator', role: 'operator' as const };
     const auth = createAuthService();
     const repository = {
@@ -506,14 +470,13 @@ describe('Studio API routes', () => {
       headers: createAuthenticatedHeaders(auth, operator)
     });
 
-    expect(response.statusCode).toBe(403);
-    expect(response.json()).toEqual({ error: 'Owner role required for this mutation.' });
+    expect(response.statusCode).toBe(404);
     expect(repository.getApproval).not.toHaveBeenCalled();
     expect(repository.resolveApproval).not.toHaveBeenCalled();
     await app.close();
   });
 
-  it('requires pending approval state before approval execution', async () => {
+  it('does not execute historical approvals through the API', async () => {
     const owner = { id: 'user_1', email: 'owner@example.com', name: 'Owner', role: 'owner' as const };
     const auth = createAuthService();
     const repository = {
@@ -540,8 +503,7 @@ describe('Studio API routes', () => {
       headers: createAuthenticatedHeaders(auth, owner)
     });
 
-    expect(response.statusCode).toBe(409);
-    expect(response.json()).toEqual({ error: 'Only a pending approval can be approved.' });
+    expect(response.statusCode).toBe(404);
     expect(repository.resolveApproval).not.toHaveBeenCalled();
     await app.close();
   });
@@ -1023,7 +985,7 @@ describe('Studio API routes', () => {
     await app.close();
   });
 
-  it('reconciles roadmap step states through an exactly authorized chat mutation', async () => {
+  it('reconciles roadmap step states through an authenticated chat mutation without approval binding', async () => {
     const reconciliation = {
       projectId: 'project_1', examinedSteps: 2,
       updatedSteps: [{
@@ -1051,15 +1013,12 @@ describe('Studio API routes', () => {
 
     expect(response.statusCode).toBe(200);
     expect(response.json()).toEqual({ reconciliation, roadmap });
-    expect(repository.isChatApiMutationAuthorized).toHaveBeenCalledWith(expect.objectContaining({
-      runId: 'run_1', userId: ownerUser.id, type: 'risky_refactor', method: 'POST',
-      path: '/api/projects/project_1/implementation-steps/reconcile'
-    }));
+    expect(repository.isChatApiMutationAuthorized).not.toHaveBeenCalled();
     expect(repository.reconcileProjectImplementationSteps).toHaveBeenCalledWith('project_1');
     await app.close();
   });
 
-  it('treats a repeated extension approval as idempotent before invoking the provider', async () => {
+  it('treats a repeated accepted extension decision as idempotent before invoking the provider', async () => {
     const roadmap = {
       projectId: 'project_1',
       cycles: [
@@ -1091,7 +1050,7 @@ describe('Studio API routes', () => {
       method: 'POST',
       url: '/api/projects/project_1/extension/decision',
       headers,
-      payload: { approved: true, cycleId: 'cycle_1' }
+      payload: { accepted: true, cycleId: 'cycle_1' }
     });
 
     expect(response.statusCode).toBe(200);
@@ -1140,33 +1099,19 @@ describe('Studio API routes', () => {
         title: 'Demo', description: 'Done', acceptanceCriteria: ['Done'], requirementIds: ['REQ-DEMO'],
         deliverables: ['Demo'], dependsOnStepTitles: [], validationFocus: [], status: 'completed', taskId: 'task_1'
       }],
-      evidence: [{
-        id: 'evidence_1', cycleId: 'cycle_1', contractVersion: 1, source: 'artifact', status: 'passed', commitSha: 'abc1234',
-        payload: {
-          schemaVersion: 1, generatedFrom: 'qualification/platform-scenarios/scenarios.mjs',
-          scenarioCount: REQUIRED_QUALIFICATION_SCENARIOS.length,
-          scenarios: REQUIRED_QUALIFICATION_SCENARIOS.map((scenario) => ({ ...scenario }))
-        }
-      }, {
-        id: 'evidence_borek', cycleId: 'cycle_1', contractVersion: 1, source: 'artifact', status: 'passed', commitSha: 'abc1234',
-        payload: {
-          validationKind: 'borek-filip-unreal', executionAdapterKind: 'unreal', manuallyApproved: true,
-          fixture: false, windowsExecutionJobId: 'job_1', approvalId: 'approval_1'
-        }
-      }], capabilities: [], auditJobs: []
+      evidence: [], capabilities: [], auditJobs: []
     };
     const repository = {
       getCurrentUser: vi.fn(async () => ownerUser),
       getProject: vi.fn(async () => ({
-        id: 'project_1', name: 'Project', projectMemory: { version: 1, baseCommitSha: 'abc1234', recentWork: [], updatedAt: '' },
+        id: 'project_1', name: 'Project',
         projectContract: {
           version: 1, summary: 'Demo', invariants: [], prohibitedSubstitutes: [], releaseCriteria: ['Ready'],
           requirements: [{ id: 'REQ-DEMO', title: 'Demo', description: 'Demo works.', acceptanceCriteria: ['Done'], status: 'active' }]
         }
       })),
       getProjectRoadmap: vi.fn(async () => roadmap),
-      enqueueProjectAudit: vi.fn(async () => ({ enqueued: true, job: { id: 'audit_1' } })),
-      writeAudit: vi.fn(async () => undefined)
+      enqueueProjectAudit: vi.fn(async () => ({ enqueued: true, job: { id: 'audit_1' } }))
     };
     const app = Fastify();
     const auth = createAuthService();
@@ -1177,11 +1122,7 @@ describe('Studio API routes', () => {
 
     expect(response.statusCode).toBe(200);
     expect(repository.enqueueProjectAudit).toHaveBeenCalledWith({
-      projectId: 'project_1', cycleId: 'cycle_1', triggerTaskId: 'task_1', requirementIds: ['REQ-DEMO'],
-      manualRequest: {
-        contractVersion: 1, commitSha: 'abc1234',
-        qualificationEvidenceIds: ['evidence_1', 'evidence_borek'], completedStepIds: ['step_1']
-      }
+      projectId: 'project_1', cycleId: 'cycle_1', triggerTaskId: 'task_1', requirementIds: ['REQ-DEMO']
     });
     await app.close();
   });
@@ -1190,7 +1131,7 @@ describe('Studio API routes', () => {
     const repository = {
       getCurrentUser: vi.fn(async () => ownerUser),
       getProject: vi.fn(async () => ({
-        id: 'project_1', projectMemory: { version: 1, baseCommitSha: 'abc1234', recentWork: [], updatedAt: '' },
+        id: 'project_1',
         projectContract: {
           version: 1, summary: 'Demo', invariants: [], prohibitedSubstitutes: [], releaseCriteria: ['Ready'],
           requirements: [{ id: 'REQ-DEMO', title: 'Demo', description: 'Demo works.', acceptanceCriteria: ['Done'], status: 'active' }]
@@ -1212,47 +1153,6 @@ describe('Studio API routes', () => {
 
     expect(response.statusCode).toBe(409);
     expect(repository.enqueueProjectAudit).not.toHaveBeenCalled();
-    await app.close();
-  });
-
-  it('rejects a manual final audit without qualification evidence for the current project state', async () => {
-    const repository = {
-      getCurrentUser: vi.fn(async () => ownerUser),
-      getProject: vi.fn(async () => ({
-        id: 'project_1',
-        projectContract: {
-          version: 2, summary: 'Demo', invariants: [], prohibitedSubstitutes: [], releaseCriteria: ['Ready'],
-          requirements: [{ id: 'REQ-DEMO', title: 'Demo', description: 'Demo works.', acceptanceCriteria: ['Done'], status: 'active' }]
-        }
-      })),
-      getProjectRoadmap: vi.fn(async () => ({
-        projectId: 'project_1',
-        cycles: [{ id: 'cycle_2', projectId: 'project_1', cycleNumber: 2, objective: 'Demo', status: 'active' }],
-        steps: [{ id: 'step_2', cycleId: 'cycle_2', sequenceNumber: 1, status: 'completed', taskId: 'task_2' }],
-        evidence: [{
-          id: 'failed_evidence', cycleId: 'cycle_2', contractVersion: 2, source: 'artifact', status: 'failed', commitSha: 'abc1234',
-          payload: {
-            schemaVersion: 1, generatedFrom: 'qualification/platform-scenarios/scenarios.mjs',
-            scenarioCount: REQUIRED_QUALIFICATION_SCENARIOS.length,
-            scenarios: REQUIRED_QUALIFICATION_SCENARIOS.map((scenario) => ({ ...scenario }))
-          }
-        }],
-        capabilities: [], auditJobs: []
-      })),
-      enqueueProjectAudit: vi.fn(),
-      writeAudit: vi.fn()
-    };
-    const app = Fastify();
-    const auth = createAuthService();
-    const headers = createOwnerAuthenticatedHeaders(auth);
-    registerRoutes(app, repository as never, undefined, auth);
-
-    const response = await app.inject({ method: 'POST', url: '/api/projects/project_1/audit/start', headers });
-
-    expect(response.statusCode).toBe(409);
-    expect(response.json().error).toContain('Current qualification evidence');
-    expect(repository.enqueueProjectAudit).not.toHaveBeenCalled();
-    expect(repository.writeAudit).not.toHaveBeenCalled();
     await app.close();
   });
 
@@ -1656,8 +1556,7 @@ describe('Studio API routes', () => {
       headers,
       payload: { validationProfile }
     });
-    expect(validationProfileResponse.statusCode).toBe(200);
-    expect(repository.updateProject).toHaveBeenLastCalledWith('project_1', { validationProfile });
+    expect(validationProfileResponse.statusCode).toBe(400);
 
     const shortProjectBriefResponse = await app.inject({
       method: 'PATCH',
@@ -1911,9 +1810,7 @@ describe('Studio API routes', () => {
         scopeFiles: ['apps/mobile-pwa/src/App.tsx', 'apps/studio-api/src/routes.ts'],
         acceptanceCriteria: ['Build passes', 'Task reaches ready_for_user_review'],
         runtimeSummary: 'No infra changes allowed.',
-        mode: 'safe',
-        maxIterations: 12,
-        maxBudgetUsd: 3
+        mode: 'safe'
       }
     });
 
@@ -1923,8 +1820,6 @@ describe('Studio API routes', () => {
         projectId: 'project_1',
         title: 'Rich task payload',
         mode: 'safe',
-        maxIterations: 12,
-        maxBudgetUsd: 3,
         prompt: expect.stringContaining('Priority: high')
       })
     );
@@ -2517,12 +2412,11 @@ describe('Studio API routes', () => {
       url: '/api/notifications/settings',
       headers,
       payload: {
-        approvalRequests: false,
-        budgetAlerts: true
+        taskUpdates: false
       }
     });
     expect(putSettingsResponse.statusCode).toBe(200);
-    expect(putSettingsResponse.json().settings.approvalRequests).toBe(false);
+    expect(putSettingsResponse.json().settings.taskUpdates).toBe(false);
 
     const unsubscribeResponse = await app.inject({
       method: 'POST',
@@ -2664,7 +2558,7 @@ describe('Studio API routes', () => {
     await app.close();
   });
 
-  it('resumes and enqueues task after final approval is approved', async () => {
+  it('does not expose the historical approval-resume endpoint', async () => {
     const repository = {
       getCurrentUser: vi.fn(async () => ({ id: 'user_1', email: 'owner@example.com', name: 'Owner', role: 'owner' })),
       getWorkerStatus: vi.fn(async () => ({
@@ -2769,16 +2663,10 @@ describe('Studio API routes', () => {
       headers
     });
 
-    expect(response.statusCode).toBe(200);
-    expect(repository.resolveApproval).toHaveBeenCalledWith('approval_1', 'approved');
-    expect(repository.retryTask).toHaveBeenCalledWith('task_1', true);
-    expect(repository.enqueueTask).toHaveBeenCalledWith('task_1', 'task_retried');
-    expect(repository.writeAudit).toHaveBeenCalledWith(
-      expect.objectContaining({
-        eventType: 'task_enqueued',
-        taskId: 'task_1'
-      })
-    );
+    expect(response.statusCode).toBe(404);
+    expect(repository.resolveApproval).not.toHaveBeenCalled();
+    expect(repository.retryTask).not.toHaveBeenCalled();
+    expect(repository.enqueueTask).not.toHaveBeenCalled();
 
     await app.close();
   });
@@ -3052,16 +2940,16 @@ describe('Studio API routes', () => {
           summary: 'Implementation done',
           changedFiles: ['README.md'],
           diffStat: { filesChanged: 1, insertions: 3, deletions: 0 },
-          requestedApprovals: [],
+          validationChecks: [{ kind: 'command', command: 'node --version' }],
           fileUpdates: [{ path: 'README.md', content: '# Pipeline test\n' }]
         };
       },
       async review(_input: ReviewInput): Promise<ReviewResult> {
         return {
+          verdict: 'satisfied',
           summary: 'Review ok',
           blockers: [],
-          safeImprovements: [],
-          riskyChanges: []
+          criterionResults: []
         };
       },
       async estimateCost(): Promise<CostEstimateResult> {

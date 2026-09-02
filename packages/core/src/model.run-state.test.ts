@@ -21,14 +21,12 @@ describe('shared task run state model', () => {
     expect(normalizeRunState('failed')).toMatchObject({ version: 1, status: 'failed' });
   });
 
-  it('keeps inactive worker, paused queue, and unavailable capability waiting reasons distinct', () => {
+  it('keeps inactive worker and paused queue waiting reasons distinct', () => {
     const inactive = createWaitingRunState('inactive_worker');
     const paused = createWaitingRunState('paused_queue');
-    const unavailable = createWaitingRunState('unavailable_capability', { requiredCapabilities: ['windows'] });
 
     expect(inactive.reason).not.toBe(paused.reason);
-    expect(paused.reason).not.toBe(unavailable.reason);
-    expect(getRunStateDetail(unavailable)).toContain('windows');
+    expect(getRunStateDetail(paused)).toBeDefined();
     expect(getRunStateLabel(createRetryScheduledRunState())).toBe('Retry scheduled');
   });
 });

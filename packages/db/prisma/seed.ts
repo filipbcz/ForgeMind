@@ -23,32 +23,10 @@ ai:
   primary_provider: "codex"
   reviewer_provider: "codex"
   model_profile: "balanced"
-limits:
-  max_iterations: 10
-  max_runtime_minutes: 600
-  max_changed_files: 20
-  max_diff_lines: 2000
-  max_repeated_error_count: 3
-commands:
-  verify: "node --version"
-approval:
-  required_for:
-    - new_dependency
-  auto_allowed:
-    - docs_update
-sandbox:
-  allow_network: false
-  allow_sudo: false
-  writable_paths:
-    - "/workspace"
-  forbidden_paths:
-    - "/etc"
-    - "/root"
 github:
   issue_label: "ai-task"
   branch_prefix: "ai/"
   pr_draft: true
-  require_ci_green: true
 `;
 
 async function main() {

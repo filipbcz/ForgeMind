@@ -39,26 +39,6 @@ export interface PullRequestState {
   mergeCommitSha?: string;
 }
 
-export interface GitHubCheckFailure {
-  name: string;
-  detailsUrl?: string;
-  output: string;
-}
-
-export interface GitHubChecksResult {
-  status: 'success' | 'failure' | 'not_configured' | 'timeout';
-  summary: string;
-  failures: GitHubCheckFailure[];
-}
-
-export interface WaitForGitHubChecksOptions {
-  timeoutMs?: number;
-  discoveryTimeoutMs?: number;
-  pollIntervalMs?: number;
-  onProgress?: (message: string) => Promise<void> | void;
-  signal?: AbortSignal;
-}
-
 export interface GitHubAdapter {
   createIssue(input: CreateIssueInput, signal?: AbortSignal): Promise<CreateIssueResult>;
   getRemoteUrl?(project: Project): string | undefined;
@@ -69,7 +49,6 @@ export interface GitHubAdapter {
   getPullRequestState?(project: Project, pullRequestNumber: number): Promise<PullRequestState>;
   commentOnIssue(project: Project, issueNumber: number, body: string, signal?: AbortSignal): Promise<void>;
   readCheckStatus(project: Project, ref: string): Promise<'pending' | 'success' | 'failure'>;
-  waitForChecks?(project: Project, ref: string, options?: WaitForGitHubChecksOptions): Promise<GitHubChecksResult>;
 }
 
 export interface GitHubAppAdapterOptions {
@@ -197,34 +176,6 @@ interface GitHubMergePullResponse {
 
 interface GitHubStatusResponse {
   state: 'error' | 'failure' | 'pending' | 'success';
-}
-
-interface GitHubCheckRunsResponse {
-  total_count: number;
-  check_runs: GitHubCheckRunResponse[];
-}
-
-interface GitHubCheckRunResponse {
-  id: number;
-  name: string;
-  status: 'queued' | 'in_progress' | 'completed' | 'waiting' | 'requested' | 'pending';
-  conclusion: string | null;
-  details_url?: string | null;
-  output?: {
-    title?: string | null;
-    summary?: string | null;
-    text?: string | null;
-  };
-}
-
-interface GitHubCheckAnnotationResponse {
-  path: string;
-  start_line: number;
-  end_line: number;
-  annotation_level: string;
-  message: string;
-  title?: string | null;
-  raw_details?: string | null;
 }
 
 interface GitHubRepositoryResponse {
@@ -417,153 +368,6 @@ export class GitHubAppAdapter implements GitHubAdapter {
     return 'failure';
   }
 
-  async waitForChecks(project: Project, ref: string, options: WaitForGitHubChecksOptions = {}): Promise<GitHubChecksResult> {
-    const repository = requireProjectRepository(project);
-    const startedAt = Date.now();
-    const timeoutMs = options.timeoutMs ?? readPositiveIntegerEnv('FORGEMIND_GITHUB_CHECKS_TIMEOUT_MS', 30 * 60_000);
-    const discoveryTimeoutMs = Math.min(
-      timeoutMs,
-      options.discoveryTimeoutMs ?? readPositiveIntegerEnv('FORGEMIND_GITHUB_CHECKS_DISCOVERY_TIMEOUT_MS', 30_000)
-    );
-    const pollIntervalMs = options.pollIntervalMs ?? readPositiveIntegerEnv('FORGEMIND_GITHUB_CHECKS_POLL_INTERVAL_MS', 10_000);
-    let lastProgress = '';
-
-    while (Date.now() - startedAt < timeoutMs) {
-      throwIfAborted(options.signal);
-      const checksPath = `/repos/${repository.owner}/${repository.repo}/commits/${encodeURIComponent(ref)}/check-runs?filter=latest&per_page=100`;
-      const checks = options.signal
-        ? await this.request<GitHubCheckRunsResponse>('GET', checksPath, undefined, options.signal)
-        : await this.request<GitHubCheckRunsResponse>('GET', checksPath);
-      const runs = checks.check_runs ?? [];
-
-      if (runs.length === 0) {
-        if (Date.now() - startedAt >= discoveryTimeoutMs) {
-          return {
-            status: 'not_configured',
-            summary: 'No GitHub checks were discovered for the pushed commit.',
-            failures: []
-          };
-        }
-        lastProgress = await reportCheckProgress(options, lastProgress, 'Waiting for GitHub checks to start.');
-        await delay(pollIntervalMs, options.signal);
-        continue;
-      }
-
-      const pending = runs.filter((run) => run.status !== 'completed');
-      if (pending.length > 0) {
-        lastProgress = await reportCheckProgress(
-          options,
-          lastProgress,
-          `GitHub checks are running (${runs.length - pending.length}/${runs.length} completed).`
-        );
-        await delay(pollIntervalMs, options.signal);
-        continue;
-      }
-
-      const failedRuns = runs.filter((run) => !isSuccessfulCheckConclusion(run.conclusion));
-      if (failedRuns.length === 0) {
-        return {
-          status: 'success',
-          summary: `${runs.length} GitHub check(s) passed.`,
-          failures: []
-        };
-      }
-
-      const failures = await Promise.all(failedRuns.map((run) => this.describeCheckFailure(repository, run, options.signal)));
-      return {
-        status: 'failure',
-        summary: compactCheckOutput(failures.map((failure) => `${failure.name}: ${failure.output}`).join('\n\n')),
-        failures
-      };
-    }
-
-    return {
-      status: 'timeout',
-      summary: `GitHub checks did not finish within ${Math.ceil(timeoutMs / 60_000)} minute(s).`,
-      failures: []
-    };
-  }
-
-  private async describeCheckFailure(
-    repository: { owner: string; repo: string },
-    run: GitHubCheckRunResponse,
-    signal?: AbortSignal
-  ): Promise<GitHubCheckFailure> {
-    const fallback = compactCheckOutput([
-      run.output?.title,
-      run.output?.summary,
-      run.output?.text,
-      run.conclusion ? `Conclusion: ${run.conclusion}` : undefined
-    ].filter((value): value is string => Boolean(value)).join('\n'));
-    const jobId = parseActionsJobId(run.details_url);
-    let output = fallback;
-
-    if (jobId) {
-      try {
-        const log = await this.requestText('GET', `/repos/${repository.owner}/${repository.repo}/actions/jobs/${jobId}/logs`, signal);
-        output = compactCheckOutput(log) || fallback;
-      } catch (error) {
-        const annotations = await this.readCheckAnnotations(repository, run.id, signal);
-        output = annotations
-          ? compactCheckOutput([fallback, annotations].filter(Boolean).join('\n'))
-          : `${fallback}\nUnable to read the failed job log: ${toSafeGitHubError(error)}`.trim();
-      }
-    }
-
-    return {
-      name: run.name,
-      detailsUrl: run.details_url ?? undefined,
-      output: output || `GitHub check concluded with ${run.conclusion ?? 'an unknown failure'}.`
-    };
-  }
-
-  private async readCheckAnnotations(
-    repository: { owner: string; repo: string },
-    checkRunId: number,
-    signal?: AbortSignal
-  ): Promise<string> {
-    try {
-      const annotations = await this.requestWithSignal<GitHubCheckAnnotationResponse[]>(
-        'GET',
-        `/repos/${repository.owner}/${repository.repo}/check-runs/${checkRunId}/annotations?per_page=100`,
-        undefined,
-        signal
-      );
-      return compactCheckOutput(annotations.map((annotation) => {
-        const line = annotation.start_line === annotation.end_line
-          ? `${annotation.start_line}`
-          : `${annotation.start_line}-${annotation.end_line}`;
-        return [
-          `${annotation.path}:${line}: ${annotation.annotation_level}`,
-          annotation.title,
-          annotation.message,
-          annotation.raw_details
-        ].filter((value): value is string => Boolean(value)).join('\n');
-      }).join('\n\n'));
-    } catch {
-      return '';
-    }
-  }
-
-  private async requestText(method: string, path: string, signal?: AbortSignal): Promise<string> {
-    const response = await fetch(`${this.apiBaseUrl}${path}`, {
-      method,
-      signal,
-      headers: {
-        Accept: 'application/vnd.github+json',
-        Authorization: `Bearer ${this.options.token}`,
-        'User-Agent': 'ForgeMind-GitHubAppAdapter',
-        'X-GitHub-Api-Version': '2022-11-28'
-      }
-    });
-
-    if (!response.ok) {
-      throw new Error(`GitHub API ${method} ${path} failed with ${response.status}: ${await response.text()}`);
-    }
-
-    return response.text();
-  }
-
   private requestWithSignal<T = unknown>(method: string, path: string, body: unknown, signal?: AbortSignal): Promise<T> {
     if (signal) return this.request<T>(method, path, body, signal);
     if (body === undefined) return this.request<T>(method, path);
@@ -597,77 +401,9 @@ export class GitHubAppAdapter implements GitHubAdapter {
   }
 }
 
-function isSuccessfulCheckConclusion(conclusion: string | null): boolean {
-  return conclusion === 'success' || conclusion === 'neutral' || conclusion === 'skipped';
-}
-
-function parseActionsJobId(detailsUrl: string | null | undefined): string | undefined {
-  return detailsUrl?.match(/\/actions\/runs\/\d+\/job\/(\d+)/)?.[1];
-}
-
-function compactCheckOutput(raw: string): string {
-  const lines = raw
-    .replace(/\u001b\[[0-9;]*m/g, '')
-    .split(/\r?\n/)
-    .map((line) => line.trimEnd())
-    .filter(Boolean);
-  if (lines.length === 0) return '';
-
-  const errorPattern = /(^|\b)(error|failed|failure|fatal|exception|undefined reference|process completed with exit code|C\d{4})(\b|:)/i;
-  const selected = new Set<number>();
-  for (let index = 0; index < lines.length; index += 1) {
-    if (!errorPattern.test(lines[index] ?? '')) continue;
-    for (let context = Math.max(0, index - 2); context <= Math.min(lines.length - 1, index + 2); context += 1) {
-      selected.add(context);
-    }
-  }
-
-  const compacted = (selected.size > 0
-    ? Array.from(selected).sort((left, right) => left - right).map((index) => lines[index]!)
-    : lines.slice(-40))
-    .slice(-80)
-    .join('\n');
-  return compacted.length <= 8_000 ? compacted : compacted.slice(compacted.length - 8_000);
-}
-
-async function reportCheckProgress(
-  options: WaitForGitHubChecksOptions,
-  previous: string,
-  message: string
-): Promise<string> {
-  if (message !== previous) await options.onProgress?.(message);
-  return message;
-}
-
-function readPositiveIntegerEnv(name: string, fallback: number): number {
-  const parsed = Number.parseInt(process.env[name] ?? '', 10);
-  return Number.isFinite(parsed) && parsed >= 0 ? parsed : fallback;
-}
-
-function delay(ms: number, signal?: AbortSignal): Promise<void> {
-  throwIfAborted(signal);
-  return new Promise((resolvePromise, rejectPromise) => {
-    const onAbort = () => {
-      clearTimeout(timer);
-      signal?.removeEventListener('abort', onAbort);
-      const reason = signal?.reason;
-      rejectPromise(reason instanceof Error ? reason : new Error('GitHub operation was cancelled.'));
-    };
-    const timer = setTimeout(() => {
-      signal?.removeEventListener('abort', onAbort);
-      resolvePromise();
-    }, Math.max(0, ms));
-    signal?.addEventListener('abort', onAbort, { once: true });
-  });
-}
-
 function throwIfAborted(signal?: AbortSignal): void {
   if (!signal?.aborted) return;
   throw signal.reason instanceof Error ? signal.reason : new Error('GitHub operation was cancelled.');
-}
-
-function toSafeGitHubError(error: unknown): string {
-  return error instanceof Error ? error.message.slice(0, 1_000) : String(error).slice(0, 1_000);
 }
 
 export async function createGitHubAdapterFromEnv(): Promise<GitHubAdapter> {
@@ -1239,163 +975,16 @@ export function createAiBranchName(issueNumber: number, title: string, prefix = 
 }
 
 export function renderIssueBody(task: ForgeTask): string {
-  const parsed = parseTaskPromptMetadata(task.prompt);
-  const constraints = formatConstraints(parsed);
-  const acceptanceCriteria =
-    parsed.acceptanceCriteria.length > 0
-      ? parsed.acceptanceCriteria.map((item) => `- ${item}`)
-      : ['- Nebyla dodana explicitni akceptacni kriteria. Pouzit zadani v sekci Kontekst.'];
-
   return [
     '## Cíl',
     task.title,
     '',
-    '## Kontext',
-    parsed.context || task.prompt,
-    '',
-    '## Omezení',
-    ...constraints,
-    '',
-    '## Akceptační kritéria',
-    ...acceptanceCriteria,
+    '## Zadání',
+    task.prompt.trim(),
     '',
     '## Režim',
-    task.mode,
-    '',
-    '## Limity',
-    `- max iterací: ${task.maxIterations}`,
+    task.mode
   ].join('\n');
-}
-
-function parseTaskPromptMetadata(prompt: string): {
-  context: string;
-  priority?: string;
-  runtimeSummary?: string;
-  scopeFiles: string[];
-  acceptanceCriteria: string[];
-} {
-  const lines = prompt.split(/\r?\n/);
-  const priorityIndex = lines.findIndex((line) => /^Priority:\s*/i.test(line));
-  const runtimeIndex = lines.findIndex((line) => /^Runtime Summary:\s*$/i.test(line.trim()));
-  const scopeIndex = lines.findIndex((line) => /^Scope Files:\s*$/i.test(line.trim()));
-  const acceptanceIndex = lines.findIndex((line) => /^Acceptance Criteria:\s*$/i.test(line.trim()));
-
-  const markerIndexes = [priorityIndex, runtimeIndex, scopeIndex, acceptanceIndex].filter((index) => index >= 0);
-  const firstMarkerIndex = markerIndexes.length > 0 ? Math.min(...markerIndexes) : -1;
-
-  const context = lines
-    .slice(0, firstMarkerIndex >= 0 ? firstMarkerIndex : lines.length)
-    .join('\n')
-    .trim();
-
-  const priority = priorityIndex >= 0 ? (lines[priorityIndex] ?? '').replace(/^Priority:\s*/i, '').trim() : undefined;
-
-  const runtimeSummary = collectSectionParagraph(lines, runtimeIndex, ['Scope Files:', 'Acceptance Criteria:']);
-  const scopeFiles = collectSectionBullets(lines, scopeIndex, ['Acceptance Criteria:']);
-  const acceptanceCriteria = collectSectionBullets(lines, acceptanceIndex, []);
-
-  return {
-    context,
-    priority: priority || undefined,
-    runtimeSummary: runtimeSummary || undefined,
-    scopeFiles,
-    acceptanceCriteria
-  };
-}
-
-function formatConstraints(parsed: {
-  priority?: string;
-  runtimeSummary?: string;
-  scopeFiles: string[];
-}): string[] {
-  const lines: string[] = [];
-
-  if (parsed.priority) {
-    lines.push(`- priorita: ${parsed.priority}`);
-  }
-
-  if (parsed.runtimeSummary) {
-    lines.push(`- runtime summary: ${parsed.runtimeSummary}`);
-  }
-
-  if (parsed.scopeFiles.length > 0) {
-    lines.push('- scope files:');
-    for (const file of parsed.scopeFiles) {
-      lines.push(`  - ${file}`);
-    }
-  }
-
-  if (lines.length === 0) {
-    return ['- Bez explicitnich omezeni v zadani.'];
-  }
-
-  return lines;
-}
-
-function collectSectionParagraph(lines: string[], headingIndex: number, nextHeadings: string[]): string {
-  if (headingIndex < 0) {
-    return '';
-  }
-
-  const collected: string[] = [];
-  for (let index = headingIndex + 1; index < lines.length; index += 1) {
-    const line = lines[index];
-    if (line === undefined) {
-      break;
-    }
-
-    const trimmed = line.trim();
-    if (nextHeadings.some((heading) => trimmed.toLowerCase() === heading.toLowerCase())) {
-      break;
-    }
-
-    if (!trimmed) {
-      if (collected.length > 0) {
-        break;
-      }
-      continue;
-    }
-
-    collected.push(trimmed);
-  }
-
-  return collected.join(' ');
-}
-
-function collectSectionBullets(lines: string[], headingIndex: number, nextHeadings: string[]): string[] {
-  if (headingIndex < 0) {
-    return [];
-  }
-
-  const collected: string[] = [];
-  for (let index = headingIndex + 1; index < lines.length; index += 1) {
-    const line = lines[index];
-    if (line === undefined) {
-      break;
-    }
-
-    const trimmed = line.trim();
-    if (nextHeadings.some((heading) => trimmed.toLowerCase() === heading.toLowerCase())) {
-      break;
-    }
-
-    if (!trimmed) {
-      if (collected.length > 0) {
-        break;
-      }
-      continue;
-    }
-
-    if (trimmed.startsWith('- ')) {
-      collected.push(trimmed.slice(2).trim());
-      continue;
-    }
-
-    // Backward-compatible fallback for non-bullet plain lines inside the section.
-    collected.push(trimmed);
-  }
-
-  return collected;
 }
 
 export function renderPullRequestBody(input: {

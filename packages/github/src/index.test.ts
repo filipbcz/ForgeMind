@@ -36,8 +36,6 @@ const taskFixture = {
   prompt: 'Add feature X with tests.',
   mode: 'safe' as const,
   status: 'draft' as const,
-  maxIterations: 5,
-  maxBudgetUsd: 3,
   createdAt: new Date().toISOString(),
   updatedAt: new Date().toISOString()
 };
@@ -681,131 +679,6 @@ describe('GitHub helpers', () => {
     requestSpy.mockRestore();
   });
 
-  it('waits for GitHub check runs and reports success only after all checks pass', async () => {
-    const adapter = new GitHubAppAdapter({ token: 'test-token' });
-    const requestSpy = vi.spyOn(adapter as any, 'request');
-    const progress = vi.fn();
-    requestSpy
-      .mockResolvedValueOnce({
-        total_count: 1,
-        check_runs: [{ id: 1, name: 'Native build', status: 'in_progress', conclusion: null }]
-      })
-      .mockResolvedValueOnce({
-        total_count: 1,
-        check_runs: [{ id: 1, name: 'Native build', status: 'completed', conclusion: 'success' }]
-      });
-
-    await expect(adapter.waitForChecks(projectFixture, 'head-sha', {
-      timeoutMs: 1_000,
-      discoveryTimeoutMs: 0,
-      pollIntervalMs: 0,
-      onProgress: progress
-    })).resolves.toEqual({
-      status: 'success',
-      summary: '1 GitHub check(s) passed.',
-      failures: []
-    });
-    expect(progress).toHaveBeenCalledWith('GitHub checks are running (0/1 completed).');
-    expect(requestSpy).toHaveBeenCalledWith(
-      'GET',
-      '/repos/demo/demo-repo/commits/head-sha/check-runs?filter=latest&per_page=100'
-    );
-  });
-
-  it('returns a compact failed Actions job log for AI correction', async () => {
-    const adapter = new GitHubAppAdapter({ token: 'test-token' });
-    vi.spyOn(adapter as any, 'request').mockResolvedValueOnce({
-      total_count: 1,
-      check_runs: [{
-        id: 2,
-        name: 'Native modules and smoke test',
-        status: 'completed',
-        conclusion: 'failure',
-        details_url: 'https://github.com/demo/demo-repo/actions/runs/10/job/20',
-        output: { summary: 'Process completed with exit code 1.' }
-      }]
-    });
-    vi.spyOn(adapter as any, 'requestText').mockResolvedValueOnce([
-      'telemetry.cpp',
-      'telemetry.cpp(101): error C2589: illegal token',
-      'build stopped',
-      'unrelated verbose line'
-    ].join('\n'));
-
-    const result = await adapter.waitForChecks(projectFixture, 'head-sha', {
-      timeoutMs: 1_000,
-      discoveryTimeoutMs: 0,
-      pollIntervalMs: 0
-    });
-
-    expect(result.status).toBe('failure');
-    expect(result.summary).toContain('error C2589');
-    expect(result.failures).toEqual([
-      expect.objectContaining({
-        name: 'Native modules and smoke test',
-        detailsUrl: 'https://github.com/demo/demo-repo/actions/runs/10/job/20',
-        output: expect.stringContaining('telemetry.cpp(101): error C2589')
-      })
-    ]);
-  });
-
-  it('falls back to check annotations when an expired Actions job log is unavailable', async () => {
-    const adapter = new GitHubAppAdapter({ token: 'test-token' });
-    const requestSpy = vi.spyOn(adapter as any, 'request');
-    requestSpy
-      .mockResolvedValueOnce({
-        total_count: 1,
-        check_runs: [{
-          id: 22,
-          name: 'Native modules and smoke test',
-          status: 'completed',
-          conclusion: 'failure',
-          details_url: 'https://github.com/demo/demo-repo/actions/runs/10/job/20',
-          output: { summary: 'Process completed with exit code 1.' }
-        }]
-      })
-      .mockResolvedValueOnce([{
-        path: 'core_sim/src/telemetry.cpp',
-        start_line: 101,
-        end_line: 101,
-        annotation_level: 'failure',
-        title: 'Build failed',
-        message: 'error C2589: illegal token on right side of ::',
-        raw_details: null
-      }]);
-    vi.spyOn(adapter as any, 'requestText').mockRejectedValueOnce(new Error('BlobNotFound'));
-
-    const result = await adapter.waitForChecks(projectFixture, 'head-sha', {
-      timeoutMs: 1_000,
-      discoveryTimeoutMs: 0,
-      pollIntervalMs: 0
-    });
-
-    expect(result.status).toBe('failure');
-    expect(result.summary).toContain('core_sim/src/telemetry.cpp:101: failure');
-    expect(result.summary).toContain('error C2589');
-    expect(result.summary).not.toContain('Unable to read the failed job log');
-    expect(requestSpy).toHaveBeenLastCalledWith(
-      'GET',
-      '/repos/demo/demo-repo/check-runs/22/annotations?per_page=100'
-    );
-  });
-
-  it('does not block repositories where no GitHub checks start', async () => {
-    const adapter = new GitHubAppAdapter({ token: 'test-token' });
-    vi.spyOn(adapter as any, 'request').mockResolvedValueOnce({ total_count: 0, check_runs: [] });
-
-    await expect(adapter.waitForChecks(projectFixture, 'head-sha', {
-      timeoutMs: 1_000,
-      discoveryTimeoutMs: 0,
-      pollIntervalMs: 0
-    })).resolves.toEqual({
-      status: 'not_configured',
-      summary: 'No GitHub checks were discovered for the pushed commit.',
-      failures: []
-    });
-  });
-
   it('renders pull request body with execution details', () => {
     const body = renderPullRequestBody({
       summary: 'Summary',
@@ -827,7 +700,7 @@ describe('GitHub helpers', () => {
     expect(body).toContain('Apply suggested null guard');
   });
 
-  it('renders issue body with README template sections for rich task prompt metadata', () => {
+  it('renders the complete task prompt without parsing optional headings', () => {
     const body = renderIssueBody({
       ...taskFixture,
       prompt: [
@@ -848,56 +721,29 @@ describe('GitHub helpers', () => {
       ].join('\n')
     });
 
-    expect(body).toMatchInlineSnapshot(`
-      "## Cíl
-      Implement feature X
-
-      ## Kontext
-      Implement gallery grouping by day and fullscreen navigation.
-
-      ## Omezení
-      - priorita: high
-      - runtime summary: No backend changes, keep nginx-only runtime.
-      - scope files:
-        - apps/mobile-pwa/src/App.tsx
-        - apps/mobile-pwa/src/styles.css
-
-      ## Akceptační kritéria
-      - Build passes without warnings
-      - No console errors during gallery navigation
-
-      ## Režim
-      safe
-
-      ## Limity
-      - max iterací: 5"
-    `);
+    expect(body).toContain('## Zadání');
+    expect(body).toContain('Implement gallery grouping by day and fullscreen navigation.');
+    expect(body).toContain('Priority: high');
+    expect(body).toContain('Runtime Summary:\nNo backend changes, keep nginx-only runtime.');
+    expect(body).toContain('Scope Files:\n- apps/mobile-pwa/src/App.tsx');
+    expect(body).toContain('Acceptance Criteria:\n- Build passes without warnings');
   });
 
-  it('renders issue body with fallback content when optional metadata sections are missing', () => {
+  it('renders a plain task prompt without synthetic fallback sections', () => {
     const body = renderIssueBody({
       ...taskFixture,
       prompt: 'Implement minimal static page update.'
     });
 
-    expect(body).toMatchInlineSnapshot(`
-      "## Cíl
-      Implement feature X
-
-      ## Kontext
-      Implement minimal static page update.
-
-      ## Omezení
-      - Bez explicitnich omezeni v zadani.
-
-      ## Akceptační kritéria
-      - Nebyla dodana explicitni akceptacni kriteria. Pouzit zadani v sekci Kontekst.
-
-      ## Režim
-      safe
-
-      ## Limity
-      - max iterací: 5"
-    `);
+    expect(body).toBe([
+      '## Cíl',
+      'Implement feature X',
+      '',
+      '## Zadání',
+      'Implement minimal static page update.',
+      '',
+      '## Režim',
+      'safe'
+    ].join('\n'));
   });
 });

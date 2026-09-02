@@ -1,18 +1,18 @@
 import { parseAgentConfigYaml, type AgentConfig } from '@forgemind/config';
-import { activeProjectContractRequirements, createBlockedRunState, createFailedRunState, createWaitingRunState, isNonBlockingDeferredValidation } from '@forgemind/core';
-import { advanceRoadmapAfterTaskCapabilityWait, advanceRoadmapAfterTaskCompletion, createRepository, getPrismaClient, startNextRoadmapStep, type AIProviderConnectionSecret, type ForgeMindRepository } from '@forgemind/db';
+import { createHash, randomUUID } from 'node:crypto';
+import { activeProjectContractRequirements, createBlockedRunState, createFailedRunState, WINDOWS_EVIDENCE_MAX_ARTIFACT_BYTES, WINDOWS_EVIDENCE_MAX_LOG_BYTES } from '@forgemind/core';
+import { advanceRoadmapAfterTaskCompletion, createRepository, getPrismaClient, startNextRoadmapStep, WindowsWorkerRepository, type AIProviderConnectionSecret, type ForgeMindRepository } from '@forgemind/db';
 import { GitHubAppAdapter, createGitHubAdapterFromEnv } from '@forgemind/github';
-import { buildProjectExtensionProposalPrompt, createProvider, formatProjectExtensionProposal, normalizeProviderError, type AIProvider, type ProviderSessionContext, type ProviderUsageMeasurement } from '@forgemind/providers';
+import { buildProjectExtensionProposalPrompt, createProvider, formatProjectExtensionProposal, normalizeProviderError, type AIProvider, type CapabilityAuditInput, type ProviderSessionContext, type ProviderUsageMeasurement, type ReleaseAuditInput, type ValidationCheck } from '@forgemind/providers';
 import type { NormalizedProviderErrorDetails, ProviderCircuitBreakerSnapshot, ProviderKind } from '@forgemind/core';
 import { toErrorMessage } from '@forgemind/shared';
 import { formatProjectArchitectureContext, runWorkerTask } from './workflow.js';
-import { buildTargetedRepositoryContext, prepareCapabilityAuditWorkspace, runCapabilityAudit, runReleaseAudit } from './capability-audit.js';
-import { resolveWorkerCapabilities } from './worker-capabilities.js';
+import { buildCompleteRepositoryContext, prepareCapabilityAuditWorkspace, runCapabilityAudit, runReleaseAudit } from './capability-audit.js';
 import { runNextChatTurn } from './chat-worker.js';
 import { hasSatisfiedReleaseAudit, recordTaskAcceptanceEvidence, sanitizeAuditErrorMessage } from './db-worker/audit.js';
 import { buildIterationErrorFingerprint, resolveTaskResumeContext } from './db-worker/checkpoints.js';
 import { cleanupCompletedTaskWorkspace, installWorkerInterruptionRecovery, resolveWorkerWorkspaceRoot, runWorkspaceRetentionCleanup, startProjectAuditHeartbeat, startQueueClaimHeartbeat, startTaskCancellationWatcher, TaskCancellationError, throwIfTaskCancelled } from './db-worker/lifecycle.js';
-import { extractAttemptNumber, handleWorkerLimitsOrThrow, isApprovalType, normalizeRuntimeApprovals, resolveBlockedRunReason, resolveLimits, WorkerApprovalRequiredError, WorkerLimitError } from './db-worker/limits.js';
+import { extractAttemptNumber, resolveBlockedRunReason } from './db-worker/limits.js';
 import { normalizeProviderUsageMeasurement } from './db-worker/provider-usage.js';
 import {
   assertFreeSpaceForWorker,
@@ -23,10 +23,109 @@ import {
 export { recordTaskAcceptanceEvidence } from './db-worker/audit.js';
 export { resolveWorkerWorkspaceRoot } from './db-worker/lifecycle.js';
 
+async function enqueueExternalWindowsValidations(
+  repository: ForgeMindRepository,
+  windowsWorkers: WindowsWorkerRepository,
+  input: {
+    project: import('@forgemind/core').Project;
+    taskId: string;
+    taskRunId: string;
+    commitSha?: string;
+    checks: ValidationCheck[];
+  }
+): Promise<void> {
+  if (input.checks.length === 0) return;
+  const project = input.project;
+  const contract = project.projectContract;
+  const step = await repository.getImplementationStepByTaskId(input.taskId);
+  if (!input.commitSha || !/^(?:[a-f0-9]{40}|[a-f0-9]{64})$/i.test(input.commitSha) || !project.githubOwner || !project.githubRepo || !contract || !step) {
+    await repository.writeAudit({
+      actorType: 'system', eventType: 'windows_validation_not_enqueued', projectId: project.id, taskId: input.taskId,
+      payload: { reason: 'Windows validation requires a delivered GitHub commit and a contract-linked roadmap step.', count: input.checks.length }
+    });
+    return;
+  }
+
+  for (const check of input.checks) {
+    const jobId = randomUUID();
+    const checkId = randomUUID();
+    const requestedCapabilities = Array.from(new Set(check.requiredCapabilities ?? []));
+    const requiredCapabilities = ['windows'];
+    const inputHash = createHash('sha256')
+      .update(JSON.stringify({ commitSha: input.commitSha, command: check.command, shell: check.shell ?? 'system', requestedCapabilities }))
+      .digest('hex');
+    await windowsWorkers.enqueue({
+      id: jobId,
+      projectId: project.id,
+      taskId: input.taskId,
+      runId: input.taskRunId,
+      requiredCapabilities,
+      packet: {
+        schemaVersion: 1,
+        projectId: project.id,
+        taskId: input.taskId,
+        runId: input.taskRunId,
+        checkId,
+        jobId,
+        leaseId: 'pending',
+        repository: `${project.githubOwner}/${project.githubRepo}`,
+        sourceUrl: `https://github.com/${project.githubOwner}/${project.githubRepo}.git`,
+        commitSha: input.commitSha,
+        workspaceRoot: 'runner-managed',
+        artifactRoot: 'runner-managed',
+        check: {
+          command: check.command,
+          shell: check.shell ?? 'system',
+          category: check.category ?? 'smoke',
+          criterion: check.criterion,
+          requiredCapabilities
+        },
+        requiredCapabilities,
+        resourcePolicy: {
+          timeoutSeconds: Math.max(60, Math.min(36_000, Math.round((check.timeoutMinutes ?? 10) * 60))),
+          maxLogBytes: WINDOWS_EVIDENCE_MAX_LOG_BYTES,
+          maxArtifactBytes: WINDOWS_EVIDENCE_MAX_ARTIFACT_BYTES
+        },
+        expectedArtifacts: [],
+        nonce: 'pending',
+        inputHash,
+        evidenceContext: {
+          cycleId: step.cycleId,
+          stepId: step.id,
+          requirementIds: step.requirementIds,
+          contractVersion: contract.version
+        }
+      }
+    });
+    await repository.recordAcceptanceEvidence({
+      projectId: project.id,
+      cycleId: step.cycleId,
+      stepId: step.id,
+      taskId: input.taskId,
+      taskRunId: input.taskRunId,
+      requirementIds: step.requirementIds,
+      criterion: check.criterion ?? check.command,
+      source: 'artifact',
+      status: 'deferred',
+      evidenceIdentity: `windows:${jobId}`,
+      contractVersion: contract.version,
+      commitSha: input.commitSha,
+      command: check.command,
+      payload: { platform: 'windows', jobId, requestedCapabilities }
+    });
+    await repository.writeAudit({
+      actorType: 'agent', eventType: 'windows_validation_enqueued', projectId: project.id, taskId: input.taskId,
+      payload: { jobId, checkId, command: check.command, requestedCapabilities, commitSha: input.commitSha }
+    });
+  }
+}
+
 let preferChatQueue = true;
 
 export async function runDatabaseWorkerOnce(options: { deferInterruptSignals?: boolean } = {}) {
-  const repository = createRepository(getPrismaClient());
+  const prisma = getPrismaClient();
+  const repository = createRepository(prisma);
+  const windowsWorkers = new WindowsWorkerRepository(prisma);
   const defaultAIProviderConnection = await readAIProviderConnectionSecret(repository);
   const providerOverride = process.env.FORGEMIND_PROVIDER as ProviderKind | undefined;
   const fallbackProviderOverride = process.env.FORGEMIND_FALLBACK_PROVIDER as ProviderKind | undefined;
@@ -37,18 +136,6 @@ export async function runDatabaseWorkerOnce(options: { deferInterruptSignals?: b
   const claimTimeoutMinutes = Number(process.env.FORGEMIND_QUEUE_CLAIM_TIMEOUT_MINUTES ?? 2);
   const recovery = await repository.recoverStuckQueueJobs(claimTimeoutMinutes);
   const recoveredChatRuns = await repository.recoverStuckChatRuns(claimTimeoutMinutes);
-  const workerCapabilities = resolveWorkerCapabilities();
-  const requeuedCapabilityTasks = await repository.requeueTasksWaitingForCapabilities(workerCapabilities);
-  const deferredCapabilityTasks = await repository.listTasksWaitingForCapabilities();
-  for (const task of deferredCapabilityTasks) {
-    if (isNonBlockingDeferredValidation(task.waitingForCapabilities ?? [])) {
-      const completed = await repository.completeTaskWithDeferredValidation(task.id);
-      if (completed) {
-        await advanceRoadmapAfterTaskCompletion(repository, task.id);
-        await cleanupCompletedTaskWorkspace(resolveWorkerWorkspaceRoot(), task.id);
-      }
-    }
-  }
   const recoveredProjectAudits = await repository.recoverStuckProjectAudits(claimTimeoutMinutes);
   if (preferChatQueue) {
     const chatResult = await runNextChatTurn(repository);
@@ -79,8 +166,7 @@ export async function runDatabaseWorkerOnce(options: { deferInterruptSignals?: b
       message: 'No submitted task or project audit found.',
       recoveredQueueJobs: recovery.recoveredCount,
       recoveredChatRuns,
-      recoveredProjectAudits,
-      requeuedCapabilityTasks
+      recoveredProjectAudits
     };
   }
   preferChatQueue = true;
@@ -144,7 +230,6 @@ export async function runDatabaseWorkerOnce(options: { deferInterruptSignals?: b
         ? new GitHubAppAdapter({ token: githubConnection.token, apiBaseUrl: githubConnection.apiBaseUrl })
         : await createGitHubAdapterFromEnv())
     : undefined;
-  const limits = resolveLimits(claimed.project.configYaml, claimed.task.maxIterations);
   let resourcePolicy: WorkerResourcePolicy;
   try {
     resourcePolicy = resolveWorkerResourcePolicy(claimed.project.configYaml);
@@ -244,8 +329,7 @@ export async function runDatabaseWorkerOnce(options: { deferInterruptSignals?: b
     repository,
     claimed.task.id,
     claimed.queueReason,
-    claimed.taskRun.id,
-    claimed.task.maxIterations
+    claimed.taskRun.id
   );
   if (resumeContext?.workflowResume) {
     const resume = resumeContext.workflowResume;
@@ -268,30 +352,26 @@ export async function runDatabaseWorkerOnce(options: { deferInterruptSignals?: b
       }
     });
   }
-  let costEstimate;
+  let costEstimate = {
+    inputTokens: 0,
+    outputTokens: 0,
+    estimatedCostUsd: 0
+  };
+  let costEstimateAvailable = true;
   try {
-    costEstimate = await provider.estimateCost({ prompt: claimed.task.prompt, repositorySizeHint: 'small' });
-  } catch (error) {
-    const message = sanitizeAuditErrorMessage(toErrorMessage(error));
-    await repository.failTask(claimed.task.id, message, 'provider_failed');
-    await repository.finishTaskRun({
-      taskRunId: claimed.taskRun.id,
-      status: 'failed',
-      errorMessage: message,
-      iterationCount: attemptCount,
-      inputTokens: 0,
-      outputTokens: 0,
-      totalTokens: 0,
-      usageSource: 'unavailable',
-      estimatedCostUsd: 0,
-      actualCostUsd: null
+    costEstimate = await primaryRuntimeProvider.provider.estimateCost({
+      prompt: claimed.task.prompt,
+      repositorySizeHint: 'small'
     });
-    await finalizeQueueJob('failed', message);
-    return {
-      claimed: true,
+  } catch (error) {
+    costEstimateAvailable = false;
+    const message = sanitizeAuditErrorMessage(toErrorMessage(error));
+    await repository.writeAudit({
+      actorType: 'system',
+      eventType: 'task_cost_estimate_unavailable',
       taskId: claimed.task.id,
-      status: 'provider_failed'
-    };
+      payload: { taskRunId: claimed.taskRun.id, message }
+    });
   }
   const getRunUsageFields = () => ({
     inputTokens: measuredUsage.completeBreakdown ? measuredUsage.inputTokens : 0,
@@ -317,7 +397,9 @@ export async function runDatabaseWorkerOnce(options: { deferInterruptSignals?: b
       reviewProvider,
       workspaceRoot,
       resourcePolicy,
-      usageSummary: `Pre-run estimate: ${costEstimate.inputTokens} input tokens, ${costEstimate.outputTokens} output tokens, ${costEstimate.estimatedCostUsd.toFixed(4)} USD`,
+      usageSummary: costEstimateAvailable
+        ? `Pre-run estimate: ${costEstimate.inputTokens} input tokens, ${costEstimate.outputTokens} output tokens, ${costEstimate.estimatedCostUsd.toFixed(4)} USD`
+        : 'Pre-run cost estimate unavailable; execution continued.',
       resume: resumeContext?.workflowResume,
       providerSession,
       reviewProviderSession: {
@@ -330,7 +412,7 @@ export async function runDatabaseWorkerOnce(options: { deferInterruptSignals?: b
         onActivity: async (activity) => {
           await repository.writeAudit({
             actorType: activity.phase === 'github' ? 'github' : 'agent',
-            eventType: activity.operation === 'command_denied' ? 'command_denied' : 'task_activity',
+            eventType: 'task_activity',
             taskId: claimed.task.id,
             payload: {
               taskRunId: claimed.taskRun.id,
@@ -472,26 +554,6 @@ export async function runDatabaseWorkerOnce(options: { deferInterruptSignals?: b
                 : null
             }
           });
-          if (normalizedUsage) {
-            await handleWorkerLimitsOrThrow(
-              repository,
-              claimed.task.id,
-              {
-                iterations: attemptCount,
-                runtimeMinutes: (Date.now() - startedAtMs) / 60_000,
-                changedFiles,
-                diffLines,
-                repeatedErrorCount,
-                estimatedCostUsd: costEstimate.estimatedCostUsd,
-                actualCostUsd: measuredUsage.completeCost ? measuredUsage.actualCostUsd : undefined
-              },
-              limits,
-              resumeContext?.ignoredLimitSignals ?? [],
-              claimed.task.mode,
-              new Set((projectConfig?.approval.required_for ?? []).filter(isApprovalType)),
-              claimed.project.allowSafeOperationsWithoutApproval ?? false
-            );
-          }
         },
         onIteration: async (iteration) => {
           iterationNumber += 1;
@@ -518,24 +580,6 @@ export async function runDatabaseWorkerOnce(options: { deferInterruptSignals?: b
 
           attemptCount = Math.max(attemptCount, extractAttemptNumber(iteration));
 
-          const usage = {
-            iterations: attemptCount,
-            runtimeMinutes: (Date.now() - startedAtMs) / 60_000,
-            changedFiles,
-            diffLines,
-            repeatedErrorCount
-          };
-          await handleWorkerLimitsOrThrow(
-            repository,
-            claimed.task.id,
-            usage,
-            limits,
-            resumeContext?.ignoredLimitSignals ?? [],
-            claimed.task.mode,
-            new Set((projectConfig?.approval.required_for ?? []).filter(isApprovalType)),
-            claimed.project.allowSafeOperationsWithoutApproval ?? false,
-            iteration.phase === 'review'
-          );
         }
       }
     });
@@ -547,64 +591,24 @@ export async function runDatabaseWorkerOnce(options: { deferInterruptSignals?: b
       taskRunId: claimed.taskRun.id,
       result
     });
-
-    if (result.status === 'needs_approval') {
-      const approvalTypes = normalizeRuntimeApprovals(result.approvals);
-      await repository.transitionTask(claimed.task.id, 'needs_approval', { approvals: approvalTypes });
-      for (const approvalType of approvalTypes) {
-        await repository.createApproval({
+    if (result.status !== 'failed' && result.status !== 'validation_failed') {
+      try {
+        await enqueueExternalWindowsValidations(repository, windowsWorkers, {
+          project: claimed.project,
           taskId: claimed.task.id,
-          type: approvalType,
-          requestedBy: 'agent',
-          title: `Approval required: ${approvalType}`,
-          description: `Worker requested approval for ${approvalType}.`,
-          riskLevel: approvalType === 'new_dependency' ? 'medium' : 'high',
-          payload: {
-            risk: 'Potentially risky agent action.',
-            recommendation: 'Review the diff and approve only when the change is intended.',
-            touchedFiles: []
-          }
+          taskRunId: claimed.taskRun.id,
+          commitSha: result.commitSha,
+          checks: result.externalValidationChecks ?? []
+        });
+      } catch (error) {
+        await repository.writeAudit({
+          actorType: 'system', eventType: 'windows_validation_enqueue_failed', projectId: claimed.project.id, taskId: claimed.task.id,
+          payload: { errorMessage: toErrorMessage(error), taskRunId: claimed.taskRun.id }
         });
       }
-      await repository.finishTaskRun({
-        taskRunId: claimed.taskRun.id,
-        status: 'succeeded',
-        summary: result.summary,
-        runState: createWaitingRunState('approval_required', { detail: result.summary }),
-        iterationCount: attemptCount,
-        ...getRunUsageFields()
-      });
-      await finalizeQueueJob('succeeded');
-    } else if (result.status === 'waiting_for_capability') {
-      await repository.waitTaskForCapabilities(claimed.task.id, result.requiredCapabilities ?? [], {
-        validation: {
-          command: result.validation.command,
-          deferredChecks: (result.validation.deferredChecks ?? []).map((check) => ({
-            command: check.command,
-            category: check.category ?? null,
-            criterion: check.criterion ?? null,
-            rationale: check.rationale ?? null,
-            requiredCapabilities: check.requiredCapabilities,
-            missingCapabilities: check.missingCapabilities
-          }))
-        },
-        pullRequestUrl: result.pullRequestUrl ?? null,
-        commitSha: result.commitSha ?? null
-      });
-      await advanceRoadmapAfterTaskCapabilityWait(repository, claimed.task.id);
-      await repository.finishTaskRun({
-        taskRunId: claimed.taskRun.id,
-        status: 'succeeded',
-        summary: result.summary,
-        runState: createWaitingRunState('unavailable_capability', {
-          detail: result.summary,
-          requiredCapabilities: result.requiredCapabilities ?? []
-        }),
-        iterationCount: attemptCount,
-        ...getRunUsageFields()
-      });
-      await finalizeQueueJob('succeeded');
-    } else if (result.status === 'validation_failed') {
+    }
+
+    if (result.status === 'validation_failed') {
       await repository.transitionTask(claimed.task.id, 'validation_failed', {
         validation: {
           command: result.validation.command,
@@ -637,9 +641,6 @@ export async function runDatabaseWorkerOnce(options: { deferInterruptSignals?: b
       });
       await finalizeQueueJob('failed', result.summary, false);
     } else {
-      if (result.requiredCapabilities?.length) {
-        await repository.setTaskDeferredValidationCapabilities(claimed.task.id, result.requiredCapabilities);
-      }
       await repository.transitionTask(claimed.task.id, 'ready_for_user_review', {
         pullRequestUrl: result.pullRequestUrl ?? null,
         branchName: result.branchName
@@ -688,24 +689,8 @@ export async function runDatabaseWorkerOnce(options: { deferInterruptSignals?: b
         status: 'cancelled'
       };
     }
-    if (error instanceof WorkerApprovalRequiredError) {
-      await repository.finishTaskRun({
-        taskRunId: claimed.taskRun.id,
-        status: 'succeeded',
-        summary: error.message,
-        iterationCount: attemptCount,
-        ...getRunUsageFields()
-      });
-      await finalizeQueueJob('succeeded');
-      return {
-        claimed: true,
-        taskId: claimed.task.id,
-        status: 'needs_approval'
-      };
-    }
-
     const message = sanitizeAuditErrorMessage(toErrorMessage(error));
-    const status = error instanceof WorkerLimitError ? error.status : error instanceof ProviderExecutionError ? 'provider_failed' : 'failed';
+    const status = error instanceof ProviderExecutionError ? 'provider_failed' : 'failed';
     await repository.failTask(claimed.task.id, message, status);
     await repository.finishTaskRun({
       taskRunId: claimed.taskRun.id,
@@ -774,6 +759,7 @@ async function runNextProjectAudit(input: {
         }
       })
     });
+    const nativeRepositoryAudit = provider.supportsNativeRepositoryAudit?.() === true;
     const triggerTask = claimed.job.triggerTaskId
       ? await input.repository.getTask(claimed.job.triggerTaskId)
       : undefined;
@@ -781,7 +767,8 @@ async function runNextProjectAudit(input: {
       workspaceRoot: resolveWorkerWorkspaceRoot(),
       project: claimed.project,
       github,
-      preferredBranch: triggerTask?.branchName
+      preferredBranch: triggerTask?.branchName,
+      includeRepositoryContext: !nativeRepositoryAudit
     });
     cleanup = workspace.cleanup;
 
@@ -833,15 +820,11 @@ async function runNextProjectAudit(input: {
         workItems,
         workspacePath: workspace.workspacePath,
         commitSha: workspace.commitSha,
-        repositoryContext: [
-          formatProjectArchitectureContext(claimed.project.projectArchitecture, `${requirement.title} ${requirement.description}`),
-          await buildTargetedRepositoryContext(workspace.workspacePath, [
-            requirement.id,
-            requirement.title,
-            requirement.description,
-            ...requirement.acceptanceCriteria
-          ])
-        ].filter(Boolean).join('\n\n'),
+        repositoryContext: nativeRepositoryAudit ? undefined : workspace.repositoryContext,
+        supplementalContext: formatProjectArchitectureContext(
+          claimed.project.projectArchitecture,
+          `${requirement.title} ${requirement.description}`
+        ),
         onActivity
       });
 
@@ -905,17 +888,6 @@ async function runNextProjectAudit(input: {
     if (!allSatisfied) throw new Error('Capability audit finished without satisfying every project requirement.');
 
     if (!hasSatisfiedReleaseAudit(finalRoadmap?.evidence ?? [], contract, workspace.commitSha)) {
-      const releaseFocus = [
-        contract.summary,
-        ...contract.invariants,
-        ...contract.releaseCriteria,
-        ...activeProjectContractRequirements(contract).flatMap((requirement) => [
-          requirement.id,
-          requirement.title,
-          requirement.description,
-          ...requirement.acceptanceCriteria
-        ])
-      ];
       const releaseAudit = await runReleaseAudit({
         repository: input.repository,
         provider,
@@ -923,10 +895,8 @@ async function runNextProjectAudit(input: {
         cycleId: claimed.cycle.id,
         workspacePath: workspace.workspacePath,
         commitSha: workspace.commitSha,
-        repositoryContext: [
-          formatProjectArchitectureContext(claimed.project.projectArchitecture, contract.summary),
-          await buildTargetedRepositoryContext(workspace.workspacePath, releaseFocus)
-        ].filter(Boolean).join('\n\n'),
+        repositoryContext: nativeRepositoryAudit ? undefined : workspace.repositoryContext,
+        supplementalContext: formatProjectArchitectureContext(claimed.project.projectArchitecture, contract.summary),
         onActivity
       });
       if (releaseAudit.verdict === 'blocked') {
@@ -1010,10 +980,10 @@ async function runNextProjectAudit(input: {
     await input.repository.updateProjectRoadmapCycleStatus(claimed.cycle.id, 'completed');
     await input.repository.setProjectRoadmapCycleExtensionProposal(claimed.cycle.id, {
       proposal: extensionProposal,
-      status: 'awaiting_extension_approval'
+      status: 'awaiting_extension_decision'
     });
     await input.repository.finalizeProjectAudit(claimed.job.id, 'succeeded');
-    return { claimed: true, kind: 'project_audit', projectId: claimed.project.id, status: 'awaiting_extension_approval', provider: getLastProviderKind() };
+    return { claimed: true, kind: 'project_audit', projectId: claimed.project.id, status: 'awaiting_extension_decision', provider: getLastProviderKind() };
   } catch (error) {
     const message = sanitizeAuditErrorMessage(toErrorMessage(error));
     const finalized = await input.repository.finalizeProjectAudit(claimed.job.id, 'failed', message);
@@ -1177,6 +1147,7 @@ function createPolicyAwareProvider(input: PolicyAwareProviderInput): { provider:
     },
     supportsLocalRepo: () => input.primary.provider.supportsLocalRepo(),
     supportsGitHubNativeFlow: () => input.primary.provider.supportsGitHubNativeFlow(),
+    supportsNativeRepositoryAudit: () => input.primary.provider.supportsNativeRepositoryAudit?.() === true,
     async plan(planInput) {
       return callWithFallback('plan', (provider) => provider.plan(planInput), planInput.signal);
     },
@@ -1187,15 +1158,15 @@ function createPolicyAwareProvider(input: PolicyAwareProviderInput): { provider:
       return callWithFallback('review', (provider) => provider.review(reviewInput), reviewInput.signal);
     },
     async auditCapability(auditInput) {
-      return callWithFallback('audit_capability', (provider) => {
+      return callWithFallback('audit_capability', async (provider) => {
         if (!provider.auditCapability) throw new Error('Configured provider does not support capability audits.');
-        return provider.auditCapability(auditInput);
+        return provider.auditCapability(await prepareAuditInputForProvider(provider, auditInput));
       });
     },
     async auditRelease(auditInput) {
-      return callWithFallback('audit_release', (provider) => {
+      return callWithFallback('audit_release', async (provider) => {
         if (!provider.auditRelease) throw new Error('Configured provider does not support release audits.');
-        return provider.auditRelease(auditInput);
+        return provider.auditRelease(await prepareAuditInputForProvider(provider, auditInput));
       });
     },
     async estimateCost(costInput) {
@@ -1206,6 +1177,24 @@ function createPolicyAwareProvider(input: PolicyAwareProviderInput): { provider:
   return {
     provider,
     getLastProviderKind: () => lastProviderKind
+  };
+}
+
+async function prepareAuditInputForProvider<T extends CapabilityAuditInput | ReleaseAuditInput>(
+  provider: AIProvider,
+  input: T
+): Promise<T> {
+  if (provider.supportsNativeRepositoryAudit?.() === true) {
+    return { ...input, repositoryAccess: 'read_only_checkout' };
+  }
+
+  const repositoryContext = input.repositoryContext?.trim()
+    ? input.repositoryContext
+    : await buildCompleteRepositoryContext(input.repositoryPath);
+  return {
+    ...input,
+    repositoryAccess: 'complete_snapshot',
+    repositoryContext
   };
 }
 

@@ -4,39 +4,27 @@ export const TERMINAL_TASK_STATUSES: ReadonlySet<TaskStatus> = new Set([
   'completed',
   'failed',
   'cancelled',
-  'budget_exceeded',
-  'iteration_limit_reached',
-  'repeated_error_detected',
-  'approval_rejected',
   'provider_failed',
-  'validation_failed',
-  'waiting_for_capability'
+  'validation_failed'
 ]);
 
 const transitions: Record<TaskStatus, TaskStatus[]> = {
   draft: ['submitted', 'cancelled'],
   submitted: ['planning', 'cancelled'],
-  planning: ['waiting_for_plan_approval', 'creating_github_issue', 'creating_branch', 'running_ai', 'failed', 'cancelled'],
-  waiting_for_plan_approval: ['creating_github_issue', 'creating_branch', 'running_ai', 'approval_rejected', 'cancelled'],
+  planning: ['creating_github_issue', 'creating_branch', 'running_ai', 'failed', 'cancelled'],
   creating_github_issue: ['creating_branch', 'running_ai', 'failed', 'cancelled'],
   creating_branch: ['running_ai', 'failed', 'cancelled'],
-  running_ai: ['validating', 'needs_approval', 'provider_failed', 'budget_exceeded', 'iteration_limit_reached', 'cancelled'],
-  validating: ['reviewing', 'running_ai', 'needs_approval', 'validation_failed', 'repeated_error_detected', 'waiting_for_capability', 'failed', 'cancelled'],
-  reviewing: ['improving', 'running_ai', 'creating_pr', 'ready_for_user_review', 'needs_approval', 'waiting_for_capability', 'failed', 'cancelled'],
-  improving: ['running_ai', 'validating', 'needs_approval', 'failed', 'cancelled'],
-  needs_approval: ['running_ai', 'creating_pr', 'approval_rejected', 'cancelled'],
-  creating_pr: ['running_ai', 'ready_for_user_review', 'validation_failed', 'waiting_for_capability', 'failed', 'cancelled'],
-  ready_for_user_review: ['completed', 'running_ai', 'waiting_for_capability', 'cancelled'],
+  running_ai: ['validating', 'provider_failed', 'failed', 'cancelled'],
+  validating: ['reviewing', 'running_ai', 'validation_failed', 'failed', 'cancelled'],
+  reviewing: ['improving', 'running_ai', 'creating_pr', 'ready_for_user_review', 'failed', 'cancelled'],
+  improving: ['running_ai', 'validating', 'failed', 'cancelled'],
+  creating_pr: ['running_ai', 'ready_for_user_review', 'validation_failed', 'failed', 'cancelled'],
+  ready_for_user_review: ['completed', 'running_ai', 'cancelled'],
   completed: [],
   failed: [],
   cancelled: ['completed'],
-  budget_exceeded: [],
-  iteration_limit_reached: [],
-  repeated_error_detected: [],
-  approval_rejected: [],
   provider_failed: [],
-  validation_failed: [],
-  waiting_for_capability: ['submitted', 'completed', 'cancelled']
+  validation_failed: []
 };
 
 export function canTransitionTask(from: TaskStatus, to: TaskStatus): boolean {
@@ -47,8 +35,4 @@ export function assertTaskTransition(from: TaskStatus, to: TaskStatus): void {
   if (!canTransitionTask(from, to)) {
     throw new Error(`Invalid task status transition from "${from}" to "${to}"`);
   }
-}
-
-export function isNonBlockingDeferredValidation(capabilities: readonly string[]): boolean {
-  return capabilities.some((capability) => capability.trim().toLowerCase() === 'windows');
 }

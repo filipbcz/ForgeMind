@@ -38,11 +38,27 @@ describe('capability audit contract', () => {
 
     expect(prompt).toContain('REQ-LEADERBOARD');
     expect(prompt).toContain('Hard-coded leaderboard rows.');
-    expect(prompt).toContain('Targeted repository packet:');
-    expect(prompt).toContain('task validation and GitHub checks are supporting evidence');
+    expect(prompt).toContain('Complete repository snapshot:');
+    expect(prompt).toContain('task validation is supporting evidence');
     expect(prompt).toContain('Copy each acceptance criterion');
     expect(prompt).toContain('Do not rerun commands that already have passed trusted execution evidence');
     expect(prompt).toContain('status deferred identifies a Windows-specific check');
+  });
+
+  it('keeps supplemental evidence separate from a native read-only repository checkout', () => {
+    const prompt = buildCapabilityAuditPrompt({
+      ...input,
+      repositoryAccess: 'read_only_checkout',
+      repositoryContext: 'snapshot text must not be sent to a native audit',
+      supplementalContext: 'Trusted evidence lineage: README.md changed after validation.'
+    });
+
+    expect(prompt).toContain('checked-out repository is the authoritative inspection surface');
+    expect(prompt).toContain('Supplemental audit context (supporting context only, not a repository snapshot):');
+    expect(prompt).toContain('Trusted evidence lineage: README.md changed after validation.');
+    expect(prompt).not.toContain('Do not access repository files outside the supplied snapshot');
+    expect(prompt).not.toContain('Complete repository snapshot:');
+    expect(prompt).not.toContain('snapshot text must not be sent to a native audit');
   });
 
   it('accepts a fully evidenced satisfied verdict', () => {

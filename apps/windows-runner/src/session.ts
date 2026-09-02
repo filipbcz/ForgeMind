@@ -25,7 +25,18 @@ export async function runManualSession(transport: WindowsRunnerTransport, auth: 
       if (!leaseId && !draining) {
         const claim = await transport.claim(auth, sessionId, randomUUID());
         leaseId = claim.lease?.id;
-        if (claim.lease) await options.onClaim(claim, { sessionId, signal: local.signal });
+        if (claim.lease) {
+          const activeLeaseId = claim.lease.id;
+          const heartbeat = setInterval(() => {
+            void transport.heartbeat(auth, sessionId, activeLeaseId).catch(() => local.abort());
+          }, Math.min(interval, 15_000));
+          try {
+            await options.onClaim(claim, { sessionId, signal: local.signal });
+          } finally {
+            clearInterval(heartbeat);
+            leaseId = undefined;
+          }
+        }
       }
       await delay(interval, local.signal);
     }

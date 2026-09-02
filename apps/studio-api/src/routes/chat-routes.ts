@@ -130,20 +130,6 @@ export function registerChatRoutes(app: FastifyInstance, repository: ForgeMindRe
     }
   });
 
-  app.post('/api/chat/approvals/:id/:decision', async (request, reply) => {
-    try {
-      const params = z.object({ id: z.string().uuid(), decision: z.enum(['approve', 'reject']) }).parse(request.params);
-      const user = await repository.getCurrentUser();
-      const approval = await repository.resolveChatApproval(
-        params.id,
-        params.decision === 'approve' ? 'approved' : 'rejected',
-        user.id
-      );
-      return approval ?? reply.code(404).send({ error: `Chat approval "${params.id}" not found.` });
-    } catch (error) {
-      return sendBadRequest(reply, error);
-    }
-  });
 }
 
 function sendBadRequest(reply: { code: (status: number) => { send: (body: unknown) => unknown } }, error: unknown) {

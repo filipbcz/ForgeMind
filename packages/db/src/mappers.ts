@@ -1,8 +1,6 @@
 import type {
   AcceptanceEvidence as CoreAcceptanceEvidence,
-  Approval as CoreApproval,
   AuditEvent,
-  ChatApproval as CoreChatApproval,
   ChatMessage as CoreChatMessage,
   ChatRun as CoreChatRun,
   ChatThread as CoreChatThread,
@@ -16,7 +14,6 @@ import type {
   ProjectContractRequirementStatus,
   ProjectContractVersion as CoreProjectContractVersion,
   ProjectMemory,
-  ProjectValidationProfile,
   ProjectRoadmapCycle as CoreProjectRoadmapCycle,
   ProjectSpecificationVersion as CoreProjectSpecificationVersion,
   Project as CoreProject,
@@ -24,7 +21,7 @@ import type {
 } from '@forgemind/core';
 import { normalizeRunState, parseTaskRunState } from '@forgemind/core';
 import type { JsonValue } from '@forgemind/shared';
-import type { AcceptanceEvidence, Approval, AuditLog, ChatApproval, ChatMessage, ChatRun, ChatThread, Prisma, Project, ProjectArchitectureVersion, ProjectAuditJob, ProjectContractVersion, ProjectImplementationStep, ProjectRoadmapCycle, ProjectSpecificationVersion, Task, TaskRun } from '@prisma/client';
+import type { AcceptanceEvidence, AuditLog, ChatMessage, ChatRun, ChatThread, Prisma, Project, ProjectArchitectureVersion, ProjectAuditJob, ProjectContractVersion, ProjectImplementationStep, ProjectRoadmapCycle, ProjectSpecificationVersion, Task, TaskRun } from '@prisma/client';
 
 export function toProject(project: Project): CoreProject {
   return {
@@ -41,7 +38,6 @@ export function toProject(project: Project): CoreProject {
     projectMemory: toProjectMemory(project.projectMemory),
     projectArchitecture: toProjectArchitecture(project.projectArchitecture),
     currentArchitectureVersionId: project.currentArchitectureVersionId ?? undefined,
-    validationProfile: toProjectValidationProfile(project.validationProfile),
     planningSessionId: project.planningSessionId ?? undefined,
     planningSessionProvider: project.planningSessionProvider ?? undefined,
     planningSessionModel: project.planningSessionModel ?? undefined,
@@ -50,31 +46,11 @@ export function toProject(project: Project): CoreProject {
     autoCreatePullRequest: project.autoCreatePullRequest,
     autoMergePullRequest: project.autoMergePullRequest,
     autoCompleteTask: project.autoCompleteTask,
-    allowSafeOperationsWithoutApproval: project.allowSafeOperationsWithoutApproval,
     defaultTaskMode: project.defaultTaskMode,
     aiProviderConnectionId: project.aiProviderConnectionId ?? undefined,
     isActive: project.isActive,
     createdAt: project.createdAt.toISOString(),
     updatedAt: project.updatedAt.toISOString()
-  };
-}
-
-function toProjectValidationProfile(value: Prisma.JsonValue | null): ProjectValidationProfile | undefined {
-  if (!value || typeof value !== 'object' || Array.isArray(value)) return undefined;
-  const profile = value as Record<string, Prisma.JsonValue>;
-  if (profile.version !== 1 || typeof profile.enabled !== 'boolean') return undefined;
-  const timeout = typeof profile.commandTimeoutMinutes === 'number' && Number.isFinite(profile.commandTimeoutMinutes)
-    ? Math.max(1, Math.min(60, Math.trunc(profile.commandTimeoutMinutes)))
-    : 10;
-  return {
-    version: 1,
-    enabled: profile.enabled,
-    dockerComposeFiles: jsonStringArray(profile.dockerComposeFiles),
-    dockerComposeServices: jsonStringArray(profile.dockerComposeServices),
-    requiredEnvironmentVariables: jsonStringArray(profile.requiredEnvironmentVariables),
-    migrationCommands: jsonStringArray(profile.migrationCommands),
-    readinessCommands: jsonStringArray(profile.readinessCommands),
-    commandTimeoutMinutes: timeout
   };
 }
 
@@ -145,7 +121,6 @@ function toProjectArchitecture(value: Prisma.JsonValue | null): ProjectArchitect
     conventions: jsonStringArray(architecture.conventions),
     dependencyRules: jsonStringArray(architecture.dependencyRules),
     knownDebt: jsonStringArray(architecture.knownDebt),
-    validationCommands: jsonStringArray(architecture.validationCommands),
     updatedAt: architecture.updatedAt
   };
 }
@@ -434,7 +409,6 @@ export function toTask(task: Task): ForgeTask {
     prompt: task.prompt,
     mode: task.mode,
     status: task.status,
-    waitingForCapabilities: jsonStringArray(task.waitingForCapabilities),
     deferredValidationCapabilities: jsonStringArray(task.deferredValidationCapabilities),
     githubIssueNumber: task.githubIssueNumber ?? undefined,
     githubIssueUrl: task.githubIssueUrl ?? undefined,
@@ -447,8 +421,6 @@ export function toTask(task: Task): ForgeTask {
     providerSessionModel: task.providerSessionModel ?? undefined,
     providerSessionConnectionId: task.providerSessionConnectionId ?? undefined,
     providerSessionUpdatedAt: task.providerSessionUpdatedAt?.toISOString(),
-    maxIterations: task.maxIterations,
-    maxBudgetUsd: Number(task.maxBudgetUsd),
     createdAt: task.createdAt.toISOString(),
     updatedAt: task.updatedAt.toISOString(),
     startedAt: task.startedAt?.toISOString(),
@@ -477,23 +449,6 @@ export function toTaskRun(run: TaskRun): CoreTaskRun {
     finishedAt: run.finishedAt?.toISOString(),
     summary: run.summary ?? undefined,
     errorMessage: run.errorMessage ?? undefined
-  };
-}
-
-export function toApproval(approval: Approval): CoreApproval {
-  return {
-    id: approval.id,
-    taskId: approval.taskId,
-    type: approval.type,
-    status: approval.status,
-    requestedBy: approval.requestedBy as CoreApproval['requestedBy'],
-    approvedByUserId: approval.approvedByUserId ?? undefined,
-    title: approval.title,
-    description: approval.description,
-    riskLevel: approval.riskLevel,
-    payload: approval.payloadJson as JsonValue,
-    createdAt: approval.createdAt.toISOString(),
-    resolvedAt: approval.resolvedAt?.toISOString()
   };
 }
 
@@ -576,24 +531,6 @@ export function toChatRun(run: ChatRun): CoreChatRun {
     finishedAt: run.finishedAt?.toISOString(),
     createdAt: run.createdAt.toISOString(),
     updatedAt: run.updatedAt.toISOString()
-  };
-}
-
-export function toChatApproval(approval: ChatApproval): CoreChatApproval {
-  return {
-    id: approval.id,
-    threadId: approval.threadId,
-    runId: approval.runId,
-    type: approval.type,
-    status: approval.status,
-    requestedBy: approval.requestedBy as CoreChatApproval['requestedBy'],
-    approvedByUserId: approval.approvedByUserId ?? undefined,
-    title: approval.title,
-    description: approval.description,
-    riskLevel: approval.riskLevel,
-    payload: approval.payloadJson as JsonValue,
-    createdAt: approval.createdAt.toISOString(),
-    resolvedAt: approval.resolvedAt?.toISOString()
   };
 }
 

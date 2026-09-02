@@ -7,7 +7,6 @@ import { tmpdir } from 'node:os';
 const createProviderMock = vi.fn();
 const runWorkerTaskMock = vi.fn();
 const advanceRoadmapAfterTaskCompletionMock = vi.fn(async () => ({ advanced: false }));
-const advanceRoadmapAfterTaskCapabilityWaitMock = vi.fn(async () => ({ advanced: false }));
 const startNextRoadmapStepMock = vi.fn(async (): Promise<{ id: string } | undefined> => undefined);
 const runCapabilityAuditMock = vi.fn();
 const runReleaseAuditMock = vi.fn();
@@ -18,6 +17,7 @@ const prepareCapabilityAuditWorkspaceMock = vi.fn(async () => ({
   cleanup: vi.fn(async () => undefined)
 }));
 const buildTargetedRepositoryContextMock = vi.fn(async () => 'src/index.ts');
+const enqueueWindowsValidationMock = vi.fn(async () => 'windows_job_1');
 
 function createClaimedTask(queueReason = 'task_started') {
   return {
@@ -29,8 +29,6 @@ function createClaimedTask(queueReason = 'task_started') {
       prompt: 'Prompt long enough',
       mode: 'safe',
       status: 'submitted',
-      maxIterations: 3,
-      maxBudgetUsd: 2,
       createdAt: new Date().toISOString(),
       updatedAt: new Date().toISOString()
     },
@@ -69,17 +67,11 @@ limits:
   max_budget_usd: 1
   soft_budget_threshold_percent: ${input.softPercent}
   hard_budget_threshold_percent: ${input.hardPercent}
-commands: {}
-approval: {}
-sandbox:
-  allow_network: true
 github: {}`;
 }
 
 const repositoryMock = {
   recoverStuckQueueJobs: vi.fn(async () => ({ recoveredCount: 0, queueJobIds: [] })),
-  requeueTasksWaitingForCapabilities: vi.fn(async () => 0),
-  listTasksWaitingForCapabilities: vi.fn(async () => []),
   recoverStuckProjectAudits: vi.fn(async () => 0),
   recoverStuckChatRuns: vi.fn(async () => 0),
   claimNextChatRun: vi.fn(async (): Promise<unknown> => undefined),
@@ -91,6 +83,8 @@ const repositoryMock = {
   listTasks: vi.fn(async (): Promise<unknown[]> => []),
   getTask: vi.fn(async (): Promise<unknown> => undefined),
   getProjectRoadmap: vi.fn(async (): Promise<unknown> => undefined),
+  getImplementationStepByTaskId: vi.fn(async (): Promise<unknown> => undefined),
+  recordAcceptanceEvidence: vi.fn(async () => undefined),
   finalizeProjectAudit: vi.fn(async () => ({ retryScheduled: false })),
   appendProjectImplementationSteps: vi.fn(async (): Promise<Array<{ id: string }>> => []),
   updateProjectRoadmapCycleStatus: vi.fn(async () => undefined),
@@ -101,9 +95,6 @@ const repositoryMock = {
   recordCompletedTaskProjectMemory: vi.fn(async () => undefined),
   recordProviderUsage: vi.fn(async () => undefined),
   transitionTask: vi.fn(async () => undefined),
-  waitTaskForCapabilities: vi.fn(async () => undefined),
-  setTaskDeferredValidationCapabilities: vi.fn(async () => undefined),
-  completeTaskWithDeferredValidation: vi.fn(async (): Promise<unknown> => ({ id: 'task_windows', status: 'completed' })),
   createApproval: vi.fn(async () => ({ id: 'approval_1' })),
   createIteration: vi.fn(async () => undefined),
   listTaskCheckpoints: vi.fn(async (): Promise<unknown[]> => []),
@@ -147,10 +138,12 @@ const repositoryMock = {
 
 vi.mock('@forgemind/db', () => ({
   advanceRoadmapAfterTaskCompletion: advanceRoadmapAfterTaskCompletionMock,
-  advanceRoadmapAfterTaskCapabilityWait: advanceRoadmapAfterTaskCapabilityWaitMock,
   startNextRoadmapStep: startNextRoadmapStepMock,
   createRepository: vi.fn(() => repositoryMock),
-  getPrismaClient: vi.fn(() => ({}))
+  getPrismaClient: vi.fn(() => ({})),
+  WindowsWorkerRepository: vi.fn(function WindowsWorkerRepository() {
+    return { enqueue: enqueueWindowsValidationMock };
+  })
 }));
 
 vi.mock('@forgemind/github', () => ({
@@ -186,6 +179,8 @@ describe('db-worker policy enforcement', () => {
     repositoryMock.getGitHubConnectionSecret.mockResolvedValue(undefined);
     repositoryMock.getTask.mockReset();
     repositoryMock.getTask.mockResolvedValue(undefined);
+    repositoryMock.getImplementationStepByTaskId.mockReset();
+    repositoryMock.getImplementationStepByTaskId.mockResolvedValue(undefined);
     repositoryMock.listTasks.mockReset();
     repositoryMock.listTasks.mockResolvedValue([]);
     repositoryMock.getTaskUsage.mockResolvedValue({
@@ -254,10 +249,6 @@ workflow:
   auto_push: false
 ai: {}
 limits: {}
-commands: {}
-approval: {}
-sandbox:
-  allow_network: true
 resources:
   min_free_space_mb: ${Number.MAX_SAFE_INTEGER}
 github: {}`;
@@ -315,10 +306,6 @@ workflow:
   auto_push: false
 ai: {}
 limits: {}
-commands: {}
-approval: {}
-sandbox:
-  allow_network: true
 resources:
   retention_days: 1
 github: {}`;
@@ -386,21 +373,6 @@ github: {}`;
       }
       await rm(workspaceRoot, { recursive: true, force: true });
     }
-  });
-
-  it('completes an existing Windows capability wait and advances its roadmap', async () => {
-    repositoryMock.listTasksWaitingForCapabilities.mockResolvedValueOnce([{
-      id: 'task_windows',
-      waitingForCapabilities: ['windows']
-    }] as never);
-    repositoryMock.claimNextSubmittedTask.mockResolvedValueOnce(undefined);
-
-    const { runDatabaseWorkerOnce } = await import('./db-worker.js');
-    const result = await runDatabaseWorkerOnce();
-
-    expect(repositoryMock.completeTaskWithDeferredValidation).toHaveBeenCalledWith('task_windows');
-    expect(advanceRoadmapAfterTaskCompletionMock).toHaveBeenCalledWith(repositoryMock, 'task_windows');
-    expect(result).toEqual(expect.objectContaining({ claimed: false }));
   });
 
   it('persists a redacted GitHub failure and keeps the daemon available for retries', async () => {
@@ -513,20 +485,10 @@ limits:
   max_changed_files: 20
   max_diff_lines: 2000
   max_repeated_error_count: 3
-commands: {}
-approval:
-  required_for: []
-  auto_allowed: []
-sandbox:
-  allow_network: false
-  allow_sudo: false
-  writable_paths: ["/workspace"]
-  forbidden_paths: ["/etc", "/root"]
 github:
   issue_label: ai-task
   branch_prefix: ai/
-  pr_draft: true
-  require_ci_green: false`;
+  pr_draft: true`;
     repositoryMock.claimNextSubmittedTask.mockResolvedValueOnce(claimed);
     repositoryMock.getGitHubConnectionSecret.mockRejectedValueOnce(new Error('Stored credential cannot be decrypted.'));
     runWorkerTaskMock.mockResolvedValueOnce({
@@ -574,20 +536,10 @@ limits:
   max_changed_files: 20
   max_diff_lines: 2000
   max_repeated_error_count: 3
-commands: {}
-approval:
-  required_for: []
-  auto_allowed: []
-sandbox:
-  allow_network: false
-  allow_sudo: false
-  writable_paths: ["/workspace"]
-  forbidden_paths: ["/etc", "/root"]
 github:
   issue_label: ai-task
   branch_prefix: ai/
-  pr_draft: true
-  require_ci_green: false`;
+  pr_draft: true`;
     repositoryMock.claimNextSubmittedTask.mockResolvedValueOnce(claimed);
     repositoryMock.getAIProviderConnectionSecretById.mockResolvedValueOnce({
       id: 'reviewer_openai', userId: 'user_1', name: 'Independent reviewer', isDefault: false,
@@ -635,6 +587,11 @@ github:
         {
           phase: 'planning',
           resultSummary: 'Existing plan',
+          validationResult: {}
+        },
+        {
+          phase: 'implementation',
+          resultSummary: 'Preserved implementation',
           validationResult: {
             validationChecks: [
               {
@@ -671,7 +628,7 @@ github:
         resume: expect.objectContaining({
           kind: 'worker_interrupted',
           planSummary: 'Existing plan',
-          implementationSummary: expect.stringContaining('preserved in the workspace'),
+          implementationSummary: 'Preserved implementation',
           validationChecks: [
             expect.objectContaining({
               kind: 'command',
@@ -692,6 +649,12 @@ github:
       deletions: 0,
       iterations: [
         {
+          phase: 'planning',
+          prompt: 'Plan task',
+          resultSummary: 'Use the focused build command.',
+          validationResult: { passed: true }
+        },
+        {
           phase: 'implementation',
           prompt: 'Implement task',
           resultSummary: 'Implementation is already present.',
@@ -699,16 +662,8 @@ github:
             passed: true,
             architectureUpdate: {
               modules: [{ name: 'Domain', responsibility: 'Business logic', paths: ['src/domain/**'], publicInterfaces: [], dependencies: [] }],
-              decisions: [], conventions: [], dependencyRules: [], knownDebt: [], resolvedDebt: [], validationCommands: []
-            }
-          }
-        },
-        {
-          phase: 'planning',
-          prompt: 'Correct validation',
-          resultSummary: 'Use the focused build command.',
-          validationResult: {
-            passed: true,
+              decisions: [], conventions: [], dependencyRules: [], knownDebt: [], resolvedDebt: []
+            },
             validationChecks: [{ kind: 'command', command: 'cmake --preset test' }]
           }
         },
@@ -739,75 +694,10 @@ github:
         kind: 'validation_retry',
         planSummary: 'Use the focused build command.',
         implementationSummary: 'Implementation is already present.',
-        validationChecks: [{ kind: 'command', command: 'cmake --preset test' }],
+        validationChecks: [expect.objectContaining({ kind: 'command', command: 'cmake --preset test', shell: 'system' })],
         architectureUpdate: expect.objectContaining({ modules: [expect.objectContaining({ name: 'Domain' })] })
       })
     }));
-  });
-
-  it('resumes deferred validation from safe checkpoints without repeating portable checks or delivery effects', async () => {
-    repositoryMock.claimNextSubmittedTask.mockResolvedValueOnce(createClaimedTask('capability_available'));
-    repositoryMock.getTaskDiff.mockResolvedValueOnce({
-      taskId: 'task_1', filesChanged: 1, insertions: 5, deletions: 0,
-      iterations: [
-        { phase: 'planning', prompt: 'Plan', resultSummary: 'Plan', validationResult: { validationChecks: [
-          { kind: 'command', command: 'npm test', requiredCapabilities: [] },
-          { kind: 'command', command: 'UnrealEditor.exe Flying.uproject', requiredCapabilities: ['windows'] }
-        ] }, createdAt: '2026-08-02T10:00:10.000Z' },
-        { phase: 'implementation', prompt: 'Implement', resultSummary: 'Implemented', diffStat: { filesChanged: 1, insertions: 5, deletions: 0 }, validationResult: { changedFiles: ['src/a.cpp'] }, createdAt: '2026-08-02T10:00:20.000Z' },
-        { phase: 'validation', prompt: 'Validate', resultSummary: 'Portable checks passed; Win64 deferred', validationResult: {
-          command: 'npm test && UnrealEditor.exe Flying.uproject', exitCode: 0, stdout: '', stderr: '', passed: true,
-          passedValidationChecks: [{ command: 'npm test', inputHash: 'tree-hash', exitCode: 0, stdout: 'ok', stderr: '', passed: true }],
-          deferredChecks: [{ command: 'UnrealEditor.exe Flying.uproject', requiredCapabilities: ['windows'], missingCapabilities: ['windows'] }]
-        }, createdAt: '2026-08-02T10:00:30.000Z' },
-        { phase: 'review', prompt: 'Review', resultSummary: 'Review passed', validationResult: { blockers: [], riskyChanges: [] }, createdAt: '2026-08-02T10:00:40.000Z' }
-      ]
-    });
-    repositoryMock.listTaskAudit.mockResolvedValueOnce([
-      { eventType: 'task_activity', payload: { phase: 'git', state: 'completed', operation: 'commit_and_push' }, createdAt: '2026-08-02T10:00:45.000Z' }
-    ]);
-    repositoryMock.listTaskCheckpoints.mockResolvedValueOnce([
-      { key: 'validation:npm-test', phase: 'validation', status: 'completed', inputHash: 'tree-hash', output: { evidenceVersion: 1, command: 'npm test', exitCode: 0, stdout: 'ok', stderr: '' } },
-      { key: 'validation:deferred', phase: 'validation', status: 'completed', inputHash: 'tree-hash', output: { evidenceVersion: 1, deferred: true, command: 'UnrealEditor.exe Flying.uproject' } },
-      { key: 'external:wait_for_checks', phase: 'github', status: 'completed', inputHash: 'checks-hash', output: { status: 'success', summary: 'passed', failures: [] } },
-      { key: 'external:merge_pr', phase: 'github', status: 'completed', inputHash: 'merge-hash', output: { merged: true, sha: 'abcdef1234567' } }
-    ]);
-    runWorkerTaskMock.mockResolvedValueOnce({
-      taskId: 'task_1', status: 'completed', issueUrl: '', branchName: 'ai/1-task', workspacePath: 'C:/tmp/worker',
-      validation: { command: 'UnrealEditor.exe Flying.uproject', exitCode: 0, stdout: 'passed', stderr: '', passed: true },
-      summary: 'Capability gate passed.', approvals: [], completedAt: new Date().toISOString()
-    });
-
-    const { runDatabaseWorkerOnce } = await import('./db-worker.js');
-    await runDatabaseWorkerOnce();
-
-    expect(runWorkerTaskMock).toHaveBeenCalledWith(expect.objectContaining({
-      resume: expect.objectContaining({
-        kind: 'capability_available',
-        resumeFrom: 'validation',
-        validation: undefined,
-        validationChecks: [
-          expect.objectContaining({ command: 'npm test', requiredCapabilities: [] }),
-          expect.objectContaining({
-            command: 'UnrealEditor.exe Flying.uproject',
-            requiredCapabilities: ['windows']
-          })
-        ],
-        passedValidationChecks: [expect.objectContaining({
-          command: 'npm test',
-          inputHash: 'tree-hash',
-          passed: true
-        })],
-        completedOperations: expect.arrayContaining(['commit_and_push', 'wait_for_checks', 'merge_pr']),
-        mergeCommitSha: 'abcdef1234567'
-      })
-    }));
-    expect(repositoryMock.transitionTask).toHaveBeenNthCalledWith(1, 'task_1', 'ready_for_user_review', {
-      pullRequestUrl: null,
-      branchName: 'ai/1-task'
-    });
-    expect(repositoryMock.transitionTask).toHaveBeenNthCalledWith(2, 'task_1', 'completed');
-    expect(repositoryMock.finalizeQueueJob).toHaveBeenCalledWith('queue_1', 'succeeded');
   });
 
   it.each([
@@ -835,7 +725,7 @@ github:
       expected: { resumeFrom: 'implementation', attempt: 2, previousReviewBlockers: ['Fix adapter lookup.'] }
     },
     {
-      label: 'failed validation requiring AI recovery decision',
+      label: 'failed validation returned directly to implementation',
       iterations: [
         { phase: 'implementation', prompt: 'Implement', resultSummary: 'Implementation', diffStat: { filesChanged: 1, insertions: 5, deletions: 0 }, validationResult: { changedFiles: ['src/a.ts'], validationChecks: [{ kind: 'command', command: 'npm test' }], attempt: 1 }, createdAt: '2026-08-02T10:00:20.000Z' },
         { phase: 'validation', prompt: 'npm test', resultSummary: 'Validation failed', validationResult: { command: 'npm test', exitCode: 1, stdout: '', stderr: 'Assertion failed', passed: false, attempt: 1 }, createdAt: '2026-08-02T10:00:30.000Z' }
@@ -844,9 +734,8 @@ github:
         { eventType: 'task_status_validation_failed', payload: {}, createdAt: '2026-08-02T10:00:40.000Z' }
       ],
       expected: {
-        resumeFrom: 'validation',
-        resumeValidationPlanRevision: true,
-        validation: expect.objectContaining({ passed: false, stderr: 'Assertion failed' })
+        resumeFrom: 'implementation',
+        previousValidationError: expect.stringContaining('Assertion failed')
       }
     },
     {
@@ -860,9 +749,8 @@ github:
         { eventType: 'task_failed', payload: { status: 'provider_failed' }, createdAt: '2026-08-02T10:00:40.000Z' }
       ],
       expected: {
-        resumeFrom: 'validation',
-        resumeValidationPlanRevision: false,
-        validationChecks: [{ kind: 'command', command: 'npm test' }]
+        resumeFrom: 'implementation',
+        previousValidationError: expect.stringContaining('not found')
       }
     },
     {
@@ -905,7 +793,7 @@ github:
       }
     },
     {
-      label: 'provider failure while revising validation commands',
+      label: 'legacy validation-revision failure returned to implementation',
       iterations: [
         { phase: 'implementation', prompt: 'Implement', resultSummary: 'Implementation', diffStat: { filesChanged: 1, insertions: 5, deletions: 0 }, validationResult: { changedFiles: ['src/a.ts'], validationChecks: [{ kind: 'command', command: 'missing-tool test' }], attempt: 1 }, createdAt: '2026-08-02T10:00:20.000Z' },
         { phase: 'validation', prompt: 'missing-tool test', resultSummary: 'Validation failed', validationResult: { command: 'missing-tool test', exitCode: 1, stdout: '', stderr: 'not found', passed: false, failingCommand: 'missing-tool test', attempt: 1 }, createdAt: '2026-08-02T10:00:30.000Z' }
@@ -915,9 +803,8 @@ github:
         { eventType: 'task_failed', payload: { status: 'provider_failed' }, createdAt: '2026-08-02T10:00:40.000Z' }
       ],
       expected: {
-        resumeFrom: 'validation',
-        resumeValidationPlanRevision: true,
-        validation: expect.objectContaining({ passed: false, failingCommand: 'missing-tool test' })
+        resumeFrom: 'implementation',
+        previousValidationError: expect.stringContaining('not found')
       }
     },
     {
@@ -933,8 +820,7 @@ github:
       expected: {
         resumeFrom: 'validation',
         validation: undefined,
-        resumeValidationPlanRevision: false,
-        validationChecks: [{ kind: 'command', command: 'npm run validate' }]
+        validationChecks: [expect.objectContaining({ kind: 'command', command: 'npm run validate', shell: 'system' })]
       }
     },
     {
@@ -1026,6 +912,7 @@ github:
         output: {
           evidenceVersion: 1,
           command: 'npm test',
+          shell: 'system',
           exitCode: 0,
           stdout: '42 tests passed',
           stderr: 'one compiler warning',
@@ -1053,6 +940,7 @@ github:
       resume: expect.objectContaining({
         passedValidationChecks: [{
           command: 'npm test',
+          shell: 'system',
           exitCode: 0,
           stdout: '42 tests passed',
           stderr: 'one compiler warning',
@@ -1065,7 +953,7 @@ github:
     }));
   });
 
-  it('restores a completed GitHub checks checkpoint with its commit input hash', async () => {
+  it('ignores a retired GitHub checks checkpoint when resuming delivery', async () => {
     repositoryMock.claimNextSubmittedTask.mockResolvedValueOnce(createClaimedTask('task_retried'));
     repositoryMock.getTaskDiff.mockResolvedValueOnce({
       taskId: 'task_1',
@@ -1106,12 +994,11 @@ github:
     expect(runWorkerTaskMock).toHaveBeenCalledWith(expect.objectContaining({
       resume: expect.objectContaining({
         kind: 'phase_retry',
-        resumeFrom: 'delivery',
-        completedOperations: expect.arrayContaining(['wait_for_checks']),
-        githubChecksInputHash: 'current-head-and-pr-hash',
-        githubChecks: { status: 'success', summary: 'Current commit passed.', failures: [] }
+        resumeFrom: 'delivery'
       })
     }));
+    const resume = runWorkerTaskMock.mock.calls.at(-1)?.[0]?.resume;
+    expect(resume?.completedOperations).not.toContain('wait_for_checks');
     expect(repositoryMock.writeAudit).toHaveBeenCalledWith(expect.objectContaining({
       actorType: 'system',
       eventType: 'task_retry_resume_decision',
@@ -1119,7 +1006,7 @@ github:
       payload: expect.objectContaining({
         queueReason: 'task_retried',
         resumeFrom: 'delivery',
-        skippedExternalEffects: expect.arrayContaining(['wait_for_checks'])
+        skippedExternalEffects: expect.not.arrayContaining(['wait_for_checks'])
       })
     }));
   });
@@ -1234,7 +1121,7 @@ github:
     }));
   });
 
-  it('starts a new attempt budget when the user retries after the previous run exhausted attempt ten', async () => {
+  it('preserves the attempt number when retry resumes the failed phase', async () => {
     repositoryMock.claimNextSubmittedTask.mockResolvedValueOnce(createClaimedTask('task_retried'));
     repositoryMock.getTaskDiff.mockResolvedValueOnce({
       taskId: 'task_1', filesChanged: 1, insertions: 5, deletions: 0,
@@ -1259,7 +1146,7 @@ github:
     await runDatabaseWorkerOnce();
 
     expect(runWorkerTaskMock).toHaveBeenCalledWith(expect.objectContaining({
-      resume: expect.objectContaining({ resumeFrom: 'delivery', attempt: 1 })
+      resume: expect.objectContaining({ resumeFrom: 'delivery', attempt: 10 })
     }));
   });
 
@@ -1350,7 +1237,7 @@ github:
     }));
   });
 
-  it('maps provider estimate failure to provider_failed status', async () => {
+  it('records provider estimate failure without blocking task execution', async () => {
     createProviderMock.mockReturnValueOnce({
       estimateCost: vi.fn(async () => {
         throw new Error('Provider timeout');
@@ -1363,6 +1250,12 @@ github:
       supportsLocalRepo: () => true,
       supportsGitHubNativeFlow: () => false
     });
+    runWorkerTaskMock.mockResolvedValueOnce({
+      taskId: 'task_1', status: 'ready_for_user_review', issueUrl: '', branchName: 'ai/1-task',
+      workspacePath: 'C:/tmp/worker',
+      validation: { command: 'npm test', exitCode: 0, stdout: 'ok', stderr: '', passed: true },
+      summary: 'done', completedAt: new Date().toISOString()
+    });
 
     const { runDatabaseWorkerOnce } = await import('./db-worker.js');
 
@@ -1372,14 +1265,16 @@ github:
       expect.objectContaining({
         claimed: true,
         taskId: 'task_1',
-        status: 'provider_failed'
+        result: expect.objectContaining({ status: 'ready_for_user_review' })
       })
     );
-    expect(repositoryMock.failTask).toHaveBeenCalledWith('task_1', expect.stringContaining('estimate_cost failed'), 'provider_failed');
-    expect(repositoryMock.finalizeQueueJob).toHaveBeenCalledWith('queue_1', 'failed', expect.stringContaining('estimate_cost failed'));
+    expect(repositoryMock.writeAudit).toHaveBeenCalledWith(expect.objectContaining({
+      eventType: 'task_cost_estimate_unavailable'
+    }));
+    expect(repositoryMock.failTask).not.toHaveBeenCalled();
   });
 
-  it('rejects non-equivalent fallback provider when primary provider estimate fails', async () => {
+  it('does not invoke a fallback provider only because cost estimation failed', async () => {
     const previousProvider = process.env.FORGEMIND_PROVIDER;
     const previousFallback = process.env.FORGEMIND_FALLBACK_PROVIDER;
     process.env.FORGEMIND_PROVIDER = 'openai';
@@ -1439,17 +1334,16 @@ github:
     const { runDatabaseWorkerOnce } = await import('./db-worker.js');
     const result = await runDatabaseWorkerOnce();
 
-    expect(result).toEqual(expect.objectContaining({ claimed: true, taskId: 'task_1', status: 'provider_failed' }));
+    expect(result).toEqual(expect.objectContaining({
+      claimed: true,
+      taskId: 'task_1',
+      result: expect.objectContaining({ status: 'ready_for_user_review' })
+    }));
     expect(createProviderMock).toHaveBeenCalledWith('openai', undefined);
     expect(createProviderMock).toHaveBeenCalledWith('codex', undefined);
     expect(fallbackEstimate).not.toHaveBeenCalled();
     expect(repositoryMock.writeAudit).toHaveBeenCalledWith(expect.objectContaining({
-      eventType: 'provider_fallback_skipped',
-      payload: expect.objectContaining({
-        primaryProvider: 'openai',
-        fallbackProvider: 'codex',
-        reason: 'fallback_not_semantically_equivalent'
-      })
+      eventType: 'task_cost_estimate_unavailable'
     }));
 
     if (previousProvider === undefined) {
@@ -1464,7 +1358,7 @@ github:
     }
   });
 
-  it('opens a bounded circuit breaker after retryable provider failures and audits fallback policy', async () => {
+  it('does not open a provider circuit or invoke fallback for cost-estimate telemetry failures', async () => {
     const previousConnectionId = process.env.FORGEMIND_PROVIDER_CONNECTION_ID;
     const previousFallbackConnectionId = process.env.FORGEMIND_FALLBACK_PROVIDER_CONNECTION_ID;
     const previousThreshold = process.env.FORGEMIND_PROVIDER_CIRCUIT_BREAKER_FAILURE_THRESHOLD;
@@ -1481,6 +1375,7 @@ github:
       outputTokens: 10,
       estimatedCostUsd: 0.02
     }));
+    repositoryMock.claimNextSubmittedTask.mockResolvedValue(createClaimedTask());
 
     try {
       repositoryMock.getAIProviderConnectionSecretById.mockImplementation(async (connectionId: string) => {
@@ -1551,34 +1446,13 @@ github:
       await runDatabaseWorkerOnce();
       await runDatabaseWorkerOnce();
 
-      expect(primaryEstimate).toHaveBeenCalledTimes(2);
-      expect(fallbackEstimate).toHaveBeenCalledTimes(3);
-      expect(repositoryMock.writeAudit).toHaveBeenCalledWith(expect.objectContaining({
-        eventType: 'provider_circuit_breaker_state',
-        payload: expect.objectContaining({
-          provider: 'codex',
-          connectionId: 'conn_primary_codex',
-          circuitBreaker: expect.objectContaining({
-            state: 'open',
-            failureCount: 2,
-            failureThreshold: 2
-          })
-        })
+      expect(primaryEstimate).toHaveBeenCalledTimes(3);
+      expect(fallbackEstimate).not.toHaveBeenCalled();
+      expect(repositoryMock.writeAudit).not.toHaveBeenCalledWith(expect.objectContaining({
+        eventType: 'provider_circuit_breaker_state'
       }));
-      expect(repositoryMock.writeAudit).toHaveBeenCalledWith(expect.objectContaining({
-        eventType: 'provider_fallback_used',
-        payload: expect.objectContaining({
-          primaryProvider: 'codex',
-          fallbackProvider: 'codex',
-          policy: 'semantically_equivalent_same_operation_retryable_primary_failure'
-        })
-      }));
-      expect(repositoryMock.writeAudit).toHaveBeenCalledWith(expect.objectContaining({
-        eventType: 'provider_request_succeeded',
-        payload: expect.objectContaining({
-          provider: 'codex',
-          operation: 'estimate_cost'
-        })
+      expect(repositoryMock.writeAudit).not.toHaveBeenCalledWith(expect.objectContaining({
+        eventType: 'provider_fallback_used'
       }));
     } finally {
       const { resetProviderCircuitBreakersForTests } = await import('./db-worker.js');
@@ -1797,7 +1671,7 @@ github:
     }));
   });
 
-  it('surfaces soft usage limits through budget approval workflow', async () => {
+  it('does not turn usage telemetry into an approval pause', async () => {
     const claimed = createClaimedTask();
     claimed.project.configYaml = usageLimitConfigYaml({ softPercent: 50, hardPercent: 100 });
     repositoryMock.claimNextSubmittedTask.mockResolvedValueOnce(claimed);
@@ -1826,29 +1700,13 @@ github:
     const { runDatabaseWorkerOnce } = await import('./db-worker.js');
     const result = await runDatabaseWorkerOnce();
 
-    expect(result).toEqual(expect.objectContaining({ claimed: true, taskId: 'task_1', status: 'needs_approval' }));
-    expect(repositoryMock.transitionTask).toHaveBeenCalledWith('task_1', 'needs_approval', expect.objectContaining({
-      approvals: ['budget_increase'],
-      limitSignal: 'soft_usage_limit_reached'
-    }));
-    expect(repositoryMock.createApproval).toHaveBeenCalledWith(expect.objectContaining({
-      taskId: 'task_1',
-      type: 'budget_increase',
-      title: 'Approval required: soft usage limit reached',
-      riskLevel: 'medium'
-    }));
-    expect(repositoryMock.writeAudit).toHaveBeenCalledWith(expect.objectContaining({
-      eventType: 'usage_limit_approval_requested',
-      payload: expect.objectContaining({
-        limitSignal: 'soft_usage_limit_reached',
-        retryBounded: true
-      })
-    }));
-    expect(repositoryMock.failTask).not.toHaveBeenCalled();
-    expect(repositoryMock.finalizeQueueJob).toHaveBeenCalledWith('queue_1', 'succeeded');
+    expect(result).toEqual(expect.objectContaining({ claimed: true, taskId: 'task_1', status: 'failed' }));
+    expect(repositoryMock.transitionTask).not.toHaveBeenCalledWith('task_1', 'needs_approval', expect.anything());
+    expect(repositoryMock.createApproval).not.toHaveBeenCalled();
+    expect(repositoryMock.failTask).toHaveBeenCalledWith('task_1', expect.stringContaining('Soft usage limit should pause the worker'), 'failed');
   });
 
-  it('blocks hard usage limits until budget increase approval is granted', async () => {
+  it('does not turn hard usage telemetry into an approval pause', async () => {
     const claimed = createClaimedTask();
     claimed.project.configYaml = usageLimitConfigYaml({ softPercent: 50, hardPercent: 90 });
     repositoryMock.claimNextSubmittedTask.mockResolvedValueOnce(claimed);
@@ -1877,18 +1735,9 @@ github:
     const { runDatabaseWorkerOnce } = await import('./db-worker.js');
     const result = await runDatabaseWorkerOnce();
 
-    expect(result).toEqual(expect.objectContaining({ claimed: true, taskId: 'task_1', status: 'needs_approval' }));
-    expect(repositoryMock.transitionTask).toHaveBeenCalledWith('task_1', 'needs_approval', expect.objectContaining({
-      approvals: ['budget_increase'],
-      limitSignal: 'hard_usage_limit_reached'
-    }));
-    expect(repositoryMock.createApproval).toHaveBeenCalledWith(expect.objectContaining({
-      taskId: 'task_1',
-      type: 'budget_increase',
-      title: 'Approval required: hard usage limit reached',
-      riskLevel: 'critical'
-    }));
-    expect(repositoryMock.failTask).not.toHaveBeenCalled();
+    expect(result).toEqual(expect.objectContaining({ claimed: true, taskId: 'task_1', status: 'failed' }));
+    expect(repositoryMock.transitionTask).not.toHaveBeenCalledWith('task_1', 'needs_approval', expect.anything());
+    expect(repositoryMock.createApproval).not.toHaveBeenCalled();
   });
 
   it('continues after an approved hard usage limit budget increase', async () => {
@@ -1949,7 +1798,7 @@ github:
     }));
   });
 
-  it('does not let unrelated approved budget increases bypass hard usage limits', async () => {
+  it('ignores historical budget approvals because runtime approvals no longer exist', async () => {
     const claimed = createClaimedTask();
     claimed.project.configYaml = usageLimitConfigYaml({ softPercent: 50, hardPercent: 90 });
     repositoryMock.claimNextSubmittedTask.mockResolvedValueOnce(claimed);
@@ -1993,16 +1842,9 @@ github:
     const { runDatabaseWorkerOnce } = await import('./db-worker.js');
     const result = await runDatabaseWorkerOnce();
 
-    expect(result).toEqual(expect.objectContaining({ claimed: true, taskId: 'task_1', status: 'needs_approval' }));
-    expect(repositoryMock.transitionTask).toHaveBeenCalledWith('task_1', 'needs_approval', expect.objectContaining({
-      approvals: ['budget_increase'],
-      limitSignal: 'hard_usage_limit_reached'
-    }));
-    expect(repositoryMock.createApproval).toHaveBeenCalledWith(expect.objectContaining({
-      taskId: 'task_1',
-      type: 'budget_increase',
-      title: 'Approval required: hard usage limit reached'
-    }));
+    expect(result).toEqual(expect.objectContaining({ claimed: true, taskId: 'task_1', status: 'failed' }));
+    expect(repositoryMock.transitionTask).not.toHaveBeenCalledWith('task_1', 'needs_approval', expect.anything());
+    expect(repositoryMock.createApproval).not.toHaveBeenCalled();
   });
 
   it('persists the provider session created during a task run', async () => {
@@ -2091,7 +1933,7 @@ github:
     });
   });
 
-  it('maps requested approvals to needs_approval policy path', async () => {
+  it('ignores legacy task approval results and keeps the workflow moving', async () => {
     runWorkerTaskMock.mockResolvedValueOnce({
       taskId: 'task_1',
       status: 'needs_approval',
@@ -2119,18 +1961,11 @@ github:
         taskId: 'task_1'
       })
     );
-    expect(repositoryMock.transitionTask).toHaveBeenCalledWith('task_1', 'needs_approval', {
-      approvals: ['new_dependency']
-    });
-    expect(repositoryMock.createApproval).toHaveBeenCalledWith(
-      expect.objectContaining({
-        taskId: 'task_1',
-        type: 'new_dependency'
-      })
-    );
+    expect(repositoryMock.transitionTask).toHaveBeenCalledWith('task_1', 'ready_for_user_review', expect.anything());
+    expect(repositoryMock.createApproval).not.toHaveBeenCalled();
   });
 
-  it('normalizes free-form approval reasons before creating approval records', async () => {
+  it('does not create approvals from legacy free-form provider output', async () => {
     runWorkerTaskMock.mockResolvedValueOnce({
       taskId: 'task_1',
       status: 'needs_approval',
@@ -2158,18 +1993,11 @@ github:
         taskId: 'task_1'
       })
     );
-    expect(repositoryMock.transitionTask).toHaveBeenCalledWith('task_1', 'needs_approval', {
-      approvals: ['risky_refactor']
-    });
-    expect(repositoryMock.createApproval).toHaveBeenCalledWith(
-      expect.objectContaining({
-        taskId: 'task_1',
-        type: 'risky_refactor'
-      })
-    );
+    expect(repositoryMock.transitionTask).toHaveBeenCalledWith('task_1', 'ready_for_user_review', expect.anything());
+    expect(repositoryMock.createApproval).not.toHaveBeenCalled();
   });
 
-  it('pauses for approval instead of failing when current diff line guardrail is exceeded', async () => {
+  it('does not interrupt a large diff with an approval guardrail', async () => {
     runWorkerTaskMock.mockImplementationOnce(async (input: { hooks?: { onIteration?: (iteration: { phase: 'implementation'; prompt: string; resultSummary: string; diffStat: { filesChanged: number; insertions: number; deletions: number }; validationResult: { passed: boolean } }) => Promise<void> } }) => {
       await input.hooks?.onIteration?.({
         phase: 'implementation',
@@ -2189,26 +2017,12 @@ github:
       expect.objectContaining({
         claimed: true,
         taskId: 'task_1',
-        status: 'needs_approval'
+        status: 'failed'
       })
     );
-    expect(repositoryMock.transitionTask).toHaveBeenCalledWith(
-      'task_1',
-      'needs_approval',
-      expect.objectContaining({
-        approvals: ['risky_refactor'],
-        limitSignal: 'diff_lines_limit_reached'
-      })
-    );
-    expect(repositoryMock.createApproval).toHaveBeenCalledWith(
-      expect.objectContaining({
-        taskId: 'task_1',
-        type: 'risky_refactor',
-        title: 'Approval required: large implementation diff'
-      })
-    );
-    expect(repositoryMock.failTask).not.toHaveBeenCalled();
-    expect(repositoryMock.finalizeQueueJob).toHaveBeenCalledWith('queue_1', 'succeeded');
+    expect(repositoryMock.transitionTask).not.toHaveBeenCalledWith('task_1', 'needs_approval', expect.anything());
+    expect(repositoryMock.createApproval).not.toHaveBeenCalled();
+    expect(repositoryMock.failTask).toHaveBeenCalled();
   });
 
   it('continues past the large diff guardrail in full-auto mode', async () => {
@@ -2221,8 +2035,6 @@ github:
         prompt: 'Prompt long enough',
         mode: 'full_auto',
         status: 'submitted',
-        maxIterations: 3,
-        maxBudgetUsd: 2,
         createdAt: new Date().toISOString(),
         updatedAt: new Date().toISOString()
       },
@@ -2837,7 +2649,7 @@ github:
     );
   });
 
-  it('stops with repeated_error_detected when the same validation error repeats', async () => {
+  it('does not interrupt provider-controlled retries with a repeated-error guardrail', async () => {
     repositoryMock.claimNextSubmittedTask.mockResolvedValueOnce({
       task: {
         id: 'task_1',
@@ -2847,8 +2659,6 @@ github:
         prompt: 'Prompt long enough',
         mode: 'safe',
         status: 'submitted',
-        maxIterations: 10,
-        maxBudgetUsd: 2,
         createdAt: new Date().toISOString(),
         updatedAt: new Date().toISOString()
       },
@@ -2911,10 +2721,10 @@ github:
       expect.objectContaining({
         claimed: true,
         taskId: 'task_1',
-        status: 'repeated_error_detected'
+        result: expect.objectContaining({ status: 'ready_for_user_review' })
       })
     );
-    expect(repositoryMock.failTask).toHaveBeenCalledWith('task_1', expect.stringContaining('repeated_error_detected'), 'repeated_error_detected');
+    expect(repositoryMock.failTask).not.toHaveBeenCalledWith('task_1', expect.stringContaining('repeated_error_detected'), 'repeated_error_detected');
   });
 
   it('allows the final configured iteration to finish the workflow', async () => {
@@ -2927,8 +2737,6 @@ github:
         prompt: 'Prompt long enough',
         mode: 'safe',
         status: 'submitted',
-        maxIterations: 1,
-        maxBudgetUsd: 2,
         createdAt: new Date().toISOString(),
         updatedAt: new Date().toISOString()
       },
@@ -3018,7 +2826,15 @@ github:
     expect(advanceRoadmapAfterTaskCompletionMock).toHaveBeenCalledWith(repositoryMock, 'task_1');
   });
 
-  it('completes a task with deferred Windows validation evidence', async () => {
+  it('queues AI-selected Windows validation as non-blocking evidence after delivery', async () => {
+    const claimed = createClaimedTask();
+    Object.assign(claimed.project, {
+      projectContract: { version: 3, requirements: [{ id: 'REQ-WIN' }] }
+    });
+    repositoryMock.claimNextSubmittedTask.mockResolvedValueOnce(claimed);
+    repositoryMock.getImplementationStepByTaskId.mockResolvedValue({
+      id: 'step_1', cycleId: 'cycle_1', requirementIds: ['REQ-WIN']
+    });
     runWorkerTaskMock.mockResolvedValueOnce({
       taskId: 'task_1',
       status: 'completed',
@@ -3026,77 +2842,37 @@ github:
       branchName: 'ai/1-task',
       pullRequestUrl: 'https://github.com/demo/repo/pull/1',
       workspacePath: 'C:/tmp/worker',
-      validation: {
-        command: 'UnrealEditor.exe Flying.uproject', exitCode: 0, stdout: '', stderr: '', passed: true,
-        deferredChecks: [{
-          command: 'UnrealEditor.exe Flying.uproject', criterion: 'Win64 starts',
-          requiredCapabilities: ['windows'], missingCapabilities: ['windows']
-        }]
-      },
-      requiredCapabilities: ['windows'],
-      summary: 'Source delivered; Win64 gate deferred.', approvals: [], completedAt: new Date().toISOString()
-    });
-
-    const { runDatabaseWorkerOnce } = await import('./db-worker.js');
-    await runDatabaseWorkerOnce();
-
-    expect(repositoryMock.setTaskDeferredValidationCapabilities).toHaveBeenCalledWith('task_1', ['windows']);
-    expect(repositoryMock.transitionTask).toHaveBeenNthCalledWith(1, 'task_1', 'ready_for_user_review', {
-      pullRequestUrl: 'https://github.com/demo/repo/pull/1',
-      branchName: 'ai/1-task'
-    });
-    expect(repositoryMock.transitionTask).toHaveBeenNthCalledWith(2, 'task_1', 'completed');
-    expect(repositoryMock.waitTaskForCapabilities).not.toHaveBeenCalled();
-    expect(advanceRoadmapAfterTaskCompletionMock).toHaveBeenCalledWith(repositoryMock, 'task_1');
-    expect(repositoryMock.finalizeQueueJob).toHaveBeenCalledWith('queue_1', 'succeeded');
-    expect(repositoryMock.failTask).not.toHaveBeenCalled();
-  });
-
-  it('emits a capability waiting lifecycle state with concrete missing capabilities', async () => {
-    runWorkerTaskMock.mockResolvedValueOnce({
-      taskId: 'task_1',
-      status: 'waiting_for_capability',
-      issueUrl: 'https://github.com/demo/repo/issues/1',
-      branchName: 'ai/1-task',
-      pullRequestUrl: 'https://github.com/demo/repo/pull/1',
-      workspacePath: 'C:/tmp/worker',
-      validation: {
-        command: 'UnrealEditor.exe Flying.uproject',
-        exitCode: 0,
-        stdout: '',
-        stderr: '',
-        passed: true,
-        deferredChecks: [{
-          command: 'UnrealEditor.exe Flying.uproject',
-          criterion: 'Win64 starts',
-          requiredCapabilities: ['windows'],
-          missingCapabilities: ['windows']
-        }]
-      },
-      requiredCapabilities: ['windows'],
-      summary: 'Source delivery completed; waiting for Windows validation.',
-      approvals: [],
+      commitSha: 'a'.repeat(40),
+      validation: { command: 'npm test', exitCode: 0, stdout: 'passed', stderr: '', passed: true },
+      externalValidationChecks: [{
+        kind: 'command', command: 'cmake --build --preset windows-release', shell: 'powershell', target: 'windows',
+        requiredCapabilities: ['windows', 'cmake', 'msvc'], timeoutMinutes: 45, category: 'build', criterion: 'Windows build passes.'
+      }],
+      summary: 'Merged successfully.',
       completedAt: new Date().toISOString()
     });
 
     const { runDatabaseWorkerOnce } = await import('./db-worker.js');
     await runDatabaseWorkerOnce();
 
-    expect(repositoryMock.waitTaskForCapabilities).toHaveBeenCalledWith('task_1', ['windows'], expect.objectContaining({
-      validation: expect.objectContaining({
-        command: 'UnrealEditor.exe Flying.uproject',
-        deferredChecks: [expect.objectContaining({
-          requiredCapabilities: ['windows'],
-          missingCapabilities: ['windows']
-        })]
+    expect(repositoryMock.writeAudit).not.toHaveBeenCalledWith(expect.objectContaining({ eventType: 'windows_validation_not_enqueued' }));
+    expect(enqueueWindowsValidationMock).toHaveBeenCalledWith(expect.objectContaining({
+      projectId: 'project_1',
+      taskId: 'task_1',
+      runId: 'run_1',
+      requiredCapabilities: ['windows'],
+      packet: expect.objectContaining({
+        commitSha: 'a'.repeat(40),
+        check: expect.objectContaining({ command: 'cmake --build --preset windows-release', shell: 'powershell' }),
+        resourcePolicy: expect.objectContaining({ timeoutSeconds: 2700 }),
+        evidenceContext: { cycleId: 'cycle_1', stepId: 'step_1', requirementIds: ['REQ-WIN'], contractVersion: 3 }
       })
     }));
-    expect(advanceRoadmapAfterTaskCapabilityWaitMock).toHaveBeenCalledWith(repositoryMock, 'task_1');
-    expect(repositoryMock.finishTaskRun).toHaveBeenCalledWith(expect.objectContaining({
-      taskRunId: 'run_1',
-      status: 'succeeded',
-      summary: 'Source delivery completed; waiting for Windows validation.'
+    expect(repositoryMock.recordAcceptanceEvidence).toHaveBeenCalledWith(expect.objectContaining({
+      taskId: 'task_1', status: 'deferred', evidenceIdentity: expect.stringMatching(/^windows:/),
+      payload: expect.objectContaining({ requestedCapabilities: ['windows', 'cmake', 'msvc'] })
     }));
+    expect(repositoryMock.transitionTask).toHaveBeenLastCalledWith('task_1', 'completed');
   });
 
   it('runs capability and release audits before completing a roadmap cycle', async () => {
@@ -3159,7 +2935,7 @@ github:
     const { runDatabaseWorkerOnce } = await import('./db-worker.js');
     const result = await runDatabaseWorkerOnce();
 
-    expect(result).toMatchObject({ claimed: true, kind: 'project_audit', status: 'awaiting_extension_approval' });
+    expect(result).toMatchObject({ claimed: true, kind: 'project_audit', status: 'awaiting_extension_decision' });
     expect(runCapabilityAuditMock).toHaveBeenCalledTimes(1);
     expect(runCapabilityAuditMock).toHaveBeenCalledWith(expect.objectContaining({
       workItems: [expect.objectContaining({ id: 'step_1', cycleId: 'cycle_0' })]
@@ -3175,7 +2951,7 @@ github:
     expect(repositoryMock.updateProjectRoadmapCycleStatus).toHaveBeenCalledWith('cycle_1', 'completed');
     expect(repositoryMock.setProjectRoadmapCycleExtensionProposal).toHaveBeenCalledWith('cycle_1', {
       proposal: expect.stringMatching(/Rozšíření přidá týmovou spolupráci[\s\S]*## Funkční rozsah[\s\S]*- Správa týmů[\s\S]*## Měřitelná kritéria úspěchu/),
-      status: 'awaiting_extension_approval'
+      status: 'awaiting_extension_decision'
     });
   });
 

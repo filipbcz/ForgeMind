@@ -29,7 +29,6 @@ const project: ProjectSummary = {
   autoCreatePullRequest: true,
   autoMergePullRequest: false,
   autoCompleteTask: false,
-  allowSafeOperationsWithoutApproval: false,
   defaultTaskMode: 'safe',
   isActive: true,
   createdAt: '',
@@ -282,7 +281,7 @@ describe('project roadmap status filters', () => {
 
     expect(projectStepMatchesStatusFilter(withStatus('pending'), 'active')).toBe(true);
     expect(projectStepMatchesStatusFilter(withStatus('running'), 'active')).toBe(true);
-    expect(projectStepMatchesStatusFilter(withStatus('waiting_for_capability'), 'waiting')).toBe(true);
+    expect(projectStepMatchesStatusFilter(withStatus('pending'), 'waiting')).toBe(false);
     expect(projectStepMatchesStatusFilter(withStatus('cancelled'), 'failed')).toBe(true);
     expect(projectStepMatchesStatusFilter(withStatus('completed'), 'completed')).toBe(true);
   });
@@ -317,7 +316,7 @@ describe('project roadmap status filters', () => {
     };
 
     expect(projectCycleMatchesStatusFilter(withCycleStatus('active'), 'active')).toBe(true);
-    expect(projectCycleMatchesStatusFilter(withCycleStatus('awaiting_extension_approval'), 'waiting')).toBe(true);
+    expect(projectCycleMatchesStatusFilter(withCycleStatus('awaiting_extension_decision'), 'waiting')).toBe(true);
     expect(projectCycleMatchesStatusFilter(withCycleStatus('blocked'), 'failed')).toBe(true);
     expect(projectCycleMatchesStatusFilter(withCycleStatus('completed'), 'completed')).toBe(true);
     expect(projectAuditMatchesStatusFilter({ ...audit, status: 'claimed' }, 'active')).toBe(true);

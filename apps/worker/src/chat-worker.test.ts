@@ -27,8 +27,7 @@ function createClaimedRun(mode: 'safe' | 'auto' | 'full_auto' = 'safe') {
     messages: [{
       id: 'message_1', threadId: 'thread_1', runId: 'run_1', sequence: 1,
       role: 'user', content: 'Answer the user.', createdAt: now
-    }],
-    approvals: []
+    }]
   };
 }
 
@@ -46,7 +45,6 @@ function createRepository(claimed = createClaimedRun()) {
     refreshChatRunHeartbeat: vi.fn(async () => true),
     isChatRunStopRequested: vi.fn(async () => false),
     writeAudit: vi.fn(async () => ({ id: 'audit_1' })),
-    createChatApproval: vi.fn(async () => ({ id: 'approval_1' })),
     completeChatRun: vi.fn(async () => undefined),
     failChatRun: vi.fn(async () => undefined),
     finishCancelledChatRun: vi.fn(async () => undefined),
@@ -113,7 +111,7 @@ describe('chat worker', () => {
         kind: 'stdout',
         message: JSON.stringify({ response: 'Ověřuji dostupné podklady.', changedFiles: [] })
       });
-      return { response: 'Direct answer.', changedFiles: [], requestedApprovals: [], validationChecks: [] };
+      return { response: 'Direct answer.', changedFiles: [], validationChecks: [] };
     });
 
     const result = await runNextChatTurn(repository as never, {
@@ -143,14 +141,14 @@ describe('chat worker', () => {
     const workspaceRoot = await createWorkspaceRoot();
     const chat = vi.fn()
       .mockResolvedValueOnce({
-        response: 'I will create the contract.', changedFiles: [], requestedApprovals: [], validationChecks: [],
+        response: 'I will create the contract.', changedFiles: [], validationChecks: [],
         forgeMindActions: [{
           method: 'POST', path: '/api/projects/project_1/contracts',
           bodyJson: JSON.stringify({ contract: { version: 1 }, changeSummary: 'Initial contract.' }), rationale: 'Persist the requested contract.'
         }]
       })
       .mockResolvedValueOnce({
-        response: 'The contract was created in ForgeMind.', changedFiles: [], requestedApprovals: [], validationChecks: [], forgeMindActions: []
+        response: 'The contract was created in ForgeMind.', changedFiles: [], validationChecks: [], forgeMindActions: []
       });
     const apiFetch = vi.fn(async () => new Response(JSON.stringify({ projectId: 'project_1', current: { version: 1 } }), {
       status: 201,
@@ -176,55 +174,37 @@ describe('chat worker', () => {
     expect(repository.revokeAuthSession).toHaveBeenCalledTimes(1);
   });
 
-  it('pauses a safe-mode run when the provider requests a risky operation', async () => {
-    const repository = createRepository();
-    const workspaceRoot = await createWorkspaceRoot();
-
-    const result = await runNextChatTurn(repository as never, {
-      workspaceRoot,
-      createProvider: () => ({
-        kind: 'codex',
-        preflight: vi.fn(async () => ({ provider: 'codex', ok: true, checkedAt: new Date().toISOString() })),
-        chat: vi.fn(async () => ({
-          response: 'Production deployment needs approval.',
-          changedFiles: [], requestedApprovals: ['deploy_production'], validationChecks: []
-        }))
-      }) as never
-    });
-
-    expect(result).toMatchObject({ status: 'waiting_for_approval' });
-    expect(repository.createChatApproval).toHaveBeenCalledWith(expect.objectContaining({ type: 'deploy_production' }));
-    expect(repository.completeChatRun).not.toHaveBeenCalled();
-  });
-
-  it('requires an exact approval before reconciling roadmap state in safe mode', async () => {
+  it('executes ForgeMind mutations in safe mode without an approval pause', async () => {
     const claimed = createClaimedRun('safe');
     (claimed.thread as typeof claimed.thread & { projectId?: string }).projectId = 'project_1';
     const repository = createRepository(claimed);
     const workspaceRoot = await createWorkspaceRoot();
 
+    const chat = vi.fn()
+      .mockResolvedValueOnce({
+        response: 'Reconciling roadmap state.', changedFiles: [], validationChecks: [],
+        forgeMindActions: [{
+          method: 'POST', path: '/api/projects/project_1/implementation-steps/reconcile', bodyJson: '',
+          rationale: 'Synchronize inconsistent steps from linked terminal task states.'
+        }]
+      })
+      .mockResolvedValueOnce({ response: 'Roadmap state reconciled.', changedFiles: [], validationChecks: [], forgeMindActions: [] });
+    vi.stubGlobal('fetch', vi.fn(async () => new Response(JSON.stringify({ ok: true }), {
+      status: 200,
+      headers: { 'Content-Type': 'application/json' }
+    })));
+
     const result = await runNextChatTurn(repository as never, {
       workspaceRoot,
       createProvider: () => ({
         kind: 'codex',
         preflight: vi.fn(async () => ({ provider: 'codex', ok: true, checkedAt: new Date().toISOString() })),
-        chat: vi.fn(async () => ({
-          response: 'Roadmap reconciliation requires approval.', changedFiles: [], requestedApprovals: [], validationChecks: [],
-          forgeMindActions: [{
-            method: 'POST', path: '/api/projects/project_1/implementation-steps/reconcile', bodyJson: '',
-            rationale: 'Synchronize inconsistent steps from linked terminal task states.'
-          }]
-        }))
+        chat
       }) as never
     });
 
-    expect(result).toMatchObject({ status: 'waiting_for_approval' });
-    expect(repository.createChatApproval).toHaveBeenCalledWith(expect.objectContaining({
-      type: 'risky_refactor',
-      payload: expect.objectContaining({ apiMutation: expect.objectContaining({
-        method: 'POST', path: '/api/projects/project_1/implementation-steps/reconcile', actorId: 'user_1'
-      }) })
-    }));
+    expect(result).toMatchObject({ status: 'succeeded' });
+    expect(chat).toHaveBeenCalledTimes(2);
   });
 
   it('records setup failures instead of leaving the run claimed', async () => {

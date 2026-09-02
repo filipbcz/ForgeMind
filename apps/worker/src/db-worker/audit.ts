@@ -1,4 +1,4 @@
-import { isNonBlockingDeferredValidation, type AcceptanceEvidence, type Project, type ProjectContract } from '@forgemind/core';
+import type { AcceptanceEvidence, Project, ProjectContract } from '@forgemind/core';
 import type { ForgeMindRepository } from '@forgemind/db';
 import { toErrorMessage } from '@forgemind/shared';
 import type { WorkerTaskResult } from '../workflow.js';
@@ -57,47 +57,6 @@ export async function recordTaskAcceptanceEvidence(
       });
     }
 
-    for (const check of input.result.validation.deferredChecks ?? []) {
-      if (!check.criterion?.trim()) continue;
-      await repository.recordAcceptanceEvidence({
-        projectId: input.project.id,
-        cycleId: step.cycleId,
-        stepId: step.id,
-        taskId: input.taskId,
-        taskRunId: input.taskRunId,
-        requirementIds: step.requirementIds,
-        criterion: check.criterion,
-        source: 'validation_command',
-        status: isNonBlockingDeferredValidation(check.requiredCapabilities) ? 'deferred' : 'blocked',
-        evidenceIdentity: `deferred:${check.command}`,
-        contractVersion: contract.version,
-        commitSha: input.result.commitSha,
-        command: check.command,
-        payload: {
-          rationale: check.rationale ?? null,
-          requiredCapabilities: check.requiredCapabilities,
-          missingCapabilities: check.missingCapabilities
-        }
-      });
-    }
-
-    if (input.result.githubChecks?.status === 'success' && input.result.commitSha) {
-      await repository.recordAcceptanceEvidence({
-        projectId: input.project.id,
-        cycleId: step.cycleId,
-        stepId: step.id,
-        taskId: input.taskId,
-        taskRunId: input.taskRunId,
-        requirementIds: step.requirementIds,
-        criterion: `GitHub checks pass for work item: ${step.title}`,
-        source: 'github_check',
-        status: 'passed',
-        evidenceIdentity: `github-checks:${input.result.commitSha}`,
-        contractVersion: contract.version,
-        commitSha: input.result.commitSha,
-        payload: { summary: limitEvidenceText(input.result.githubChecks.summary) }
-      });
-    }
   } catch (error) {
     await repository.writeAudit({
       actorType: 'system',

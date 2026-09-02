@@ -28,7 +28,7 @@ export function projectStepMatchesStatusFilter(
   filter: ProjectItemStatusFilter
 ): boolean {
   if (filter === 'active') return step.status === 'pending' || step.status === 'running';
-  if (filter === 'waiting') return step.status === 'waiting_for_capability';
+  if (filter === 'waiting') return false;
   if (filter === 'failed') return step.status === 'cancelled';
   return step.status === 'completed';
 }
@@ -38,7 +38,7 @@ export function projectCycleMatchesStatusFilter(
   filter: ProjectItemStatusFilter
 ): boolean {
   if (filter === 'active') return cycle.status === 'active' || cycle.status === 'verifying' || cycle.status === 'partial';
-  if (filter === 'waiting') return cycle.status === 'awaiting_extension_approval';
+  if (filter === 'waiting') return cycle.status === 'awaiting_extension_decision';
   if (filter === 'failed') return cycle.status === 'blocked';
   return cycle.status === 'completed';
 }

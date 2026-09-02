@@ -1,5 +1,4 @@
 import type { ForgeTask, Project, ProjectImplementationStep, ProjectRoadmapCycle } from '@forgemind/core';
-import { parseAgentConfigYaml } from '@forgemind/config';
 import type { ForgeMindRepository } from './repository.js';
 
 export interface RoadmapAdvanceResult {
@@ -11,28 +10,12 @@ export interface RoadmapAdvanceResult {
   project?: Project;
 }
 
-export async function advanceRoadmapAfterTaskCapabilityWait(
-  repository: ForgeMindRepository,
-  taskId: string
-): Promise<RoadmapAdvanceResult> {
-  const linkedStep = await repository.getImplementationStepByTaskId(taskId);
-  if (!linkedStep || (linkedStep.status !== 'running' && linkedStep.status !== 'waiting_for_capability')) {
-    return { advanced: false };
-  }
-  const waitingStep = linkedStep.status === 'waiting_for_capability'
-    ? linkedStep
-    : await repository.updateImplementationStepStatus(linkedStep.id, 'waiting_for_capability');
-  if (!waitingStep) return { advanced: false };
-  const nextTask = await startNextRoadmapStep(repository, waitingStep.projectId, waitingStep.cycleId);
-  return { advanced: true, completedStep: waitingStep, nextTask };
-}
-
 export async function advanceRoadmapAfterTaskCompletion(
   repository: ForgeMindRepository,
   taskId: string
 ): Promise<RoadmapAdvanceResult> {
   const linkedStep = await repository.getImplementationStepByTaskId(taskId);
-  if (!linkedStep || !['running', 'waiting_for_capability', 'completed'].includes(linkedStep.status)) {
+  if (!linkedStep || !['running', 'completed'].includes(linkedStep.status)) {
     return { advanced: false };
   }
 
@@ -52,10 +35,6 @@ export async function advanceRoadmapAfterTaskCompletion(
   if (cycleSteps.some((candidate) => candidate.status === 'running')) {
     return { advanced: linkedStep.status !== 'completed', completedStep, project };
   }
-  if (cycleSteps.some((candidate) => candidate.status === 'waiting_for_capability')) {
-    return { advanced: linkedStep.status !== 'completed', completedStep, project };
-  }
-
   const nextStep = cycleSteps.find((candidate) => candidate.status === 'pending');
   if (nextStep) {
     const nextTask = await startNextRoadmapStep(repository, project.id, cycle.id);
@@ -68,7 +47,7 @@ export async function advanceRoadmapAfterTaskCompletion(
       : await repository.updateProjectRoadmapCycleStatus(cycle.id, 'completed');
     return { advanced: true, completedStep, completedCycle, project };
   }
-  if (cycle.status === 'completed' || cycle.status === 'awaiting_extension_approval') {
+  if (cycle.status === 'completed' || cycle.status === 'awaiting_extension_decision') {
     return { advanced: linkedStep.status !== 'completed', completedStep, completedCycle: cycle, project };
   }
   // Contract-backed cycles stay active after their final implementation step.
@@ -124,19 +103,8 @@ export async function startNextRoadmapStep(
         futureSteps
       }),
       mode: project.defaultTaskMode ?? 'safe',
-      maxIterations: resolveProjectMaxIterations(project.configYaml),
-      maxBudgetUsd: 5,
       architectureVersionId: project.currentArchitectureVersionId ?? cycle.architectureVersionId
   });
-}
-
-function resolveProjectMaxIterations(configYaml: string | undefined): number {
-  if (!configYaml) return 10;
-  try {
-    return parseAgentConfigYaml(configYaml).limits.max_iterations;
-  } catch {
-    return 10;
-  }
 }
 
 export function buildRoadmapStepTaskPrompt(input: {

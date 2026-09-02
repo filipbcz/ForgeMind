@@ -12,7 +12,6 @@ import {
   fetchChatThreads,
   fetchGitHubBranches,
   fetchGitHubRepositories,
-  resolveChatApproval,
   retryChatRun,
   sendChatMessage,
   updateChatThread
@@ -30,7 +29,7 @@ import type {
   UpdateChatThreadRequest
 } from './types.js';
 
-const ACTIVE_RUN_STATUSES = new Set<ChatRunApi['status']>(['queued', 'running', 'waiting_for_approval']);
+const ACTIVE_RUN_STATUSES = new Set<ChatRunApi['status']>(['queued', 'running']);
 
 export function ChatPanel(props: { projects: ProjectSummary[]; providerConnections: ProviderConnectionApi[] }) {
   const queryClient = useQueryClient();
@@ -63,8 +62,7 @@ export function ChatPanel(props: { projects: ProjectSummary[]; providerConnectio
         if (message.event.eventType === 'chat_run_completed'
           || message.event.eventType === 'chat_run_failed'
           || message.event.eventType === 'chat_run_cancelled'
-          || message.event.eventType === 'chat_approval_requested'
-          || message.event.eventType === 'chat_approval_resolved') {
+          ) {
           void queryClient.invalidateQueries({ queryKey: ['chat-thread', selectedThreadId] });
           void queryClient.invalidateQueries({ queryKey: ['chat-threads'] });
         }
@@ -118,14 +116,9 @@ export function ChatPanel(props: { projects: ProjectSummary[]; providerConnectio
     mutationFn: ({ runId, action }: { runId: string; action: 'retry' | 'cancel' }) => action === 'retry' ? retryChatRun(runId) : cancelChatRun(runId),
     onSuccess: (run) => void queryClient.invalidateQueries({ queryKey: ['chat-thread', run.threadId] })
   });
-  const approvalMutation = useMutation({
-    mutationFn: ({ id, decision }: { id: string; decision: 'approve' | 'reject' }) => resolveChatApproval(id, decision),
-    onSuccess: (approval) => void queryClient.invalidateQueries({ queryKey: ['chat-thread', approval.threadId] })
-  });
-
   const detail = detailQuery.data;
   const events = useMemo(() => mergeEvents(detail?.events ?? [], liveEvents), [detail?.events, liveEvents]);
-  const mutationError = createMutation.error ?? continueMutation.error ?? updateMutation.error ?? deleteMutation.error ?? sendMutation.error ?? runMutation.error ?? approvalMutation.error;
+  const mutationError = createMutation.error ?? continueMutation.error ?? updateMutation.error ?? deleteMutation.error ?? sendMutation.error ?? runMutation.error;
 
   return (
     <section className="chat-workspace" aria-label="AI Chat">
@@ -177,10 +170,9 @@ export function ChatPanel(props: { projects: ProjectSummary[]; providerConnectio
             events={events}
             projects={props.projects}
             providerConnections={props.providerConnections}
-            busy={sendMutation.isPending || runMutation.isPending || updateMutation.isPending || continueMutation.isPending || approvalMutation.isPending}
+            busy={sendMutation.isPending || runMutation.isPending || updateMutation.isPending || continueMutation.isPending}
             onSend={(content) => sendMutation.mutate({ id: detail.thread.id, content })}
             onRunAction={(runId, action) => runMutation.mutate({ runId, action })}
-            onApproval={(id, decision) => approvalMutation.mutate({ id, decision })}
             onUpdate={(input) => updateMutation.mutate({ id: detail.thread.id, input })}
             onContinue={(input) => continueMutation.mutate({ id: detail.thread.id, input })}
             onDelete={() => {
@@ -422,7 +414,6 @@ function ChatThreadView(props: {
   busy: boolean;
   onSend: (content: string) => void;
   onRunAction: (runId: string, action: 'retry' | 'cancel') => void;
-  onApproval: (id: string, decision: 'approve' | 'reject') => void;
   onUpdate: (input: UpdateChatThreadRequest) => void;
   onContinue: (input: CreateChatThreadRequest) => void;
   onDelete: () => void;
@@ -433,7 +424,6 @@ function ChatThreadView(props: {
   const messageEndRef = useRef<HTMLDivElement>(null);
   const activeRun = [...props.detail.runs].reverse().find((run) => ACTIVE_RUN_STATUSES.has(run.status));
   const latestRun = props.detail.runs.at(-1);
-  const pendingApprovals = props.detail.approvals.filter((approval) => approval.status === 'pending');
   const interimResultsByRun = useMemo(
     () => new Map(props.detail.runs.map((run) => [
       run.id,
@@ -536,26 +526,13 @@ function ChatThreadView(props: {
             <div className="chat-live-heading">
               <span className="activity-pulse" />
               <div><strong>{runStatusLabel(activeRun.status)}</strong><small>Pokus {activeRun.attemptCount || 1}</small></div>
-              {activeRun.status !== 'waiting_for_approval' ? (
-                <button className="secondary-action" type="button" disabled={props.busy} onClick={() => props.onRunAction(activeRun.id, 'cancel')}><CircleStop size={16} /> Zastavit</button>
-              ) : null}
+              <button className="secondary-action" type="button" disabled={props.busy} onClick={() => props.onRunAction(activeRun.id, 'cancel')}><CircleStop size={16} /> Zastavit</button>
             </div>
             {activeInterimResults.length > 0
               ? <ChatInterimResults items={activeInterimResults} />
               : <p>AI zpracovává požadavek. Průběžný výsledek se zobrazí, jakmile bude k dispozici.</p>}
           </section>
         ) : null}
-
-        {pendingApprovals.map((approval) => (
-          <section className="chat-approval" key={approval.id}>
-            <div><strong>{approval.title}</strong><span className={`risk ${approval.riskLevel}`}>{approval.riskLevel}</span></div>
-            <p>{approval.description}</p>
-            <div className="chat-form-actions">
-              <button className="secondary-action" type="button" disabled={props.busy} onClick={() => props.onApproval(approval.id, 'reject')}><X size={16} /> Zamítnout</button>
-              <button className="primary-action" type="button" disabled={props.busy} onClick={() => props.onApproval(approval.id, 'approve')}><Check size={16} /> Schválit</button>
-            </div>
-          </section>
-        ))}
 
         {!activeRun && latestRun?.status === 'failed' ? (
           <section className="chat-run-error">
@@ -681,7 +658,6 @@ function mergeEvents(stored: AuditEventApi[], live: AuditEventApi[]) {
 
 function runStatusLabel(status: ChatRunApi['status']) {
   if (status === 'queued') return 'Čeká ve frontě';
-  if (status === 'waiting_for_approval') return 'Čeká na schválení';
   return 'AI právě pracuje';
 }
 

@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import {
+  activityWorkflowStage,
   currentExecutionEntries,
   resolveCurrentActivity,
   sanitizeProviderActivityDetail
@@ -13,6 +14,23 @@ describe('activity display', () => {
     ];
 
     expect(currentExecutionEntries(entries)).toEqual([entries[1]]);
+  });
+
+  it('uses the explicitly selected run and excludes timing from older retries', () => {
+    const entries = [
+      { createdAt: '2026-08-14T10:00:00.000Z', state: 'completed' as const, attempt: 1, runId: 'run_1' },
+      { createdAt: '2026-08-14T10:01:00.000Z', state: 'completed' as const, attempt: 2, runId: 'run_2' },
+      { createdAt: '2026-08-14T10:01:01.000Z', state: 'progress' as const, attempt: 2 }
+    ];
+
+    expect(currentExecutionEntries(entries, 'run_2')).toEqual(entries.slice(1));
+    expect(currentExecutionEntries(entries, 'run_3')).toEqual([]);
+  });
+
+  it('maps GitHub setup status events separately from delivery operations', () => {
+    expect(activityWorkflowStage({ phase: 'github' })).toBe(1);
+    expect(activityWorkflowStage({ phase: 'github', operation: 'create_branch' })).toBe(1);
+    expect(activityWorkflowStage({ phase: 'github', operation: 'merge_pr' })).toBe(5);
   });
 
   it('does not present an old failure as current after the task advances', () => {

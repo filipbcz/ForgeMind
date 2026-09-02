@@ -41,13 +41,11 @@ function task(overrides: Partial<TaskSummary> = {}): TaskSummary {
     projectId: 'project_1',
     title: 'Windows validation',
     prompt: '',
-    status: 'waiting_for_capability',
+    status: 'submitted',
     currentStep: '',
     mode: 'safe',
     iterations: 0,
-    maxIterations: 1,
     updatedAt: '',
-    waitingForCapabilities: ['windows'],
     plan: [],
     testResult: '',
     diffSummary: '',
@@ -112,7 +110,7 @@ describe('summarizeProjectProgress', () => {
 
   it('shows when the project is waiting for an extension decision', () => {
     const source = roadmap();
-    source.cycles[0]!.status = 'awaiting_extension_approval';
+    source.cycles[0]!.status = 'awaiting_extension_decision';
     source.steps[1]!.status = 'completed';
 
     expect(summarizeProjectProgress(source, 'task_1')).toMatchObject({
@@ -147,23 +145,6 @@ describe('summarizeProjectOperationalOverview', () => {
     });
   });
 
-  it('surfaces capability waits as blockers without a primary shell action', () => {
-    const source = roadmap();
-    source.steps[1]!.status = 'waiting_for_capability';
-    source.steps[1]!.taskId = 'task_2';
-
-    expect(summarizeProjectOperationalOverview(source, [task()])).toMatchObject({
-      tone: 'attention',
-      state: 'Čeká na capability',
-      activeStep: 'Krok 2: User flow',
-      primaryAction: 'none'
-    });
-    expect(summarizeProjectOperationalOverview(source, [task()]).blockers).toEqual([
-      'Krok 2 čeká na validační prostředí.',
-      'Windows validation: čeká na windows.'
-    ]);
-  });
-
   it('maps blocked audit state to a retry audit action with the audit blocker first', () => {
     const source = roadmap({
       auditJobs: [{
@@ -183,7 +164,7 @@ describe('summarizeProjectOperationalOverview', () => {
 
   it('maps extension approval wait to the extension decision action', () => {
     const source = roadmap();
-    source.cycles[0]!.status = 'awaiting_extension_approval';
+    source.cycles[0]!.status = 'awaiting_extension_decision';
 
     expect(summarizeProjectOperationalOverview(source)).toMatchObject({
       tone: 'attention',

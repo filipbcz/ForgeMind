@@ -3,6 +3,7 @@ import { activeProjectContractRequirements } from '@forgemind/core';
 import type { ProjectContractRequirement } from '@forgemind/core';
 
 export function buildCapabilityAuditPrompt(input: CapabilityAuditInput): string {
+  const usesReadOnlyCheckout = usesNativeRepositoryAudit(input);
   return [
     'Perform an independent read-only ForgeMind capability audit.',
     '',
@@ -14,11 +15,11 @@ export function buildCapabilityAuditPrompt(input: CapabilityAuditInput): string 
     '',
     'Rules:',
     '- Do not modify repository files.',
-    ...(input.repositoryContext
-      ? ['- The targeted repository packet below is the complete inspection surface for this audit. Do not run shell commands or access repository files outside the packet.']
-      : []),
+    ...(usesReadOnlyCheckout
+      ? ['- Inspect the complete current repository using read-only repository and shell tools. The checked-out repository is the authoritative inspection surface.']
+      : ['- The complete repository snapshot below is the complete inspection surface for this audit. Do not access repository files outside the supplied snapshot.']),
     '- Treat pass-valued JSON, declarations, documentation, mocks, placeholders, and synthetic data as claims rather than proof unless the criterion explicitly requires them.',
-    '- Supplied task validation and GitHub checks are supporting evidence, not proof that the whole capability is complete.',
+    '- Supplied task validation is supporting evidence, not proof that the whole capability is complete.',
     '- Evidence with status deferred identifies a Windows-specific check intentionally postponed until this project audit. Inspect the implementation and portable evidence for the associated risk. The deferred status alone is not a blocker and is not passed evidence.',
     '- Do not rerun commands that already have passed trusted execution evidence for the audited commit; inspect the implementation and tests instead.',
     '- A passed criterion needs concrete repository evidence such as implemented code paths, tests, configuration, or artifacts.',
@@ -56,8 +57,11 @@ export function buildCapabilityAuditPrompt(input: CapabilityAuditInput): string 
     input.evidence.length
       ? input.evidence.map((item) => `- [${item.source}/${item.status}] ${item.criterion}${item.command ? ` | ${item.command}` : ''}${item.commitSha ? ` | ${item.commitSha}` : ''}${item.summary ? ` | ${item.summary}` : ''}`).join('\n')
       : '- (none)',
-    ...(input.repositoryContext
-      ? ['', 'Targeted repository packet:', input.repositoryContext]
+    ...(input.supplementalContext?.trim()
+      ? ['', 'Supplemental audit context (supporting context only, not a repository snapshot):', input.supplementalContext]
+      : []),
+    ...(!usesReadOnlyCheckout && input.repositoryContext
+      ? ['', 'Complete repository snapshot:', input.repositoryContext]
       : [])
   ].join('\n');
 }
@@ -75,6 +79,7 @@ export function normalizeCapabilityAuditResult(
 }
 
 export function buildReleaseAuditPrompt(input: ReleaseAuditInput): string {
+  const usesReadOnlyCheckout = usesNativeRepositoryAudit(input);
   return [
     'Perform an independent read-only ForgeMind release audit.',
     '',
@@ -88,9 +93,9 @@ export function buildReleaseAuditPrompt(input: ReleaseAuditInput): string {
     '',
     'Rules:',
     '- Do not modify repository files.',
-    ...(input.repositoryContext
-      ? ['- The targeted repository packet below is the complete inspection surface for this audit. Do not run shell commands or access repository files outside the packet.']
-      : []),
+    ...(usesReadOnlyCheckout
+      ? ['- Inspect the complete current repository using read-only repository and shell tools. The checked-out repository is the authoritative inspection surface.']
+      : ['- The complete repository snapshot below is the complete inspection surface for this audit. Do not access repository files outside the supplied snapshot.']),
     '- Declarations, docs, mocks, placeholders, synthetic fixtures, and pass-valued reports are not proof of a working release.',
     '- Passed criteria require concrete repository evidence.',
     '- briefCoverage must evaluate every materially distinct obligation from the original brief exactly once and collectively reference every existing contract requirement ID.',
@@ -156,8 +161,16 @@ export function buildReleaseAuditPrompt(input: ReleaseAuditInput): string {
     input.executionEvidence?.length
       ? input.executionEvidence.map((item) => `- [${item.source}/${item.status}] ${item.criterion}${item.command ? ` | ${item.command}` : ''}${item.commitSha ? ` | ${item.commitSha}` : ''}${item.summary ? ` | ${item.summary}` : ''}`).join('\n')
       : '- (none)',
-    ...(input.repositoryContext ? ['', 'Targeted repository packet:', input.repositoryContext] : [])
+    ...(input.supplementalContext?.trim()
+      ? ['', 'Supplemental audit context (supporting context only, not a repository snapshot):', input.supplementalContext]
+      : []),
+    ...(!usesReadOnlyCheckout && input.repositoryContext ? ['', 'Complete repository snapshot:', input.repositoryContext] : [])
   ].join('\n');
+}
+
+function usesNativeRepositoryAudit(input: CapabilityAuditInput | ReleaseAuditInput): boolean {
+  if (input.repositoryAccess) return input.repositoryAccess === 'read_only_checkout';
+  return !input.repositoryContext?.trim();
 }
 
 export function normalizeReleaseAuditResult(input: ReleaseAuditInput, value: ReleaseAuditResult): ReleaseAuditResult {

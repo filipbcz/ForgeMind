@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from 'vitest';
-import { advanceRoadmapAfterTaskCapabilityWait, advanceRoadmapAfterTaskCompletion } from './roadmap.js';
+import { advanceRoadmapAfterTaskCompletion } from './roadmap.js';
 
 const configuredProjectYaml = `
 project:
@@ -27,20 +27,10 @@ limits:
   max_changed_files: 20
   max_diff_lines: 1000
   max_repeated_error_count: 2
-commands: {}
-approval:
-  required_for: []
-  auto_allowed: []
-sandbox:
-  allow_network: false
-  allow_sudo: false
-  writable_paths: [/workspace]
-  forbidden_paths: [/etc]
 github:
   issue_label: ai-task
   branch_prefix: ai/
   pr_draft: true
-  require_ci_green: true
 `;
 
 describe('roadmap task completion', () => {
@@ -88,7 +78,7 @@ describe('roadmap task completion', () => {
     expect(first.nextTask?.id).toBe('task_2');
     expect(steps.map((step) => step.status)).toEqual(['completed', 'running']);
     expect(createAndStartRoadmapStepTask).toHaveBeenCalledTimes(1);
-    expect(createAndStartRoadmapStepTask).toHaveBeenCalledWith('step_2', expect.objectContaining({ maxIterations: 4 }));
+    expect(createAndStartRoadmapStepTask).toHaveBeenCalledWith('step_2', expect.objectContaining({ mode: 'auto' }));
     expect(second.nextTask).toBeUndefined();
   });
 
@@ -190,53 +180,4 @@ describe('roadmap task completion', () => {
     expect(createAndStartRoadmapStepTask).not.toHaveBeenCalled();
   });
 
-  it('marks a capability-blocked step as waiting and starts an independent step', async () => {
-    const steps = [
-      { id: 'step_1', projectId: 'project_1', cycleId: 'cycle_1', sequenceNumber: 1, title: 'Win64 gate', description: 'Run Win64', acceptanceCriteria: ['Runs'], dependsOnStepTitles: [], status: 'running', taskId: 'task_1' },
-      { id: 'step_2', projectId: 'project_1', cycleId: 'cycle_1', sequenceNumber: 2, title: 'Docs', description: 'Document', acceptanceCriteria: ['Documented'], dependsOnStepTitles: [], status: 'pending' }
-    ];
-    const repository = {
-      getImplementationStepByTaskId: vi.fn(async () => steps[0]),
-      updateImplementationStepStatus: vi.fn(async (_id: string, status: string) => {
-        steps[0]!.status = status;
-        return steps[0];
-      }),
-      getProjectRoadmap: vi.fn(async () => ({
-        projectId: 'project_1',
-        cycles: [{ id: 'cycle_1', projectId: 'project_1', cycleNumber: 1, objective: 'Objective', status: 'active' }],
-        steps
-      })),
-      getProject: vi.fn(async () => ({ id: 'project_1', name: 'Project', defaultTaskMode: 'auto' })),
-      createAndStartRoadmapStepTask: vi.fn(async () => ({ id: 'task_2' }))
-    };
-
-    const result = await advanceRoadmapAfterTaskCapabilityWait(repository as never, 'task_1');
-
-    expect(steps[0]!.status).toBe('waiting_for_capability');
-    expect(result.nextTask?.id).toBe('task_2');
-  });
-
-  it('does not audit a cycle while another step still waits for a capable worker', async () => {
-    const completedTaskStep = { id: 'step_2', projectId: 'project_1', cycleId: 'cycle_1', sequenceNumber: 2, title: 'Docs', status: 'running', taskId: 'task_2' };
-    const enqueueProjectAudit = vi.fn();
-    const repository = {
-      getImplementationStepByTaskId: vi.fn(async () => completedTaskStep),
-      updateImplementationStepStatus: vi.fn(async () => ({ ...completedTaskStep, status: 'completed' })),
-      getProjectRoadmap: vi.fn(async () => ({
-        projectId: 'project_1',
-        cycles: [{ id: 'cycle_1', projectId: 'project_1', cycleNumber: 1, objective: 'Objective', status: 'active' }],
-        steps: [
-          { id: 'step_1', projectId: 'project_1', cycleId: 'cycle_1', sequenceNumber: 1, title: 'Win64 gate', status: 'waiting_for_capability', taskId: 'task_1' },
-          { ...completedTaskStep, status: 'completed' }
-        ]
-      })),
-      getProject: vi.fn(async () => ({ id: 'project_1', name: 'Project', projectContract: { version: 1, requirements: [], invariants: [], prohibitedSubstitutes: [], releaseCriteria: [] } })),
-      enqueueProjectAudit
-    };
-
-    const result = await advanceRoadmapAfterTaskCompletion(repository as never, 'task_2');
-
-    expect(result.auditQueued).toBeUndefined();
-    expect(enqueueProjectAudit).not.toHaveBeenCalled();
-  });
 });

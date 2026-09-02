@@ -11,13 +11,11 @@ describe('repository chat contract', () => {
       repositoryPath: '/workspace',
       repositoryAttached: true,
       mode: 'safe',
-      approvedOperations: ['new_dependency'],
       forgeMindContext: 'Current project id: project-1\nPOST /api/projects/project-1/contracts'
     }, true);
 
     expect(prompt).toContain('Current user message:\nOprav chybu v nacitani profilu.');
     expect(prompt).toContain('Continue the existing chat session');
-    expect(prompt).toContain('new_dependency');
     expect(prompt).toContain('forgeMindActions');
     expect(prompt).toContain('/api/projects/project-1/contracts');
     expect(prompt).not.toContain('Older context that should not be resent.');
@@ -40,7 +38,6 @@ describe('repository chat contract', () => {
     const result = parseChatResult(JSON.stringify({
       response: 'Hotovo.',
       changedFiles: ['src/index.ts'],
-      requestedApprovals: [],
       validationChecks: [{ kind: 'command', command: 'npm test', category: 'build' }],
       fileUpdates: [{ path: 'src/index.ts', content: 'export {};' }],
       forgeMindActions: [{ method: 'POST', path: '/api/projects/project-1/contracts', bodyJson: '{}', rationale: 'Persist contract.' }]
@@ -53,9 +50,33 @@ describe('repository chat contract', () => {
     expect(() => parseChatResult(JSON.stringify({
       response: 'Bad update.',
       changedFiles: [],
-      requestedApprovals: [],
       validationChecks: [],
       fileUpdates: [{ path: '../outside.ts' }]
     }), 'chat test')).toThrow('fileUpdates');
+  });
+
+  it('preserves the AI-selected Windows target, capabilities, and timeout', () => {
+    const result = parseChatResult(JSON.stringify({
+      response: 'Hotovo.',
+      changedFiles: ['src/native.cpp'],
+      validationChecks: [{
+        kind: 'command',
+        command: 'cmake --build --preset windows-release',
+        shell: 'powershell',
+        target: 'windows',
+        requiredCapabilities: ['cmake', 'msvc'],
+        timeoutMinutes: 45,
+        category: 'build'
+      }],
+      fileUpdates: [],
+      forgeMindActions: []
+    }), 'chat test');
+
+    expect(result.validationChecks).toEqual([expect.objectContaining({
+      target: 'windows',
+      shell: 'powershell',
+      requiredCapabilities: ['windows', 'cmake', 'msvc'],
+      timeoutMinutes: 45
+    })]);
   });
 });

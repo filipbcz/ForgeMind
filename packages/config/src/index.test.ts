@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { parseAgentConfigYaml, toCoreLimits } from './index.js';
+import { parseAgentConfigYaml } from './index.js';
 
 const configYaml = `
 project:
@@ -29,46 +29,31 @@ limits:
   max_budget_usd: 4
   soft_budget_threshold_percent: 70
   hard_budget_threshold_percent: 110
-commands:
-  verify: npm run build
-approval:
-  required_for:
-    - new_dependency
-  auto_allowed:
-    - docs_update
-sandbox:
-  allow_network: false
-  allow_sudo: false
-  writable_paths:
-    - /workspace
-  forbidden_paths:
-    - /etc
 github:
   issue_label: ai-task
   branch_prefix: ai/
   pr_draft: true
-  require_ci_green: true
 `;
 
 describe('agent config parser', () => {
-  it('parses YAML and converts limits to core shape', () => {
+  it('parses YAML and ignores legacy runtime limits', () => {
     const config = parseAgentConfigYaml(configYaml);
     expect(config.project.id).toBe('demo');
     expect(config.ai.primary_provider).toBe('codex');
     expect(config.ai.reviewer_connection_id).toBe('reviewer-connection');
-    expect(toCoreLimits(config).maxIterations).toBe(7);
-    expect(toCoreLimits(config).maxDiffLines).toBe(500);
-    expect(toCoreLimits(config)).toMatchObject({
-      maxBudgetUsd: 4,
-      softBudgetThresholdPercent: 70,
-      hardBudgetThresholdPercent: 110
-    });
+    expect(config).not.toHaveProperty('limits');
   });
 
-  it('rejects hard budget thresholds below the soft threshold', () => {
-    expect(() => parseAgentConfigYaml(configYaml
-      .replace('soft_budget_threshold_percent: 70', 'soft_budget_threshold_percent: 80')
-      .replace('hard_budget_threshold_percent: 110', 'hard_budget_threshold_percent: 60')
-    )).toThrow('hard_budget_threshold_percent must be greater than or equal to soft_budget_threshold_percent');
+  it('ignores removed command, approval and sandbox sections from legacy configs', () => {
+    const legacyConfig = parseAgentConfigYaml(configYaml.replace(
+      'github:',
+      `commands:\n  verify: npm run build\napproval:\n  required_for: [new_dependency]\nsandbox:\n  allow_network: false\ngithub:\n  require_ci_green: true`
+    ));
+
+    expect(legacyConfig).not.toHaveProperty('commands');
+    expect(legacyConfig).not.toHaveProperty('approval');
+    expect(legacyConfig).not.toHaveProperty('sandbox');
+    expect(legacyConfig).not.toHaveProperty('limits');
+    expect(legacyConfig.github).not.toHaveProperty('require_ci_green');
   });
 });

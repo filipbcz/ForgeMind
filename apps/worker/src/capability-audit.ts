@@ -3,8 +3,9 @@ import type { Project, ProjectContractRequirement, ProjectImplementationStep } f
 import type { ForgeMindRepository } from '@forgemind/db';
 import type { GitHubAdapter } from '@forgemind/github';
 import type { AIProvider, CapabilityAuditResult, ProviderActivityHandler, ReleaseAuditResult } from '@forgemind/providers';
+import { createHash } from 'node:crypto';
 import { mkdir, mkdtemp, readFile, rm } from 'node:fs/promises';
-import { basename, join, resolve } from 'node:path';
+import { join, resolve } from 'node:path';
 import { simpleGit } from 'simple-git';
 
 export async function runCapabilityAudit(input: {
@@ -17,6 +18,7 @@ export async function runCapabilityAudit(input: {
   workspacePath: string;
   commitSha: string;
   repositoryContext?: string;
+  supplementalContext?: string;
   onActivity?: ProviderActivityHandler;
 }): Promise<CapabilityAuditResult> {
   const contract = input.project.projectContract;
@@ -72,7 +74,8 @@ export async function runCapabilityAudit(input: {
       summary: evidenceSummary(item.payload)
     })),
     repositoryPath: input.workspacePath,
-    repositoryContext: [input.repositoryContext, evidenceLineageContext].filter(Boolean).join('\n\n'),
+    repositoryContext: input.repositoryContext,
+    supplementalContext: [input.supplementalContext, evidenceLineageContext].filter(Boolean).join('\n\n') || undefined,
     commitSha: input.commitSha,
     onActivity: input.onActivity
   });
@@ -121,6 +124,7 @@ export async function runReleaseAudit(input: {
   workspacePath: string;
   commitSha: string;
   repositoryContext?: string;
+  supplementalContext?: string;
   onActivity?: ProviderActivityHandler;
 }): Promise<ReleaseAuditResult> {
   const contract = input.project.projectContract;
@@ -180,7 +184,8 @@ export async function runReleaseAudit(input: {
         summary: evidenceSummary(item.payload, 600)
       })),
     repositoryPath: input.workspacePath,
-    repositoryContext: [input.repositoryContext, evidenceLineageContext].filter(Boolean).join('\n\n'),
+    repositoryContext: input.repositoryContext,
+    supplementalContext: [input.supplementalContext, evidenceLineageContext].filter(Boolean).join('\n\n') || undefined,
     commitSha: input.commitSha,
     onActivity: input.onActivity
   });
@@ -251,7 +256,8 @@ export async function prepareCapabilityAuditWorkspace(input: {
   project: Project;
   github: GitHubAdapter;
   preferredBranch?: string;
-}): Promise<{ workspacePath: string; commitSha: string; repositoryContext: string; cleanup: () => Promise<void> }> {
+  includeRepositoryContext?: boolean;
+}): Promise<{ workspacePath: string; commitSha: string; repositoryContext?: string; cleanup: () => Promise<void> }> {
   const auditRoot = resolve(input.workspaceRoot, 'project-audits');
   await mkdir(auditRoot, { recursive: true });
   const workspacePath = await mkdtemp(join(auditRoot, 'audit-'));
@@ -281,125 +287,39 @@ export async function prepareCapabilityAuditWorkspace(input: {
   return {
     workspacePath,
     commitSha,
-    repositoryContext: await buildTargetedRepositoryContext(workspacePath),
+    ...(input.includeRepositoryContext === false
+      ? {}
+      : { repositoryContext: await buildCompleteRepositoryContext(workspacePath) }),
     cleanup: () => rm(workspacePath, { recursive: true, force: true })
   };
 }
 
-export async function buildTargetedRepositoryContext(workspacePath: string, focusTerms: string[] = []): Promise<string> {
-  const paths = (await simpleGit({ baseDir: workspacePath }).raw(['ls-files']))
-    .split(/\r?\n/)
+export async function buildCompleteRepositoryContext(workspacePath: string): Promise<string> {
+  const paths = (await simpleGit({ baseDir: workspacePath }).raw(['ls-files', '-z']))
+    .split('\0')
     .map((path) => path.trim())
     .filter(Boolean)
-    .filter((path) => !/(^|\/)(dist|build|coverage|vendor|node_modules)\//.test(path));
-  const terms = focusTerms
-    .flatMap((value) => value.toLowerCase().split(/[^a-z0-9]+/))
-    .filter((value) => value.length >= 4);
-  const prioritized = paths
-    .sort((left, right) => repositoryContextPriority(left, terms) - repositoryContextPriority(right, terms) || left.localeCompare(right))
-    .slice(0, 80);
-  const manifest = paths.slice(0, 300).join('\n').slice(0, 12_000);
-  const sections: string[] = [`Repository manifest (${paths.length} tracked files):\n${manifest}`];
-  const sourcePaths = prioritized.filter((path) => /(^|\/)src\//.test(path));
-  const testPaths = prioritized.filter((path) => /(^|\/)(test|tests|__tests__)\//.test(path) || /\.(test|spec)\.[cm]?[jt]sx?$/.test(path));
-  const configurationPaths = prioritized
-    .filter((path) => !sourcePaths.includes(path) && !testPaths.includes(path))
-    .sort((left, right) => repositoryConfigurationPriority(left) - repositoryConfigurationPriority(right) || left.localeCompare(right));
-  await appendRepositorySections(sections, workspacePath, configurationPaths, 16_000, terms);
-  await appendRepositorySections(sections, workspacePath, sourcePaths, 24_000, terms);
-  await appendRepositorySections(sections, workspacePath, testPaths, 24_000, terms);
+    .sort((left, right) => left.localeCompare(right));
+  const sections: string[] = [`Complete repository snapshot (${paths.length} tracked files):\n${paths.join('\n')}`];
+
+  for (const path of paths) {
+    try {
+      const content = await readFile(join(workspacePath, path));
+      if (content.includes(0)) {
+        sections.push(`--- ${path} ---\n[binary file: ${content.length} bytes, sha256=${createHash('sha256').update(content).digest('hex')}]`);
+      } else {
+        sections.push(`--- ${path} ---\n${content.toString('utf8')}`);
+      }
+    } catch (error) {
+      sections.push(`--- ${path} ---\n[unreadable file: ${error instanceof Error ? error.message : String(error)}]`);
+    }
+  }
+
   return sections.join('\n\n');
 }
 
-async function appendRepositorySections(
-  sections: string[],
-  workspacePath: string,
-  paths: string[],
-  characterBudget: number,
-  focusTerms: string[]
-): Promise<void> {
-  const candidates: Array<{ path: string; content: string; index: number; focusScore: number }> = [];
-  for (const [index, path] of paths.entries()) {
-    try {
-      const content = await readFile(join(workspacePath, path), 'utf8');
-      if (content.includes('\0')) continue;
-      const normalized = content.toLowerCase();
-      const focusScore = focusTerms.reduce((score, term) => score + (normalized.includes(term) ? 1 : 0), 0);
-      candidates.push({ path, content, index, focusScore });
-    } catch {
-      // Binary or transient files are not useful in the audit packet.
-    }
-  }
-
-  candidates.sort((left, right) => right.focusScore - left.focusScore || left.index - right.index);
-  let usedCharacters = 0;
-  for (const candidate of candidates) {
-    if (usedCharacters >= characterBudget) break;
-    const fileLimit = Math.min(6_000, characterBudget - usedCharacters);
-    const bounded = boundRepositoryFileContent(candidate.content, fileLimit, focusTerms);
-    sections.push(`--- ${candidate.path} ---\n${bounded}`);
-    usedCharacters += bounded.length;
-  }
-}
-
-function boundRepositoryFileContent(content: string, limit: number, focusTerms: string[]): string {
-  if (content.length <= limit) return content;
-  const headLength = Math.max(400, Math.floor(limit * 0.25));
-  const tailLength = Math.max(300, Math.floor(limit * 0.15));
-  const focusLimit = Math.max(0, limit - headLength - tailLength - 120);
-  const focusExcerpt = buildFocusedLineExcerpt(content, focusTerms, focusLimit);
-  return [
-    content.slice(0, headLength),
-    focusExcerpt ? '[focused excerpts]' : '[middle truncated]',
-    focusExcerpt,
-    '[tail excerpt]',
-    content.slice(-tailLength)
-  ].filter(Boolean).join('\n').slice(0, limit);
-}
-
-function buildFocusedLineExcerpt(content: string, focusTerms: string[], limit: number): string {
-  if (focusTerms.length === 0 || limit <= 0) return '';
-  const lines = content.split(/\r?\n/);
-  const matchingLines = lines.flatMap((line, index) => {
-    const normalized = line.toLowerCase();
-    return focusTerms.some((term) => normalized.includes(term)) ? [index] : [];
-  });
-  if (matchingLines.length === 0) return '';
-
-  const selected = matchingLines.length <= 8
-    ? matchingLines
-    : Array.from({ length: 8 }, (_, index) => matchingLines[Math.floor(index * (matchingLines.length - 1) / 7)]!);
-  const included = new Set<number>();
-  for (const index of selected) {
-    for (let line = Math.max(0, index - 4); line <= Math.min(lines.length - 1, index + 4); line += 1) {
-      included.add(line);
-    }
-  }
-  return [...included]
-    .sort((left, right) => left - right)
-    .map((index) => `${index + 1}: ${lines[index]}`)
-    .join('\n')
-    .slice(0, limit);
-}
-
-function repositoryConfigurationPriority(path: string): number {
-  const normalized = path.toLowerCase();
-  if (normalized === 'package.json') return 0;
-  if (normalized === 'package-lock.json' || normalized === 'npm-shrinkwrap.json') return 1;
-  if (normalized === 'compose.yaml' || normalized === 'compose.yml' || normalized === 'docker-compose.yml') return 2;
-  if (normalized === 'tsconfig.json' || normalized === 'tsconfig.base.json') return 3;
-  if (normalized.endsWith('/package.json')) return 4;
-  return 5;
-}
-
-function repositoryContextPriority(path: string, focusTerms: string[]): number {
-  const normalizedPath = path.toLowerCase();
-  const focusBoost = focusTerms.some((term) => normalizedPath.includes(term)) ? -10 : 0;
-  const name = basename(path).toLowerCase();
-  if (/(^|\/)src\//.test(path)) return focusBoost;
-  if (/(^|\/)(test|tests|__tests__)\//.test(path) || /\.(test|spec)\.[cm]?[jt]sx?$/.test(path)) return 1 + focusBoost;
-  if (['package.json', 'readme.md', 'agents.md', 'vite.config.ts', 'vite.config.js', 'tsconfig.json'].includes(name)) return 2 + focusBoost;
-  return 3 + focusBoost;
+export async function buildTargetedRepositoryContext(workspacePath: string, _focusTerms: string[] = []): Promise<string> {
+  return buildCompleteRepositoryContext(workspacePath);
 }
 
 function uniqueLatestEvidence<T extends { criterion: string; command?: string; source: string; status: string }>(items: T[]): T[] {

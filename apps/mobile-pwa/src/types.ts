@@ -14,26 +14,19 @@ export type TaskStatus =
   | 'draft'
   | 'submitted'
   | 'planning'
-  | 'waiting_for_plan_approval'
   | 'creating_github_issue'
   | 'creating_branch'
   | 'running_ai'
   | 'validating'
   | 'reviewing'
   | 'improving'
-  | 'needs_approval'
   | 'creating_pr'
   | 'ready_for_user_review'
   | 'completed'
   | 'failed'
   | 'cancelled'
-  | 'budget_exceeded'
-  | 'iteration_limit_reached'
-  | 'repeated_error_detected'
-  | 'approval_rejected'
   | 'provider_failed'
-  | 'validation_failed'
-  | 'waiting_for_capability';
+  | 'validation_failed';
 
 export interface AuthSessionApi {
   provider: 'google';
@@ -60,7 +53,7 @@ export interface AuthLoginStartResponse {
   authUrl: string;
 }
 
-export type ChatRunStatus = 'queued' | 'running' | 'waiting_for_approval' | 'succeeded' | 'failed' | 'cancelled' | 'interrupted';
+export type ChatRunStatus = 'queued' | 'running' | 'succeeded' | 'failed' | 'cancelled' | 'interrupted';
 
 export interface ChatThreadApi {
   id: string;
@@ -130,26 +123,10 @@ export interface ChatRunApi {
   updatedAt: string;
 }
 
-export interface ChatApprovalApi {
-  id: string;
-  threadId: string;
-  runId: string;
-  type: string;
-  status: 'pending' | 'approved' | 'rejected' | 'cancelled';
-  requestedBy: 'agent' | 'system';
-  title: string;
-  description: string;
-  riskLevel: 'low' | 'medium' | 'high' | 'critical';
-  payload: unknown;
-  createdAt: string;
-  resolvedAt?: string;
-}
-
 export interface ChatThreadDetailApi {
   thread: ChatThreadApi;
   messages: ChatMessageApi[];
   runs: ChatRunApi[];
-  approvals: ChatApprovalApi[];
   events: AuditEventApi[];
 }
 
@@ -186,27 +163,14 @@ export interface ProjectApi {
   projectContract?: ProjectContractApi;
   currentContractVersionId?: string;
   currentArchitectureVersionId?: string;
-  validationProfile?: ProjectValidationProfileApi;
   autoCreatePullRequest: boolean;
   autoMergePullRequest: boolean;
   autoCompleteTask: boolean;
-  allowSafeOperationsWithoutApproval: boolean;
   defaultTaskMode: 'safe' | 'auto' | 'full_auto';
   aiProviderConnectionId?: string;
   isActive: boolean;
   createdAt: string;
   updatedAt: string;
-}
-
-export interface ProjectValidationProfileApi {
-  version: 1;
-  enabled: boolean;
-  dockerComposeFiles: string[];
-  dockerComposeServices: string[];
-  requiredEnvironmentVariables: string[];
-  migrationCommands: string[];
-  readinessCommands: string[];
-  commandTimeoutMinutes: number;
 }
 
 export interface ProjectContractApi {
@@ -292,7 +256,6 @@ export interface ProjectArchitectureApi {
   conventions: string[];
   dependencyRules: string[];
   knownDebt: string[];
-  validationCommands: string[];
   updatedAt: string;
 }
 
@@ -469,34 +432,16 @@ export interface TaskApi {
   prompt: string;
   mode: 'safe' | 'auto' | 'full_auto';
   status: TaskStatus;
-  waitingForCapabilities?: string[];
   deferredValidationCapabilities?: string[];
   githubIssueNumber?: number;
   githubIssueUrl?: string;
   branchName?: string;
   pullRequestNumber?: number;
   pullRequestUrl?: string;
-  maxIterations: number;
-  maxBudgetUsd: number;
   createdAt: string;
   updatedAt: string;
   startedAt?: string;
   finishedAt?: string;
-}
-
-export interface ApprovalApi {
-  id: string;
-  taskId: string;
-  type: string;
-  status: 'pending' | 'approved' | 'rejected' | 'cancelled';
-  requestedBy: 'system' | 'agent' | 'user';
-  approvedByUserId?: string;
-  title: string;
-  description: string;
-  riskLevel: 'low' | 'medium' | 'high' | 'critical';
-  payload: unknown;
-  createdAt: string;
-  resolvedAt?: string;
 }
 
 export interface AuditEventApi {
@@ -661,9 +606,7 @@ export interface NotificationSettingsApi {
   userId: string;
   settings: {
     pushEnabled: boolean;
-    approvalRequests: boolean;
     taskUpdates: boolean;
-    budgetAlerts: boolean;
   };
   subscriptions: NotificationSubscriptionApi[];
 }
@@ -880,8 +823,6 @@ export interface CreateTaskRequest {
   acceptanceCriteria?: string[];
   runtimeSummary?: string;
   mode: TaskApi['mode'];
-  maxIterations: number;
-  maxBudgetUsd: number;
 }
 
 export interface CreateProjectRequest {
@@ -892,11 +833,9 @@ export interface CreateProjectRequest {
   defaultBranch: string;
   configYaml?: string;
   brief?: string;
-  validationProfile?: ProjectValidationProfileApi;
   autoCreatePullRequest?: boolean;
   autoMergePullRequest?: boolean;
   autoCompleteTask?: boolean;
-  allowSafeOperationsWithoutApproval?: boolean;
   defaultTaskMode?: TaskApi['mode'];
   aiProviderConnectionId?: string | null;
   repositoryMode?: 'existing' | 'create';
@@ -918,11 +857,9 @@ export interface UpdateProjectRequest {
     baseSpecificationVersion?: number;
     baseSpecificationHash?: string;
   };
-  validationProfile?: ProjectValidationProfileApi | null;
   autoCreatePullRequest?: boolean;
   autoMergePullRequest?: boolean;
   autoCompleteTask?: boolean;
-  allowSafeOperationsWithoutApproval?: boolean;
   defaultTaskMode?: TaskApi['mode'];
   aiProviderConnectionId?: string | null;
   isActive?: boolean;
@@ -950,7 +887,7 @@ export interface GenerateProjectRoadmapRequest {
 }
 
 export interface DecideProjectRoadmapExtensionRequest {
-  approved: boolean;
+  accepted: boolean;
   cycleId?: string;
   objectiveOverride?: string;
 }
@@ -979,26 +916,12 @@ export interface TaskSummary {
   currentStep: string;
   mode: TaskApi['mode'];
   iterations: number;
-  maxIterations: number;
   updatedAt: string;
   branchName?: string;
   issueUrl?: string;
   pullRequestUrl?: string;
-  waitingForCapabilities?: string[];
   deferredValidationCapabilities?: string[];
   plan: string[];
   testResult: string;
   diffSummary: string;
-}
-
-export interface ApprovalSummary {
-  id: string;
-  taskId: string;
-  title: string;
-  reason: string;
-  risk: string;
-  status: ApprovalApi['status'];
-  riskLevel: ApprovalApi['riskLevel'];
-  touchedFiles: string[];
-  recommendation: string;
 }

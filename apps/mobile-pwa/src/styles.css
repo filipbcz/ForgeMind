@@ -315,7 +315,6 @@ a {
 .metric,
 .task-row,
 .detail,
-.approval-panel,
 .project-row,
 .task-form {
   background: #fffdfa;
@@ -379,7 +378,6 @@ a {
 
 .task-row strong,
 .detail h2,
-.approval-panel h2,
 .project-row h2 {
   overflow-wrap: anywhere;
 }
@@ -399,7 +397,6 @@ a {
   color: #69736c;
 }
 
-.status-dot.needs_approval,
 .status-dot.validation_failed {
   background: #fee2e2;
   color: #991b1b;
@@ -470,7 +467,6 @@ a {
   text-transform: uppercase;
 }
 
-.badge.needs_approval,
 .badge.risk-medium,
 .badge.pending {
   background: #fef3c7;
@@ -1130,7 +1126,6 @@ a {
   overflow-wrap: anywhere;
 }
 
-.task-capability-wait,
 .task-deferred-validation {
   display: flex;
   gap: 12px;
@@ -1141,7 +1136,6 @@ a {
   color: #6f4d0c;
 }
 
-.task-capability-wait p,
 .task-deferred-validation p {
   margin: 4px 0 0;
 }
@@ -1915,10 +1909,6 @@ a {
   min-width: 0;
 }
 
-.task-form label:has(input[name="maxBudgetUsd"]) {
-  display: none;
-}
-
 .task-form input,
 .task-form select,
 .task-form textarea {
@@ -1962,7 +1952,6 @@ a {
   grid-column: 1 / -1;
 }
 
-.approval-grid,
 .settings-grid {
   display: grid;
   gap: 14px;
@@ -1979,47 +1968,6 @@ a {
 .settings-grid .task-form {
   width: 100%;
   max-width: none;
-}
-
-.approval-grid {
-  grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
-}
-
-.approval-section-heading {
-  grid-column: 1 / -1;
-  margin: 0;
-}
-
-.approval-panel {
-  padding: 18px;
-}
-
-.approval-heading {
-  display: flex;
-  gap: 8px;
-  margin-bottom: 12px;
-}
-
-.approval-panel h2,
-.approval-panel p {
-  margin: 0;
-}
-
-.approval-panel dl {
-  margin: 18px 0 0;
-  display: grid;
-  gap: 12px;
-}
-
-.approval-panel dt {
-  color: #69736c;
-  font-weight: 700;
-  font-size: 0.86rem;
-}
-
-.approval-panel dd {
-  margin: 4px 0 0;
-  overflow-wrap: anywhere;
 }
 
 .file-strip {
@@ -2070,6 +2018,24 @@ a {
 .settings-grid .project-row > .success-banner,
 .settings-grid .project-row > .error-banner {
   grid-column: 1 / -1;
+}
+
+.settings-operation-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  min-width: 0;
+  padding: 12px 0;
+  border-top: 1px solid #e3e9e3;
+}
+
+.settings-operation-row > div {
+  min-width: 0;
+}
+
+.settings-operation-row button {
+  flex: 0 0 auto;
 }
 
 .project-row label {
@@ -2232,8 +2198,7 @@ a {
 
 .chat-thread-list-heading,
 .chat-header,
-.chat-live-heading,
-.chat-approval > div:first-child {
+.chat-live-heading {
   display: flex;
   align-items: center;
   justify-content: space-between;
@@ -2564,7 +2529,6 @@ a {
 }
 
 .chat-live-run,
-.chat-approval,
 .chat-run-error,
 .chat-diff {
   max-width: 920px;
@@ -2629,11 +2593,6 @@ a {
 .chat-diff summary::-webkit-details-marker,
 .chat-untracked summary::-webkit-details-marker {
   display: none;
-}
-
-.chat-approval {
-  background: #fff8e7;
-  border-color: #efcf84;
 }
 
 .risk.medium {
@@ -2918,10 +2877,6 @@ a {
     grid-template-columns: 1fr;
   }
 
-  .approval-grid {
-    grid-template-columns: 1fr;
-  }
-
   .provider-activity-output {
     height: 340px;
   }
@@ -2983,6 +2938,11 @@ a {
 
   .settings-grid .project-row {
     grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .settings-operation-row {
+    align-items: flex-start;
+    flex-direction: column;
   }
 
   .workflow-steps {

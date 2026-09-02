@@ -10,6 +10,16 @@ function probeEvidence(capability: { key: string; version?: string }, status: 's
 }
 
 describe('Windows runner enrollment API', () => {
+  it('creates an owner-controlled enrollment for a new offline device identity', async () => {
+    const app = Fastify();
+    const credentials: any = { createEnrollment: vi.fn(async () => ({ enrollmentId: 'enrollment_1', code: 'secret-code', expiresAt: '2026-09-01T00:10:00.000Z' })) };
+    registerWindowsRunnerRoutes(app, {} as any, credentials, {} as any);
+    const deviceId = '11111111-1111-4111-8111-111111111111';
+    const response = await app.inject({ method: 'POST', url: '/api/windows-runner/enrollments', payload: { deviceId, displayName: 'Build PC', expiresInMinutes: 10 } });
+    expect(response.statusCode).toBe(200);
+    expect(credentials.createEnrollment).toHaveBeenCalledWith(deviceId, expect.any(Date), 'Build PC');
+  });
+
   it('accepts bounded hash-verified evidence idempotently and rejects prohibited paths', async () => {
     const app = Fastify(); const deviceId = '11111111-1111-4111-8111-111111111111';
     const credentials: any = { authenticate: vi.fn(async () => ({ deviceId })) }; const workers: any = { uploadEvidence: vi.fn(async () => 'duplicate') };

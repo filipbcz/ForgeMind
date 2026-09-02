@@ -18,7 +18,7 @@ afterEach(async () => {
 });
 
 describe('buildTargetedRepositoryContext', () => {
-  it('keeps production source in the bounded packet when tests are numerous and large', async () => {
+  it('includes every tracked source and test file in the complete snapshot', async () => {
     const workspace = await mkdtemp(join(tmpdir(), 'forgemind-audit-context-'));
     temporaryDirectories.push(workspace);
     await mkdir(join(workspace, 'apps', 'web', 'src'), { recursive: true });
@@ -38,7 +38,7 @@ describe('buildTargetedRepositoryContext', () => {
 
     expect(packet).toContain('--- apps/web/src/App.tsx ---');
     expect(packet).toContain('current-user-restoration');
-    expect(packet.length).toBeLessThan(80_000);
+    expect(packet).toContain('--- apps/web/test/auth-19.test.ts ---');
   });
 
   it('keeps root manifest and lockfile content alongside source and tests', async () => {
@@ -62,7 +62,7 @@ describe('buildTargetedRepositoryContext', () => {
     expect(packet).toContain('testMarker');
   });
 
-  it('includes focused evidence from the middle of a large test file', async () => {
+  it('includes complete content from a large test file', async () => {
     const workspace = await mkdtemp(join(tmpdir(), 'forgemind-audit-context-'));
     temporaryDirectories.push(workspace);
     await mkdir(join(workspace, 'packages', 'db', 'test', 'integration'), { recursive: true });
@@ -76,11 +76,11 @@ describe('buildTargetedRepositoryContext', () => {
     const packet = await buildTargetedRepositoryContext(workspace, ['WorkItem repository round trip']);
 
     expect(packet).toContain('workitem-round-trip-marker');
-    expect(packet).toContain('[focused excerpts]');
-    expect(packet.length).toBeLessThan(80_000);
+    expect(packet).toContain('const fixture0');
+    expect(packet).toContain('const fixture179');
   });
 
-  it('prioritizes a focused test file before irrelevant files exhaust the packet budget', async () => {
+  it('does not discard files when one criterion points at a focused test', async () => {
     const workspace = await mkdtemp(join(tmpdir(), 'forgemind-audit-context-'));
     temporaryDirectories.push(workspace);
     await mkdir(join(workspace, 'tests'), { recursive: true });
@@ -101,7 +101,7 @@ describe('buildTargetedRepositoryContext', () => {
 
     expect(packet).toContain('--- tests/z-cli-runner.test.cpp ---');
     expect(packet).toContain('focused-show-marker');
-    expect(packet.length).toBeLessThan(80_000);
+    expect(packet).toContain('--- tests/a-irrelevant-0.test.cpp ---');
   });
 });
 

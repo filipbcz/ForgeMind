@@ -2,7 +2,7 @@ import { randomUUID } from 'node:crypto';
 import type { Prisma, PrismaClient } from '@prisma/client';
 import { isWindowsExecutionPacket, WINDOWS_DEVICE_OFFLINE_AFTER_MS } from '@forgemind/core';
 import type {
-  ProviderKind, WorkerCapability, WorkerProbeEvidence, WindowsExecutionJob, WindowsExecutionLease,
+  WorkerCapability, WorkerProbeEvidence, WindowsExecutionJob, WindowsExecutionLease,
   WindowsExecutionPacket, WindowsExecutionResult
 } from '@forgemind/core';
 import type { WindowsEvidenceUpload, WindowsWorkerOperationsReadModel } from '@forgemind/core';
@@ -37,6 +37,11 @@ export interface WindowsRunnerControlState {
   sessionStatus: string;
   leaseStatus?: string;
   jobStatus?: string;
+}
+
+export interface SubmittedWindowsResult {
+  accepted: boolean;
+  packet?: WindowsExecutionPacket;
 }
 
 const asJson = (value: unknown): Prisma.InputJsonValue => value as Prisma.InputJsonValue;
@@ -95,30 +100,10 @@ export class WindowsWorkerRepository {
     const id = input.id ?? randomUUID();
     if (input.packet.jobId !== id || input.packet.taskId !== input.taskId || input.packet.projectId !== input.projectId
       || input.packet.runId !== input.runId || !sameCapabilitySet(input.packet.requiredCapabilities, input.requiredCapabilities)
-      || !isWindowsExecutionPacket(input.packet) || !input.packet.executionAdapter) {
+      || !isWindowsExecutionPacket(input.packet)) {
       throw new Error('Windows execution enqueue identity is invalid.');
     }
-    const executionAdapter = input.packet.executionAdapter;
     await this.prisma.$transaction(async (tx) => {
-      if (executionAdapter.kind === 'unreal') {
-        const approval = await tx.approval.findFirst({
-          where: { id: input.packet.unrealApprovalId, taskId: input.taskId, status: 'approved' }
-        });
-        const payload = approval?.payloadJson;
-        const scoped = payload && typeof payload === 'object' && !Array.isArray(payload)
-          ? payload as Record<string, unknown> : undefined;
-        if (!approval?.approvedByUserId || !approval.resolvedAt
-          || scoped?.operation !== 'windows_unreal_validation'
-          || scoped.jobId !== id || scoped.checkId !== input.packet.checkId
-          || scoped.commitSha !== input.packet.commitSha || scoped.inputHash !== input.packet.inputHash) {
-          throw new Error('Unreal validation requires a separate approved record scoped to the exact execution packet.');
-        }
-        await tx.auditLog.create({ data: {
-          actorType: 'system', eventType: 'windows_unreal_approval_verified', projectId: input.projectId, taskId: input.taskId,
-          payload: { approvalId: approval.id, jobId: id, checkId: input.packet.checkId,
-            commitSha: input.packet.commitSha, inputHash: input.packet.inputHash }
-        } });
-      }
       await tx.windowsExecutionJob.create({ data: {
         id, projectId: input.projectId, taskId: input.taskId, runId: input.runId,
         requiredCapabilities: asJson(input.requiredCapabilities), packet: asJson(input.packet)
@@ -204,7 +189,7 @@ export class WindowsWorkerRepository {
       if (!session) return undefined;
       const jobs = await tx.$queryRaw<Array<{ job_id: string }>>`
         SELECT candidate."id" AS job_id FROM "windows_execution_jobs" candidate
-        JOIN "tasks" task ON task."id" = candidate."task_id" AND task."status" = 'waiting_for_capability'
+        JOIN "tasks" task ON task."id" = candidate."task_id" AND task."status" IN ('completed', 'ready_for_user_review')
         JOIN "task_runs" run ON run."id" = candidate."run_id" AND run."task_id" = task."id"
         JOIN "worker_devices" d ON d."id" = ${session.device_id}
         WHERE candidate."status" = 'queued'
@@ -260,6 +245,10 @@ export class WindowsWorkerRepository {
           data: { expiresAt: new Date(now.getTime() + leaseSeconds * 1_000) }
         });
         if (renewed.count !== 1) return false;
+        const lease = await tx.windowsExecutionLease.findUnique({ where: { id: leaseId }, select: { jobId: true } });
+        if (!lease) return false;
+        await tx.windowsExecutionJob.updateMany({ where: { id: lease.jobId, status: 'leased' }, data: { status: 'running' } });
+        await tx.workerDevice.updateMany({ where: { id: session.device_id, status: 'reserved' }, data: { status: 'running' } });
       }
       // Recovery locks leases before devices; heartbeat must use the same order.
       await tx.workerDevice.update({ where: { id: session.device_id }, data: { lastHeartbeatAt: now } });
@@ -267,7 +256,7 @@ export class WindowsWorkerRepository {
     });
   }
 
-  async submitResult(deviceId: string, result: WindowsExecutionResult): Promise<boolean> {
+  async submitResult(deviceId: string, result: WindowsExecutionResult): Promise<SubmittedWindowsResult> {
     return this.prisma.$transaction(async (tx) => {
       const leases = await tx.$queryRaw<Array<{ jobId: string; projectId: string; taskId: string; runId: string; packet: Prisma.JsonValue }>>`
         SELECT l."job_id" AS "jobId", j."project_id" AS "projectId", j."task_id" AS "taskId", j."run_id" AS "runId", j."packet"
@@ -276,65 +265,24 @@ export class WindowsWorkerRepository {
           AND l."session_id" = ${result.sessionId} AND l."nonce" = ${result.nonce} AND l."status" = 'active'
         FOR UPDATE OF l, j`;
       const persisted = leases[0];
-      if (!persisted || !isWindowsExecutionPacket(persisted.packet)) return false;
+      if (!persisted || !isWindowsExecutionPacket(persisted.packet)) return { accepted: false };
       const packet = persisted.packet;
       if (persisted.projectId !== result.projectId || persisted.taskId !== result.taskId || persisted.runId !== result.runId
         || packet.projectId !== result.projectId || packet.taskId !== result.taskId || packet.runId !== result.runId
         || packet.checkId !== result.checkId || packet.jobId !== result.jobId || packet.leaseId !== result.leaseId
-        || packet.nonce !== result.nonce || packet.inputHash !== result.inputHash || packet.commitSha !== result.commitSha) return false;
+        || packet.nonce !== result.nonce || packet.inputHash !== result.inputHash || packet.commitSha !== result.commitSha) return { accepted: false };
       const evidence = (packet as WindowsExecutionPacket & { evidenceUpload?: WindowsEvidenceUpload }).evidenceUpload;
       if (!evidence || evidence.log.sha256.toLowerCase() !== result.logHash.toLowerCase()
         || evidence.artifacts.length !== result.artifacts.length
         || result.artifacts.some((artifact) => !evidence.artifacts.some((uploaded) => uploaded.name === artifact.name
           && uploaded.relativePath === artifact.relativePath && uploaded.sizeBytes === artifact.sizeBytes
-          && uploaded.sha256.toLowerCase() === artifact.sha256.toLowerCase()))) return false;
-      let resume: { taskId: string; provider: ProviderKind; model: string } | undefined;
-      if (result.status === 'succeeded') {
-        const [checkpoint, task, sourceRun] = await Promise.all([
-          tx.taskCheckpoint.findUnique({ where: { taskId_key: { taskId: result.taskId, key: result.checkId } } }),
-          tx.task.findUnique({ where: { id: result.taskId } }),
-          tx.taskRun.findUnique({ where: { id: result.runId } })
-        ]);
-        const deferred = checkpoint?.outputJson;
-        if (!checkpoint || checkpoint.status !== 'completed' || checkpoint.inputHash !== result.inputHash
-          || !deferred || typeof deferred !== 'object' || Array.isArray(deferred)
-          || deferred.deferred !== true || deferred.command !== packet.check.command || deferred.commitSha !== result.commitSha
-          || !task || task.status !== 'waiting_for_capability' || !sourceRun) return false;
-        const activeQueueJobs = await tx.taskQueueJob.count({ where: { taskId: task.id, status: { in: ['pending', 'claimed'] } } });
-        if (activeQueueJobs !== 0) return false;
-        resume = { taskId: task.id, provider: sourceRun.provider, model: sourceRun.model };
-      }
+          && uploaded.sha256.toLowerCase() === artifact.sha256.toLowerCase()))) return { accepted: false };
       const status = result.status === 'succeeded' ? 'succeeded' : result.status === 'cancelled' ? 'cancelled' : 'failed';
       const updated = await tx.windowsExecutionJob.updateMany({ where: { id: result.jobId, status: { in: ['leased', 'running'] } }, data: { status } });
       if (updated.count !== 1) throw new Error('Execution job changed while its result was being reconciled.');
-      if (result.status === 'succeeded') {
-        const reconciled = await tx.taskCheckpoint.updateMany({
-          where: {
-            taskId: result.taskId, key: result.checkId, inputHash: result.inputHash, status: 'completed',
-            AND: [
-              { outputJson: { path: ['deferred'], equals: true } },
-              { outputJson: { path: ['command'], equals: packet.check.command } },
-              { outputJson: { path: ['commitSha'], equals: result.commitSha } }
-            ]
-          },
-          data: { outputJson: asJson({
-            evidenceVersion: 1, deferred: false, command: packet.check.command, exitCode: 0,
-            stdout: result.summary, stderr: '', passed: true, commitSha: result.commitSha,
-            inputHash: result.inputHash, logHash: result.logHash, artifacts: result.artifacts
-          }) }
-        });
-        if (reconciled.count !== 1) throw new Error('Deferred validation evidence changed while its result was being reconciled.');
-
-        const taskId = resume!.taskId;
-        const now = new Date();
-        await tx.task.update({ where: { id: taskId }, data: { status: 'submitted', waitingForCapabilities: [], startedAt: now, finishedAt: null } });
-        await tx.projectImplementationStep.updateMany({ where: { taskId, status: 'waiting_for_capability' }, data: { status: 'running', completedAt: null } });
-        await tx.taskRun.create({ data: { taskId, provider: resume!.provider, model: resume!.model, status: 'queued' } });
-        await tx.taskQueueJob.create({ data: { taskId, reason: 'windows_validation_completed', status: 'pending', nextAttemptAt: now } });
-      }
       await tx.windowsExecutionLease.update({ where: { id: result.leaseId }, data: { status: result.status === 'cancelled' ? 'cancelled' : 'released', releasedAt: new Date() } });
       await tx.workerDevice.update({ where: { id: deviceId }, data: { status: 'idle' } });
-      return true;
+      return { accepted: true, packet };
     });
   }
 

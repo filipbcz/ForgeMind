@@ -1,14 +1,11 @@
-import type { ApprovalType, ProjectArchitectureUpdate } from '@forgemind/core';
-import type { GitHubChecksResult } from '@forgemind/github';
+import type { ProjectArchitectureUpdate } from '@forgemind/core';
 import type { ReviewResult, ValidationCheck } from '@forgemind/providers';
 import type { JsonValue } from '@forgemind/shared';
 import { formatValidationFailure } from '../validation.js';
 import type { WorkerTaskResume } from '../workflow.js';
-import { normalizeRuntimeApprovals, type ApprovedLimitSignal } from './limits.js';
 
 export interface TaskResumeContext {
   workflowResume: WorkerTaskResume;
-  ignoredLimitSignals: ApprovedLimitSignal[];
 }
 
 export interface TaskDiffIterationSnapshot {
@@ -33,7 +30,9 @@ export interface PlannedValidationCheckSnapshot {
   criterion?: string;
   rationale?: string;
   category?: string;
-  requiredCapabilities?: unknown;
+  shell?: string;
+  continueOnFailure?: boolean;
+  timeoutMinutes?: number;
 }
 
 export interface TaskCheckpointSnapshot {
@@ -46,7 +45,6 @@ export interface TaskCheckpointSnapshot {
 
 export async function resolveTaskResumeContext(
   repository: {
-    listApprovals: () => Promise<Array<{ taskId: string; type: ApprovalType; status: 'pending' | 'approved' | 'rejected' | 'cancelled'; payload: unknown; createdAt: string }>>;
     listTaskAudit: (taskId: string) => Promise<TaskAuditSnapshot[]>;
     getTaskDiff: (taskId: string) => Promise<{
       iterations: TaskDiffIterationSnapshot[];
@@ -55,76 +53,30 @@ export async function resolveTaskResumeContext(
   },
   taskId: string,
   queueReason?: string,
-  currentTaskRunId?: string,
-  maxIterations?: number
+  currentTaskRunId?: string
 ): Promise<TaskResumeContext | undefined> {
-  const [approvals, diff, audit, checkpoints] = await Promise.all([
-    repository.listApprovals(),
+  const [diff, audit, checkpoints] = await Promise.all([
     repository.getTaskDiff(taskId),
     repository.listTaskAudit(taskId),
     repository.listTaskCheckpoints?.(taskId) ?? Promise.resolve([])
   ]);
-  const taskApprovals = approvals.filter((approval) => approval.taskId === taskId);
-  const approvedTypes = new Set(taskApprovals.filter((approval) => approval.status === 'approved').map((approval) => approval.type));
   const lastPlanningIteration = findLastIteration(diff.iterations, 'planning');
   const lastImplementationIteration = findLastIteration(diff.iterations, 'implementation');
   const lastValidationIteration = findLastIteration(diff.iterations, 'validation');
   const lastReviewIteration = findLastIteration(diff.iterations, 'review');
   const architectureUpdate = extractArchitectureUpdate(lastImplementationIteration);
   const implementationResume = extractImplementationResume(lastImplementationIteration);
-  const approvedReviewResume = buildApprovedReviewResume(lastPlanningIteration, lastImplementationIteration, lastReviewIteration, approvedTypes);
-  if (approvedReviewResume) approvedReviewResume.architectureUpdate = architectureUpdate;
-  const latestApprovedLargeDiffAt = getLatestApprovedLargeDiffAt(taskApprovals);
-  const latestApprovedReviewAt = approvedReviewResume
-    ? getLatestApprovedReviewAt(taskApprovals, approvedReviewResume.riskyChanges ?? [])
-    : undefined;
-
-  if (queueReason === 'capability_available' && lastImplementationIteration) {
-    const checkpointResume = buildPhaseRetryResume(
-      diff.iterations,
-      audit,
-      approvedTypes,
-      currentTaskRunId,
-      checkpoints,
-      false,
-      maxIterations
-    );
-    return {
-      workflowResume: {
-        ...checkpointResume,
-        kind: 'capability_available',
-        resumeFrom: 'validation',
-        planSummary: lastPlanningIteration?.resultSummary,
-        planSteps: extractStringArray(lastPlanningIteration?.validationResult, 'steps'),
-        acceptanceCriteria: extractStringArray(lastPlanningIteration?.validationResult, 'acceptanceCriteria'),
-        implementationSummary: lastImplementationIteration.resultSummary || 'Resume authoritative validation on a capable worker.',
-        ...implementationResume,
-        validationChecks: extractLatestValidationChecks(diff.iterations),
-        validation: undefined,
-        passedValidationChecks: checkpointResume?.passedValidationChecks
-          ?? extractPassedValidationChecks(lastValidationIteration?.validationResult),
-        resumeValidationPlanRevision: false,
-        architectureUpdate,
-        approvedApprovals: Array.from(approvedTypes)
-      },
-      ignoredLimitSignals: []
-    };
-  }
 
   if (queueReason === 'task_retried' || queueReason === 'worker_interrupted' || queueReason === 'phase_retry') {
     const phaseRetryResume = buildPhaseRetryResume(
       diff.iterations,
       audit,
-      approvedTypes,
       currentTaskRunId,
-      checkpoints,
-      queueReason === 'task_retried',
-      maxIterations
+      checkpoints
     );
     if (phaseRetryResume) {
       return {
-        workflowResume: phaseRetryResume,
-        ignoredLimitSignals: [],
+        workflowResume: phaseRetryResume
       };
     }
   }
@@ -141,10 +93,8 @@ export async function resolveTaskResumeContext(
           ?? 'Continue the implementation preserved in the workspace after the worker was interrupted.',
         ...implementationResume,
         validationChecks: extractLatestValidationChecks(diff.iterations),
-        architectureUpdate,
-        approvedApprovals: Array.from(approvedTypes)
-      },
-      ignoredLimitSignals: []
+        architectureUpdate
+      }
     };
   }
 
@@ -158,60 +108,8 @@ export async function resolveTaskResumeContext(
         implementationSummary: lastImplementationIteration.resultSummary || 'Resume the preserved implementation for validation.',
         ...implementationResume,
         validationChecks: extractLatestValidationChecks(diff.iterations),
-        architectureUpdate,
-        approvedApprovals: Array.from(approvedTypes)
-      },
-      ignoredLimitSignals: []
-    };
-  }
-
-  if (latestApprovedLargeDiffAt && (!latestApprovedReviewAt || latestApprovedLargeDiffAt >= latestApprovedReviewAt)) {
-    if (!lastImplementationIteration) {
-      return undefined;
-    }
-
-    return {
-      workflowResume: {
-        kind: 'approved_large_diff',
-        planSummary: lastPlanningIteration?.resultSummary,
-        planSteps: extractStringArray(lastPlanningIteration?.validationResult, 'steps'),
-        acceptanceCriteria: extractStringArray(lastPlanningIteration?.validationResult, 'acceptanceCriteria'),
-        implementationSummary: lastImplementationIteration.resultSummary || 'Resuming previously approved implementation.',
-        ...implementationResume,
-        validationChecks: extractLatestValidationChecks(diff.iterations),
-        architectureUpdate,
-        approvedApprovals: Array.from(approvedTypes)
-      },
-      ignoredLimitSignals: ['diff_lines_limit_reached', 'changed_files_limit_reached']
-    };
-  }
-
-  if (approvedReviewResume) {
-    return {
-      workflowResume: {
-        ...approvedReviewResume,
-        approvedApprovals: Array.from(approvedTypes)
-      },
-      ignoredLimitSignals: []
-    };
-  }
-
-  if (approvedTypes.size > 0 && (lastPlanningIteration || lastImplementationIteration)) {
-    return {
-      workflowResume: {
-        kind: 'approved_operation',
-        planSummary: lastPlanningIteration?.resultSummary,
-        planSteps: extractStringArray(lastPlanningIteration?.validationResult, 'steps'),
-        acceptanceCriteria: extractStringArray(lastPlanningIteration?.validationResult, 'acceptanceCriteria'),
-        implementationSummary:
-          lastImplementationIteration?.resultSummary
-          ?? 'Resume workspace changes after the requested operation was approved.',
-        ...implementationResume,
-        validationChecks: extractLatestValidationChecks(diff.iterations),
-        architectureUpdate,
-        approvedApprovals: Array.from(approvedTypes)
-      },
-      ignoredLimitSignals: []
+        architectureUpdate
+      }
     };
   }
 
@@ -221,11 +119,8 @@ export async function resolveTaskResumeContext(
 function buildPhaseRetryResume(
   iterations: TaskDiffIterationSnapshot[],
   audit: TaskAuditSnapshot[],
-  approvedTypes: ReadonlySet<ApprovalType>,
   currentTaskRunId?: string,
-  checkpoints: TaskCheckpointSnapshot[] = [],
-  resetExhaustedAttempt = false,
-  maxIterations?: number
+  checkpoints: TaskCheckpointSnapshot[] = []
 ): WorkerTaskResume | undefined {
   const completedIterations = [...iterations].sort((left, right) => timestampOf(left.createdAt) - timestampOf(right.createdAt));
   const latestIteration = completedIterations.at(-1);
@@ -281,7 +176,7 @@ function buildPhaseRetryResume(
     const failedOperation = asRecord(latestGitHubFailure.payload)?.operation;
     resumeFrom = failedOperation === 'create_issue' || failedOperation === 'create_branch' ? 'planning' : 'delivery';
   } else if (inFlightPhase === 'planning' && isFailedValidationIteration(latestValidation)) {
-    resumeFrom = 'validation';
+    resumeFrom = 'implementation';
   } else if (inFlightPhase) {
     resumeFrom = inFlightPhase;
   } else if (githubInfrastructureFailure) {
@@ -289,15 +184,11 @@ function buildPhaseRetryResume(
   } else if (latestIteration?.phase === 'review') {
     resumeFrom = extractReviewBlockers(latestReview).length > 0 ? 'implementation' : 'delivery';
   } else if (latestIteration?.phase === 'validation') {
-    resumeFrom = isFailedValidationIteration(latestValidation) ? 'validation' : 'review';
+    resumeFrom = isFailedValidationIteration(latestValidation) ? 'implementation' : 'review';
   } else if (latestIteration?.phase === 'implementation') {
     resumeFrom = 'validation';
   } else if (latestIteration?.phase === 'planning') {
-    const planningResult = asRecord(latestIteration.validationResult);
-    const recoveryDecision = asRecord(planningResult?.validationRecovery);
-    resumeFrom = planningResult?.revisedValidationChecksOnly === true || recoveryDecision?.action === 'blocked'
-      ? 'validation'
-      : 'implementation';
+    resumeFrom = 'implementation';
   } else {
     resumeFrom = 'planning';
   }
@@ -311,8 +202,6 @@ function buildPhaseRetryResume(
     ? extractValidationResult(effectiveValidationIteration?.validationResult)
     : undefined;
   const reviewBlockers = extractReviewBlockers(latestReview);
-  const reviewSafeImprovements = extractStringArray(latestReview?.validationResult, 'safeImprovements');
-  const reviewRisks = normalizeRuntimeApprovals(extractUnknownArray(latestReview?.validationResult, 'riskyChanges'));
   const implementationPayload = asRecord(latestImplementation?.validationResult);
   const changedFiles = Array.isArray(implementationPayload?.changedFiles)
     ? implementationPayload.changedFiles.filter((item): item is string => typeof item === 'string' && item.length > 0)
@@ -322,11 +211,7 @@ function buildPhaseRetryResume(
   const persistedAttempt = typeof startedPayload?.attempt === 'number' && Number.isFinite(startedPayload.attempt)
     ? Math.max(1, Math.trunc(startedPayload.attempt))
     : extractLatestAttempt(completedIterations);
-  const attempt = resetExhaustedAttempt
-    && typeof maxIterations === 'number'
-    && persistedAttempt >= maxIterations
-      ? 1
-      : persistedAttempt;
+  const attempt = persistedAttempt;
   const completedOperations = relevantAudit
     .filter((event) => timestampOf(event.createdAt) >= timestampOf(latestImplementation?.createdAt))
     .filter((event) => event.eventType === 'task_activity')
@@ -342,6 +227,7 @@ function buildPhaseRetryResume(
       checkpoint.status === 'completed'
       && checkpoint.key.startsWith('external:')
       && checkpoint.key !== 'external:merge_pr'
+      && checkpoint.key !== 'external:wait_for_checks'
     ))
     .map((checkpoint) => checkpoint.key.slice('external:'.length)));
   const mergeCheckpoint = checkpoints.find((checkpoint) => checkpoint.key === 'external:merge_pr');
@@ -366,6 +252,9 @@ function buildPhaseRetryResume(
     if (!command || passedValidationChecks.some((item) => item.command === command && item.inputHash === checkpoint.inputHash)) continue;
     passedValidationChecks.push({
       command,
+      shell: output?.shell === 'powershell' || output?.shell === 'cmd' || output?.shell === 'bash' || output?.shell === 'sh'
+        ? output.shell
+        : 'system',
       exitCode: typeof output?.exitCode === 'number' ? output.exitCode : 0,
       stdout: typeof output?.stdout === 'string' ? output.stdout : '',
       stderr: typeof output?.stderr === 'string' ? output.stderr : '',
@@ -375,39 +264,6 @@ function buildPhaseRetryResume(
       rationale: typeof output?.rationale === 'string' ? output.rationale : undefined
     });
   }
-  const latestPlanningResult = latestIteration?.phase === 'planning'
-    ? asRecord(latestIteration.validationResult)
-    : undefined;
-  const completedValidationReplacement = latestPlanningResult?.revisedValidationChecksOnly === true;
-  const resumeValidationPlanRevision = (
-    resumeFrom === 'validation'
-    && !completedValidationReplacement
-    && Boolean(validation && !validation.passed && validation.failingCommand)
-  );
-  const githubChecksCheckpoint = [...checkpoints].reverse().find((checkpoint) => (
-    checkpoint.status === 'completed' && checkpoint.key === 'external:wait_for_checks'
-  ));
-  const githubChecksOutput = asRecord(githubChecksCheckpoint?.output);
-  const githubChecks: GitHubChecksResult | undefined = githubChecksOutput
-    && (githubChecksOutput.status === 'success' || githubChecksOutput.status === 'not_configured')
-    && typeof githubChecksOutput.summary === 'string'
-    ? {
-        status: githubChecksOutput.status as 'success' | 'not_configured',
-        summary: githubChecksOutput.summary,
-        failures: Array.isArray(githubChecksOutput.failures)
-          ? githubChecksOutput.failures.flatMap((failure) => {
-              const item = asRecord(failure);
-              return item && typeof item.name === 'string' && typeof item.output === 'string'
-                ? [{
-                    name: item.name,
-                    output: item.output,
-                    detailsUrl: typeof item.detailsUrl === 'string' ? item.detailsUrl : undefined
-                  }]
-                : [];
-            })
-          : []
-      }
-    : undefined;
   const satisfactionReviewCheckpoint = [...checkpoints].reverse().find((checkpoint) => (
     checkpoint.status === 'completed' && checkpoint.key === 'review:already_satisfied'
   ));
@@ -420,6 +276,31 @@ function buildPhaseRetryResume(
         criterionResults: extractCriterionResults(satisfactionReviewOutput.criterionResults)
       }
     : undefined;
+  const reviewCheckpoint = [...checkpoints].reverse().find((checkpoint) => (
+    checkpoint.status === 'completed' && checkpoint.key === 'review:final'
+  ));
+  const reviewOutput = asRecord(reviewCheckpoint?.output);
+  const completedReview = reviewCheckpoint
+    && (reviewOutput?.verdict === 'satisfied' || reviewOutput?.verdict === 'not_satisfied')
+    && typeof reviewOutput.summary === 'string'
+    && Array.isArray(reviewOutput.blockers)
+    && reviewOutput.blockers.every((item) => typeof item === 'string')
+    ? {
+        inputHash: reviewCheckpoint.inputHash,
+        verdict: reviewOutput.verdict as ReviewResult['verdict'],
+        summary: reviewOutput.summary,
+        blockers: reviewOutput.blockers as string[],
+        criterionResults: extractCriterionResults(reviewOutput.criterionResults)
+      }
+    : completedSatisfactionReview
+      ? {
+          inputHash: completedSatisfactionReview.inputHash,
+          verdict: 'satisfied' as const,
+          summary: completedSatisfactionReview.summary,
+          blockers: [],
+          criterionResults: completedSatisfactionReview.criterionResults
+        }
+      : undefined;
 
   return {
     kind: 'phase_retry',
@@ -438,19 +319,14 @@ function buildPhaseRetryResume(
       ? formatValidationFailure(validation)
       : undefined,
     previousReviewBlockers: resumeFrom === 'implementation' ? reviewBlockers : undefined,
-    previousSafeImprovements: resumeFrom === 'implementation' ? reviewSafeImprovements : undefined,
     validation,
     passedValidationChecks,
-    resumeValidationPlanRevision,
     reviewSummary: latestReview?.resultSummary,
-    riskyChanges: reviewRisks,
     validationChecks: extractLatestValidationChecks(completedIterations),
-    approvedApprovals: Array.from(approvedTypes),
     completedOperations: Array.from(new Set(completedOperations)),
-    githubChecks,
-    githubChecksInputHash: githubChecksCheckpoint?.inputHash,
     mergeCommitSha,
-    completedSatisfactionReview
+    completedSatisfactionReview,
+    completedReview
   };
 }
 
@@ -499,8 +375,6 @@ function findLatestFailureTimestamp(audit: TaskAuditSnapshot[]): number | undefi
     || event.eventType === 'task_worker_interrupted'
     || event.eventType === 'task_cancelled'
     || event.eventType === 'task_status_validation_failed'
-    || event.eventType === 'task_status_iteration_limit_reached'
-    || event.eventType === 'task_status_repeated_error_detected'
   ));
   return failure ? timestampOf(failure.createdAt) : undefined;
 }
@@ -532,31 +406,8 @@ function extractValidationResult(value: unknown): WorkerTaskResume['validation']
       ? typeof payload.failingCommand === 'string'
         ? payload.failingCommand
         : typeof payload.command === 'string' ? payload.command : undefined
-      : undefined,
-    deferredChecks: extractDeferredValidationChecks(payload.deferredChecks)
+      : undefined
   };
-}
-
-function extractDeferredValidationChecks(value: unknown): NonNullable<WorkerTaskResume['validation']>['deferredChecks'] {
-  if (!Array.isArray(value)) return [];
-  return value.flatMap((entry) => {
-    const item = asRecord(entry);
-    if (!item || typeof item.command !== 'string') return [];
-    const requiredCapabilities = Array.isArray(item.requiredCapabilities)
-      ? item.requiredCapabilities.filter((capability): capability is string => typeof capability === 'string')
-      : [];
-    const missingCapabilities = Array.isArray(item.missingCapabilities)
-      ? item.missingCapabilities.filter((capability): capability is string => typeof capability === 'string')
-      : [];
-    return [{
-      command: item.command,
-      category: item.category === 'setup' || item.category === 'build' || item.category === 'database' || item.category === 'api' || item.category === 'browser' || item.category === 'smoke' ? item.category : undefined,
-      criterion: typeof item.criterion === 'string' ? item.criterion : undefined,
-      rationale: typeof item.rationale === 'string' ? item.rationale : undefined,
-      requiredCapabilities,
-      missingCapabilities
-    }];
-  });
 }
 
 function resolveValidationPassed(payload: Record<string, unknown> | undefined): boolean | undefined {
@@ -586,6 +437,7 @@ function extractUnknownArray(value: unknown, key: string): unknown[] {
 
 function extractLatestValidationChecks(iterations: TaskDiffIterationSnapshot[]): WorkerTaskResume['validationChecks'] {
   for (let index = iterations.length - 1; index >= 0; index -= 1) {
+    if (iterations[index]?.phase !== 'implementation') continue;
     const checks = extractValidationChecks(iterations[index]?.validationResult);
     if (checks?.length) return checks;
   }
@@ -611,6 +463,9 @@ function extractPassedValidationChecks(value: unknown): NonNullable<WorkerTaskRe
     }
     return [{
       command: check.command,
+      shell: check.shell === 'powershell' || check.shell === 'cmd' || check.shell === 'bash' || check.shell === 'sh'
+        ? check.shell
+        : 'system',
       exitCode: check.exitCode,
       stdout: check.stdout,
       stderr: check.stderr,
@@ -652,53 +507,6 @@ function isFailedValidationIteration(iteration: TaskDiffIterationSnapshot | unde
   return resolveValidationPassed(asRecord(iteration?.validationResult)) === false;
 }
 
-function buildApprovedReviewResume(
-  planningIteration:
-    | {
-        resultSummary: string;
-        validationResult?: unknown;
-      }
-    | undefined,
-  implementationIteration: { resultSummary: string } | undefined,
-  reviewIteration:
-    | {
-        resultSummary: string;
-        validationResult?: unknown;
-      }
-    | undefined,
-  approvedTypes: ReadonlySet<ApprovalType>
-): WorkerTaskResume | undefined {
-  if (!implementationIteration || !reviewIteration) {
-    return undefined;
-  }
-
-  const validationResult =
-    reviewIteration.validationResult && typeof reviewIteration.validationResult === 'object' && !Array.isArray(reviewIteration.validationResult)
-      ? (reviewIteration.validationResult as Record<string, JsonValue>)
-      : undefined;
-  const blockers = Array.isArray(validationResult?.blockers)
-    ? validationResult.blockers.filter((item): item is string => typeof item === 'string' && item.length > 0)
-    : [];
-  const riskyChanges = Array.isArray(validationResult?.riskyChanges)
-    ? normalizeRuntimeApprovals(validationResult.riskyChanges)
-    : [];
-
-  if (blockers.length > 0 || riskyChanges.length === 0 || !riskyChanges.every((item) => approvedTypes.has(item))) {
-    return undefined;
-  }
-
-  return {
-    kind: 'approved_review',
-    planSummary: planningIteration?.resultSummary,
-    planSteps: extractStringArray(planningIteration?.validationResult, 'steps'),
-    acceptanceCriteria: extractStringArray(planningIteration?.validationResult, 'acceptanceCriteria'),
-    implementationSummary: implementationIteration.resultSummary || 'Resuming previously reviewed implementation.',
-    reviewSummary: reviewIteration.resultSummary || 'Previously reviewed implementation resumed.',
-    riskyChanges,
-    validationChecks: extractValidationChecks(planningIteration?.validationResult)
-  };
-}
-
 function extractValidationChecks(validationResult: unknown): WorkerTaskResume['validationChecks'] {
   if (!validationResult || typeof validationResult !== 'object' || Array.isArray(validationResult)) {
     return undefined;
@@ -716,45 +524,6 @@ function extractValidationChecks(validationResult: unknown): WorkerTaskResume['v
   return checks.length > 0 ? checks : undefined;
 }
 
-function getLatestApprovedLargeDiffAt(
-  approvals: Array<{ type: ApprovalType; status: 'pending' | 'approved' | 'rejected' | 'cancelled'; payload: unknown; createdAt: string }>
-): number | undefined {
-  const timestamps = approvals
-    .filter((approval) => approval.status === 'approved' && approval.type === 'risky_refactor')
-    .filter((approval) => {
-      const payload = approval.payload && typeof approval.payload === 'object' && !Array.isArray(approval.payload)
-        ? (approval.payload as Record<string, JsonValue>)
-        : undefined;
-      const limitSignal = typeof payload?.limitSignal === 'string' ? payload.limitSignal : undefined;
-      return limitSignal === 'diff_lines_limit_reached' || limitSignal === 'changed_files_limit_reached';
-    })
-    .map((approval) => Date.parse(approval.createdAt))
-    .filter((timestamp) => Number.isFinite(timestamp));
-
-  if (timestamps.length === 0) {
-    return undefined;
-  }
-
-  return Math.max(...timestamps);
-}
-
-function getLatestApprovedReviewAt(
-  approvals: Array<{ type: ApprovalType; status: 'pending' | 'approved' | 'rejected' | 'cancelled'; createdAt: string }>,
-  riskyChanges: ApprovalType[]
-): number | undefined {
-  const relevant = new Set(riskyChanges);
-  const timestamps = approvals
-    .filter((approval) => approval.status === 'approved' && relevant.has(approval.type))
-    .map((approval) => Date.parse(approval.createdAt))
-    .filter((timestamp) => Number.isFinite(timestamp));
-
-  if (timestamps.length === 0) {
-    return undefined;
-  }
-
-  return Math.max(...timestamps);
-}
-
 function normalizeValidationCheckSnapshot(item: unknown): ValidationCheck | undefined {
   if (!item || typeof item !== 'object' || Array.isArray(item)) {
     return undefined;
@@ -765,14 +534,16 @@ function normalizeValidationCheckSnapshot(item: unknown): ValidationCheck | unde
     return {
       kind: 'command' as const,
       command: check.command.trim(),
+      shell: check.shell === 'powershell' || check.shell === 'cmd' || check.shell === 'bash' || check.shell === 'sh'
+        ? check.shell
+        : 'system',
+      continueOnFailure: check.continueOnFailure === true,
+      timeoutMinutes: typeof check.timeoutMinutes === 'number' ? check.timeoutMinutes : undefined,
       category: check.category === 'setup' || check.category === 'build' || check.category === 'database' || check.category === 'api' || check.category === 'browser' || check.category === 'smoke'
         ? check.category
         : undefined,
       criterion: typeof check.criterion === 'string' && check.criterion.trim() ? check.criterion.trim() : undefined,
       rationale: typeof check.rationale === 'string' && check.rationale.trim() ? check.rationale.trim() : undefined,
-      requiredCapabilities: Array.isArray(check.requiredCapabilities)
-        ? check.requiredCapabilities.filter((value): value is string => typeof value === 'string')
-        : undefined
     };
   }
 

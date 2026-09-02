@@ -112,7 +112,7 @@ export function summarizeProjectProgress(
     };
   }
 
-  if (latestCycle.status === 'awaiting_extension_approval') {
+  if (latestCycle.status === 'awaiting_extension_decision') {
     return {
       ...base,
       tone: 'attention',
@@ -170,16 +170,9 @@ export function summarizeProjectOperationalOverview(
     .sort((left, right) => left.sequenceNumber - right.sequenceNumber);
   const auditJob = (roadmap?.auditJobs ?? []).find((job) => job.cycleId === latestCycle.id);
   const runningStep = steps.find((step) => step.status === 'running');
-  const waitingStep = steps.find((step) => step.status === 'waiting_for_capability');
   const nextStep = steps.find((step) => step.status === 'pending' && !step.taskId);
   const completedSteps = steps.filter((step) => step.status === 'completed').length;
   const blockers = [
-    ...(waitingStep ? [`Krok ${waitingStep.sequenceNumber} čeká na validační prostředí.`] : []),
-    ...tasks
-      .filter((task) => task.projectId === roadmap?.projectId && task.status === 'waiting_for_capability')
-      .flatMap((task) => task.waitingForCapabilities?.length
-        ? [`${task.title}: čeká na ${task.waitingForCapabilities.join(', ')}.`]
-        : [`${task.title}: čeká na dostupnou worker capability.`]),
     ...(auditJob?.status === 'blocked' || auditJob?.status === 'failed'
       ? [auditJob.errorMessage ?? 'Projektový audit je zablokovaný.']
       : []),
@@ -217,16 +210,6 @@ export function summarizeProjectOperationalOverview(
     };
   }
 
-  if (waitingStep) {
-    return {
-      tone: 'attention',
-      state: 'Čeká na capability',
-      activeStep: `Krok ${waitingStep.sequenceNumber}: ${waitingStep.title}`,
-      blockers,
-      primaryAction: 'none'
-    };
-  }
-
   if (auditJob?.status === 'blocked' || auditJob?.status === 'failed') {
     return {
       tone: 'attention',
@@ -238,7 +221,7 @@ export function summarizeProjectOperationalOverview(
     };
   }
 
-  if (latestCycle.status === 'awaiting_extension_approval') {
+  if (latestCycle.status === 'awaiting_extension_decision') {
     return {
       tone: 'attention',
       state: 'Čeká rozhodnutí',

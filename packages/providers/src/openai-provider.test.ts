@@ -146,50 +146,27 @@ describe('OpenAI provider', () => {
       .rejects.toThrow('OpenAI plan returned invalid JSON');
   });
 
-  it('passes the complete validation failure and preserves the AI recovery decision', async () => {
+  it('keeps planning separate from implementation validation', async () => {
     process.env.OPENAI_API_KEY = 'test-key';
     vi.mocked(fetch).mockResolvedValueOnce(successfulResponse({
       choices: [{
         message: {
           content: JSON.stringify({
-            summary: 'Repair repository code.',
-            steps: [],
-            acceptanceCriteria: [],
-            validationChecks: [],
-            validationRecovery: {
-              action: 'repair_implementation',
-              rationale: 'The test correctly detected a broken implementation.'
-            }
+            summary: 'Plan repository code.',
+            steps: ['Implement the requested behavior.'],
+            acceptanceCriteria: ['Behavior is complete.']
           })
         }
       }]
     }));
 
-    const result = await new OpenAIProvider().plan({
-      taskId: 'validation-recovery',
-      title: 'Repair validation failure',
-      prompt: 'Diagnose the failed check.',
-      validationFailure: {
-        command: 'npm test',
-        exitCode: 1,
-        stdout: 'complete stdout',
-        stderr: 'complete stderr'
-      },
-      previousValidationChecks: [{ kind: 'command', command: 'npm test' }]
-    });
+    await new OpenAIProvider().plan({ taskId: 'plan', title: 'Plan work', prompt: 'Create the roadmap.' });
 
-    expect(result.validationRecovery).toEqual({
-      action: 'repair_implementation',
-      rationale: 'The test correctly detected a broken implementation.'
-    });
     const request = vi.mocked(fetch).mock.calls.at(-1)?.[1];
     const body = JSON.parse(String(request?.body)) as { messages: Array<{ content: string }> };
     const prompt = body.messages.map((message) => message.content).join('\n');
-    expect(prompt).toContain('"command": "npm test"');
-    expect(prompt).toContain('"exitCode": 1');
-    expect(prompt).toContain('complete stdout');
-    expect(prompt).toContain('complete stderr');
-    expect(prompt).toContain('persistent workspace environment');
+    expect(prompt).toContain('Do not propose executable validation commands during planning');
+    expect(prompt).not.toContain('validationRecovery');
   });
 
   it('emits the actual token breakdown returned by the API', async () => {
@@ -237,7 +214,6 @@ describe('OpenAI provider', () => {
                 summary: 'implemented',
                 changedFiles: ['src/demo.ts'],
                 diffStat: { filesChanged: 1, insertions: 1, deletions: 0 },
-                requestedApprovals: [],
                 fileUpdates: [{ path: 'src/demo.ts', content: 'export const demo = true;\n' }],
                 validationChecks: [
                   {
@@ -282,7 +258,6 @@ describe('OpenAI provider', () => {
                 changedFiles: [],
                 evidenceFiles: ['src/existing-behavior.test.ts'],
                 diffStat: { filesChanged: 0, insertions: 0, deletions: 0 },
-                requestedApprovals: [],
                 validationChecks: [
                   {
                     kind: 'command',
@@ -480,7 +455,6 @@ describe('Codex provider', () => {
                   summary: 'implemented',
                   changedFiles: ['src/codex.ts'],
                   diffStat: { filesChanged: 1, insertions: 1, deletions: 0 },
-                  requestedApprovals: [],
                   fileUpdates: [{ path: 'src/codex.ts', content: 'export const codex = true;\n' }]
                 })
               }
@@ -515,7 +489,6 @@ describe('Codex provider', () => {
                   changedFiles: [],
                   evidenceFiles: ['src/existing-behavior.test.ts'],
                   diffStat: { filesChanged: 0, insertions: 0, deletions: 0 },
-                  requestedApprovals: [],
                   validationChecks: [
                     {
                       kind: 'command',

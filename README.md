@@ -5,6 +5,19 @@ Stav: návrh pro MVP a navazující vývoj
 Název platformy: **ForgeMind**
 Produktová řada: **ForgeMind Studio**, **ForgeMind Agent**, **ForgeMind Mobile**
 
+## Aktuální autonomní orchestrace
+
+Původní návrh MVP počítal s příkazovým allowlistem, runtime sandbox policy a schvalováním rizikových operací. Aktuální implementace tento model zjednodušuje a následující pravidla mají přednost před staršími návrhovými pasážemi v tomto dokumentu:
+
+1. Task vstupuje přímo do implementace. AI analyzuje repozitář, provede změny a ve stejné odpovědi navrhne autoritativní sadu spustitelných validačních příkazů.
+2. Validační příkazy nesmí pocházet z `agent.config.yaml`, plánování ani projektové architektury. Worker spustí všechny neprázdné příkazy bez obsahového allowlistu, sandbox filtru nebo capability odkladu.
+3. Při selhání validace dostane implementační AI celý příkaz, exit code, stdout a stderr. Opraví implementaci nebo navrhne odpovídající novou validaci.
+4. Review má read-only přístup k repozitáři a posuzuje pouze to, zda výsledek odpovídá zadání a akceptačním kritériím. Validaci neopakuje. Blocker vrací v plném znění implementační AI.
+5. Po úspěšném review následuje GitHub delivery. Retry pokračuje od první nedokončené fáze a neopakuje hotové externí operace ani platné validační checkpointy.
+6. Runtime approval mechanismus byl odstraněn. Autentizace, autorizace API, oprávnění uložených integrací, audit a izolace hostitelského worker prostředí zůstávají zachovány.
+
+Aktuální mapování konfigurace je v `docs/project-config.md`, runtime tok v `docs/architecture.md` a implementační evidence v `docs/readme-parity.md`.
+
 ## 1. Účel projektu
 
 Cílem projektu ForgeMind je vytvořit vlastní platformu pro řízení autonomních AI vývojových agentů. Platforma má umožnit zadávat komplexní programátorské úkoly z mobilního telefonu, spouštět nad nimi AI vývojáře, integrovat výsledek s GitHubem a bezpečně řídit celý životní cyklus od zadání přes implementaci, testování, review až po draft pull request.
@@ -15,7 +28,7 @@ Platforma se skládá ze tří hlavních produktových částí:
 
 ```text
 ForgeMind Studio   – webové administrační a vývojové rozhraní
-ForgeMind Mobile   – mobilní PWA pro zadávání úkolů a schvalování
+ForgeMind Mobile   – mobilní PWA pro zadávání úkolů a sledování běhů
 ForgeMind Agent    – Linux worker, který vykonává úkoly nad repozitáři
 ```
 
@@ -32,19 +45,12 @@ ForgeMind následně:
 1. Vytvoří GitHub issue.
 2. Načte konfiguraci projektu.
 3. Založí pracovní branch.
-4. Připraví plán implementace.
-5. Spustí vybraného AI providera.
-6. Nechá provést změny v repozitáři.
-7. Spustí build, testy, lint a další validační příkazy.
-8. Pokud testy selžou, předá chybu zpět agentovi a nechá ji opravit.
-9. Hlí­dá počet iterací, rozpočet, čas a změněné soubory.
-10. Provede AI review změn.
-11. Bezpečná vylepšení může provést automaticky.
-12. Rizikové změny předloží ke schválení do telefonu.
-13. Pushne branch na GitHub.
-14. Otevře draft pull request.
-15. Do PR vloží shrnutí, test report, rizika a spotřebu.
-16. Po schválení umožní merge nebo další iteraci.
+4. Spustí vybraného AI providera nad aktuálním repozitářem a zadáním.
+5. Nechá provést změny a od stejné implementační AI získá validační příkazy.
+6. Příkazy spustí a při chybě vrátí kompletní výstup implementační AI.
+7. Po úspěšné validaci provede read-only AI review proti zadání.
+8. Blocker vrátí implementaci; bez blockeru pokračuje do GitHub delivery.
+9. Pushne branch, otevře pull request a zapíše shrnutí, validační důkazy a spotřebu.
 
 ## 3. Základní principy
 
@@ -56,10 +62,10 @@ Základní principy:
 GitHub je zdroj pravdy.
 AI provider je vyměnitelný.
 Každý úkol má měřitelné akceptační kritérium.
-Každý běh má limity.
+Každý běh je auditovatelný a obnovitelný z checkpointu.
 Každý výsledek končí v branchi nebo draft PR.
-Každá riziková změna vyžaduje schválení.
-Agent nesmí mít nekontrolovaný přístup k systému.
+AI má volnost zvolit implementaci i validační příkazy potřebné ke splnění cíle.
+Provozní oprávnění vymezuje účet, kontejner a uložené integrace workeru.
 ```
 
 Codex podporuje projektové instrukce přes `AGENTS.md`, které čte před zahájením práce, takže ForgeMind má pro každý repozitář generovat nebo udržovat tento soubor jako součást projektových instrukcí.
@@ -80,7 +86,6 @@ ForgeMind musí umožnit:
 * spouštění validačních příkazů,
 * sledování limitů,
 * zobrazení průběhu na mobilu,
-* vyžádání schválení při rizikové změně,
 * vytvoření draft pull requestu,
 * zápis výsledků do PR,
 * historii běhů,
@@ -107,10 +112,8 @@ V první verzi není cílem:
 
 * automatický deploy do produkce,
 * automatický merge do `main`,
-* plně autonomní rozhodování bez schvalování,
 * vlastní trénování modelu,
 * nahrazení GitHubu,
-* podpora Windows/Delphi workeru,
 * vlastní IDE,
 * komplexní multi-user enterprise správa práv.
 
@@ -129,6 +132,7 @@ Databáze: PostgreSQL
 Fronta: Redis + BullMQ nebo PostgreSQL queue
 Repozitáře: GitHub
 Worker: Linux proces / systemd služba
+Volitelný validační worker: ručně aktivovaná Windows stanice
 AI provider: Codex SDK/CLI jako první provider
 ```
 
@@ -183,7 +187,7 @@ Mobilní PWA pro:
 * výběr projektu,
 * sledování běžících úkolů,
 * potvrzování rizikových změn,
-* schvalování navýšení limitu,
+* sledování metrik a historie pokusů,
 * otevření PR v GitHubu,
 * čtení logů a výsledků testů.
 
@@ -296,58 +300,10 @@ ai:
   # reviewer_connection_id: "provider-connection-id"
   model_profile: "balanced"
 
-limits:
-  max_iterations: 15
-  max_runtime_minutes: 600
-  max_changed_files: 25
-  max_diff_lines: 2000
-  max_repeated_error_count: 3
-
-commands:
-  install: "npm ci"
-  lint: "npm run lint"
-  build: "npm run build"
-  test_unit: "npm test"
-  test_e2e: "npm run test:e2e"
-  verify: "npm run lint && npm test && npm run build"
-
-approval:
-  required_for:
-    - new_dependency
-    - database_migration
-    - nginx_config_change
-    - systemd_change
-    - github_workflow_change
-    - delete_files
-    - deploy
-    - merge_pr
-    - budget_increase
-    - write_outside_repo
-
-  auto_allowed:
-    - docs_update
-    - test_update
-    - lint_fix
-    - refactor_without_behavior_change
-    - small_ui_fix
-
-sandbox:
-  allow_network: false
-  allow_sudo: false
-  writable_paths:
-    - "/workspace"
-    - "/tmp/forgemind"
-  forbidden_paths:
-    - "/etc"
-    - "/root"
-    - "/home/*/.ssh"
-    - "/var/run/docker.sock"
-
 github:
   issue_label: "ai-task"
   branch_prefix: "ai/"
   pr_draft: true
-  require_ci_green: true
 ```
 
 ### 8.2 `AGENTS.md`
@@ -363,13 +319,10 @@ Tento repozitář obsahuje statickou webovou galerii pro STARPANT.
 
 ## Pravidla pro AI agenta
 
-- Neměň konfigurační soubory nginx bez schválení.
-- Nepřidávej nové npm dependency bez schválení.
-- Nepoužívej sudo.
-- Neměň soubory mimo repozitář.
-- Po každé změně spusť validační příkazy z agent.config.yaml.
+- Respektuj zadání, projektové invarianty a existující architekturu.
+- Po implementaci navrhni minimální sadu spustitelných validačních příkazů.
 - Pokud testy selžou, oprav chybu a spusť je znovu.
-- Pokud se stejná chyba opakuje 3×, zastav práci a požádej o zásah.
+- Neměň nesouvisející části projektu.
 
 ## Done when
 
@@ -386,50 +339,7 @@ Tento repozitář obsahuje statickou webovou galerii pro STARPANT.
 
 ## 9. Režimy autonomie
 
-ForgeMind musí podporovat tři režimy.
-
-### 9.1 Safe mode
-
-Výchozí režim.
-
-Agent smí:
-
-* číst repozitář,
-* vytvořit branch,
-* měnit soubory ve workspace,
-* spouštět povolené příkazy,
-* vytvořit draft PR.
-
-Agent nesmí bez schválení:
-
-* přidat dependency,
-* měnit CI/CD,
-* měnit databázové migrace,
-* měnit systemd/nginx,
-* mazat větší množství souborů,
-* nasadit změnu,
-* mergovat PR.
-
-### 9.2 Auto mode
-
-Agent navíc smí:
-
-* provést bezpečná AI navržená vylepšení,
-* aktualizovat PR,
-* pushovat průběžné commity,
-* reagovat na komentáře v PR.
-
-Stále nesmí:
-
-* merge,
-* deploy do produkce,
-* měnit secrets,
-* zvyšovat oprávnění,
-* měnit infrastrukturu bez schválení.
-
-### 9.3 Full-auto mode
-
-Určeno až pro budoucí použití. V MVP pouze připravit datový model a konfiguraci, ale nepovolovat automatický produkční deploy.
+Hodnoty `safe`, `auto` a `full_auto` zůstávají kompatibilním projektovým nastavením pro produktové chování a GitHub delivery. Neaktivují příkazový allowlist ani approval gate. Implementace, AI validace a read-only review mají ve všech režimech stejný jednoduchý feedback loop.
 
 ## 10. Životní cyklus úkolu
 
@@ -440,10 +350,6 @@ draft
   ↓
 submitted
   ↓
-planning
-  ↓
-waiting_for_plan_approval?  [volitelné]
-  ↓
 creating_github_issue
   ↓
 creating_branch
@@ -453,10 +359,6 @@ running_ai
 validating
   ↓
 reviewing
-  ↓
-improving
-  ↓
-needs_approval?             [volitelné]
   ↓
 creating_pr
   ↓
@@ -470,10 +372,6 @@ Chybové stavy:
 ```text
 failed
 cancelled
-budget_exceeded
-iteration_limit_reached
-repeated_error_detected
-approval_rejected
 provider_failed
 validation_failed
 ```
@@ -483,89 +381,24 @@ validation_failed
 ```text
 1. Načti task.
 2. Načti project config.
-3. Vytvoř plán.
-4. Vytvoř branch.
-5. Spusť AI implementaci.
-6. Získej diff.
-7. Spusť validace.
-8. Pokud validace selže, pošli AI celý příkaz, exit code, stdout a stderr.
-9. AI rozhodne, zda nahradit pouze chybnou kontrolu, opravit implementaci, nebo označit skutečný blocker; úspěšné kontroly se neopakují.
-10. Pokud validace projde, spusť AI review, které posoudí změny i význam validačního důkazu proti zadání.
-11. Pokud review najde blocker, vrať do implementace.
-12. Pokud review navrhne bezpečné vylepšení, proveď ho.
-13. Pokud review navrhne rizikovou změnu, vyžádej schválení.
-14. Pushni branch.
-15. Otevři draft PR.
-16. Zapiš shrnutí a výsledek.
+3. Připrav repozitář, issue a branch podle projektového nastavení.
+4. Spusť AI implementaci nad zadáním a aktuálním repozitářem.
+5. Získej diff, shrnutí a sadu validačních příkazů od implementační AI.
+6. Spusť všechny navržené příkazy bez obsahového omezení.
+7. Pokud validace selže, pošli implementační AI celý příkaz, exit code, stdout a stderr.
+8. AI opraví implementaci nebo validační sadu; platné checkpointy nad nezměněným workspace se neopakují.
+9. Pokud validace projde, spusť read-only AI review pouze proti zadání a akceptačním kritériím.
+10. Pokud review najde blocker, vrať jeho celé znění implementační AI.
+11. Bez blockeru pushni branch, otevři pull request a zapiš shrnutí a výsledek.
 ```
 
-## 11. Limity a ochrana proti zacyklení
+## 11. Metriky a obnova
 
-Každý task musí mít limity:
+Metriky tokenů, ceny, času a velikosti změn slouží pouze k reportingu a nikdy nezastavují task. O obnově po chybě rozhodují checkpointy fáze: worker pokračuje od selhané operace a neopakuje již dokončenou přípravu, GitHub delivery ani platné validační příkazy. Codex subprocess má desetihodinový technický timeout proti opuštěnému procesu; nejde o task budget ani o rozhodovací limit orchestrace.
 
-```text
-max_iterations
-max_runtime_minutes
-max_changed_files
-max_diff_lines
-max_repeated_error_count
-max_auto_improvements
-```
+## 12. Autorizace bez runtime approval
 
-Agent musí zastavit, pokud:
-
-* překročí počet iterací,
-* překročí časový limit,
-* spotřebuje rozpočet,
-* stejná chyba se objeví 3×,
-* diff roste bez zjevného pokroku,
-* mění zakázané soubory,
-* potřebuje nepovolený shell příkaz,
-* chce přidat dependency bez schválení,
-* chce zapisovat mimo workspace.
-
-Diff a changed-files limity jsou review guardrails: při překročení se task přepne do schválení, ne do tvrdého selhání. Tvrdým stop signálem zůstává zacyklení, budget, runtime a opakované chyby.
-
-Při dosažení soft limitu například 75 % rozpočtu musí ForgeMind poslat notifikaci:
-
-```text
-Úkol dosáhl 75 % rozpočtu. Agent navrhuje pokračovat ještě 3 iterace.
-[Schválit] [Zastavit] [Upravit zadání]
-```
-
-## 12. Schvalování z telefonu
-
-Schvalování musí být dostupné ve ForgeMind Mobile.
-
-Typy schválení:
-
-```text
-approval_type:
-  - budget_increase
-  - continue_after_iteration_limit
-  - new_dependency
-  - risky_refactor
-  - database_migration
-  - config_change
-  - deploy_staging
-  - deploy_production
-  - merge_pr
-  - delete_files
-```
-
-Každá žádost o schválení musí obsahovat:
-
-```text
-- název úkolu,
-- projekt,
-- branch,
-- důvod schválení,
-- riziko,
-- dotčené soubory,
-- odhad další spotřeby,
-- doporučení AI,
-- tlačítka Schválit / Zamítnout / Upravit instrukci.
-```
+Všechny API operace vyžadují platnou Google session a odpovídající roli. Browser mutace chrání origin a CSRF. Worker používá pouze oprávnění provozního účtu a konkrétních uložených integrací. Samostatná žádost o schválení uprostřed tasku se nevytváří.
 
 ## 13. Mobilní aplikace ForgeMind Mobile
 
@@ -610,27 +443,12 @@ Výsledek testů
 Diff summary
 Odkaz na issue
 Odkaz na PR
-Čekající schválení
+Chyba aktuální fáze a historie pokusů
 ```
 
-### 13.4 Schválení
+### 13.4 Historie pokusů
 
-Zobrazit jednoduchou kartu:
-
-```text
-Agent žádá o schválení
-
-Důvod:
-Přidání nové dependency "sharp".
-
-Riziko:
-Nová produkční dependency, možný dopad na build a deployment.
-
-Doporučení:
-Schválit pouze pokud je nutné generovat náhledy serverově.
-
-[Schválit] [Zamítnout] [Napsat instrukci]
-```
+Detail ukazuje aktivní fázi, průběžnou aktivitu, výsledek každého pokusu a plnou chybu posledního selhání. Nový pokus nesmí zaměňovat starou chybu za chybu aktuálního pokusu.
 
 Push notifikace v PWA musí využívat service worker; Push API vyžaduje aktivní service worker a subscription přes PushManager.
 
@@ -782,9 +600,9 @@ Požadavky:
 * předávat relevantní kontext,
 * respektovat `AGENTS.md`,
 * běžet bez `sudo`,
-* běžet v sandboxovaném workspace.
+* běžet v provozně izolovaném worker prostředí.
 
-Sandbox je důležitý, protože Codex dokumentace jej popisuje jako hranici, která umožňuje autonomní práci bez neomezeného přístupu k počítači; sandbox určuje například zapisovatelné soubory a síťový přístup, zatímco approval policy určuje, kdy se má agent zastavit a zeptat.
+ForgeMind nefiltruje AI příkazy podle jejich obsahu. Bezpečnostní hranici proto musí poskytovat účet a kontejner workeru, oprávnění uložených integrací a oddělený workspace. Tato provozní izolace není součástí validační orchestrace.
 
 ### 15.2 GitHubCopilotProvider
 
@@ -807,7 +625,7 @@ Mock provider musí umět:
 * vytvořit umělý diff,
 * simulovat chybu buildu,
 * simulovat překročení rozpočtu,
-* simulovat potřebu schválení.
+* simulovat chybu validace a review blocker.
 
 ## 16. Datový model
 
@@ -853,8 +671,6 @@ github_issue_url
 branch_name
 pull_request_number
 pull_request_url
-max_iterations
-max_budget_usd
 created_at
 updated_at
 started_at
@@ -893,7 +709,9 @@ validation_result_json
 created_at
 ```
 
-### 16.6 Tabulka `approvals`
+### 16.6 Historické tabulky `approvals`
+
+Tabulky zůstávají pouze kvůli čitelnosti auditu starých běhů. Aktivní runtime nové approval záznamy nevytváří ani neřeší.
 
 ```sql
 id
@@ -975,15 +793,9 @@ GET    /api/tasks/:id/diff
 GET    /api/tasks/:id/usage
 ```
 
-### 17.4 Approvals
+### 17.4 Runtime approvals
 
-```http
-GET    /api/approvals
-GET    /api/approvals/:id
-POST   /api/approvals/:id/approve
-POST   /api/approvals/:id/reject
-POST   /api/approvals/:id/comment
-```
+Aktivní approval API bylo odstraněno. Autorizovaný uživatel provádí podporované mutace přímo; každá operace se nadále zapisuje do auditu.
 
 ### 17.5 GitHub webhook
 
@@ -1075,20 +887,7 @@ GITHUB_TOKEN=***
 
 ### 18.5 Síť
 
-Výchozí režim:
-
-```text
-network_default: deny
-```
-
-Povolit jen nutné domény podle projektu, například:
-
-```text
-github.com
-api.github.com
-registry.npmjs.org
-api.openai.com
-```
+Validační workflow síťové příkazy neblokuje. Případná síťová izolace se nastavuje na úrovni hostitele nebo kontejneru workeru a nesmí měnit význam AI navržené validace.
 
 ## 19. Monitoring a logování
 
@@ -1106,8 +905,6 @@ provider_finished
 validation_started
 validation_failed
 validation_passed
-approval_requested
-approval_resolved
 pr_created
 task_completed
 task_failed
@@ -1124,7 +921,6 @@ forgemind_tasks_failed_total
 forgemind_task_duration_seconds
 forgemind_provider_cost_usd_total
 forgemind_provider_tokens_total
-forgemind_approvals_pending
 forgemind_iterations_total
 forgemind_validation_failures_total
 ```
@@ -1152,7 +948,7 @@ Testovat:
 * validaci limitů,
 * stavový automat,
 * budget tracker,
-* approval rules,
+* phase-aware checkpoint a retry pravidla,
 * provider adapter interface,
 * GitHub payload parser.
 
@@ -1166,7 +962,7 @@ Testovat:
 * zpracování webhooku,
 * simulace provider běhu,
 * simulace selhání buildu,
-* žádost o approval.
+* navrácení plné validační chyby implementační AI.
 
 ### 20.3 E2E testy
 
@@ -1184,11 +980,11 @@ Scénáře:
 Druhý scénář:
 
 ```text
-1. Provider navrhne přidat dependency.
-2. Systém zastaví běh.
-3. V mobilu se zobrazí approval.
-4. Uživatel schválí.
-5. Agent pokračuje.
+1. Validace selže.
+2. Worker předá AI celý příkaz, exit code, stdout a stderr.
+3. AI opraví implementaci nebo validační sadu.
+4. Worker neopakuje dříve platné checkpointy nad nezměněným workspace.
+5. Validace projde a workflow pokračuje do review.
 ```
 
 Třetí scénář:
@@ -1196,8 +992,8 @@ Třetí scénář:
 ```text
 1. Build selže.
 2. Agent opraví chybu.
-3. Build selže stejnou chybou 3×.
-4. Systém zastaví task jako repeated_error_detected.
+3. AI dostane úplný výstup chyby a zvolí jinou opravu implementace nebo validace.
+4. Již úspěšné checkpointy nad nezměněným workspace se znovu nespouštějí.
 ```
 
 ## 21. MVP rozsah
@@ -1213,7 +1009,7 @@ GitHub App integraci
 CodexProvider nebo MockProvider + připravené rozhraní pro Codex
 projektovou konfiguraci
 task lifecycle
-approval workflow
+phase-aware retry a audit
 draft PR workflow
 základní logy a audit
 základní budget/iteration limity
@@ -1240,7 +1036,7 @@ MVP je hotové, když:
 * systém hlídá max iterace,
 * systém vytvoří draft PR,
 * mobilní UI zobrazí stav,
-* approval z mobilu funguje,
+* validace a review vrací úplnou zpětnou vazbu implementaci,
 * konfigurace projektu se načítá z YAML,
 * systém odmítne zakázanou akci.
 
@@ -1254,7 +1050,7 @@ MVP je hotové, když:
 * základní PWA,
 * CodexProvider nebo MockProvider,
 * draft PR,
-* ruční schválení merge mimo ForgeMind.
+* ruční merge mimo ForgeMind,
 
 ### Fáze 2 – v1
 
@@ -1391,7 +1187,6 @@ projects
 tasks
 task_runs
 task_iterations
-approvals
 provider_usage
 audit_log
 ```
@@ -1405,8 +1200,8 @@ POST /api/tasks
 GET /api/tasks
 GET /api/tasks/:id
 POST /api/tasks/:id/start
-POST /api/approvals/:id/approve
-POST /api/approvals/:id/reject
+POST /api/tasks/:id/retry
+POST /api/tasks/:id/cancel
 ```
 
 ### Krok 4: Worker
@@ -1418,10 +1213,11 @@ Implementovat jednoduchý worker:
 2. vytvoří workspace,
 3. naklonuje repo,
 4. založí branch,
-5. zavolá MockProvider,
-6. spustí verify command,
-7. pushne branch,
-8. vytvoří draft PR.
+5. zavolá implementační AI provider,
+6. spustí validační příkazy vrácené implementační AI,
+7. předá případnou plnou chybu zpět implementaci,
+8. provede read-only review proti zadání,
+9. pushne branch a vytvoří pull request.
 ```
 
 ### Krok 5: GitHub adapter
@@ -1445,7 +1241,7 @@ Implementovat obrazovky:
 Tasks list
 New task
 Task detail
-Approval detail
+AI Chat
 Settings
 ```
 
@@ -1503,12 +1299,11 @@ Projekt ForgeMind MVP je hotový, pokud lze provést tento scénář:
 6. ForgeMind Agent spustí AI providera.
 7. Agent provede změny.
 8. Agent spustí testy/build.
-9. Pokud narazí na rizikovou změnu, požádá o potvrzení.
-10. Uživatel potvrdí z telefonu.
-11. Agent pokračuje.
-12. Agent vytvoří draft PR.
-13. V PR je shrnutí, test report, diff summary a spotřeba.
-14. Uživatel může otevřít PR v GitHubu.
+9. Při chybě validace předá kompletní výstup AI a nechá ji problém opravit.
+10. Read-only review potvrdí soulad se zadáním, nebo vrátí blocker implementaci.
+11. Agent vytvoří pull request.
+12. V PR je shrnutí, test report, diff summary a spotřeba.
+13. Uživatel může otevřít PR v GitHubu.
 ```
 
 ## 28. Kritické požadavky
@@ -1521,22 +1316,22 @@ Tyto požadavky nesmí být vynechány:
 - Všechny změny přes Git branch.
 - Každý task má limity.
 - Každý běh má audit.
-- Každé schválení je dohledatelné.
+- Každý retry naváže od první nedokončené operace.
 - AI provider je vyměnitelný.
 - Projektová pravidla jsou konfigurovatelná.
 - GitHub je hlavní zdroj pravdy.
-- Mobilní schvalování je součást MVP.
+- Validační příkazy navrhuje pouze implementační AI.
 ```
 
 ## 29. Shrnutí
 
-ForgeMind má být vlastní řídicí platforma pro AI vývojáře. Nemá být jen chat s AI, ale systém, který umí přijmout komplexní úkol, rozpadnout ho, nechat AI pracovat v bezpečných hranicích, opakovaně validovat výsledek, hlídat náklady, žádat o schválení a předat hotovou práci přes GitHub pull request.
+ForgeMind má být vlastní řídicí platforma pro AI vývojáře. Nemá být jen chat s AI, ale systém, který přijme komplexní úkol, nechá AI implementovat řešení, spustí AI navrženou validaci, vrátí úplnou chybu k opravě, provede nezávislé read-only review a předá hotovou práci přes GitHub pull request.
 
 Základní produktová struktura:
 
 ```text
 ForgeMind Studio – řízení a administrace
-ForgeMind Mobile – telefonní ovládání a schvalování
+ForgeMind Mobile – telefonní ovládání a sledování
 ForgeMind Agent  – Linux worker pro autonomní práci
 ```
 
@@ -1558,9 +1353,9 @@ Statusy v dokumentaci jsou:
 
 Aktualni stav tohoto repozitare:
 
-- README MVP runtime parity je `implemented` a reprezentativni pipeline coverage je `tested`; evidence je v `docs/readme-parity.md`, `apps/worker/src/mvp-scenario.test.ts` a `apps/studio-api/src/routes.test.ts`.
+- README runtime parity je `implemented` a reprezentativni pipeline coverage je `tested`; evidence je v `docs/readme-parity.md`, workflow testech a `apps/studio-api/src/routes.test.ts`.
 - Produkcni overeni realneho GitHubu, realneho providera a nasazene PWA je `deferred`.
-- Automaticky merge do `main` a automaticky produkcni deploy projektu spravovanych ForgeMindem zustavaji `deferred` a mimo MVP scope.
+- Automaticky produkcni deploy projektu spravovanych ForgeMindem zustava `deferred` a mimo aktualni scope.
 
 ### Windows validation worker (vNext)
 
@@ -1585,4 +1380,4 @@ Kompletni priprava serveru, secrets a deployment workflow jsou popsane v `docs/d
 
 Migrace existujici produkce na ARM64 Raspberry Pi pres Tailscale je popsana v `docs/deploy-raspberry.md`. Raspberry workflow nasazuje automaticky po pushi do `main` a lze jej spustit i rucne; OCI workflow zustava rucni jako rollback cesta. Raspberry pouziva samostatne ARM64 image tagy, aby neovlivnil OCI nasazeni.
 
-Toto nasazeni platformy nemeni approval pravidla pro produkcni deploy projektu spravovanych ForgeMindem.
+Nasazeni platformy je oddelene od GitHub delivery a produkcniho deploye projektu spravovanych ForgeMindem.

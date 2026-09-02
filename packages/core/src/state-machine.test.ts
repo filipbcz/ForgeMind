@@ -1,13 +1,9 @@
 import { describe, expect, it } from 'vitest';
-import { canTransitionTask, isNonBlockingDeferredValidation, TERMINAL_TASK_STATUSES } from './state-machine.js';
+import { canTransitionTask, TERMINAL_TASK_STATUSES } from './state-machine.js';
 
 describe('task state machine', () => {
   it('allows the happy path from draft to submitted', () => {
     expect(canTransitionTask('draft', 'submitted')).toBe(true);
-  });
-
-  it('allows approval pauses from validating when guardrails trigger after validation starts', () => {
-    expect(canTransitionTask('validating', 'needs_approval')).toBe(true);
   });
 
   it('allows a failed pull request check to return to AI correction', () => {
@@ -33,16 +29,4 @@ describe('task state machine', () => {
     expect(canTransitionTask('cancelled', 'running_ai')).toBe(false);
   });
 
-  it('allows validation to pause until a capable worker becomes available', () => {
-    expect(canTransitionTask('validating', 'waiting_for_capability')).toBe(true);
-    expect(TERMINAL_TASK_STATUSES.has('waiting_for_capability')).toBe(true);
-    expect(canTransitionTask('waiting_for_capability', 'submitted')).toBe(true);
-  });
-
-  it('treats deferred Windows validation as non-blocking roadmap evidence', () => {
-    expect(isNonBlockingDeferredValidation(['windows'])).toBe(true);
-    expect(isNonBlockingDeferredValidation(['Windows', 'unreal-engine'])).toBe(true);
-    expect(isNonBlockingDeferredValidation(['linux'])).toBe(false);
-    expect(isNonBlockingDeferredValidation([])).toBe(false);
-  });
 });

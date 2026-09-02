@@ -69,6 +69,14 @@ export class GitHubCopilotProvider implements AIProvider {
     return false;
   }
 
+  supportsNativeRepositoryReview(): boolean {
+    return false;
+  }
+
+  supportsNativeRepositoryAudit(): boolean {
+    return false;
+  }
+
   async listModels(): Promise<ProviderModelOption[]> {
     throw new Error(GITHUB_COPILOT_FROZEN_MESSAGE);
   }

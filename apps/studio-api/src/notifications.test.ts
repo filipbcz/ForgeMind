@@ -12,9 +12,7 @@ describe('notification service', () => {
         const current = state.get(userId) ?? {
           settings: {
             pushEnabled: false,
-            approvalRequests: true,
-            taskUpdates: true,
-            budgetAlerts: true
+            taskUpdates: true
           },
           subscriptions: []
         };
@@ -35,9 +33,7 @@ describe('notification service', () => {
         const current = state.get(userId) ?? {
           settings: {
             pushEnabled: false,
-            approvalRequests: true,
-            taskUpdates: true,
-            budgetAlerts: true
+            taskUpdates: true
           },
           subscriptions: []
         };
@@ -57,9 +53,7 @@ describe('notification service', () => {
         const current = state.get(userId) ?? {
           settings: {
             pushEnabled: false,
-            approvalRequests: true,
-            taskUpdates: true,
-            budgetAlerts: true
+            taskUpdates: true
           },
           subscriptions: []
         };
@@ -87,9 +81,7 @@ describe('notification service', () => {
         const current = state.get(userId) ?? {
           settings: {
             pushEnabled: false,
-            approvalRequests: true,
-            taskUpdates: true,
-            budgetAlerts: true
+            taskUpdates: true
           },
           subscriptions: []
         };
@@ -121,9 +113,9 @@ describe('notification service', () => {
     expect(settingsAfterSubscribe.settings.pushEnabled).toBe(true);
     expect(settingsAfterSubscribe.subscriptions).toHaveLength(1);
 
-    await service.updateSettings('user_1', { approvalRequests: false });
+    await service.updateSettings('user_1', { taskUpdates: false });
     const settingsAfterUpdate = await service.getSettings('user_1');
-    expect(settingsAfterUpdate.settings.approvalRequests).toBe(false);
+    expect(settingsAfterUpdate.settings.taskUpdates).toBe(false);
 
     await service.unsubscribe('user_1', 'https://push.example.com/one');
     const settingsAfterUnsubscribe = await service.getSettings('user_1');
@@ -134,7 +126,7 @@ describe('notification service', () => {
   });
 
   it('sends push payloads for task events only while subscription is active', async () => {
-    const settingsByUser = new Map<string, { pushEnabled: boolean; approvalRequests: boolean; taskUpdates: boolean; budgetAlerts: boolean }>();
+    const settingsByUser = new Map<string, NotificationSettings>();
     const subscriptionsByUser = new Map<string, Array<{ endpoint: string; keys?: { p256dh?: string; auth?: string } }>>();
     const sentPayloads: Array<{ endpoint: string; title: string; body: string }> = [];
 
@@ -142,9 +134,7 @@ describe('notification service', () => {
       async getNotificationSettings(userId) {
         const settings = settingsByUser.get(userId) ?? {
           pushEnabled: false,
-          approvalRequests: true,
-          taskUpdates: true,
-          budgetAlerts: true
+          taskUpdates: true
         };
         const subscriptions = subscriptionsByUser.get(userId) ?? [];
 
@@ -174,9 +164,7 @@ describe('notification service', () => {
         );
         settingsByUser.set(userId, {
           pushEnabled: true,
-          approvalRequests: true,
-          taskUpdates: true,
-          budgetAlerts: true
+          taskUpdates: true
         });
 
         return {
@@ -195,9 +183,7 @@ describe('notification service', () => {
 
         const currentSettings = settingsByUser.get(userId) ?? {
           pushEnabled: false,
-          approvalRequests: true,
-          taskUpdates: true,
-          budgetAlerts: true
+          taskUpdates: true
         };
         settingsByUser.set(userId, { ...currentSettings, pushEnabled: next.length > 0 });
 
@@ -227,11 +213,11 @@ describe('notification service', () => {
       userId: 'user_1',
       taskId: 'task_123',
       taskTitle: 'Implement notifications',
-      status: 'needs_approval'
+      status: 'completed'
     });
 
     expect(firstSend.sent).toBe(1);
-    expect(sentPayloads[0]?.title).toBe('Approval required');
+    expect(sentPayloads[0]?.title).toBe('Task completed');
 
     await service.unsubscribe('user_1', 'https://push.example.com/subscription/2');
 

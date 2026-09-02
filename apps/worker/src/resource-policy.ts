@@ -1,16 +1,10 @@
-import { spawnSync } from 'node:child_process';
 import { rm, stat, statfs, readdir } from 'node:fs/promises';
 import { dirname, join, resolve } from 'node:path';
 import { parseAgentConfigYaml } from '@forgemind/config';
 
 const MB = 1024 * 1024;
-let cachedNetworkIsolationSupported: boolean | undefined;
 
 export interface WorkerResourcePolicy {
-  allowNetwork: boolean;
-  cpuLimitSeconds?: number;
-  memoryLimitMb?: number;
-  diskLimitMb?: number;
   minFreeSpaceMb: number;
   retentionDays: number;
 }
@@ -37,10 +31,6 @@ export function resolveWorkerResourcePolicy(configYaml?: string): WorkerResource
   try {
     const config = parseAgentConfigYaml(configYaml);
     return {
-      allowNetwork: config.sandbox.allow_network,
-      cpuLimitSeconds: config.resources.cpu_limit_seconds,
-      memoryLimitMb: config.resources.memory_limit_mb,
-      diskLimitMb: config.resources.disk_limit_mb,
       minFreeSpaceMb: config.resources.min_free_space_mb,
       retentionDays: config.resources.retention_days
     };
@@ -88,57 +78,6 @@ async function nearestExistingPath(path: string): Promise<string> {
   }
 }
 
-export function prepareResourcePolicyCommand(command: string, policy?: WorkerResourcePolicy): string {
-  if (!policy) return command;
-
-  const hasResourceLimit = Boolean(policy.cpuLimitSeconds || policy.memoryLimitMb || policy.diskLimitMb);
-  if (process.platform === 'win32') {
-    if (hasResourceLimit) {
-      throw new WorkerResourcePolicyError(
-        'Configured worker CPU, memory, or disk limits are unsupported on this worker runtime.',
-        { policy: 'resource_policy', reason: 'resource_limits_unsupported', command }
-      );
-    }
-    if (!policy.allowNetwork) {
-      throw new WorkerResourcePolicyError(
-        'Configured worker network isolation is unsupported on this worker runtime.',
-        { policy: 'network_policy', reason: 'network_isolation_unsupported', command }
-      );
-    }
-    return command;
-  }
-
-  if (policy.diskLimitMb) {
-    throw new WorkerResourcePolicyError(
-      'Configured worker disk quota is unsupported on this worker runtime.',
-      { policy: 'resource_policy', reason: 'disk_limit_unsupported', command }
-    );
-  }
-
-  const prefixes: string[] = [];
-  if (policy.cpuLimitSeconds) prefixes.push(`ulimit -t ${policy.cpuLimitSeconds}`);
-  if (policy.memoryLimitMb) prefixes.push(`ulimit -v ${policy.memoryLimitMb * 1024}`);
-  const limitedCommand = prefixes.length > 0 ? `${prefixes.join('; ')}; ${command}` : command;
-  if (policy.allowNetwork) return limitedCommand;
-  if (isNetworkIsolationSupported()) return `unshare -n /bin/sh -lc ${shellQuote(limitedCommand)}`;
-  throw new WorkerResourcePolicyError(
-    `Configured worker network isolation is unsupported on this worker runtime, so validation command execution is denied: ${command}`,
-    { policy: 'network_policy', reason: 'network_isolation_unsupported', command }
-  );
-}
-
-export function isNetworkIsolationSupported(): boolean {
-  if (process.platform === 'win32') return false;
-  if (cachedNetworkIsolationSupported === undefined) {
-    const result = spawnSync('unshare', ['-n', 'true'], {
-      stdio: 'ignore',
-      timeout: 5_000
-    });
-    cachedNetworkIsolationSupported = result.status === 0;
-  }
-  return cachedNetworkIsolationSupported;
-}
-
 export async function cleanupExpiredWorkerArtifacts(input: {
   workspaceRoot: string;
   activeTaskIds: ReadonlySet<string>;
@@ -182,13 +121,8 @@ export async function cleanupExpiredWorkerArtifacts(input: {
   return { removed, kept };
 }
 
-function shellQuote(value: string): string {
-  return `'${value.replace(/'/g, `'\\''`)}'`;
-}
-
 function defaultWorkerResourcePolicy(): WorkerResourcePolicy {
   return {
-    allowNetwork: false,
     minFreeSpaceMb: 0,
     retentionDays: 14
   };

@@ -1,7 +1,7 @@
 import { createHash, randomBytes } from 'node:crypto';
 import { mkdir, readFile, writeFile } from 'node:fs/promises';
 import { join, relative, resolve } from 'node:path';
-import { requiresApproval, redactSecrets, type ApprovalType, type ChatMessage, type ProviderKind } from '@forgemind/core';
+import { redactSecrets, type ChatMessage, type ProviderKind } from '@forgemind/core';
 import type { AIProviderConnectionSecret, ClaimedChatRun, ForgeMindRepository } from '@forgemind/db';
 import { createProvider, normalizeProviderError, type ChatResult, type ForgeMindApiAction, type ProviderSessionContext, type ProviderUsageMeasurement } from '@forgemind/providers';
 import { simpleGit, type SimpleGit } from 'simple-git';
@@ -10,11 +10,6 @@ import { runValidationChecks } from './validation.js';
 import { assertFreeSpaceForWorker, resolveWorkerResourcePolicy } from './resource-policy.js';
 import { resolveWorkerWorkspaceRoot } from './db-worker/lifecycle.js';
 
-const APPROVAL_TYPES: ReadonlySet<ApprovalType> = new Set([
-  'budget_increase', 'continue_after_iteration_limit', 'new_dependency', 'risky_refactor', 'database_migration',
-  'config_change', 'deploy_staging', 'deploy_production', 'merge_pr', 'delete_files', 'github_workflow_change',
-  'systemd_change', 'nginx_config_change', 'write_outside_repo'
-]);
 const MAX_CHAT_PROVIDER_TURNS = 6;
 const UNSAFE_INHERITED_GIT_ENVIRONMENT = new Set([
   'editor',
@@ -90,9 +85,6 @@ export async function runNextChatTurn(repository: ForgeMindRepository, runtime: 
         connectionId: connection?.id
       })
     };
-    const approvedOperations = claimed.approvals
-      .filter((approval) => approval.status === 'approved')
-      .map((approval) => approval.type);
     const usage = createUsageAccumulator();
     stopRuntimeWatchers = startChatRuntimeWatchers(repository, claimed.run.id, abortController);
     await provider.preflight(abortController.signal);
@@ -115,7 +107,6 @@ export async function runNextChatTurn(repository: ForgeMindRepository, runtime: 
         repositoryPath: workspace.path,
         repositoryAttached: workspace.repositoryAttached,
         mode: claimed.thread.mode,
-        approvedOperations,
         forgeMindContext: buildForgeMindActionContext(claimed),
         session: providerSession,
         signal: abortController.signal,
@@ -148,45 +139,6 @@ export async function runNextChatTurn(repository: ForgeMindRepository, runtime: 
       finalResult = result;
       for (const path of result.changedFiles) providerChangedFiles.add(path);
       for (const update of result.fileUpdates ?? []) providerChangedFiles.add(update.path);
-
-      const actionApprovalRequests = (result.forgeMindActions ?? []).flatMap((action) => {
-        const type = requiredActionApprovalType(action);
-        if (!type || !requiresApproval(type, claimed.thread.mode) || hasApprovedAction(claimed, type, action)) return [];
-        return [{ type, action }];
-      });
-      const actionApprovalTypes = new Set(actionApprovalRequests.map((request) => request.type));
-      const requestedApprovals = uniqueApprovalTypes(result.requestedApprovals)
-        .filter((type) => requiresApproval(type, claimed.thread.mode))
-        .filter((type) => !actionApprovalTypes.has(type))
-        .filter((type) => !approvedOperations.includes(type));
-      if (requestedApprovals.length > 0 || actionApprovalRequests.length > 0) {
-        for (const type of requestedApprovals) {
-          await repository.createChatApproval({
-            threadId: claimed.thread.id,
-            runId: claimed.run.id,
-            type,
-            title: `Chat requires approval: ${type}`,
-            description: result.response,
-            riskLevel: approvalRiskLevel(type),
-            payload: { response: result.response, changedFiles: result.changedFiles }
-          });
-        }
-        for (const request of actionApprovalRequests) {
-          await repository.createChatApproval({
-            threadId: claimed.thread.id,
-            runId: claimed.run.id,
-            type: request.type,
-            title: `Chat requires approval: ${request.type}`,
-            description: `${request.action.rationale}\n\n${request.action.method} ${request.action.path}`,
-            riskLevel: approvalRiskLevel(request.type),
-            payload: {
-              response: result.response,
-              apiMutation: toApiMutationBinding(claimed.thread.userId, request.action)
-            }
-          });
-        }
-        return chatResult(claimed, 'waiting_for_approval');
-      }
 
       await applyChatFileUpdates(workspace.path, result);
 
@@ -235,10 +187,7 @@ export async function runNextChatTurn(repository: ForgeMindRepository, runtime: 
         },
         new Map(),
         undefined,
-        abortController.signal,
-        undefined,
-        undefined,
-        resourcePolicy
+        abortController.signal
       );
       validationSummary = {
         passed: validation.passed,
@@ -332,7 +281,6 @@ function buildForgeMindActionContext(claimed: ClaimedChatRun): string {
     '- POST /api/projects/:id/audit/start; POST /api/projects/:id/audit/retry; POST /api/projects/:id/extension/decision.',
     '- GET /api/tasks; POST /api/tasks; GET /api/tasks/:id; POST /api/tasks/:id/start|cancel|retry|complete.',
     '- For task failure analysis, call GET /api/tasks/:id/diagnostics first. Follow up with GET /api/tasks/:id/logs, /runs, /queue, /diff, or /usage only when needed.',
-    '- GET /api/approvals; POST /api/approvals/:id/approve|reject|comment.',
     '- GET /api/worker/status and GET /api/worker/events; PUT /api/worker/queue changes whether new work may start.',
     'Task diagnostics are authoritative. Do not infer that validation details are unavailable from repository files before querying the task diagnostics endpoint.',
     'Contract creation bodyJson must encode: { "contract": { "version": 1, "summary": string, "invariants": string[], "prohibitedSubstitutes": string[], "requirements": [{ "id": "REQ-...", "title": string, "description": string, "acceptanceCriteria": string[], "briefReferences": string[] }], "releaseCriteria": string[] }, "changeSummary": string }.',
@@ -439,39 +387,6 @@ function parseApiResponse(raw: string): unknown {
   }
 }
 
-function requiredActionApprovalType(action: ForgeMindApiAction): ApprovalType | undefined {
-  const path = new URL(action.path, 'http://forgemind.internal').pathname;
-  if (path === '/api/worker/queue' || path.startsWith('/api/github/') || path.startsWith('/api/providers/')) return 'config_change';
-  if (path.endsWith('/implementation-steps/reconcile')) return 'risky_refactor';
-  if (action.method === 'DELETE' && path.startsWith('/api/projects/')) return 'delete_files';
-  return undefined;
-}
-
-function hasApprovedAction(claimed: ClaimedChatRun, type: ApprovalType, action: ForgeMindApiAction): boolean {
-  const expected = toApiMutationBinding(claimed.thread.userId, action);
-  return claimed.approvals.some((approval) => {
-    if (approval.status !== 'approved' || approval.type !== type) return false;
-    const payload = approval.payload;
-    if (!payload || typeof payload !== 'object' || Array.isArray(payload)) return false;
-    const mutation = (payload as { apiMutation?: unknown }).apiMutation;
-    if (!mutation || typeof mutation !== 'object' || Array.isArray(mutation)) return false;
-    const actual = mutation as Partial<typeof expected>;
-    return actual.method === expected.method
-      && actual.path === expected.path
-      && actual.actorId === expected.actorId
-      && actual.bodyHash === expected.bodyHash;
-  });
-}
-
-function toApiMutationBinding(actorId: string, action: ForgeMindApiAction) {
-  return {
-    method: action.method,
-    path: new URL(action.path, 'http://forgemind.internal').pathname,
-    actorId,
-    bodyHash: createHash('sha256').update(stableJson(parseActionBody(action.bodyJson) ?? null)).digest('hex')
-  };
-}
-
 function parseActionBody(bodyJson: string): unknown {
   const normalized = bodyJson.trim();
   if (!normalized) return undefined;
@@ -480,15 +395,6 @@ function parseActionBody(bodyJson: string): unknown {
   } catch {
     throw new Error('ForgeMind action bodyJson is not valid JSON.');
   }
-}
-
-function stableJson(value: unknown): string {
-  if (value === null || typeof value !== 'object') return JSON.stringify(value);
-  if (Array.isArray(value)) return `[${value.map(stableJson).join(',')}]`;
-  const entries = Object.entries(value as Record<string, unknown>)
-    .filter(([, item]) => item !== undefined)
-    .sort(([left], [right]) => left.localeCompare(right));
-  return `{${entries.map(([key, item]) => `${JSON.stringify(key)}:${stableJson(item)}`).join(',')}}`;
 }
 
 async function prepareChatWorkspace(repository: ForgeMindRepository, claimed: ClaimedChatRun, workspaceRoot?: string): Promise<{
@@ -659,16 +565,6 @@ function resolveChatProviderModel(provider: ProviderKind, connection?: AIProvide
   if (provider === 'openai') return process.env.OPENAI_MODEL ?? 'gpt-4o-mini';
   if (provider === 'codex') return process.env.CODEX_MODEL ?? 'gpt-5.5';
   return provider;
-}
-
-function uniqueApprovalTypes(values: ApprovalType[]): ApprovalType[] {
-  return Array.from(new Set(values.filter((value) => APPROVAL_TYPES.has(value))));
-}
-
-function approvalRiskLevel(type: ApprovalType): 'medium' | 'high' | 'critical' {
-  if (type === 'deploy_production' || type === 'merge_pr' || type === 'write_outside_repo') return 'critical';
-  if (type === 'delete_files' || type === 'database_migration' || type === 'github_workflow_change') return 'high';
-  return 'medium';
 }
 
 export interface ChatProviderActivityPresentation {

@@ -1,5 +1,5 @@
 import { redactError } from '@forgemind/core';
-import type { AcceptanceEvidenceSource, AcceptanceEvidenceStatus, ApprovalType, NormalizedProviderErrorDetails, NormalizedProviderErrorKind, ProjectArchitectureUpdate, ProjectContract, ProjectContractDelta, ProjectContractRequirement, ProviderKind, ProviderPreflightResult, TaskMode, ValidationCheckCategory } from '@forgemind/core';
+import type { AcceptanceEvidenceSource, AcceptanceEvidenceStatus, NormalizedProviderErrorDetails, NormalizedProviderErrorKind, ProjectArchitectureUpdate, ProjectContract, ProjectContractDelta, ProjectContractRequirement, ProviderKind, ProviderPreflightResult, TaskMode, ValidationCheckCategory } from '@forgemind/core';
 
 export type { NormalizedProviderErrorDetails, NormalizedProviderErrorKind, ProviderPreflightResult } from '@forgemind/core';
 
@@ -42,9 +42,6 @@ export interface PlanInput {
   prompt: string;
   repositoryPath?: string;
   maxRuntimeMs?: number;
-  previousValidationError?: string;
-  previousValidationChecks?: ValidationCheck[];
-  validationFailure?: ValidationFailureDetails;
   onActivity?: ProviderActivityHandler;
   session?: ProviderSessionContext;
   signal?: AbortSignal;
@@ -58,22 +55,8 @@ export interface PlanResult {
   projectContract?: ProjectContract;
   contractDelta?: ProjectContractDelta;
   architectureUpdate?: ProjectArchitectureUpdate;
-  validationChecks?: ValidationCheck[];
-  validationRecovery?: ValidationRecoveryDecision;
   providerPrompt?: string;
   providerResponse?: string;
-}
-
-export interface ValidationFailureDetails {
-  command: string;
-  exitCode: number;
-  stdout: string;
-  stderr: string;
-}
-
-export interface ValidationRecoveryDecision {
-  action: 'replace_validation_check' | 'repair_implementation' | 'blocked';
-  rationale: string;
 }
 
 export interface ImplementationStepPlan {
@@ -112,11 +95,14 @@ export interface RoadmapRepairResult {
 export interface ValidationCheck {
   kind: 'command';
   command: string;
+  shell?: 'system' | 'powershell' | 'cmd' | 'bash' | 'sh';
+  target?: 'local' | 'windows';
+  requiredCapabilities?: string[];
+  continueOnFailure?: boolean;
   category?: ValidationCheckCategory;
   timeoutMinutes?: number;
   criterion?: string;
   rationale?: string;
-  requiredCapabilities?: string[];
 }
 
 export function normalizeValidationChecks(value: unknown): ValidationCheck[] {
@@ -128,22 +114,27 @@ export function normalizeValidationChecks(value: unknown): ValidationCheck[] {
     const criterion = typeof check.criterion === 'string' ? check.criterion.trim() || undefined : undefined;
     const rationale = typeof check.rationale === 'string' ? check.rationale.trim() || undefined : undefined;
     const category = isValidationCheckCategory(check.category) ? check.category : undefined;
-    const requiredCapabilities = normalizeCapabilities(check.requiredCapabilities);
-
+    const shell = isValidationShell(check.shell) ? check.shell : 'system';
+    const continueOnFailure = check.continueOnFailure === true;
+    const target = check.target === 'windows' ? 'windows' : 'local';
+    const timeoutMinutes = typeof check.timeoutMinutes === 'number' && Number.isFinite(check.timeoutMinutes)
+      ? Math.max(1, Math.min(600, check.timeoutMinutes))
+      : undefined;
+    const requiredCapabilities = Array.isArray(check.requiredCapabilities)
+      ? Array.from(new Set(check.requiredCapabilities.filter((item): item is string => typeof item === 'string' && item.trim().length > 0).map((item) => item.trim())))
+      : [];
     if (check.kind === 'command' && typeof check.command === 'string' && check.command.trim()) {
-      return [{ kind: 'command', command: check.command.trim(), category, criterion, rationale, requiredCapabilities }];
+      return [{
+        kind: 'command', command: check.command.trim(), shell, target, continueOnFailure, category, criterion, rationale, timeoutMinutes,
+        requiredCapabilities: target === 'windows' ? Array.from(new Set(['windows', ...requiredCapabilities])) : []
+      }];
     }
     return [];
   });
 }
 
-function normalizeCapabilities(value: unknown): string[] | undefined {
-  if (!Array.isArray(value)) return undefined;
-  const normalized = Array.from(new Set(value
-    .filter((item): item is string => typeof item === 'string')
-    .map((item) => item.trim().toLowerCase())
-    .filter(Boolean)));
-  return normalized.length > 0 ? normalized : undefined;
+function isValidationShell(value: unknown): value is NonNullable<ValidationCheck['shell']> {
+  return value === 'system' || value === 'powershell' || value === 'cmd' || value === 'bash' || value === 'sh';
 }
 
 function isValidationCheckCategory(value: unknown): value is ValidationCheckCategory {
@@ -158,7 +149,6 @@ export interface ImplementInput {
   attemptNumber?: number;
   previousValidationError?: string;
   previousReviewBlockers?: string[];
-  previousSafeImprovements?: string[];
   onActivity?: ProviderActivityHandler;
   session?: ProviderSessionContext;
   signal?: AbortSignal;
@@ -176,7 +166,6 @@ export interface ChatInput {
   repositoryPath?: string;
   repositoryAttached: boolean;
   mode: TaskMode;
-  approvedOperations?: ApprovalType[];
   forgeMindContext?: string;
   onActivity?: ProviderActivityHandler;
   session?: ProviderSessionContext;
@@ -193,7 +182,6 @@ export interface ForgeMindApiAction {
 export interface ChatResult {
   response: string;
   changedFiles: string[];
-  requestedApprovals: ApprovalType[];
   validationChecks: ValidationCheck[];
   fileUpdates?: FileUpdate[];
   forgeMindActions?: ForgeMindApiAction[];
@@ -202,7 +190,7 @@ export interface ChatResult {
 }
 
 export interface ImplementResult {
-  outcome?: 'changes_made' | 'already_satisfied';
+  outcome?: 'changes_made' | 'already_satisfied' | 'blocked';
   summary: string;
   changedFiles: string[];
   evidenceFiles?: string[];
@@ -211,7 +199,6 @@ export interface ImplementResult {
     insertions: number;
     deletions: number;
   };
-  requestedApprovals: ApprovalType[];
   validationChecks?: ValidationCheck[];
   architectureUpdate?: ProjectArchitectureUpdate;
   fileUpdates?: FileUpdate[];
@@ -228,20 +215,6 @@ export interface ReviewInput {
   acceptanceCriteria: string[];
   previousReviewSummary?: string;
   previousReviewBlockers?: string[];
-  validation: {
-    command: string;
-    exitCode: number;
-    stdout: string;
-    stderr: string;
-    passed: boolean;
-    deferredChecks?: Array<{
-      command: string;
-      criterion?: string;
-      rationale?: string;
-      requiredCapabilities: string[];
-      missingCapabilities: string[];
-    }>;
-  };
   diff: string;
   reviewMode?: 'changes' | 'existing_state';
   repositoryEvidence?: string;
@@ -253,11 +226,9 @@ export interface ReviewInput {
 }
 
 export interface ReviewResult {
+  verdict: 'satisfied' | 'not_satisfied';
   summary: string;
   blockers: string[];
-  safeImprovements: string[];
-  riskyChanges: ApprovalType[];
-  validationChecks?: ValidationCheck[];
   criterionResults?: Array<{
     criterion: string;
     status: 'satisfied' | 'not_satisfied' | 'insufficient_evidence' | 'deferred';
@@ -418,10 +389,9 @@ export function parseImplementResult(content: string, operation: string, require
   requireString(value, 'summary', operation);
   requireStringArray(value, 'changedFiles', operation);
   if (value.evidenceFiles !== undefined) requireStringArray(value, 'evidenceFiles', operation);
-  requireStringArray(value, 'requestedApprovals', operation);
   const outcome = value.outcome;
-  if (outcome !== 'changes_made' && outcome !== 'already_satisfied') {
-    throw new ProviderContractError(`${operation} field "outcome" must be "changes_made" or "already_satisfied".`);
+  if (outcome !== 'changes_made' && outcome !== 'already_satisfied' && outcome !== 'blocked') {
+    throw new ProviderContractError(`${operation} field "outcome" must be "changes_made", "already_satisfied", or "blocked".`);
   }
   const diffStat = value.diffStat;
   if (!diffStat || typeof diffStat !== 'object' || Array.isArray(diffStat)) {
@@ -452,7 +422,6 @@ export function parseChatResult(content: string, operation: string): ChatResult 
   const value = parseProviderJsonObject(content, operation);
   requireString(value, 'response', operation);
   requireStringArray(value, 'changedFiles', operation);
-  requireStringArray(value, 'requestedApprovals', operation);
   if (value.validationChecks !== undefined && !Array.isArray(value.validationChecks)) {
     throw new ProviderContractError(`${operation} field "validationChecks" must be an array.`);
   }
@@ -486,10 +455,8 @@ export function parseReviewResult(content: string, operation: string): ReviewRes
   const value = parseProviderJsonObject(content, operation);
   requireString(value, 'summary', operation);
   requireStringArray(value, 'blockers', operation);
-  requireStringArray(value, 'safeImprovements', operation);
-  requireStringArray(value, 'riskyChanges', operation);
-  if (value.validationChecks !== undefined && !Array.isArray(value.validationChecks)) {
-    throw new ProviderContractError(`${operation} field "validationChecks" must be an array.`);
+  if (value.verdict !== 'satisfied' && value.verdict !== 'not_satisfied') {
+    throw new ProviderContractError(`${operation} field "verdict" must be "satisfied" or "not_satisfied".`);
   }
   if (value.criterionResults !== undefined) {
     if (!Array.isArray(value.criterionResults) || value.criterionResults.some((item) => {
@@ -503,10 +470,13 @@ export function parseReviewResult(content: string, operation: string): ReviewRes
       throw new ProviderContractError(`${operation} field "criterionResults" must contain structured criterion verdicts.`);
     }
   }
-  return {
-    ...value,
-    validationChecks: normalizeValidationChecks(value.validationChecks)
-  } as unknown as ReviewResult;
+  if (value.verdict === 'satisfied' && (value.blockers as string[]).length > 0) {
+    throw new ProviderContractError(`${operation} cannot return blockers with verdict "satisfied".`);
+  }
+  if (value.verdict === 'not_satisfied' && (value.blockers as string[]).length === 0) {
+    throw new ProviderContractError(`${operation} must return blockers with verdict "not_satisfied".`);
+  }
+  return value as unknown as ReviewResult;
 }
 
 function requireString(value: Record<string, unknown>, field: string, operation: string): void {
@@ -543,7 +513,9 @@ export interface CapabilityAuditInput {
     summary?: string;
   }>;
   repositoryPath: string;
+  repositoryAccess?: 'read_only_checkout' | 'complete_snapshot';
   repositoryContext?: string;
+  supplementalContext?: string;
   commitSha?: string;
   onActivity?: ProviderActivityHandler;
 }
@@ -603,7 +575,9 @@ export interface ReleaseAuditInput {
     summary?: string;
   }>;
   repositoryPath: string;
+  repositoryAccess?: 'read_only_checkout' | 'complete_snapshot';
   repositoryContext?: string;
+  supplementalContext?: string;
   commitSha: string;
   onActivity?: ProviderActivityHandler;
 }
@@ -637,4 +611,6 @@ export interface AIProvider {
   estimateCost(input: CostEstimateInput): Promise<CostEstimateResult>;
   supportsLocalRepo(): boolean;
   supportsGitHubNativeFlow(): boolean;
+  supportsNativeRepositoryReview?(): boolean;
+  supportsNativeRepositoryAudit?(): boolean;
 }

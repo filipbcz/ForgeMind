@@ -1,9 +1,11 @@
 #!/usr/bin/env node
 import { createInterface } from 'node:readline/promises';
 import { release as osRelease } from 'node:os';
+import { join } from 'node:path';
 import { stdin, stdout } from 'node:process';
 import { pathToFileURL } from 'node:url';
 import { WindowsCredentialStore } from './credential-store.js';
+import { cleanupWindowsValidationWorkspace, executeWindowsValidation } from './executor.js';
 import { runCapabilityProbes } from './probes.js';
 import { runManualSession } from './session.js';
 import { WindowsRunnerTransport } from './transport.js';
@@ -12,7 +14,7 @@ const RUNNER_VERSION = '0.1.0';
 
 export type CliCommand =
   | { command: 'enroll' | 'probe'; apiUrl: string }
-  | { command: 'session-start'; apiUrl: string; minutes: number }
+  | { command: 'session-start'; apiUrl: string; minutes: number; workspaceRoot: string; artifactRoot: string }
   | { command: 'session-drain'; apiUrl: string; sessionId: string };
 
 export function parseCliArgs(args: string[]): CliCommand {
@@ -25,7 +27,12 @@ export function parseCliArgs(args: string[]): CliCommand {
   if (command === 'session' && action === 'start') {
     const minutes = Number(option(options, '--minutes') ?? '60');
     if (!Number.isInteger(minutes) || minutes < 1 || minutes > 720) throw new Error('--minutes must be an integer from 1 to 720.');
-    return { command: 'session-start', apiUrl, minutes };
+    const localRoot = process.env.LOCALAPPDATA ?? process.cwd();
+    return {
+      command: 'session-start', apiUrl, minutes,
+      workspaceRoot: option(options, '--workspace-root') ?? join(localRoot, 'ForgeMind', 'windows-runner', 'workspaces'),
+      artifactRoot: option(options, '--artifact-root') ?? join(localRoot, 'ForgeMind', 'windows-runner', 'artifacts')
+    };
   }
   if (command === 'session' && action === 'drain') {
     const sessionId = option(options, '--session-id');
@@ -55,7 +62,25 @@ export async function main(args = process.argv.slice(2)): Promise<void> {
     await transport.publishDevice(auth, { runnerVersion: RUNNER_VERSION, displayName: process.env.COMPUTERNAME ?? 'Windows runner', capabilities: probes.capabilities, probeEvidence: probes.evidence });
     const controller = new AbortController(); process.once('SIGINT', () => controller.abort());
     await runManualSession(transport, auth, { durationMinutes: parsed.minutes, signal: controller.signal,
-      onClaim: async () => { stdout.write('Compatible validation leased; no command executor is enabled in this runner version.\n'); } });
+      onClaim: async (claim, context) => {
+        if (!claim.job || !claim.lease) return;
+        stdout.write(`Running Windows validation ${claim.job.packet.checkId}: ${claim.job.packet.check.command}\n`);
+        try {
+          const executed = await executeWindowsValidation(claim.job.packet, {
+            deviceId: auth.deviceId,
+            sessionId: context.sessionId,
+            workspaceRoot: parsed.workspaceRoot,
+            artifactRoot: parsed.artifactRoot,
+            observedCapabilities: probes.capabilities,
+            signal: context.signal
+          });
+          await transport.uploadEvidence(auth, executed.evidence);
+          await transport.submitResult(auth, executed.result);
+          stdout.write(`${executed.result.summary}\n`);
+        } finally {
+          await cleanupWindowsValidationWorkspace(parsed.workspaceRoot, parsed.artifactRoot, claim.job.id);
+        }
+      } });
     return;
   }
   if (parsed.command === 'session-drain') { await transport.drain(auth, parsed.sessionId); return; }

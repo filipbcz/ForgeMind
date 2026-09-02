@@ -22,7 +22,7 @@ describe('project roadmap generation', () => {
         summary: 'Layered application.',
         modules: [{ name: 'UI', responsibility: 'User interaction.', paths: ['src/ui/**'], publicInterfaces: ['App'], dependencies: ['Domain'] }],
         decisions: [], conventions: ['Keep UI state local.'], dependencyRules: ['UI depends on Domain.'],
-        knownDebt: [], resolvedDebt: [], validationCommands: ['npm run architecture:check']
+        knownDebt: [], resolvedDebt: []
       }
     })).toMatchObject({ summary: 'Layered application.', modules: [{ name: 'UI' }] });
 
@@ -30,7 +30,7 @@ describe('project roadmap generation', () => {
       summary: 'Roadmap', steps: [], acceptanceCriteria: [],
       architectureUpdate: {
         summary: 'No modules.', modules: [], decisions: [], conventions: [], dependencyRules: [],
-        knownDebt: [], resolvedDebt: [], validationCommands: []
+        knownDebt: [], resolvedDebt: []
       }
     }, true)).toThrow('initial project architecture module');
   });
@@ -40,7 +40,7 @@ describe('project roadmap generation', () => {
       summary: 'Extension', steps: [], acceptanceCriteria: [],
       architectureUpdate: {
         summary: undefined, modules: [], decisions: [], conventions: [], dependencyRules: [],
-        knownDebt: [], resolvedDebt: [], validationCommands: []
+        knownDebt: [], resolvedDebt: []
       }
     })).toMatchObject({ modules: [], decisions: [] });
   });

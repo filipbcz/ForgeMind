@@ -127,7 +127,7 @@ describe('capability audit providers', () => {
     await expect(provider.auditCapability(input)).resolves.toMatchObject({ verdict: 'satisfied' });
   });
 
-  it('runs Codex OAuth audits from the bounded repository packet without repository shell access', async () => {
+  it('runs Codex OAuth audits with read-only access to the complete repository', async () => {
     const provider = new CodexProvider({ authMode: 'codex_oauth', codexHome: '/codex-home' });
     const runCodexExec = vi.spyOn(provider as unknown as {
       runCodexExec: (input: Record<string, unknown>) => Promise<string>;
@@ -135,12 +135,11 @@ describe('capability audit providers', () => {
 
     await expect(provider.auditCapability(input)).resolves.toMatchObject({ verdict: 'satisfied' });
     expect(runCodexExec).toHaveBeenCalledWith(expect.objectContaining({
-      packetOnly: true,
       sandbox: 'read-only',
-      prompt: expect.stringContaining(input.repositoryContext!)
+      repositoryPath: '/workspace',
+      prompt: expect.stringContaining('checked-out repository is the authoritative inspection surface')
     }));
-    expect(runCodexExec.mock.calls[0]?.[0]).not.toHaveProperty('repositoryPath');
-    expect(runCodexExec.mock.calls[0]?.[0].prompt).toContain('Do not run shell commands');
+    expect(runCodexExec.mock.calls[0]?.[0]?.prompt).not.toContain(input.repositoryContext!);
   });
 
   it('asks Codex to repair invalid audit JSON once without repeating repository inspection', async () => {

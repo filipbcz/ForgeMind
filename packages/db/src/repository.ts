@@ -1,30 +1,19 @@
 import {
   activeProjectContractRequirements,
   applyProjectContractDelta,
-  BOREK_FILIP_UNREAL_PROFILE_ID,
   createBlockedRunState,
   createFailedRunState,
   createRunningRunState,
   createRetryScheduledRunState,
   createWaitingRunState,
-  hasCompleteCurrentQualificationEvidence,
-  isWindowsExecutionPacket,
-  listCurrentManualBorekFilipEvidence,
-  WINDOWS_DEVICE_OFFLINE_AFTER_MS,
   normalizeRunState,
   parseTaskRunState,
   redactSecrets,
-  requiresApproval,
-  toManualFinalAuditResultStatus,
   type AcceptanceEvidence,
   type AcceptanceEvidenceSource,
   type AcceptanceEvidenceStatus,
   assertTaskTransition,
-  type Approval,
-  type ApprovalStatus,
-  type ApprovalType,
   type AuditEvent,
-  type ChatApproval,
   type ChatMessage,
   type ChatRun,
   type ChatThread,
@@ -41,7 +30,6 @@ import {
   type ProjectContractRequirement,
   type ProjectContractSnapshot,
   type ProjectMemory,
-  type ProjectValidationProfile,
   type ProjectRoadmapCycle,
   type ProjectRoadmapCycleStatus,
   type ProjectSpecificationSnapshot,
@@ -49,7 +37,6 @@ import {
   type ProjectCapability,
   type ProviderConnectionRuntimeStatus,
   type ProviderKind,
-  type RiskLevel,
   type RunStatus,
   type TaskDiagnosticExport,
   type TaskStatus,
@@ -63,10 +50,8 @@ import { Prisma } from '@prisma/client';
 import type { AiProviderConnection, AuditLog, GitHubConnection, PrismaClient, ProjectAuditJobStatus, QueueJobStatus, TaskMode } from '@prisma/client';
 import { decryptSecret, encryptSecret, fingerprintSecret } from './credentials.js';
 import {
-  toApproval,
   toAcceptanceEvidence,
   toAuditEvent,
-  toChatApproval,
   toChatMessage,
   toChatRun,
   toChatThread,
@@ -156,7 +141,6 @@ export interface ChatThreadDetail {
   thread: ChatThread;
   messages: ChatMessage[];
   runs: ChatRun[];
-  approvals: ChatApproval[];
   events: AuditEvent[];
 }
 
@@ -165,7 +149,6 @@ export interface ClaimedChatRun {
   run: ChatRun;
   messages: ChatMessage[];
   project?: Project;
-  approvals: ChatApproval[];
 }
 
 export interface CreateProjectInput {
@@ -176,11 +159,9 @@ export interface CreateProjectInput {
   defaultBranch: string;
   configYaml?: string;
   brief?: string;
-  validationProfile?: ProjectValidationProfile;
   autoCreatePullRequest?: boolean;
   autoMergePullRequest?: boolean;
   autoCompleteTask?: boolean;
-  allowSafeOperationsWithoutApproval?: boolean;
   defaultTaskMode?: TaskMode;
   aiProviderConnectionId?: string | null;
 }
@@ -193,11 +174,9 @@ export interface UpdateProjectInput {
   defaultBranch?: string;
   configYaml?: string;
   brief?: string | null;
-  validationProfile?: ProjectValidationProfile | null;
   autoCreatePullRequest?: boolean;
   autoMergePullRequest?: boolean;
   autoCompleteTask?: boolean;
-  allowSafeOperationsWithoutApproval?: boolean;
   defaultTaskMode?: TaskMode;
   aiProviderConnectionId?: string | null;
   isActive?: boolean;
@@ -352,9 +331,7 @@ export interface NotificationSettingsSnapshot {
   userId: string;
   settings: {
     pushEnabled: boolean;
-    approvalRequests: boolean;
     taskUpdates: boolean;
-    budgetAlerts: boolean;
   };
   subscriptions: NotificationSubscriptionSnapshot[];
 }
@@ -379,8 +356,6 @@ export interface CreateTaskInput {
   title: string;
   prompt: string;
   mode: TaskMode;
-  maxIterations: number;
-  maxBudgetUsd: number;
   architectureVersionId?: string;
 }
 
@@ -425,7 +400,7 @@ export interface WorkerStatusSnapshot {
   activeIteration?: {
     taskId: string;
     taskRunId?: string;
-    phase: 'planning' | 'implementation' | 'validation' | 'review' | 'approval' | 'pr_creation';
+    phase: 'planning' | 'implementation' | 'validation' | 'review' | 'pr_creation';
     attempt: number;
     prompt: string;
     providerPrompt?: string;
@@ -451,14 +426,10 @@ export interface OperationalMetricsSnapshot {
     draft: number;
     submitted: number;
     active: number;
-    needsApproval: number;
     completed: number;
     failed: number;
     cancelled: number;
     providerFailed: number;
-    budgetExceeded: number;
-    iterationLimitReached: number;
-    repeatedErrorDetected: number;
     validationFailed: number;
   };
   queue: {
@@ -467,12 +438,6 @@ export interface OperationalMetricsSnapshot {
     failed: number;
     averagePendingWaitSeconds: number;
     maxPendingWaitSeconds: number;
-  };
-  approvals: {
-    pending: number;
-    approved: number;
-    rejected: number;
-    cancelled: number;
   };
   runs: {
     queued: number;
@@ -519,17 +484,12 @@ const ACTIVE_QUEUE_STATUSES = ['pending', 'claimed'] as const;
 const ROADMAP_STEP_CANCELLING_TASK_STATUSES: ReadonlySet<TaskStatus> = new Set([
   'failed',
   'cancelled',
-  'budget_exceeded',
-  'iteration_limit_reached',
-  'repeated_error_detected',
-  'approval_rejected',
   'provider_failed',
   'validation_failed'
 ]);
 
 function terminalImplementationStepStatus(taskStatus: TaskStatus): ProjectImplementationStepStatus | undefined {
   if (taskStatus === 'completed') return 'completed';
-  if (taskStatus === 'waiting_for_capability') return 'waiting_for_capability';
   if (ROADMAP_STEP_CANCELLING_TASK_STATUSES.has(taskStatus)) return 'cancelled';
   return undefined;
 }
@@ -1024,11 +984,9 @@ export class ForgeMindRepository {
           defaultBranch: input.defaultBranch,
           configYaml: input.configYaml,
           brief: input.brief,
-          validationProfile: input.validationProfile ? toPrismaJson(input.validationProfile as unknown as JsonValue) : undefined,
           autoCreatePullRequest,
           autoMergePullRequest,
           autoCompleteTask,
-          allowSafeOperationsWithoutApproval: input.allowSafeOperationsWithoutApproval,
           defaultTaskMode: input.defaultTaskMode,
           aiProviderConnectionId: input.aiProviderConnectionId
         }
@@ -1190,7 +1148,6 @@ export class ForgeMindRepository {
     const autoCreatePullRequest = input.autoCreatePullRequest ?? existing.autoCreatePullRequest;
     const autoMergePullRequest = input.autoMergePullRequest ?? existing.autoMergePullRequest;
     const autoCompleteTask = input.autoCompleteTask ?? existing.autoCompleteTask;
-    const allowSafeOperationsWithoutApproval = input.allowSafeOperationsWithoutApproval ?? existing.allowSafeOperationsWithoutApproval;
     const defaultTaskMode = input.defaultTaskMode ?? existing.defaultTaskMode;
     if (autoMergePullRequest && !autoCreatePullRequest) {
       throw new Error('Automatic pull request creation is required for automatic merge.');
@@ -1213,9 +1170,6 @@ export class ForgeMindRepository {
           defaultBranch: input.defaultBranch,
           configYaml: input.configYaml,
           brief: input.brief,
-          validationProfile: input.validationProfile === null
-            ? Prisma.DbNull
-            : input.validationProfile ? toPrismaJson(input.validationProfile as unknown as JsonValue) : undefined,
           projectContract: invalidateProjectContext ? Prisma.DbNull : undefined,
           currentContractVersionId: invalidateProjectContext ? null : undefined,
           planningSessionId: invalidatePlanningSession ? null : undefined,
@@ -1226,7 +1180,6 @@ export class ForgeMindRepository {
           autoCreatePullRequest,
           autoMergePullRequest,
           autoCompleteTask,
-          allowSafeOperationsWithoutApproval,
           defaultTaskMode,
           aiProviderConnectionId: input.aiProviderConnectionId,
           isActive: input.isActive
@@ -1267,13 +1220,11 @@ export class ForgeMindRepository {
           autoCreatePullRequest: result.autoCreatePullRequest,
           autoMergePullRequest: result.autoMergePullRequest,
           autoCompleteTask: result.autoCompleteTask,
-          allowSafeOperationsWithoutApproval: result.allowSafeOperationsWithoutApproval,
           defaultTaskMode: result.defaultTaskMode,
           aiProviderConnectionId: result.aiProviderConnectionId,
           isActive: result.isActive,
           hasConfigYaml: Boolean(result.configYaml),
           hasBrief: Boolean(result.brief),
-          validationProfileEnabled: toProject(result).validationProfile?.enabled ?? false,
           specificationRevised: invalidateProjectContext
         }
       });
@@ -1354,7 +1305,6 @@ export class ForgeMindRepository {
       });
       if (taskIds.length > 0) {
         await tx.providerUsage.deleteMany({ where: { taskId: { in: taskIds } } });
-        await tx.approval.deleteMany({ where: { taskId: { in: taskIds } } });
         await tx.taskQueueJob.deleteMany({ where: { taskId: { in: taskIds } } });
       }
       if (runIds.length > 0) {
@@ -1513,8 +1463,8 @@ export class ForgeMindRepository {
           if (!sourceCycle || sourceCycle.projectId !== input.projectId) {
             throw new Error('Approved extension source cycle does not exist in this project.');
           }
-          if (sourceCycle.status !== 'awaiting_extension_approval') {
-            throw new Error(`Roadmap cycle "${sourceCycle.id}" is not awaiting extension approval.`);
+          if (sourceCycle.status !== 'awaiting_extension_decision') {
+            throw new Error(`Roadmap cycle "${sourceCycle.id}" is not awaiting an extension decision.`);
           }
         }
 
@@ -1671,7 +1621,7 @@ export class ForgeMindRepository {
         await tx.projectRoadmapCycle.updateMany({
           where: {
             projectId: input.projectId,
-            status: { in: ['active', 'verifying', 'partial', 'blocked', 'awaiting_extension_approval'] }
+            status: { in: ['active', 'verifying', 'partial', 'blocked', 'awaiting_extension_decision'] }
           },
           data: {
             status: 'completed',
@@ -1773,7 +1723,7 @@ export class ForgeMindRepository {
       where: { id: cycleId },
       data: {
         extensionProposal: input.proposal,
-        status: input.status ?? 'awaiting_extension_approval'
+        status: input.status ?? 'awaiting_extension_decision'
       }
     });
 
@@ -2117,8 +2067,6 @@ export class ForgeMindRepository {
           mode: input.mode,
           status: 'submitted',
           architectureVersionId,
-          maxIterations: input.maxIterations,
-          maxBudgetUsd: input.maxBudgetUsd,
           startedAt
         }
       });
@@ -2366,15 +2314,11 @@ export class ForgeMindRepository {
       settings: settings
         ? {
             pushEnabled: settings.pushEnabled,
-            approvalRequests: settings.approvalRequests,
-            taskUpdates: settings.taskUpdates,
-            budgetAlerts: settings.budgetAlerts
+            taskUpdates: settings.taskUpdates
           }
         : {
             pushEnabled: false,
-            approvalRequests: true,
-            taskUpdates: true,
-            budgetAlerts: true
+            taskUpdates: true
           },
       subscriptions: subscriptions.map((item) => ({
         id: item.id,
@@ -2743,89 +2687,19 @@ export class ForgeMindRepository {
     return { enqueued: true };
   }
 
-  async enqueueProjectAudit(input: {
-    projectId: string;
-    cycleId: string;
-    triggerTaskId?: string;
-    requirementIds: string[];
-    manualRequest?: { contractVersion: number; commitSha: string; qualificationEvidenceIds: string[]; completedStepIds: string[] };
-  }): Promise<{ enqueued: boolean; job: ProjectAuditJob }> {
+  async enqueueProjectAudit(input: { projectId: string; cycleId: string; triggerTaskId?: string; requirementIds: string[] }): Promise<{ enqueued: boolean; job: ProjectAuditJob }> {
     return this.prisma.$transaction(async (tx) => {
       await tx.$queryRawUnsafe(WORKER_QUEUE_ADVISORY_LOCK_SQL);
-      if (input.manualRequest) {
-        await tx.$queryRawUnsafe('SELECT "id" FROM "projects" WHERE "id" = $1 FOR UPDATE', input.projectId);
-        await tx.$queryRawUnsafe('SELECT "id" FROM "project_roadmap_cycles" WHERE "project_id" = $1 ORDER BY "cycle_number" FOR UPDATE', input.projectId);
-        await tx.$queryRawUnsafe('SELECT "id" FROM "project_implementation_steps" WHERE "cycle_id" = $1 ORDER BY "sequence_number" FOR UPDATE', input.cycleId);
-        await tx.$queryRawUnsafe('SELECT "id" FROM "acceptance_evidence" WHERE "cycle_id" = $1 ORDER BY "id" FOR UPDATE', input.cycleId);
-      }
       const [cycle, project] = await Promise.all([
         tx.projectRoadmapCycle.findUnique({ where: { id: input.cycleId } }),
         tx.project.findUnique({ where: { id: input.projectId } })
       ]);
       if (!cycle || cycle.projectId !== input.projectId) throw new Error('Project audit references an unknown roadmap cycle.');
-      const currentProject = project ? toProject(project) : undefined;
-      const contract = currentProject?.projectContract;
+      const contract = project ? toProject(project).projectContract : undefined;
       const knownRequirementIds = new Set(contract?.requirements.map((requirement) => requirement.id) ?? []);
       const requirementIds = Array.from(new Set(input.requirementIds));
       if (!contract || requirementIds.length === 0 || requirementIds.some((id) => !knownRequirementIds.has(id))) {
         throw new Error('Project audit must reference requirements from the active project contract.');
-      }
-      if (input.manualRequest) {
-        const [latestCycle, currentSteps, evidenceRecords] = await Promise.all([
-          tx.projectRoadmapCycle.findFirst({
-            where: { projectId: input.projectId },
-            orderBy: { cycleNumber: 'desc' }
-          }),
-          tx.projectImplementationStep.findMany({ where: { cycleId: input.cycleId } }),
-          tx.acceptanceEvidence.findMany({ where: { id: { in: input.manualRequest.qualificationEvidenceIds } } })
-        ]);
-        const currentStepIds = currentSteps.map((step) => step.id).sort();
-        const requestedStepIds = [...new Set(input.manualRequest.completedStepIds)].sort();
-        const requestedEvidenceIds = [...new Set(input.manualRequest.qualificationEvidenceIds)].sort();
-        const foundEvidenceIds = evidenceRecords.map((evidence) => evidence.id).sort();
-        const mappedEvidence = evidenceRecords.map(toAcceptanceEvidence);
-        const borekEvidence = listCurrentManualBorekFilipEvidence(mappedEvidence, {
-          cycleId: input.cycleId,
-          contractVersion: input.manualRequest.contractVersion,
-          commitSha: input.manualRequest.commitSha
-        }).sort((left, right) => left.id.localeCompare(right.id));
-        let verifiedManualBorekFilip = false;
-        for (const evidence of borekEvidence) {
-          const windowsExecutionJobId = evidence.payload.windowsExecutionJobId;
-          const approvalId = evidence.payload.approvalId;
-          if (typeof windowsExecutionJobId !== 'string' || typeof approvalId !== 'string') continue;
-          await tx.$queryRawUnsafe('SELECT "id" FROM "windows_execution_jobs" WHERE "id" = $1 FOR UPDATE', windowsExecutionJobId);
-          await tx.$queryRawUnsafe('SELECT "id" FROM "approvals" WHERE "id" = $1 FOR UPDATE', approvalId);
-          const [executionJob, approval] = await Promise.all([
-            tx.windowsExecutionJob.findUnique({
-              where: { id: windowsExecutionJobId },
-              include: { leases: { include: { session: true, device: true } } }
-            }),
-            tx.approval.findUnique({ where: { id: approvalId } })
-          ]);
-          verifiedManualBorekFilip = isVerifiedManualBorekFilipExecution(
-            executionJob, approval, input.projectId, input.manualRequest.commitSha
-          );
-          if (verifiedManualBorekFilip) break;
-        }
-        const snapshotIsCurrent =
-          latestCycle?.id === input.cycleId
-          && cycle.status === 'active'
-          && contract.version === input.manualRequest.contractVersion
-          && currentProject?.projectMemory?.baseCommitSha === input.manualRequest.commitSha
-          && currentSteps.length > 0
-          && currentSteps.every((step) => step.status === 'completed')
-          && JSON.stringify(currentStepIds) === JSON.stringify(requestedStepIds)
-          && JSON.stringify(foundEvidenceIds) === JSON.stringify(requestedEvidenceIds)
-          && hasCompleteCurrentQualificationEvidence(mappedEvidence, {
-            cycleId: input.cycleId,
-            contractVersion: input.manualRequest.contractVersion,
-            commitSha: input.manualRequest.commitSha
-          })
-          && verifiedManualBorekFilip;
-        if (!snapshotIsCurrent) {
-          throw new Error('Manual final audit request no longer matches the current project state and qualification evidence.');
-        }
       }
 
       const existing = await tx.projectAuditJob.findUnique({ where: { cycleId: input.cycleId } });
@@ -2876,17 +2750,8 @@ export class ForgeMindRepository {
         taskId: input.triggerTaskId,
         payload: { auditJobId: job.id, cycleId: input.cycleId, requirementIds }
       });
-      if (input.manualRequest) {
-        await this.writeAuditTx(tx, {
-          actorType: 'user',
-          eventType: 'project_audit_requested',
-          projectId: input.projectId,
-          taskId: input.triggerTaskId,
-          payload: { auditJobId: job.id, cycleId: input.cycleId, ...input.manualRequest }
-        });
-      }
       return { enqueued: true, job: toProjectAuditJob(job) };
-    }, { isolationLevel: Prisma.TransactionIsolationLevel.Serializable });
+    });
   }
 
   async claimNextProjectAudit(): Promise<ClaimedProjectAuditJob | undefined> {
@@ -2977,12 +2842,7 @@ export class ForgeMindRepository {
         eventType: `project_audit_${status}`,
         projectId: job.projectId,
         taskId: job.triggerTaskId ?? undefined,
-        payload: {
-          auditJobId,
-          cycleId: job.cycleId,
-          resultStatus: toManualFinalAuditResultStatus(status),
-          errorMessage: errorMessage ?? null
-        }
+        payload: { auditJobId, cycleId: job.cycleId, errorMessage: errorMessage ?? null }
       });
     });
     return { retryScheduled: false };
@@ -3247,34 +3107,6 @@ export class ForgeMindRepository {
     return result.count === 1;
   }
 
-  async isChatApiMutationAuthorized(input: {
-    runId: string;
-    userId: string;
-    type: ApprovalType;
-    method: string;
-    path: string;
-    bodyHash: string;
-  }): Promise<boolean> {
-    const run = await this.prisma.chatRun.findUnique({
-      where: { id: input.runId },
-      include: { thread: true, approvals: true }
-    });
-    if (!run || run.status !== 'running' || run.thread.userId !== input.userId) return false;
-    if (!requiresApproval(input.type, run.thread.mode)) return true;
-    return run.approvals.some((approval) => {
-      if (approval.type !== input.type || approval.status !== 'approved') return false;
-      const payload = approval.payloadJson;
-      if (!payload || typeof payload !== 'object' || Array.isArray(payload)) return false;
-      const mutation = (payload as { apiMutation?: unknown }).apiMutation;
-      if (!mutation || typeof mutation !== 'object' || Array.isArray(mutation)) return false;
-      const expected = mutation as { method?: unknown; path?: unknown; actorId?: unknown; bodyHash?: unknown };
-      return expected.method === input.method
-        && expected.path === input.path
-        && expected.actorId === input.userId
-        && expected.bodyHash === input.bodyHash;
-    });
-  }
-
   async refreshProjectAuditClaim(auditJobId: string): Promise<boolean> {
     const result = await this.prisma.projectAuditJob.updateMany({
       where: { id: auditJobId, status: 'claimed' },
@@ -3531,23 +3363,15 @@ export class ForgeMindRepository {
       draftTasks,
       submittedTasks,
       activeTasks,
-      needsApprovalTasks,
       completedTasks,
       failedTasks,
       cancelledTasks,
       providerFailedTasks,
-      budgetExceededTasks,
-      iterationLimitTasks,
-      repeatedErrorTasks,
       validationFailedTasks,
       pendingQueueJobs,
       claimedQueueJobs,
       failedQueueJobs,
       pendingQueueWaitJobs,
-      pendingApprovals,
-      approvedApprovals,
-      rejectedApprovals,
-      cancelledApprovals,
       queuedRuns,
       runningRuns,
       succeededRuns,
@@ -3559,14 +3383,10 @@ export class ForgeMindRepository {
       this.prisma.task.count({ where: { status: 'draft' } }),
       this.prisma.task.count({ where: { status: 'submitted' } }),
       this.prisma.task.count({ where: { status: { in: [...ACTIVE_TASK_STATUSES] } } }),
-      this.prisma.task.count({ where: { status: 'needs_approval' } }),
       this.prisma.task.count({ where: { status: 'completed' } }),
       this.prisma.task.count({ where: { status: 'failed' } }),
       this.prisma.task.count({ where: { status: 'cancelled' } }),
       this.prisma.task.count({ where: { status: 'provider_failed' } }),
-      this.prisma.task.count({ where: { status: 'budget_exceeded' } }),
-      this.prisma.task.count({ where: { status: 'iteration_limit_reached' } }),
-      this.prisma.task.count({ where: { status: 'repeated_error_detected' } }),
       this.prisma.task.count({ where: { status: 'validation_failed' } }),
       this.prisma.taskQueueJob.count({ where: { status: 'pending' } }),
       this.prisma.taskQueueJob.count({ where: { status: 'claimed' } }),
@@ -3575,10 +3395,6 @@ export class ForgeMindRepository {
         where: { status: 'pending' },
         select: { createdAt: true }
       }),
-      this.prisma.approval.count({ where: { status: 'pending' } }),
-      this.prisma.approval.count({ where: { status: 'approved' } }),
-      this.prisma.approval.count({ where: { status: 'rejected' } }),
-      this.prisma.approval.count({ where: { status: 'cancelled' } }),
       this.prisma.taskRun.count({ where: { status: 'queued' } }),
       this.prisma.taskRun.count({ where: { status: 'running' } }),
       this.prisma.taskRun.count({ where: { status: 'succeeded' } }),
@@ -3612,14 +3428,10 @@ export class ForgeMindRepository {
         draft: draftTasks,
         submitted: submittedTasks,
         active: activeTasks,
-        needsApproval: needsApprovalTasks,
         completed: completedTasks,
         failed: failedTasks,
         cancelled: cancelledTasks,
         providerFailed: providerFailedTasks,
-        budgetExceeded: budgetExceededTasks,
-        iterationLimitReached: iterationLimitTasks,
-        repeatedErrorDetected: repeatedErrorTasks,
         validationFailed: validationFailedTasks
       },
       queue: {
@@ -3628,12 +3440,6 @@ export class ForgeMindRepository {
         failed: failedQueueJobs,
         averagePendingWaitSeconds,
         maxPendingWaitSeconds
-      },
-      approvals: {
-        pending: pendingApprovals,
-        approved: approvedApprovals,
-        rejected: rejectedApprovals,
-        cancelled: cancelledApprovals
       },
       runs: {
         queued: queuedRuns,
@@ -3672,9 +3478,7 @@ export class ForgeMindRepository {
         prompt: input.prompt,
         mode: input.mode,
         status: 'draft',
-        architectureVersionId,
-        maxIterations: input.maxIterations,
-        maxBudgetUsd: input.maxBudgetUsd
+        architectureVersionId
       }
     });
 
@@ -3821,14 +3625,13 @@ export class ForgeMindRepository {
         where: { id: taskId },
         data: {
           status: start ? 'submitted' : 'draft',
-          waitingForCapabilities: [],
           deferredValidationCapabilities: [],
           startedAt: start ? new Date() : null,
           finishedAt: null
         }
       });
       await tx.projectImplementationStep.updateMany({
-        where: { taskId, status: { in: ['completed', 'waiting_for_capability', 'cancelled'] } },
+        where: { taskId, status: { in: ['completed', 'cancelled'] } },
         data: { status: 'running', completedAt: null }
       });
       return retriedTask;
@@ -3856,7 +3659,6 @@ export class ForgeMindRepository {
         where: { id: taskId },
         data: {
           status: nextStatus,
-          waitingForCapabilities: nextStatus === 'completed' ? [] : undefined,
           finishedAt: nextStatus === 'completed' || ROADMAP_STEP_CANCELLING_TASK_STATUSES.has(nextStatus)
             ? new Date()
             : undefined
@@ -3888,158 +3690,6 @@ export class ForgeMindRepository {
     });
 
     return toTask(updated);
-  }
-
-  async waitTaskForCapabilities(taskId: string, capabilities: string[], payload: JsonValue = {}): Promise<ForgeTask> {
-    const current = await this.getTask(taskId);
-    if (!current) throw new Error(`Task "${taskId}" not found`);
-    assertTaskTransition(current.status, 'waiting_for_capability');
-    const normalized = Array.from(new Set(capabilities.map((item) => item.trim().toLowerCase()).filter(Boolean)));
-    const runState = createWaitingRunState('unavailable_capability', {
-      requiredCapabilities: normalized,
-      detail: 'Authoritative validation is waiting for a worker with the required capability.'
-    });
-    const updated = await this.prisma.task.update({
-      where: { id: taskId },
-      data: {
-        status: 'waiting_for_capability',
-        waitingForCapabilities: normalized,
-        finishedAt: new Date()
-      }
-    });
-    await this.prisma.taskRun.updateMany({
-      where: { taskId, status: 'running' },
-      data: { runStateJson: toTaskRunStateJson(runState) }
-    });
-    await this.writeAudit({
-      actorType: 'system',
-      eventType: 'task_waiting_for_capability',
-      projectId: updated.projectId,
-      taskId: updated.id,
-      payload: {
-        ...payload as Record<string, JsonValue>,
-        requiredCapabilities: normalized,
-        runState: runState as unknown as JsonValue
-      }
-    });
-    return toTask(updated);
-  }
-
-  async setTaskDeferredValidationCapabilities(taskId: string, capabilities: string[]): Promise<ForgeTask> {
-    const normalized = Array.from(new Set(capabilities.map((item) => item.trim().toLowerCase()).filter(Boolean)));
-    const updated = await this.prisma.task.update({
-      where: { id: taskId },
-      data: { deferredValidationCapabilities: normalized }
-    });
-    return toTask(updated);
-  }
-
-  async completeTaskWithDeferredValidation(taskId: string): Promise<ForgeTask | undefined> {
-    return this.prisma.$transaction(async (tx) => {
-      await tx.$queryRawUnsafe(WORKER_QUEUE_ADVISORY_LOCK_SQL);
-      const task = await tx.task.findUnique({ where: { id: taskId } });
-      if (!task || task.status !== 'waiting_for_capability') return undefined;
-
-      const completedAt = new Date();
-      const updated = await tx.task.update({
-        where: { id: task.id },
-        data: {
-          status: 'completed',
-          waitingForCapabilities: [],
-          deferredValidationCapabilities: jsonStringArray(task.waitingForCapabilities),
-          finishedAt: completedAt
-        }
-      });
-      await tx.projectImplementationStep.updateMany({
-        where: { taskId: task.id, status: 'waiting_for_capability' },
-        data: { status: 'completed', completedAt }
-      });
-      await tx.acceptanceEvidence.updateMany({
-        where: { taskId: task.id, source: 'validation_command', status: 'blocked' },
-        data: { status: 'deferred' }
-      });
-      await this.writeAuditTx(tx, {
-        actorType: 'system',
-        eventType: 'task_status_completed',
-        projectId: task.projectId,
-        taskId: task.id,
-        payload: {
-          deferredValidationCapabilities: jsonStringArray(task.waitingForCapabilities),
-          migratedFromCapabilityWait: true
-        }
-      });
-      return toTask(updated);
-    });
-  }
-
-  async listTasksWaitingForCapabilities(): Promise<ForgeTask[]> {
-    const tasks = await this.prisma.task.findMany({
-      where: { status: 'waiting_for_capability' },
-      orderBy: { createdAt: 'asc' }
-    });
-    return tasks.map(toTask);
-  }
-
-  async requeueTasksWaitingForCapabilities(availableCapabilities: ReadonlySet<string>): Promise<number> {
-    const waitingTasks = await this.prisma.task.findMany({ where: { status: 'waiting_for_capability' } });
-    let requeued = 0;
-    for (const candidate of waitingTasks) {
-      const required = jsonStringArray(candidate.waitingForCapabilities);
-      if (required.length === 0 || required.some((capability) => !availableCapabilities.has(capability))) continue;
-      const didRequeue = await this.prisma.$transaction(async (tx) => {
-        await tx.$queryRawUnsafe(WORKER_QUEUE_ADVISORY_LOCK_SQL);
-        const task = await tx.task.findUnique({ where: { id: candidate.id } });
-        if (!task || task.status !== 'waiting_for_capability') return false;
-        const activeQueueJobs = await tx.taskQueueJob.count({
-          where: { taskId: task.id, status: { in: ['pending', 'claimed'] } }
-        });
-        if (activeQueueJobs > 0) return false;
-        const linkedStep = await tx.projectImplementationStep.findFirst({ where: { taskId: task.id } });
-        if (linkedStep) {
-          const otherRunningSteps = await tx.projectImplementationStep.count({
-            where: {
-              projectId: linkedStep.projectId,
-              cycleId: linkedStep.cycleId,
-              status: 'running',
-              id: { not: linkedStep.id }
-            }
-          });
-          if (otherRunningSteps > 0) return false;
-        }
-        const now = new Date();
-        await tx.task.update({
-          where: { id: task.id },
-          data: { status: 'submitted', waitingForCapabilities: [], startedAt: now, finishedAt: null }
-        });
-        if (linkedStep) {
-          await tx.projectImplementationStep.update({
-            where: { id: linkedStep.id },
-            data: { status: 'running', completedAt: null }
-          });
-        }
-        await tx.taskRun.create({
-          data: {
-            taskId: task.id,
-            provider: resolveProjectProvider((await tx.project.findUnique({ where: { id: task.projectId } }))?.configYaml ?? undefined),
-            model: 'queued',
-            status: 'queued',
-            runStateJson: toTaskRunStateJson(normalizeRunState('queued'))
-          }
-        });
-        await tx.taskQueueJob.create({
-          data: { taskId: task.id, reason: 'capability_available', status: 'pending', nextAttemptAt: now }
-        });
-        await tx.auditLog.create({
-          data: {
-            actorType: 'system', eventType: 'task_capability_available', projectId: task.projectId, taskId: task.id,
-            payload: { requiredCapabilities: required }
-          }
-        });
-        return true;
-      });
-      if (didRequeue) requeued += 1;
-    }
-    return requeued;
   }
 
   async updateTaskGitHubFields(
@@ -4469,7 +4119,6 @@ export class ForgeMindRepository {
       include: {
         messages: { orderBy: { sequence: 'asc' } },
         runs: { orderBy: { createdAt: 'asc' } },
-        approvals: { orderBy: { createdAt: 'asc' } },
         auditLog: { orderBy: { createdAt: 'desc' }, take: 500 }
       }
     });
@@ -4478,7 +4127,6 @@ export class ForgeMindRepository {
       thread: toChatThread(thread),
       messages: thread.messages.map(toChatMessage),
       runs: thread.runs.map(toChatRun),
-      approvals: thread.approvals.map(toChatApproval),
       events: thread.auditLog.reverse().map(toAuditEvent)
     };
   }
@@ -4547,7 +4195,7 @@ export class ForgeMindRepository {
       throw new Error('This chat thread already has a repository.');
     }
     const activeRuns = await this.prisma.chatRun.count({
-      where: { threadId: sourceThreadId, status: { in: ['queued', 'running', 'waiting_for_approval'] } }
+      where: { threadId: sourceThreadId, status: { in: ['queued', 'running'] } }
     });
     if (activeRuns > 0) {
       throw new Error('Wait for the active chat response or stop it before continuing with a repository.');
@@ -4590,7 +4238,7 @@ export class ForgeMindRepository {
       || input.branchName !== undefined;
     if (changesExecutionContext) {
       const activeRuns = await this.prisma.chatRun.count({
-        where: { threadId, status: { in: ['queued', 'running', 'waiting_for_approval'] } }
+        where: { threadId, status: { in: ['queued', 'running'] } }
       });
       if (activeRuns > 0) throw new Error('Chat execution context cannot change while a run is active.');
       const changesRepository = input.projectId !== undefined
@@ -4622,7 +4270,7 @@ export class ForgeMindRepository {
     if (Boolean(effectiveOwner) !== Boolean(effectiveName)) throw new Error('Repository owner and name must be configured together.');
     const status = input.status;
     if (status === 'archived') {
-      const activeRuns = await this.prisma.chatRun.count({ where: { threadId, status: { in: ['queued', 'running', 'waiting_for_approval'] } } });
+      const activeRuns = await this.prisma.chatRun.count({ where: { threadId, status: { in: ['queued', 'running'] } } });
       if (activeRuns > 0) throw new Error('An active chat thread cannot be archived.');
     }
     const thread = await this.prisma.chatThread.update({
@@ -4650,7 +4298,7 @@ export class ForgeMindRepository {
   async deleteChatThread(threadId: string, userId = LOCAL_USER_ID): Promise<boolean> {
     const thread = await this.prisma.chatThread.findFirst({ where: { id: threadId, userId } });
     if (!thread) return false;
-    const activeRuns = await this.prisma.chatRun.count({ where: { threadId, status: { in: ['queued', 'running', 'waiting_for_approval'] } } });
+    const activeRuns = await this.prisma.chatRun.count({ where: { threadId, status: { in: ['queued', 'running'] } } });
     if (activeRuns > 0) throw new Error('An active chat thread cannot be deleted.');
     await this.prisma.chatThread.delete({ where: { id: threadId } });
     return true;
@@ -4664,7 +4312,7 @@ export class ForgeMindRepository {
       if (!thread) throw new Error(`Chat thread "${threadId}" not found.`);
       if (thread.status !== 'active') throw new Error('Messages cannot be sent to an archived chat thread.');
       const activeRun = await tx.chatRun.findFirst({
-        where: { threadId, status: { in: ['queued', 'running', 'waiting_for_approval'] } }
+        where: { threadId, status: { in: ['queued', 'running'] } }
       });
       if (activeRun) throw new Error('Wait for the active chat response or stop it before sending another message.');
       const latestMessage = await tx.chatMessage.findFirst({ where: { threadId }, orderBy: { sequence: 'desc' } });
@@ -4722,8 +4370,7 @@ export class ForgeMindRepository {
         },
         orderBy: { createdAt: 'asc' },
         include: {
-          thread: { include: { project: true } },
-          approvals: { orderBy: { createdAt: 'asc' } }
+          thread: { include: { project: true } }
         }
       });
       if (!queued) return undefined;
@@ -4744,8 +4391,7 @@ export class ForgeMindRepository {
         thread: toChatThread(queued.thread),
         run: toChatRun(claimed),
         messages: messages.map(toChatMessage),
-        project: queued.thread.project ? toProject(queued.thread.project) : undefined,
-        approvals: queued.approvals.map(toChatApproval)
+        project: queued.thread.project ? toProject(queued.thread.project) : undefined
       };
     });
   }
@@ -4866,7 +4512,7 @@ export class ForgeMindRepository {
   async cancelChatRun(runId: string, userId = LOCAL_USER_ID): Promise<ChatRun | undefined> {
     const existing = await this.prisma.chatRun.findFirst({ where: { id: runId, thread: { userId } } });
     if (!existing) return undefined;
-    if (!['queued', 'running', 'waiting_for_approval'].includes(existing.status)) return toChatRun(existing);
+    if (!['queued', 'running'].includes(existing.status)) return toChatRun(existing);
     const run = await this.prisma.chatRun.update({
       where: { id: runId },
       data: existing.status === 'running'
@@ -4892,152 +4538,6 @@ export class ForgeMindRepository {
       chatThreadId: existing.threadId, chatRunId: existing.id, payload: {}
     });
     return toChatRun(run);
-  }
-
-  async createChatApproval(input: {
-    threadId: string;
-    runId: string;
-    type: ApprovalType;
-    title: string;
-    description: string;
-    riskLevel: RiskLevel;
-    payload: JsonValue;
-  }): Promise<ChatApproval> {
-    const approval = await this.prisma.$transaction(async (tx) => {
-      const created = await tx.chatApproval.create({
-        data: {
-          threadId: input.threadId, runId: input.runId, type: input.type, requestedBy: 'agent',
-          title: input.title, description: input.description, riskLevel: input.riskLevel,
-          payloadJson: toPrismaJson(redactSecrets(input.payload))
-        }
-      });
-      await tx.chatRun.update({ where: { id: input.runId }, data: { status: 'waiting_for_approval', claimedAt: null, heartbeatAt: null } });
-      await this.writeAuditTx(tx, {
-        actorType: 'agent', eventType: 'chat_approval_requested', chatThreadId: input.threadId, chatRunId: input.runId,
-        payload: { approvalId: created.id, type: input.type, riskLevel: input.riskLevel }
-      });
-      return created;
-    });
-    return toChatApproval(approval);
-  }
-
-  async resolveChatApproval(approvalId: string, status: Extract<ApprovalStatus, 'approved' | 'rejected'>, userId = LOCAL_USER_ID): Promise<ChatApproval | undefined> {
-    return this.prisma.$transaction(async (tx) => {
-      const approval = await tx.chatApproval.findFirst({ where: { id: approvalId, thread: { userId } } });
-      if (!approval) return undefined;
-      if (approval.status !== 'pending') throw new Error(`Chat approval "${approvalId}" is already ${approval.status}.`);
-      const resolved = await tx.chatApproval.update({
-        where: { id: approvalId }, data: { status, approvedByUserId: userId, resolvedAt: new Date() }
-      });
-      if (status === 'rejected') {
-        await tx.chatRun.update({ where: { id: approval.runId }, data: { status: 'failed', errorMessage: 'Requested operation was rejected.', finishedAt: new Date() } });
-      } else {
-        const pending = await tx.chatApproval.count({ where: { runId: approval.runId, status: 'pending', id: { not: approval.id } } });
-        if (pending === 0) {
-          await tx.chatRun.update({ where: { id: approval.runId }, data: { status: 'queued', nextAttemptAt: null, errorMessage: null } });
-        }
-      }
-      await this.writeAuditTx(tx, {
-        actorType: 'user', actorId: userId, eventType: 'chat_approval_resolved', chatThreadId: approval.threadId, chatRunId: approval.runId,
-        payload: { approvalId, status }
-      });
-      return toChatApproval(resolved);
-    });
-  }
-
-  async listApprovals(): Promise<Approval[]> {
-    const approvals = await this.prisma.approval.findMany({
-      orderBy: { createdAt: 'desc' }
-    });
-    return approvals.map(toApproval);
-  }
-
-  async getApproval(approvalId: string): Promise<Approval | undefined> {
-    const approval = await this.prisma.approval.findUnique({ where: { id: approvalId } });
-    return approval ? toApproval(approval) : undefined;
-  }
-
-  async createApproval(input: {
-    taskId: string;
-    type: ApprovalType;
-    requestedBy: Approval['requestedBy'];
-    title: string;
-    description: string;
-    riskLevel: RiskLevel;
-    payload: JsonValue;
-  }): Promise<Approval> {
-    const approval = await this.prisma.approval.create({
-      data: {
-        taskId: input.taskId,
-        type: input.type,
-        requestedBy: input.requestedBy,
-        title: input.title,
-        description: input.description,
-        riskLevel: input.riskLevel,
-        payloadJson: toPrismaJson(input.payload)
-      }
-    });
-
-    await this.writeAudit({
-      actorType: 'agent',
-      eventType: 'approval_requested',
-      taskId: approval.taskId,
-      payload: { type: approval.type, riskLevel: approval.riskLevel }
-    });
-
-    return toApproval(approval);
-  }
-
-  async resolveApproval(approvalId: string, status: Extract<ApprovalStatus, 'approved' | 'rejected'>): Promise<Approval | undefined> {
-    const approval = await this.prisma.approval.findUnique({ where: { id: approvalId } });
-    if (!approval) return undefined;
-    if (approval.status !== 'pending') {
-      throw new Error(`Approval "${approvalId}" is already ${approval.status}`);
-    }
-
-    const updated = await this.prisma.approval.update({
-      where: { id: approvalId },
-      data: {
-        status,
-        approvedByUserId: status === 'approved' ? LOCAL_USER_ID : null,
-        resolvedAt: new Date()
-      }
-    });
-
-    await this.writeAudit({
-      actorType: 'user',
-      actorId: LOCAL_USER_ID,
-      eventType: status === 'approved' ? 'approval_approved' : 'approval_rejected',
-      taskId: updated.taskId,
-      payload: { approvalId }
-    });
-
-    return toApproval(updated);
-  }
-
-  async consumeRiskApproval(approvalId: string): Promise<boolean> {
-    const result = await this.prisma.approval.updateMany({
-      where: {
-        id: approvalId,
-        status: 'approved'
-      },
-      data: {
-        status: 'cancelled',
-        resolvedAt: new Date()
-      }
-    });
-
-    if (result.count === 0) {
-      return false;
-    }
-
-    await this.writeAudit({
-      actorType: 'system',
-      eventType: 'approval_consumed',
-      payload: { approvalId }
-    });
-
-    return true;
   }
 
   async listTaskAudit(taskId: string): Promise<AuditEvent[]> {
@@ -5097,7 +4597,7 @@ export class ForgeMindRepository {
       }),
       this.prisma.task.findUnique({
         where: { id: taskId },
-        select: { status: true, waitingForCapabilities: true }
+        select: { status: true }
       }),
       this.prisma.taskQueueJob.findFirst({
         where: {
@@ -5144,12 +4644,10 @@ export class ForgeMindRepository {
       runs: runs.map((run, index) => {
         const isLatestRun = index === runs.length - 1;
         const detail = run.errorMessage ?? run.summary ?? undefined;
-        const waitingForCapabilities = task ? jsonStringArray(task.waitingForCapabilities) : [];
         const fallbackState = isLatestRun
           ? resolveTaskRunState({
               persistedStatus: run.status,
               taskStatus: task?.status,
-              waitingForCapabilities,
               nextAttemptAt: queuedJob?.nextAttemptAt?.toISOString(),
               detail
             })
@@ -5372,7 +4870,7 @@ export type PrismaJsonObject = Prisma.JsonObject;
 function parseActiveIterationAudit(event: AuditLog | null):
   | {
       taskRunId?: string;
-      phase: 'planning' | 'implementation' | 'validation' | 'review' | 'approval' | 'pr_creation';
+      phase: 'planning' | 'implementation' | 'validation' | 'review' | 'pr_creation';
       attempt: number;
       prompt: string;
       providerPrompt?: string;
@@ -5385,7 +4883,7 @@ function parseActiveIterationAudit(event: AuditLog | null):
 
   const payload = event.payload as Record<string, unknown>;
   const phase = typeof payload.phase === 'string' ? payload.phase : '';
-  if (!['planning', 'implementation', 'validation', 'review', 'approval', 'pr_creation'].includes(phase)) {
+  if (!['planning', 'implementation', 'validation', 'review', 'pr_creation'].includes(phase)) {
     return undefined;
   }
 
@@ -5396,7 +4894,7 @@ function parseActiveIterationAudit(event: AuditLog | null):
 
   return {
     taskRunId: typeof payload.taskRunId === 'string' ? payload.taskRunId : undefined,
-    phase: phase as 'planning' | 'implementation' | 'validation' | 'review' | 'approval' | 'pr_creation',
+    phase: phase as 'planning' | 'implementation' | 'validation' | 'review' | 'pr_creation',
     attempt: typeof payload.attempt === 'number' && Number.isFinite(payload.attempt) ? payload.attempt : 0,
     prompt,
     providerPrompt: typeof payload.providerPrompt === 'string' && payload.providerPrompt.length > 0 ? payload.providerPrompt : undefined,
@@ -5450,15 +4948,6 @@ function isGitHubEvent(event: AuditEvent): boolean {
 }
 
 function resolveDiagnosticTaskState(task: ForgeTask, nextAttemptAt?: string): TaskRunState | undefined {
-  if (task.status === 'waiting_for_capability') {
-    return createWaitingRunState('unavailable_capability', {
-      detail: 'Task is waiting for a worker with the required capability.',
-      requiredCapabilities: task.waitingForCapabilities ?? []
-    });
-  }
-  if (task.status === 'needs_approval' || task.status === 'waiting_for_plan_approval') {
-    return createWaitingRunState('approval_required', { detail: 'Task is waiting for approval.' });
-  }
   if (nextAttemptAt) {
     return createRetryScheduledRunState({
       detail: 'Task queue job is waiting for retry backoff.',
@@ -5467,10 +4956,6 @@ function resolveDiagnosticTaskState(task: ForgeTask, nextAttemptAt?: string): Ta
   }
   if (task.status === 'validation_failed') return createBlockedRunState('validation_failed');
   if (task.status === 'provider_failed') return createBlockedRunState('provider_failed');
-  if (task.status === 'approval_rejected') return createBlockedRunState('approval_rejected');
-  if (task.status === 'budget_exceeded') return createBlockedRunState('budget_exceeded');
-  if (task.status === 'iteration_limit_reached') return createBlockedRunState('iteration_limit_reached');
-  if (task.status === 'repeated_error_detected') return createBlockedRunState('repeated_error_detected');
   return undefined;
 }
 
@@ -5567,7 +5052,6 @@ function toProjectArchitectureUpdate(value: Prisma.JsonValue | undefined): Proje
     dependencyRules: jsonStringArray(record.dependencyRules ?? []),
     knownDebt: jsonStringArray(record.knownDebt ?? []),
     resolvedDebt: jsonStringArray(record.resolvedDebt ?? []),
-    validationCommands: jsonStringArray(record.validationCommands ?? [])
   };
 }
 
@@ -5598,78 +5082,6 @@ function toAuthSessionSnapshot(session: {
     lastSeenAt: session.lastSeenAt.toISOString(),
     revokedAt: session.revokedAt?.toISOString()
   };
-}
-
-export function isVerifiedManualBorekFilipExecution(
-  executionJob: {
-    id: string; projectId: string; taskId: string; status: string; packet: unknown;
-    leases?: Array<{
-      id: string; deviceId: string; sessionId: string; status: string; claimedAt: Date; releasedAt: Date | null;
-      session: { id: string; deviceId: string; startedAt: Date; expiresAt: Date; lastHeartbeatAt: Date };
-      device: { id: string; capabilities: unknown; probeEvidence: unknown };
-    }>;
-  } | null | undefined,
-  approval: {
-    id: string; taskId: string; status: string; approvedByUserId: string | null;
-    resolvedAt: Date | null; payloadJson: unknown;
-  } | null | undefined,
-  projectId: string,
-  commitSha: string
-): boolean {
-  if (!executionJob || !approval || !isWindowsExecutionPacket(executionJob.packet)) return false;
-  const packet = executionJob.packet;
-  const payload = approval.payloadJson;
-  const scoped = payload && typeof payload === 'object' && !Array.isArray(payload)
-    ? payload as Record<string, unknown>
-    : undefined;
-  const provenance = executionJob.leases?.some((lease) => {
-    const capabilities = Array.isArray(lease.device.capabilities) ? lease.device.capabilities : [];
-    const probeEvidence = Array.isArray(lease.device.probeEvidence) ? lease.device.probeEvidence : [];
-    const hasCapability = (key: string) => capabilities.some((item) =>
-      item && typeof item === 'object' && !Array.isArray(item) && (item as Record<string, unknown>).key === key
-    );
-    const hasSuccessfulProbe = (key: string) => probeEvidence.some((item) => {
-      if (!item || typeof item !== 'object' || Array.isArray(item)) return false;
-      const record = item as Record<string, unknown>;
-      const capability = record.capability;
-      return record.status === 'supported' && capability && typeof capability === 'object' && !Array.isArray(capability)
-        && (capability as Record<string, unknown>).key === key;
-    });
-    return lease.id === packet.leaseId
-      && lease.status === 'released'
-      && Boolean(lease.releasedAt)
-      && lease.deviceId === lease.device.id
-      && lease.sessionId === lease.session.id
-      && lease.session.deviceId === lease.device.id
-      && approval.resolvedAt !== null
-      && approval.resolvedAt <= lease.claimedAt
-      && lease.claimedAt >= lease.session.startedAt
-      && lease.claimedAt <= lease.session.expiresAt
-      && lease.session.lastHeartbeatAt.getTime() >= lease.claimedAt.getTime() - WINDOWS_DEVICE_OFFLINE_AFTER_MS
-      && hasCapability('windows')
-      && hasCapability('unreal-engine-5.8')
-      && hasSuccessfulProbe('windows')
-      && hasSuccessfulProbe('unreal-engine-5.8');
-  });
-  return Boolean(
-    executionJob.projectId === projectId
-    && executionJob.status === 'succeeded'
-    && packet.commitSha === commitSha
-    && packet.executionAdapter?.kind === 'unreal'
-    && packet.executionAdapter.profile.profileId === BOREK_FILIP_UNREAL_PROFILE_ID
-    && packet.jobId === executionJob.id
-    && packet.unrealApprovalId === approval.id
-    && provenance
-    && approval.taskId === executionJob.taskId
-    && approval.status === 'approved'
-    && approval.approvedByUserId
-    && approval.resolvedAt
-    && scoped?.operation === 'windows_unreal_validation'
-    && scoped.jobId === executionJob.id
-    && scoped.checkId === packet.checkId
-    && scoped.commitSha === packet.commitSha
-    && scoped.inputHash === packet.inputHash
-  );
 }
 
 export function deriveProjectCapabilities(
@@ -5808,7 +5220,6 @@ export function mergeProjectArchitecture(
     conventions: uniqueArchitectureItems([...(current?.conventions ?? []), ...(update.conventions ?? [])], 30, 400),
     dependencyRules: uniqueArchitectureItems([...(current?.dependencyRules ?? []), ...(update.dependencyRules ?? [])], 30, 400),
     knownDebt,
-    validationCommands: uniqueArchitectureItems([...(current?.validationCommands ?? []), ...(update.validationCommands ?? [])], 20, 500),
     updatedAt
   };
 }
@@ -5865,29 +5276,15 @@ function toTaskRunStateJson(state: TaskRunState): Prisma.InputJsonValue {
 function resolveTaskRunState(input: {
   persistedStatus: RunStatus;
   taskStatus?: TaskStatus;
-  waitingForCapabilities: string[];
   nextAttemptAt?: string;
   detail?: string;
 }): TaskRunState {
-  if (input.taskStatus === 'waiting_for_capability') {
-    return createWaitingRunState('unavailable_capability', {
-      detail: input.detail,
-      requiredCapabilities: input.waitingForCapabilities
-    });
-  }
-  if (input.taskStatus === 'needs_approval') {
-    return createWaitingRunState('approval_required', { detail: input.detail });
-  }
   if (input.taskStatus === 'submitted' && input.nextAttemptAt) {
     return createRetryScheduledRunState({ detail: input.detail, nextAttemptAt: input.nextAttemptAt });
   }
   if (
     input.taskStatus === 'validation_failed'
     || input.taskStatus === 'provider_failed'
-    || input.taskStatus === 'budget_exceeded'
-    || input.taskStatus === 'iteration_limit_reached'
-    || input.taskStatus === 'repeated_error_detected'
-    || input.taskStatus === 'approval_rejected'
   ) {
     return createBlockedRunState(input.taskStatus, input.detail);
   }

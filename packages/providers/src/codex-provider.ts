@@ -41,34 +41,15 @@ import type { ProviderModelOption } from './openai-provider.js';
 const DEFAULT_CODEX_API_URL = 'https://api.openai.com/v1/responses';
 const DEFAULT_CODEX_MODEL = 'gpt-5.5';
 const execFileAsync = promisify(execFile);
-const APPROVAL_TYPES = [
-  'budget_increase',
-  'continue_after_iteration_limit',
-  'new_dependency',
-  'risky_refactor',
-  'database_migration',
-  'config_change',
-  'deploy_staging',
-  'deploy_production',
-  'merge_pr',
-  'delete_files',
-  'github_workflow_change',
-  'systemd_change',
-  'nginx_config_change',
-  'write_outside_repo'
-];
-
 export function buildCodexReviewSchema(): Record<string, unknown> {
   return {
     type: 'object',
     additionalProperties: false,
-    required: ['summary', 'blockers', 'safeImprovements', 'riskyChanges', 'validationChecks', 'criterionResults'],
+    required: ['verdict', 'summary', 'blockers', 'criterionResults'],
     properties: {
+      verdict: { type: 'string', enum: ['satisfied', 'not_satisfied'] },
       summary: { type: 'string' },
       blockers: { type: 'array', items: { type: 'string' } },
-      safeImprovements: { type: 'array', items: { type: 'string' } },
-      riskyChanges: { type: 'array', items: { type: 'string', enum: APPROVAL_TYPES } },
-      validationChecks: validationChecksJsonSchema(),
       criterionResults: {
         type: 'array',
         items: {
@@ -189,14 +170,18 @@ function validationChecksJsonSchema(): Record<string, unknown> {
     items: {
       type: 'object',
       additionalProperties: false,
-      required: ['kind', 'command', 'category', 'criterion', 'rationale', 'requiredCapabilities'],
+      required: ['kind', 'command', 'shell', 'target', 'requiredCapabilities', 'continueOnFailure', 'category', 'criterion', 'rationale', 'timeoutMinutes'],
       properties: {
         kind: { type: 'string', enum: ['command'] },
         command: { type: 'string' },
+        shell: { type: 'string', enum: ['system', 'powershell', 'cmd', 'bash', 'sh'] },
+        target: { type: 'string', enum: ['local', 'windows'] },
+        requiredCapabilities: { type: 'array', items: { type: 'string' } },
+        continueOnFailure: { type: 'boolean' },
         category: { type: 'string', enum: ['setup', 'build', 'database', 'api', 'browser', 'smoke'] },
         criterion: { type: ['string', 'null'] },
         rationale: { type: ['string', 'null'] },
-        requiredCapabilities: { type: 'array', items: { type: 'string' } }
+        timeoutMinutes: { type: 'integer', minimum: 1, maximum: 600 }
       }
     }
   };
@@ -342,7 +327,7 @@ function architectureUpdateJsonSchema(): Record<string, unknown> {
   return {
     type: 'object',
     additionalProperties: false,
-    required: ['summary', 'modules', 'databaseSchemas', 'decisions', 'conventions', 'dependencyRules', 'knownDebt', 'resolvedDebt', 'validationCommands'],
+    required: ['summary', 'modules', 'databaseSchemas', 'decisions', 'conventions', 'dependencyRules', 'knownDebt', 'resolvedDebt'],
     properties: {
       summary: { type: ['string', 'null'] },
       modules: {
@@ -388,7 +373,6 @@ function architectureUpdateJsonSchema(): Record<string, unknown> {
       dependencyRules: { type: 'array', items: { type: 'string' } },
       knownDebt: { type: 'array', items: { type: 'string' } },
       resolvedDebt: { type: 'array', items: { type: 'string' } },
-      validationCommands: { type: 'array', items: { type: 'string' } }
     }
   };
 }
@@ -566,33 +550,18 @@ export class CodexProvider implements AIProvider {
       return this.planWithCli(input);
     }
 
-    const isValidationRecovery = Boolean(input.validationFailure);
     const messages: Array<{ role: 'system' | 'user' | 'assistant'; content: string }> = [
       {
         role: 'system',
-        content: isValidationRecovery
-          ? 'Diagnose the supplied validation failure. Decide whether to replace only the invalid validation check, repair the implementation, or report a genuine blocker. A missing portable installable project tool or language package is not by itself a reason to weaken or replace an otherwise authoritative check: choose repair_implementation so the repository can declare the dependency and ForgeMind can install it in the persistent workspace environment. Replace a check only when the command or criterion itself is invalid. Return JSON with summary, empty steps, empty acceptanceCriteria, empty implementationSteps, validationChecks containing replacements only when action is replace_validation_check, and validationRecovery with action and rationale. Do not modify repository files. Reply with JSON only.'
-          : 'You are Codex. Return JSON with summary, steps, acceptanceCriteria, validationChecks, implementationSteps, projectContract, contractDelta, and architectureUpdate. ' +
+        content: 'You are Codex. Return JSON with summary, steps, acceptanceCriteria, implementationSteps, projectContract, contractDelta, and architectureUpdate. ' +
             'For ordinary task plans, implementationSteps must be an empty array and projectContract, contractDelta, and architectureUpdate must be null. For an initial project roadmap, include a full projectContract, set contractDelta to null, and include implementationSteps and architectureUpdate. For an approved project extension, set projectContract to null and return contractDelta against the supplied base contract, plus only implementationSteps required by that delta and a compact architectureUpdate. Never silently omit an existing requirement: update, supersede, or remove it with an explicit rationale. Every new or replacement requirement must include briefReferences with short source phrases or section names from the brief. ' +
             'Every implementation step must include changeRationale, dependsOnStepTitles referencing only earlier steps, and validationFocus. Include regression validation for extensions and migration or compatibility validation when the delta declares those impacts. Architecture updates must include databaseSchemas. ' +
-            'validationChecks must contain only executable command checks and classify each command as setup, build, database, api, browser, or smoke. Omit criteria that cannot be verified automatically. ' +
-            'Commands must verify a criterion through their exit code and must not use shell redirection, fallback chains, or inspection-only git diff/status/log commands. ' +
-            'Declare non-installable platform or licensed-runtime requirements in requiredCapabilities, for example ["windows", "unreal-engine-5.8"]. A check that consumes an artifact produced by a platform-specific check must repeat the producer requiredCapabilities so both checks are deferred together. Use an empty array when the current worker can run the check on any normal platform. Never replace an authoritative platform check with weaker static inspection. ' +
-            'Use { "kind": "command", "command": "...", "criterion": "...", "rationale": "...", "requiredCapabilities": [] }. Reply with JSON only.'
+            'Do not propose executable validation commands during planning; the implementation provider will derive them from the resulting repository. Reply with JSON only.'
       },
       {
         role: 'user',
         content: [
-          `Create a plan for task "${input.title}". Prompt:\n${input.prompt}`,
-          input.validationFailure
-            ? `Complete validation failure:\n${JSON.stringify(input.validationFailure, null, 2)}`
-            : input.previousValidationError ? `Previous validation error: ${input.previousValidationError}` : '',
-          input.previousValidationChecks?.length
-            ? `Previous validation checks:\n${input.previousValidationChecks.map((check) => check.command).join('\n')}`
-            : '',
-          isValidationRecovery
-            ? 'Inspect the repository before deciding. Return replacement checks only for replace_validation_check; use repair_implementation when repository changes are required; use blocked only when no autonomous correction is possible.'
-            : ''
+          `Create a plan for task "${input.title}". Prompt:\n${input.prompt}`
         ]
           .filter(Boolean)
           .join('\n\n')
@@ -671,11 +640,10 @@ export class CodexProvider implements AIProvider {
         role: 'system',
         content:
           'You are Codex implementation agent. Make only the repository changes required by the supplied task and correction context. ' +
-          'Do not run broad test suites, full builds, type checks, dependency installation, database validation, or repository-wide formatting; ForgeMind runs authoritative validation after implementation. ' +
-          'Run a narrowly targeted check only when it is required to make the edit correctly. ' +
-          'Set outcome to changes_made when repository changes are required. If the current repository already satisfies every acceptance criterion, do not modify files: set outcome to already_satisfied, return empty changedFiles, a zero diffStat, non-empty evidenceFiles naming the repository files that prove the criteria, and executable validationChecks that prove the criteria. ' +
-          'After editing, propose the smallest authoritative validationChecks set that verifies the acceptance criteria against the resulting repository. Classify every check as setup, build, database, api, browser, or smoke. Declare non-installable platform or licensed-runtime requirements in requiredCapabilities (for example windows or unreal-engine-5.8); otherwise use an empty array. A check that consumes an artifact produced by a platform-specific check must repeat the producer requiredCapabilities so both checks are deferred together. Never replace an authoritative platform check with weaker static inspection. ' +
-          'Return JSON with outcome, summary, changedFiles, evidenceFiles, diffStat, requestedApprovals, validationChecks, architectureUpdate, and optional fileUpdates [{ path, content }]. architectureUpdate must contain only architectural facts introduced or changed by this attempt, including databaseSchemas; use empty arrays when nothing changed. Reply with JSON only.'
+          'Use any repository, shell, network, installation, build, test, or formatting command needed to implement the task correctly. ForgeMind still runs the returned authoritative validation checks afterward. ' +
+          'Set outcome to changes_made when repository changes are required, already_satisfied when the repository already meets the task, or blocked only for a concrete external blocker that prevents further progress. ' +
+          'After editing, propose authoritative validationChecks. An empty array explicitly means no executable validation is applicable. For every command select shell, target (local or windows), requiredCapabilities, continueOnFailure, and timeoutMinutes. Use target windows only when the check genuinely requires Windows or Windows-only tooling. ForgeMind executes the command text exactly as returned. ' +
+          'Return JSON with outcome, summary, changedFiles, evidenceFiles, diffStat, validationChecks, architectureUpdate, and optional fileUpdates [{ path, content }]. architectureUpdate must contain only architectural facts introduced or changed by this attempt, including databaseSchemas; use empty arrays when nothing changed. Reply with JSON only.'
       },
       {
         role: 'user',
@@ -686,7 +654,6 @@ export class CodexProvider implements AIProvider {
           continueSession ? '' : `Plan: ${input.plan.steps.join(' | ')}`,
           input.previousValidationError ? `Previous validation error: ${input.previousValidationError}` : '',
           input.previousReviewBlockers?.length ? `Previous review blockers: ${input.previousReviewBlockers.join(' | ')}` : '',
-          input.previousSafeImprovements?.length ? `Apply these safe improvements automatically: ${input.previousSafeImprovements.join(' | ')}` : ''
         ]
           .filter(Boolean)
           .join('\n')
@@ -759,7 +726,7 @@ export class CodexProvider implements AIProvider {
     const messages: Array<{ role: 'system' | 'user' | 'assistant'; content: string }> = [
       {
         role: 'system',
-        content: 'You are Codex reviewer. Follow the review packet constraints and return JSON with summary, blockers, safeImprovements, riskyChanges, validationChecks, and criterionResults.'
+        content: 'You are a read-only repository reviewer. Decide only whether the current implementation satisfies the task. Return verdict satisfied or not_satisfied and concrete implementation blockers.'
       },
       {
         role: 'user',
@@ -782,14 +749,15 @@ export class CodexProvider implements AIProvider {
   }
 
   async auditCapability(input: CapabilityAuditInput): Promise<CapabilityAuditResult> {
-    if (!input.repositoryContext?.trim()) {
-      throw new Error('Codex capability audit requires a targeted repository packet.');
-    }
-    const providerPrompt = buildCapabilityAuditPrompt(input);
+    const auditInput: CapabilityAuditInput = {
+      ...input,
+      repositoryAccess: this.authMode === 'oauth' ? 'read_only_checkout' : 'complete_snapshot'
+    };
+    const providerPrompt = buildCapabilityAuditPrompt(auditInput);
     if (this.authMode === 'oauth') {
-      return this.auditCapabilityWithCli(input, providerPrompt);
+      return this.auditCapabilityWithCli(auditInput, providerPrompt);
     }
-    if (!input.repositoryContext?.trim()) {
+    if (!auditInput.repositoryContext?.trim()) {
       throw new Error('Codex API capability audit requires a targeted repository packet.');
     }
     const messages: Array<{ role: 'system' | 'user' | 'assistant'; content: string }> = [
@@ -804,9 +772,9 @@ export class CodexProvider implements AIProvider {
     const normalized = await normalizeAuditContentWithSingleRepair<CapabilityAuditResult>({
       auditKind: 'capability',
       content: response.content,
-      expectedCriteria: input.requirement.acceptanceCriteria,
-      allowedRequirementIds: [input.requirement.id],
-      normalize: (value) => normalizeCapabilityAuditResult(input, value),
+      expectedCriteria: auditInput.requirement.acceptanceCriteria,
+      allowedRequirementIds: [auditInput.requirement.id],
+      normalize: (value) => normalizeCapabilityAuditResult(auditInput, value),
       repair: async (repairPrompt) => {
         const repairResponse = await this.requestResponses([
           { role: 'system', content: 'Repair only the supplied audit JSON. Do not inspect or reassess the repository. Return strict JSON.' },
@@ -826,14 +794,15 @@ export class CodexProvider implements AIProvider {
   }
 
   async auditRelease(input: ReleaseAuditInput): Promise<ReleaseAuditResult> {
-    if (!input.repositoryContext?.trim()) {
-      throw new Error('Codex release audit requires a targeted repository packet.');
-    }
-    const providerPrompt = buildReleaseAuditPrompt(input);
+    const auditInput: ReleaseAuditInput = {
+      ...input,
+      repositoryAccess: this.authMode === 'oauth' ? 'read_only_checkout' : 'complete_snapshot'
+    };
+    const providerPrompt = buildReleaseAuditPrompt(auditInput);
     if (this.authMode === 'oauth') {
-      const schema = releaseAuditJsonSchema([...input.contract.invariants, ...input.contract.releaseCriteria]);
+      const schema = releaseAuditJsonSchema([...auditInput.contract.invariants, ...auditInput.contract.releaseCriteria]);
       const content = await this.runCodexExec({
-        packetOnly: true,
+        repositoryPath: input.repositoryPath,
         sandbox: 'read-only',
         onActivity: input.onActivity,
         schema,
@@ -842,11 +811,11 @@ export class CodexProvider implements AIProvider {
       const normalized = await normalizeAuditContentWithSingleRepair<ReleaseAuditResult>({
         auditKind: 'release',
         content,
-        expectedCriteria: [...input.contract.invariants, ...input.contract.releaseCriteria],
-        allowedRequirementIds: input.contract.requirements.map((requirement) => requirement.id),
-        normalize: (value) => normalizeReleaseAuditResult(input, value),
+        expectedCriteria: [...auditInput.contract.invariants, ...auditInput.contract.releaseCriteria],
+        allowedRequirementIds: auditInput.contract.requirements.map((requirement) => requirement.id),
+        normalize: (value) => normalizeReleaseAuditResult(auditInput, value),
         repair: (repairPrompt) => this.runCodexExec({
-          packetOnly: true,
+          repositoryPath: input.repositoryPath,
           sandbox: 'read-only',
           onActivity: input.onActivity,
           schema,
@@ -859,7 +828,7 @@ export class CodexProvider implements AIProvider {
         providerResponse: normalized.response
       };
     }
-    if (!input.repositoryContext?.trim()) throw new Error('Codex API release audit requires a targeted repository packet.');
+    if (!auditInput.repositoryContext?.trim()) throw new Error('Codex API release audit requires a targeted repository packet.');
     const messages: Array<{ role: 'system' | 'user' | 'assistant'; content: string }> = [
       { role: 'system', content: 'You are an independent read-only release auditor. Inspect integration and contract satisfaction, then return strict JSON.' },
       { role: 'user', content: providerPrompt }
@@ -869,9 +838,9 @@ export class CodexProvider implements AIProvider {
     const normalized = await normalizeAuditContentWithSingleRepair<ReleaseAuditResult>({
       auditKind: 'release',
       content: response.content,
-      expectedCriteria: [...input.contract.invariants, ...input.contract.releaseCriteria],
-      allowedRequirementIds: input.contract.requirements.map((requirement) => requirement.id),
-      normalize: (value) => normalizeReleaseAuditResult(input, value),
+      expectedCriteria: [...auditInput.contract.invariants, ...auditInput.contract.releaseCriteria],
+      allowedRequirementIds: auditInput.contract.requirements.map((requirement) => requirement.id),
+      normalize: (value) => normalizeReleaseAuditResult(auditInput, value),
       repair: async (repairPrompt) => {
         const repairResponse = await this.requestResponses([
           { role: 'system', content: 'Repair only the supplied release-audit JSON. Do not inspect or reassess the repository. Return strict JSON.' },
@@ -911,28 +880,23 @@ export class CodexProvider implements AIProvider {
     return false;
   }
 
+  supportsNativeRepositoryReview(): boolean {
+    return this.authMode === 'oauth';
+  }
+
+  supportsNativeRepositoryAudit(): boolean {
+    return this.authMode === 'oauth';
+  }
+
   private async planWithCli(input: PlanInput): Promise<PlanResult> {
-    const isValidationRecovery = Boolean(input.validationFailure);
     const providerPrompt = [
-      isValidationRecovery
-        ? 'Diagnose the supplied validation failure for this ForgeMind task. Decide whether to replace only the invalid validation check, repair the implementation, or report a genuine blocker. A missing portable installable project tool or language package is not by itself a reason to weaken or replace an otherwise authoritative check: choose repair_implementation so the repository can declare the dependency and ForgeMind can install it in the persistent workspace environment. Replace a check only when the command or criterion itself is invalid. Do not modify repository files.'
-        : 'Create an implementation plan for this ForgeMind task.',
+      'Create an implementation plan for this ForgeMind task.',
       'Return only JSON matching the provided schema.',
-      'Translate acceptance criteria into concrete validation checks whenever possible.',
       'For roadmap plans, every implementation step must include changeRationale, dependsOnStepTitles referencing only earlier steps, and validationFocus. Architecture updates must include databaseSchemas.',
-      'Return only executable validation commands. Omit criteria that cannot be verified automatically. Commands must verify a criterion through their exit code and must not use shell redirection, fallback chains, or inspection-only git diff/status/log commands.',
+      'Do not propose executable validation commands during planning; the implementation provider will derive them from the resulting repository.',
       `Task id: ${input.taskId}`,
       `Title: ${input.title}`,
-      `Prompt:\n${input.prompt}`,
-      input.validationFailure
-        ? `Complete validation failure:\n${JSON.stringify(input.validationFailure, null, 2)}`
-        : input.previousValidationError ? `Previous validation error:\n${input.previousValidationError}` : '',
-      input.previousValidationChecks?.length
-        ? `Previous validation checks:\n${input.previousValidationChecks.map((check) => check.command).join('\n')}`
-        : '',
-      isValidationRecovery
-        ? 'Inspect the repository before deciding. Return validationRecovery.action as replace_validation_check, repair_implementation, or blocked. Return replacement validationChecks only for replace_validation_check; otherwise return an empty array.'
-        : ''
+      `Prompt:\n${input.prompt}`
     ].join('\n\n');
     const content = await this.runCodexExec({
       sandbox: 'read-only',
@@ -940,29 +904,10 @@ export class CodexProvider implements AIProvider {
       session: input.session,
       maxRuntimeMs: input.maxRuntimeMs,
       signal: input.signal,
-      schema: isValidationRecovery ? {
+      schema: {
         type: 'object',
         additionalProperties: false,
-        required: ['summary', 'steps', 'acceptanceCriteria', 'validationChecks', 'validationRecovery'],
-        properties: {
-          summary: { type: 'string' },
-          steps: { type: 'array', items: { type: 'string' } },
-          acceptanceCriteria: { type: 'array', items: { type: 'string' } },
-          validationChecks: validationChecksJsonSchema(),
-          validationRecovery: {
-            type: 'object',
-            additionalProperties: false,
-            required: ['action', 'rationale'],
-            properties: {
-              action: { type: 'string', enum: ['replace_validation_check', 'repair_implementation', 'blocked'] },
-              rationale: { type: 'string' }
-            }
-          }
-        }
-      } : {
-        type: 'object',
-        additionalProperties: false,
-        required: ['summary', 'steps', 'acceptanceCriteria', 'implementationSteps', 'projectContract', 'contractDelta', 'architectureUpdate', 'validationChecks'],
+        required: ['summary', 'steps', 'acceptanceCriteria', 'implementationSteps', 'projectContract', 'contractDelta', 'architectureUpdate'],
         properties: {
           summary: { type: 'string' },
           steps: { type: 'array', items: { type: 'string' } },
@@ -976,8 +921,7 @@ export class CodexProvider implements AIProvider {
           },
           architectureUpdate: {
             anyOf: [architectureUpdateJsonSchema(), { type: 'null' }]
-          },
-          validationChecks: validationChecksJsonSchema()
+          }
         }
       },
       prompt: providerPrompt
@@ -1008,9 +952,9 @@ export class CodexProvider implements AIProvider {
         schema: {
           type: 'object',
           additionalProperties: false,
-          required: ['outcome', 'summary', 'changedFiles', 'evidenceFiles', 'diffStat', 'requestedApprovals', 'validationChecks', 'architectureUpdate'],
+          required: ['outcome', 'summary', 'changedFiles', 'evidenceFiles', 'diffStat', 'validationChecks', 'architectureUpdate'],
           properties: {
-            outcome: { type: 'string', enum: ['changes_made', 'already_satisfied'] },
+            outcome: { type: 'string', enum: ['changes_made', 'already_satisfied', 'blocked'] },
             summary: { type: 'string' },
             changedFiles: { type: 'array', items: { type: 'string' } },
             evidenceFiles: { type: 'array', items: { type: 'string' } },
@@ -1024,7 +968,6 @@ export class CodexProvider implements AIProvider {
                 deletions: { type: 'number' }
               }
             },
-            requestedApprovals: { type: 'array', items: { type: 'string', enum: APPROVAL_TYPES } },
             validationChecks: validationChecksJsonSchema(),
             architectureUpdate: architectureUpdateJsonSchema()
           }
@@ -1057,7 +1000,6 @@ export class CodexProvider implements AIProvider {
           summary: `Codex stopped after inactivity; preserved ${changedFiles.length} changed file(s) for validation and review.`,
           changedFiles,
           diffStat: await collectDiffStat(input.repositoryPath, changedFiles),
-          requestedApprovals: [],
           validationChecks: []
         }
       : parseImplementResult(content, 'Codex CLI implementation');
@@ -1095,7 +1037,7 @@ export class CodexProvider implements AIProvider {
   private async auditCapabilityWithCli(input: CapabilityAuditInput, providerPrompt: string): Promise<CapabilityAuditResult> {
     const schema = capabilityAuditJsonSchema(input.requirement.acceptanceCriteria);
     const content = await this.runCodexExec({
-      packetOnly: true,
+      repositoryPath: input.repositoryPath,
       sandbox: 'read-only',
       onActivity: input.onActivity,
       schema,
@@ -1108,7 +1050,7 @@ export class CodexProvider implements AIProvider {
       allowedRequirementIds: [input.requirement.id],
       normalize: (value) => normalizeCapabilityAuditResult(input, value),
       repair: (repairPrompt) => this.runCodexExec({
-        packetOnly: true,
+        repositoryPath: input.repositoryPath,
         sandbox: 'read-only',
         onActivity: input.onActivity,
         schema,
@@ -1412,7 +1354,7 @@ export async function runCodexProcess(
     process.env.CODEX_EXEC_INACTIVITY_TIMEOUT_MS ?? process.env.CODEX_EXEC_TIMEOUT_MS,
     600_000
   );
-  const maxRuntimeMs = resolvePositiveTimeout(options.maxRuntimeMs, process.env.CODEX_EXEC_MAX_RUNTIME_MS, 3_600_000);
+  const maxRuntimeMs = resolvePositiveTimeout(options.maxRuntimeMs, process.env.CODEX_EXEC_MAX_RUNTIME_MS, 36_000_000);
 
   return await new Promise<CodexProcessResult>((resolve, reject) => {
     const child = spawn(options.binary ?? resolveCodexBinary(), args, {
@@ -1802,11 +1744,10 @@ export function buildCodexImplementationPrompt(input: ImplementInput, continueSe
   return [
     'Implement this task directly in the repository workspace.',
     'Do not create commits, branches, issues, or pull requests. ForgeMind handles those steps.',
-    'Do not run broad test suites, full builds, type checks, dependency installation, database validation, or repository-wide formatting. ForgeMind runs authoritative validation after implementation.',
-    'Run a narrowly targeted check only when it is required to make the edit correctly.',
-    'Set outcome to changes_made when repository changes are required. If the current repository already satisfies every acceptance criterion, do not modify files: set outcome to already_satisfied, return empty changedFiles, a zero diffStat, non-empty evidenceFiles naming repository files that prove the criteria, and executable validationChecks that prove the criteria.',
-    'After editing, return the smallest authoritative validationChecks set for the resulting repository and acceptance criteria. Every check must declare requiredCapabilities; use an empty array unless it requires a non-installable platform or licensed runtime such as windows or unreal-engine-5.8. A check that consumes an artifact produced by a platform-specific check must repeat the producer requiredCapabilities so both checks are deferred together. Never replace an authoritative platform check with weaker static inspection. Do not use environment-only smoke checks such as node --version unless the task explicitly requires them.',
-    'Return architectureUpdate as a compact delta containing only modules, databaseSchemas, interfaces, dependencies, decisions, conventions, debt, or architecture validation commands introduced or changed by this attempt. Use empty arrays when architecture did not change.',
+    'Use any repository, shell, network, installation, build, or test command needed to implement the task correctly. ForgeMind still runs the returned authoritative validation checks afterward.',
+    'Set outcome to changes_made when repository changes are required, already_satisfied when the repository already meets the task, or blocked only for a concrete external blocker that prevents further progress.',
+    'After editing, return authoritative validationChecks. An empty array explicitly means no executable validation is applicable. For every command select shell (system, powershell, cmd, bash, or sh), target (local or windows), requiredCapabilities, continueOnFailure, and a realistic timeoutMinutes from 1 to 600. Use target windows only when the check genuinely requires Windows or Windows-only tooling. ForgeMind executes the command text exactly as returned. Do not use environment-only smoke checks such as node --version unless the task explicitly requires them.',
+    'Return architectureUpdate as a compact delta containing only modules, databaseSchemas, interfaces, dependencies, decisions, conventions, or debt introduced or changed by this attempt. Use empty arrays when architecture did not change.',
     'Validation checks must be executable commands that prove a criterion through their exit code. Omit criteria that cannot be verified automatically.',
     input.attemptNumber && input.attemptNumber > 1
       ? 'This is a correction pass. Preserve completed work and change only what is required by the supplied validation error or review blocker.'
@@ -1818,7 +1759,6 @@ export function buildCodexImplementationPrompt(input: ImplementInput, continueSe
     continueSession ? '' : `Plan:\n${input.plan.steps.map((step, index) => `${index + 1}. ${step}`).join('\n')}`,
     input.previousValidationError ? `Previous validation error:\n${input.previousValidationError}` : '',
     input.previousReviewBlockers?.length ? `Previous review blockers:\n${input.previousReviewBlockers.join('\n')}` : '',
-    input.previousSafeImprovements?.length ? `Safe improvements to apply:\n${input.previousSafeImprovements.join('\n')}` : ''
   ]
     .filter(Boolean)
     .join('\n\n');
@@ -1828,11 +1768,10 @@ function repositoryChatJsonSchema(): Record<string, unknown> {
   return {
     type: 'object',
     additionalProperties: false,
-    required: ['response', 'changedFiles', 'requestedApprovals', 'validationChecks', 'fileUpdates', 'forgeMindActions'],
+    required: ['response', 'changedFiles', 'validationChecks', 'fileUpdates', 'forgeMindActions'],
     properties: {
       response: { type: 'string' },
       changedFiles: { type: 'array', items: { type: 'string' } },
-      requestedApprovals: { type: 'array', items: { type: 'string', enum: APPROVAL_TYPES } },
       validationChecks: validationChecksJsonSchema(),
       fileUpdates: {
         type: 'array',

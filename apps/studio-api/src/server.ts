@@ -14,11 +14,7 @@ import { createWebPushDispatcher } from './web-push.js';
 const TERMINAL_FAILURE_STATUSES = new Set([
   'failed',
   'provider_failed',
-  'validation_failed',
-  'budget_exceeded',
-  'iteration_limit_reached',
-  'repeated_error_detected',
-  'approval_rejected'
+  'validation_failed'
 ]);
 
 const DEFAULT_CORS_ORIGINS = [
@@ -80,7 +76,8 @@ export async function createApp() {
   const authService = createAuthService(repository);
   const realtime = registerRealtimeGateway(app, repository, authService);
   registerRoutes(app, repository, notificationService, authService, {
-    credentials: new WindowsRunnerCredentialAdapter(prisma), workers: new WindowsWorkerRepository(prisma)
+    credentials: new WindowsRunnerCredentialAdapter(prisma),
+    workers: new WindowsWorkerRepository(prisma)
   });
 
   startTaskNotificationBridge(app, repository, notificationService, realtime);
@@ -442,7 +439,7 @@ async function notifyFromAuditEvent(
   if (!status) {
     return;
   }
-  const shouldNotify = status === 'needs_approval' || status === 'completed' || TERMINAL_FAILURE_STATUSES.has(status);
+  const shouldNotify = status === 'completed' || TERMINAL_FAILURE_STATUSES.has(status);
   if (!shouldNotify) {
     return;
   }

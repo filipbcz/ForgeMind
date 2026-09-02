@@ -87,33 +87,17 @@ export class OpenAIProvider implements AIProvider {
   }
 
   async plan(input: PlanInput): Promise<PlanResult> {
-    const isValidationRecovery = Boolean(input.validationFailure);
     const messages: Array<{ role: 'system' | 'user' | 'assistant'; content: string }> = [
       {
         role: 'system',
-        content: isValidationRecovery
-          ? 'Diagnose the supplied validation failure. Decide whether to replace only the invalid validation check, repair the implementation, or report a genuine blocker. A missing portable installable project tool or language package is not by itself a reason to weaken or replace an otherwise authoritative check: choose repair_implementation so the repository can declare the dependency and ForgeMind can install it in the persistent workspace environment. Replace a check only when the command or criterion itself is invalid. Return JSON with summary, empty steps, empty acceptanceCriteria, empty implementationSteps, validationChecks containing replacements only when action is replace_validation_check, and validationRecovery with action and rationale. Do not modify repository files. Respond only with JSON.'
-          : 'You are an AI project planner. Provide a JSON object with summary, steps, acceptanceCriteria, validationChecks, implementationSteps, projectContract, contractDelta, and architectureUpdate. ' +
-            'For ordinary task plans, implementationSteps must be an empty array and projectContract, contractDelta, and architectureUpdate must be omitted. For an initial project roadmap, include a full projectContract and set contractDelta to null. For an approved project extension, set projectContract to null and return a contractDelta against the supplied base contract, plus only implementationSteps required by that delta. Never silently omit an existing requirement: update, supersede, or remove it with an explicit rationale. Every new or replacement requirement must include briefReferences with short source phrases or section names from the brief. Include a compact architectureUpdate describing intended modules, boundaries, conventions, decisions, debt, and architecture validation commands. ' +
-            'Every implementation step must include changeRationale, dependsOnStepTitles referencing only earlier steps, and validationFocus. Include regression validation for extensions and migration or compatibility validation when the delta declares those impacts. Architecture updates must include databaseSchemas. ' +
-            'validationChecks must contain only executable command checks and classify each command as setup, build, database, api, browser, or smoke. Omit criteria that cannot be verified automatically. ' +
-            'Commands must verify a criterion through their exit code and must not use shell redirection, fallback chains, or inspection-only git diff/status/log commands. ' +
-            'Declare non-installable platform or licensed-runtime requirements in requiredCapabilities, for example ["windows", "unreal-engine-5.8"]. A check that consumes an artifact produced by a platform-specific check must repeat the producer requiredCapabilities so both checks are deferred together. Use an empty array for portable checks and never replace an authoritative platform check with weaker static inspection. ' +
-            'Use { "kind": "command", "command": "...", "category": "build", "criterion": "...", "rationale": "...", "requiredCapabilities": [] }. Respond only with JSON.'
+        content: 'You are an AI project planner. Provide a JSON object with summary, steps, acceptanceCriteria, implementationSteps, projectContract, contractDelta, and architectureUpdate. ' +
+            'For ordinary task plans, implementationSteps must be an empty array and projectContract, contractDelta, and architectureUpdate must be omitted. For an initial project roadmap, include a full projectContract and set contractDelta to null. For an approved project extension, set projectContract to null and return a contractDelta against the supplied base contract, plus only implementationSteps required by that delta. Never silently omit an existing requirement: update, supersede, or remove it with an explicit rationale. Every new or replacement requirement must include briefReferences with short source phrases or section names from the brief. Include a compact architectureUpdate describing intended modules, boundaries, conventions, decisions, and debt. ' +
+            'Every implementation step must include changeRationale, dependsOnStepTitles referencing only earlier steps, and validationFocus. Include regression validation for extensions and migration or compatibility validation when the delta declares those impacts. Architecture updates must include databaseSchemas. Do not propose executable validation commands during planning; the implementation provider will derive them from the resulting repository. Respond only with JSON.'
       },
       {
         role: 'user',
         content: [
-          `Create a plan for the task titled "${input.title}" with the prompt:\n${input.prompt}`,
-          input.validationFailure
-            ? `Complete validation failure:\n${JSON.stringify(input.validationFailure, null, 2)}`
-            : input.previousValidationError ? `Previous validation error: ${input.previousValidationError}` : '',
-          input.previousValidationChecks?.length
-            ? `Previous validation checks:\n${input.previousValidationChecks.map((check) => check.command).join('\n')}`
-            : '',
-          isValidationRecovery
-            ? 'Inspect the repository before deciding. Return replacement checks only for replace_validation_check; use repair_implementation when repository changes are required; use blocked only when no autonomous correction is possible.'
-            : ''
+          `Create a plan for the task titled "${input.title}" with the prompt:\n${input.prompt}`
         ]
           .filter(Boolean)
           .join('\n\n')
@@ -170,7 +154,7 @@ export class OpenAIProvider implements AIProvider {
     const messages: Array<{ role: 'system' | 'user' | 'assistant'; content: string }> = [
       {
         role: 'system',
-        content: 'You are an AI implementation assistant. Make only the repository changes required by the supplied task and correction context. Do not perform broad validation that ForgeMind will run after implementation. Set outcome to changes_made when repository changes are required. If the repository already satisfies every acceptance criterion, do not modify files: set outcome to already_satisfied, return empty changedFiles, a zero diffStat, non-empty evidenceFiles naming repository files that prove the criteria, and executable validationChecks that prove the criteria. After editing, propose the smallest authoritative validationChecks set that verifies the acceptance criteria against the resulting repository and classify every check as setup, build, database, api, browser, or smoke. Every check must declare requiredCapabilities; use an empty array unless it requires a non-installable platform or licensed runtime such as windows or unreal-engine-5.8. A check that consumes an artifact produced by a platform-specific check must repeat the producer requiredCapabilities so both checks are deferred together. Never replace an authoritative platform check with weaker static inspection. Provide a JSON object with outcome, summary, changedFiles, evidenceFiles, diffStat, requestedApprovals, validationChecks, architectureUpdate, and optional fileUpdates [{ path, content }]. architectureUpdate must be a compact delta containing only architectural facts introduced or changed by this attempt, including databaseSchemas; use empty arrays when nothing changed. Respond only with JSON.'
+        content: 'You are an AI implementation assistant. Make only the repository changes required by the supplied task and correction context. Use any repository, shell, network, installation, build, or test command needed to implement the task correctly. Set outcome to changes_made when repository changes are required, already_satisfied when the repository already meets the task, or blocked only for a concrete external blocker that prevents further progress. After editing, propose the authoritative validationChecks. An empty array explicitly means no executable validation is applicable. For every command select shell (system, powershell, cmd, bash, or sh), target (local or windows), requiredCapabilities, continueOnFailure, and timeoutMinutes from 1 to 600. Use target windows only when the check genuinely requires Windows or Windows-only tooling. ForgeMind executes the command text exactly as returned. Provide a JSON object with outcome, summary, changedFiles, evidenceFiles, diffStat, validationChecks, architectureUpdate, and optional fileUpdates [{ path, content }]. architectureUpdate must be a compact delta containing only architectural facts introduced or changed by this attempt, including databaseSchemas; use empty arrays when nothing changed. Respond only with JSON.'
       },
       {
         role: 'user',
@@ -182,7 +166,6 @@ export class OpenAIProvider implements AIProvider {
           input.attemptNumber && input.attemptNumber > 1 ? 'Preserve completed work and apply only the supplied correction.' : '',
           input.previousValidationError ? `Previous validation error: ${input.previousValidationError}` : '',
           input.previousReviewBlockers?.length ? `Previous review blockers: ${input.previousReviewBlockers.join(' | ')}` : '',
-          input.previousSafeImprovements?.length ? `Apply these safe improvements automatically: ${input.previousSafeImprovements.join(' | ')}` : ''
         ]
           .filter(Boolean)
           .join('\n')
@@ -214,7 +197,7 @@ export class OpenAIProvider implements AIProvider {
     const messages: Array<{ role: 'system' | 'user' | 'assistant'; content: string }> = [
       {
         role: 'system',
-        content: 'You are ForgeMind Repository Chat. Answer directly and return JSON with response, changedFiles, requestedApprovals, validationChecks, fileUpdates, and forgeMindActions. This API mode cannot edit files directly, so every file change must be returned in fileUpdates. Use forgeMindActions for ForgeMind application operations.'
+        content: 'You are ForgeMind Repository Chat. Answer directly and return JSON with response, changedFiles, validationChecks, fileUpdates, and forgeMindActions. This API mode cannot edit files directly, so every file change must be returned in fileUpdates. Use forgeMindActions for ForgeMind application operations.'
       },
       { role: 'user', content: providerPrompt }
     ];
@@ -236,7 +219,7 @@ export class OpenAIProvider implements AIProvider {
     const messages: Array<{ role: 'system' | 'user' | 'assistant'; content: string }> = [
       {
         role: 'system',
-        content: 'You are an AI code reviewer. Follow the review packet constraints and return JSON with summary, blockers, safeImprovements, riskyChanges, validationChecks, and criterionResults when requested.'
+        content: 'You are a repository reviewer. Decide only whether the supplied implementation satisfies the task. Return verdict satisfied or not_satisfied and concrete implementation blockers.'
       },
       {
         role: 'user',
@@ -262,7 +245,8 @@ export class OpenAIProvider implements AIProvider {
     if (!input.repositoryContext?.trim()) {
       throw new Error('OpenAI capability audit requires a targeted repository packet.');
     }
-    const providerPrompt = buildCapabilityAuditPrompt(input);
+    const auditInput: CapabilityAuditInput = { ...input, repositoryAccess: 'complete_snapshot' };
+    const providerPrompt = buildCapabilityAuditPrompt(auditInput);
     const messages: Array<{ role: 'system' | 'user' | 'assistant'; content: string }> = [
       {
         role: 'system',
@@ -277,7 +261,7 @@ export class OpenAIProvider implements AIProvider {
       content: response.content,
       expectedCriteria: input.requirement.acceptanceCriteria,
       allowedRequirementIds: [input.requirement.id],
-      normalize: (value) => normalizeCapabilityAuditResult(input, value),
+      normalize: (value) => normalizeCapabilityAuditResult(auditInput, value),
       repair: async (repairPrompt) => {
         const repairResponse = await this.requestChat([
           { role: 'system', content: 'Repair only the supplied audit JSON. Do not inspect or reassess the repository. Return strict JSON.' },
@@ -298,7 +282,8 @@ export class OpenAIProvider implements AIProvider {
 
   async auditRelease(input: ReleaseAuditInput): Promise<ReleaseAuditResult> {
     if (!input.repositoryContext?.trim()) throw new Error('OpenAI release audit requires a targeted repository packet.');
-    const providerPrompt = buildReleaseAuditPrompt(input);
+    const auditInput: ReleaseAuditInput = { ...input, repositoryAccess: 'complete_snapshot' };
+    const providerPrompt = buildReleaseAuditPrompt(auditInput);
     const messages: Array<{ role: 'system' | 'user' | 'assistant'; content: string }> = [
       { role: 'system', content: 'You are an independent release auditor. Use the contract and targeted repository packet. Return strict JSON.' },
       { role: 'user', content: providerPrompt }
@@ -310,7 +295,7 @@ export class OpenAIProvider implements AIProvider {
       content: response.content,
       expectedCriteria: [...input.contract.invariants, ...input.contract.releaseCriteria],
       allowedRequirementIds: input.contract.requirements.map((requirement) => requirement.id),
-      normalize: (value) => normalizeReleaseAuditResult(input, value),
+      normalize: (value) => normalizeReleaseAuditResult(auditInput, value),
       repair: async (repairPrompt) => {
         const repairResponse = await this.requestChat([
           { role: 'system', content: 'Repair only the supplied release-audit JSON. Do not inspect or reassess the repository. Return strict JSON.' },
@@ -346,6 +331,14 @@ export class OpenAIProvider implements AIProvider {
   }
 
   supportsGitHubNativeFlow(): boolean {
+    return false;
+  }
+
+  supportsNativeRepositoryReview(): boolean {
+    return false;
+  }
+
+  supportsNativeRepositoryAudit(): boolean {
     return false;
   }
 

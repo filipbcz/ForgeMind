@@ -24,9 +24,7 @@ export interface NotificationSubscriptionInput {
 
 export interface NotificationSettings {
   pushEnabled: boolean;
-  approvalRequests: boolean;
   taskUpdates: boolean;
-  budgetAlerts: boolean;
 }
 
 export interface NotificationSubscription extends NotificationSubscriptionInput {
@@ -35,7 +33,7 @@ export interface NotificationSubscription extends NotificationSubscriptionInput 
   createdAt: string;
 }
 
-export type NotificationEventKind = 'approval_needed' | 'task_completed' | 'task_failed';
+export type NotificationEventKind = 'task_completed' | 'task_failed';
 
 export interface PushNotificationPayload {
   title: string;
@@ -56,9 +54,7 @@ export interface NotificationDispatcher {
 
 const defaultSettings: NotificationSettings = {
   pushEnabled: false,
-  approvalRequests: true,
-  taskUpdates: true,
-  budgetAlerts: true
+  taskUpdates: true
 };
 
 export class NotificationService {
@@ -141,15 +137,14 @@ export class NotificationService {
 
   async sendToUser(
     userId: string,
-    payload: PushNotificationPayload,
-    category: 'approvalRequests' | 'taskUpdates' | 'budgetAlerts' = 'taskUpdates'
+    payload: PushNotificationPayload
   ): Promise<NotificationDispatchResult> {
     if (!this.dispatcher) {
       return { sent: 0, failed: 0 };
     }
 
     const snapshot = await this.getSettings(userId);
-    if (!snapshot.settings.pushEnabled || !snapshot.settings[category]) {
+    if (!snapshot.settings.pushEnabled || !snapshot.settings.taskUpdates) {
       return { sent: 0, failed: 0 };
     }
 
@@ -180,8 +175,7 @@ export class NotificationService {
   }): Promise<NotificationDispatchResult> {
     const normalized = normalizeTaskStatus(input.status);
     const payload = createTaskNotificationPayload(input.taskId, input.taskTitle, normalized);
-    const category = normalized === 'approval_needed' ? 'approvalRequests' : 'taskUpdates';
-    return this.sendToUser(input.userId, payload, category);
+    return this.sendToUser(input.userId, payload);
   }
 }
 
@@ -190,25 +184,11 @@ export function createNotificationService(store?: NotificationStore, dispatcher?
 }
 
 function normalizeTaskStatus(status: string): NotificationEventKind {
-  if (status === 'needs_approval') return 'approval_needed';
   if (status === 'completed') return 'task_completed';
   return 'task_failed';
 }
 
 function createTaskNotificationPayload(taskId: string, taskTitle: string, eventKind: NotificationEventKind): PushNotificationPayload {
-  if (eventKind === 'approval_needed') {
-    return {
-      title: 'Approval required',
-      body: `Task "${taskTitle}" needs your approval.`,
-      tag: `task-${taskId}-approval`,
-      url: '/?view=approvals',
-      data: {
-        taskId,
-        eventType: eventKind
-      }
-    };
-  }
-
   if (eventKind === 'task_completed') {
     return {
       title: 'Task completed',
