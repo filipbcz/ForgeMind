@@ -499,8 +499,8 @@ function terminalImplementationStepStatus(taskStatus: TaskStatus): ProjectImplem
   if (ROADMAP_STEP_CANCELLING_TASK_STATUSES.has(taskStatus)) return 'cancelled';
   return undefined;
 }
-const DEFAULT_QUEUE_MAX_ATTEMPTS = 3;
 const DEFAULT_QUEUE_BACKOFF_SECONDS = 30;
+const MAX_QUEUE_BACKOFF_EXPONENT = 10;
 const DEFAULT_AUDIT_JOB_MAX_ATTEMPTS = 3;
 const WORKER_QUEUE_CONTROL_ID = 'global';
 const WORKER_QUEUE_ADVISORY_LOCK_SQL = 'SELECT pg_advisory_xact_lock(742764962030481)::text AS "lock"';
@@ -3943,52 +3943,62 @@ export class ForgeMindRepository {
     if (!isActiveQueueStatus(queueJob.status)) return;
 
     if (status === 'failed' && retryable) {
-      const maxAttempts = Math.max(1, Number(process.env.FORGEMIND_QUEUE_MAX_ATTEMPTS ?? DEFAULT_QUEUE_MAX_ATTEMPTS));
       const backoffSeconds = Math.max(1, Number(process.env.FORGEMIND_QUEUE_RETRY_BACKOFF_SECONDS ?? DEFAULT_QUEUE_BACKOFF_SECONDS));
-      const shouldRetry = queueJob.attemptCount < maxAttempts;
-
-      if (shouldRetry) {
-        const delaySeconds = backoffSeconds * Math.max(1, 2 ** Math.max(0, queueJob.attemptCount - 1));
-        const nextAttemptAt = new Date(Date.now() + delaySeconds * 1000);
-        await this.prisma.$transaction(async (tx) => {
+      const backoffExponent = Math.min(MAX_QUEUE_BACKOFF_EXPONENT, Math.max(0, queueJob.attemptCount - 1));
+      const delaySeconds = backoffSeconds * (2 ** backoffExponent);
+      const nextAttemptAt = new Date(Date.now() + delaySeconds * 1000);
+      await this.prisma.$transaction(async (tx) => {
+        const reopenedTask = await tx.task.updateMany({
+          where: {
+            id: queueJob.taskId,
+            status: { notIn: ['completed', 'cancelled'] }
+          },
+          data: {
+            status: 'submitted',
+            finishedAt: null
+          }
+        });
+        if (reopenedTask.count === 0) {
           await tx.taskQueueJob.update({
             where: { id: queueJobId },
             data: {
-              status: 'pending',
-              reason: 'phase_retry',
+              status: 'cancelled',
               claimedAt: null,
-              nextAttemptAt,
-              errorMessage: redactedErrorMessage
+              nextAttemptAt: null,
+              errorMessage: redactedErrorMessage,
+              finishedAt: new Date()
             }
           });
-          await tx.task.updateMany({
-            where: {
-              id: queueJob.taskId,
-              status: { notIn: ['completed', 'cancelled'] }
-            },
-            data: {
-              status: 'submitted',
-              finishedAt: null
-            }
-          });
-          await this.writeAuditTx(tx, {
-            actorType: 'system',
-            eventType: 'task_queue_retry_scheduled',
-            taskId: queueJob.taskId,
-            payload: {
-              queueJobId,
-              nextAttemptAt: nextAttemptAt.toISOString(),
-              errorMessage: redactedErrorMessage ?? null,
-              resumeFromCheckpoint: true,
-              runState: createRetryScheduledRunState({
-                detail: redactedErrorMessage,
-                nextAttemptAt: nextAttemptAt.toISOString()
-              }) as unknown as JsonValue
-            }
-          });
+          return;
+        }
+        await tx.taskQueueJob.update({
+          where: { id: queueJobId },
+          data: {
+            status: 'pending',
+            reason: 'phase_retry',
+            claimedAt: null,
+            nextAttemptAt,
+            errorMessage: redactedErrorMessage
+          }
         });
-        return;
-      }
+        await this.writeAuditTx(tx, {
+          actorType: 'system',
+          eventType: 'task_queue_retry_scheduled',
+          taskId: queueJob.taskId,
+          payload: {
+            queueJobId,
+            attemptCount: queueJob.attemptCount,
+            nextAttemptAt: nextAttemptAt.toISOString(),
+            errorMessage: redactedErrorMessage ?? null,
+            resumeFromCheckpoint: true,
+            runState: createRetryScheduledRunState({
+              detail: redactedErrorMessage,
+              nextAttemptAt: nextAttemptAt.toISOString()
+            }) as unknown as JsonValue
+          }
+        });
+      });
+      return;
     }
 
     await this.prisma.taskQueueJob.update({

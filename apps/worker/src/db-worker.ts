@@ -710,7 +710,7 @@ export async function runDatabaseWorkerOnce(options: { deferInterruptSignals?: b
       iterationCount: attemptCount,
       ...getRunUsageFields()
     });
-    await finalizeQueueJob('failed', message);
+    await finalizeQueueJob('failed', message, !(error instanceof ProviderExecutionError) || error.retryable);
     return {
       claimed: true,
       taskId: claimed.task.id,
@@ -1068,7 +1068,7 @@ function createPolicyAwareProvider(input: PolicyAwareProviderInput): { provider:
     const primaryAvailability = resolveCircuitBreakerAvailability(primaryBreaker);
     if (primaryAvailability.state === 'open') {
       await auditProviderCircuitBreaker(input, input.primary, operation, 'primary_skipped', primaryBreaker);
-      return callFallbackOrThrow(operation, action, signal, new ProviderExecutionError(operation, 'circuit breaker is open', input.primary.kind), true);
+      return callFallbackOrThrow(operation, action, signal, new ProviderExecutionError(operation, 'circuit breaker is open', input.primary.kind, true), true);
     }
 
     try {
@@ -1105,7 +1105,7 @@ function createPolicyAwareProvider(input: PolicyAwareProviderInput): { provider:
       const fallbackAvailability = resolveCircuitBreakerAvailability(fallbackBreaker);
       if (fallbackAvailability.state === 'open') {
         await auditProviderCircuitBreaker(input, fallback, operation, 'primary_skipped', fallbackBreaker);
-        throw new ProviderExecutionError(operation, 'primary and fallback circuit breakers are open', input.primary.kind);
+        throw new ProviderExecutionError(operation, 'primary and fallback circuit breakers are open', input.primary.kind, true);
       }
       await input.audit?.({
         eventType: 'provider_fallback_used',
@@ -1127,7 +1127,7 @@ function createPolicyAwareProvider(input: PolicyAwareProviderInput): { provider:
       } catch (fallbackError) {
         const normalizedFallbackError = normalizeProviderError(fallback.kind, fallbackError);
         await recordProviderFailure(input, fallback, operation, fallbackBreaker, normalizedFallbackError.toDetails(), openMs);
-        throw new ProviderExecutionError(operation, toErrorMessage(fallbackError), fallback.kind);
+        throw new ProviderExecutionError(operation, toErrorMessage(fallbackError), fallback.kind, normalizedFallbackError.retryable);
       }
     }
 
@@ -1147,7 +1147,7 @@ function createPolicyAwareProvider(input: PolicyAwareProviderInput): { provider:
       });
     }
 
-    throw new ProviderExecutionError(operation, toErrorMessage(primaryError), input.primary.kind);
+    throw new ProviderExecutionError(operation, toErrorMessage(primaryError), input.primary.kind, primaryIsRetryable);
   };
 
   const provider: AIProvider = {
@@ -1492,7 +1492,8 @@ class ProviderExecutionError extends Error {
   constructor(
     readonly operation: string,
     message: string,
-    readonly providerKind: ProviderKind
+    readonly providerKind: ProviderKind,
+    readonly retryable: boolean
   ) {
     super(`Provider ${providerKind} ${operation} failed: ${message}`);
     this.name = 'ProviderExecutionError';

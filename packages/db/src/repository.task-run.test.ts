@@ -1078,26 +1078,63 @@ describe('ForgeMindRepository task runs', () => {
     });
   });
 
-  it('marks a queue job as failed after max retry attempts', async () => {
+  it('keeps retrying after the former max attempts and preserves attempt diagnostics', async () => {
     const { prisma, taskQueueJobFindUnique } = createMockPrisma();
+    process.env.FORGEMIND_QUEUE_MAX_ATTEMPTS = '1';
     taskQueueJobFindUnique.mockResolvedValueOnce({
       id: 'queue_1',
+      taskId: 'task_1',
       status: 'claimed',
-      attemptCount: 3
+      attemptCount: 42
     } as any);
     const repository = new ForgeMindRepository(prisma);
 
-    await repository.finalizeQueueJob('queue_1', 'failed', 'permanent error');
+    await repository.finalizeQueueJob('queue_1', 'failed', 'temporary error');
+
+    expect(prisma.taskQueueJob.update).toHaveBeenCalledWith({
+      where: { id: 'queue_1' },
+      data: expect.objectContaining({
+        status: 'pending',
+        reason: 'phase_retry',
+        claimedAt: null,
+        nextAttemptAt: expect.any(Date),
+        errorMessage: 'temporary error'
+      })
+    });
+    expect(prisma.auditLog.create).toHaveBeenCalledWith({
+      data: expect.objectContaining({
+        eventType: 'task_queue_retry_scheduled',
+        payload: expect.objectContaining({ attemptCount: 42, resumeFromCheckpoint: true })
+      })
+    });
+    delete process.env.FORGEMIND_QUEUE_MAX_ATTEMPTS;
+  });
+
+  it('does not revive a completed or cancelled task while finalizing a retryable failure', async () => {
+    const { prisma, taskQueueJobFindUnique } = createMockPrisma();
+    taskQueueJobFindUnique.mockResolvedValueOnce({
+      id: 'queue_1',
+      taskId: 'task_1',
+      status: 'claimed',
+      attemptCount: 7
+    } as any);
+    prisma.task.updateMany.mockResolvedValueOnce({ count: 0 });
+    const repository = new ForgeMindRepository(prisma);
+
+    await repository.finalizeQueueJob('queue_1', 'failed', 'late worker failure');
 
     expect(prisma.taskQueueJob.update).toHaveBeenCalledWith({
       where: { id: 'queue_1' },
       data: {
-        status: 'failed',
+        status: 'cancelled',
         claimedAt: null,
         nextAttemptAt: null,
-        errorMessage: 'permanent error',
+        errorMessage: 'late worker failure',
         finishedAt: expect.any(Date)
       }
+    });
+    expect(prisma.auditLog.create).not.toHaveBeenCalledWith({
+      data: expect.objectContaining({ eventType: 'task_queue_retry_scheduled' })
     });
   });
 
