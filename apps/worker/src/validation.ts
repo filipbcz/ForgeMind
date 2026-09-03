@@ -1,7 +1,7 @@
 import { execaCommand } from 'execa';
 import { existsSync } from 'node:fs';
 import { delimiter, join } from 'node:path';
-import type { ValidationCheck } from '@forgemind/providers';
+import type { ValidationCheck, ValidationProvenance } from '@forgemind/providers';
 import { createWorkspaceEnvironment } from '@forgemind/shared';
 
 const VALIDATION_OUTPUT_FLUSH_MS = 350;
@@ -41,6 +41,7 @@ export interface ValidationCheckExecutionResult {
   inputHash?: string;
   criterion?: string;
   rationale?: string;
+  provenance?: ValidationProvenance;
 }
 
 export interface ProcessTreeTermination {
@@ -68,6 +69,7 @@ export interface ValidationActivity {
   stderr?: string;
   criterion?: string;
   rationale?: string;
+  provenance?: ValidationProvenance;
   termination?: ProcessTreeTermination;
 }
 
@@ -245,7 +247,8 @@ export async function runValidationChecks(
   onActivity?: ValidationActivityHandler,
   passedCheckResults: ReadonlyMap<string, ValidationCheckExecutionResult> = new Map(),
   inputHash?: string,
-  signal?: AbortSignal
+  signal?: AbortSignal,
+  createProvenance?: (check: ValidationCheck, decision: 'executed' | 'reused', rationale: string) => ValidationProvenance
 ): Promise<ValidationResult> {
   throwIfAborted(signal);
   if (checks.length === 0) {
@@ -279,7 +282,8 @@ export async function runValidationChecks(
         shell,
         criterion: check.criterion,
         rationale: check.rationale,
-        inputHash
+        inputHash,
+        provenance: createProvenance?.(check, 'reused', passedResult.provenance?.decisionRationale ?? 'AI determined that the changed inputs cannot affect this result.')
       });
       outputs.push(`[command] ${effectiveCommand}`);
       if (check.criterion) {
@@ -309,7 +313,8 @@ export async function runValidationChecks(
         stdout: passedResult.stdout,
         stderr: passedResult.stderr,
         criterion: check.criterion,
-        rationale: check.rationale
+        rationale: check.rationale,
+        provenance: checkResults.at(-1)?.provenance
       });
       continue;
     }
@@ -339,6 +344,7 @@ export async function runValidationChecks(
         exitCode: result.exitCode,
         criterion: check.criterion,
         rationale: check.rationale,
+        provenance: createProvenance?.(check, 'executed', 'Validation was executed against these workspace inputs.'),
       });
       outputs.push(`[command] ${effectiveCommand}`);
       if (check.criterion) {
@@ -411,6 +417,7 @@ export async function runValidationChecks(
       stderr: result.stderr,
       criterion: check.criterion,
       rationale: check.rationale,
+      provenance: createProvenance?.(check, 'executed', 'Validation was executed against these workspace inputs.'),
     });
     outputs.push(`[command] ${effectiveCommand}`);
     if (check.criterion) {
@@ -431,6 +438,7 @@ export async function runValidationChecks(
       inputHash,
       criterion: check.criterion,
       rationale: check.rationale,
+      provenance: createProvenance?.(check, 'executed', 'Validation was executed against these workspace inputs.'),
     });
 
     if (!result.passed) {

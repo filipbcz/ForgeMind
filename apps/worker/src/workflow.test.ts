@@ -1,6 +1,8 @@
 import { randomUUID } from 'node:crypto';
+import { mkdtemp, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { simpleGit } from 'simple-git';
 import { describe, expect, it, vi } from 'vitest';
 import type { ForgeTask, Project } from '@forgemind/core';
 import type {
@@ -12,7 +14,7 @@ import type {
   ReviewInput,
   ReviewResult
 } from '@forgemind/providers';
-import { buildTaskExecutionPrompt, createDirectTaskPlan, runWorkerTask } from './workflow.js';
+import { buildTaskExecutionPrompt, collectValidationWorkspacePatch, createDirectTaskPlan, runWorkerTask, selectReusableValidationResults, validationCheckFingerprint } from './workflow.js';
 
 const projectConfig = `project:
   id: workflow-test
@@ -126,6 +128,46 @@ function createProvider(overrides: Partial<AIProvider> = {}): AIProvider {
 }
 
 describe('simple autonomous worker workflow', () => {
+  it('includes untracked names and contents in the workspace inputs shown to impact AI', async () => {
+    const workspace = await mkdtemp(join(tmpdir(), 'forgemind-validation-inputs-'));
+    const git = simpleGit(workspace);
+    await git.init();
+    await writeFile(join(workspace, 'relevant-input.txt'), 'must invalidate\n', 'utf8');
+
+    const representation = await collectValidationWorkspacePatch(git, workspace);
+
+    expect(representation).toContain('untracked validation inputs');
+    expect(representation).toContain('relevant-input.txt');
+    expect(representation).toContain(Buffer.from('must invalidate\n').toString('base64'));
+  });
+  it('asks AI with prior evidence and input changes, but invalidates changed check identity', async () => {
+    const check = { kind: 'command' as const, command: 'npm test', shell: 'bash' as const };
+    const provenance = {
+      version: 1 as const,
+      checkFingerprint: validationCheckFingerprint(check),
+      workspaceInputHash: 'old',
+      workspacePatch: 'diff --git a/independent.ts',
+      decision: 'executed' as const,
+      decisionRationale: 'Executed.',
+      decidedAt: new Date().toISOString()
+    };
+    const prior = new Map([['old:bash:npm test', { command: 'npm test', shell: 'bash' as const, exitCode: 0, stdout: 'ok', stderr: '', passed: true, inputHash: 'old', provenance }]]);
+    const assessValidationImpact = vi.fn(async () => ({ reusable: true, rationale: 'Only an unrelated documentation input changed.' }));
+    const provider = createProvider({ assessValidationImpact });
+
+    const reused = await selectReusableValidationResults(provider, [check], prior, 'new', 'diff --git a/docs/readme.md');
+    expect(reused.get('new:bash:npm test')?.passed).toBe(true);
+    expect(assessValidationImpact).toHaveBeenCalledWith(expect.objectContaining({
+      check,
+      previousResult: expect.objectContaining({ stdout: 'ok', provenance }),
+      workspaceChange: expect.stringContaining('current validation inputs')
+    }));
+
+    const changedCommand = { ...check, command: 'npm run test:all' };
+    const invalidated = await selectReusableValidationResults(provider, [changedCommand], prior, 'newer', 'diff');
+    expect(invalidated.size).toBe(0);
+    expect(assessValidationImpact).toHaveBeenCalledTimes(1);
+  });
   it('passes the complete task prompt through and lets implementation supply all validation commands', async () => {
     const project = createProject();
     const task = createTask(project.id);
