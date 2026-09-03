@@ -250,6 +250,8 @@ function buildPhaseRetryResume(
     if (output?.evidenceVersion !== 1 || output.deferred === true) continue;
     const command = typeof output?.command === 'string' ? output.command : undefined;
     if (!command || passedValidationChecks.some((item) => item.command === command && item.inputHash === checkpoint.inputHash)) continue;
+    const provenance = extractValidationProvenance(output.provenance);
+    if (!provenance) continue;
     passedValidationChecks.push({
       command,
       shell: output?.shell === 'powershell' || output?.shell === 'cmd' || output?.shell === 'bash' || output?.shell === 'sh'
@@ -261,7 +263,8 @@ function buildPhaseRetryResume(
       passed: true,
       inputHash: checkpoint.inputHash,
       criterion: typeof output?.criterion === 'string' ? output.criterion : undefined,
-      rationale: typeof output?.rationale === 'string' ? output.rationale : undefined
+      rationale: typeof output?.rationale === 'string' ? output.rationale : undefined,
+      provenance
     });
   }
   const satisfactionReviewCheckpoint = [...checkpoints].reverse().find((checkpoint) => (
@@ -449,8 +452,10 @@ function extractPassedValidationChecks(value: unknown): NonNullable<WorkerTaskRe
   if (!Array.isArray(payload?.passedValidationChecks)) return [];
   return payload.passedValidationChecks.flatMap((entry) => {
     const check = asRecord(entry);
+    const provenance = extractValidationProvenance(check?.provenance);
     if (
       !check
+      || !provenance
       || typeof check.command !== 'string'
       || typeof check.inputHash !== 'string'
       || check.inputHash.length === 0
@@ -472,7 +477,8 @@ function extractPassedValidationChecks(value: unknown): NonNullable<WorkerTaskRe
       passed: check.passed,
       inputHash: check.inputHash,
       criterion: typeof check.criterion === 'string' ? check.criterion : undefined,
-      rationale: typeof check.rationale === 'string' ? check.rationale : undefined
+      rationale: typeof check.rationale === 'string' ? check.rationale : undefined,
+      provenance
     }];
   });
 }
@@ -620,4 +626,24 @@ function stableValidationFailureSignature(output: string): string {
       .replace(/\b\d+(?:\.\d+)?m?s\b/gi, '<duration>')
       .replace(/\b[0-9a-f]{8,}\b/gi, '<id>'));
   return selected.join('|') || 'no-output';
+}
+
+function extractValidationProvenance(value: unknown): NonNullable<WorkerTaskResume['passedValidationChecks']>[number]['provenance'] | undefined {
+  const provenance = asRecord(value);
+  if (provenance?.version !== 1
+    || typeof provenance.checkFingerprint !== 'string'
+    || typeof provenance.workspaceInputHash !== 'string'
+    || typeof provenance.workspacePatch !== 'string'
+    || (provenance.decision !== 'executed' && provenance.decision !== 'reused')
+    || typeof provenance.decisionRationale !== 'string'
+    || typeof provenance.decidedAt !== 'string') return undefined;
+  return {
+    version: 1,
+    checkFingerprint: provenance.checkFingerprint,
+    workspaceInputHash: provenance.workspaceInputHash,
+    workspacePatch: provenance.workspacePatch,
+    decision: provenance.decision,
+    decisionRationale: provenance.decisionRationale,
+    decidedAt: provenance.decidedAt
+  };
 }

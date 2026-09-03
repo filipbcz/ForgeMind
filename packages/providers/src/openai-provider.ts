@@ -19,9 +19,11 @@ import type {
   RoadmapRepairInput,
   RoadmapRepairResult,
   ReviewInput,
-  ReviewResult
+  ReviewResult,
+  ValidationImpactInput,
+  ValidationImpactResult
 } from './provider.js';
-import { ProviderContractError, normalizeProviderError, normalizeProviderPreflight, normalizeValidationChecks, parseChatResult, parseImplementResult, parsePlanResult, parseProviderJsonObject, parseReviewResult } from './provider.js';
+import { ProviderContractError, normalizeProviderError, normalizeProviderPreflight, normalizeValidationChecks, parseChatResult, parseImplementResult, parsePlanResult, parseProviderJsonObject, parseReviewResult, parseValidationImpactResult } from './provider.js';
 import { emitCapturedUsage, normalizeTokenBreakdown } from './provider-usage.js';
 import { buildReviewPrompt } from './review-prompt.js';
 import { buildRoadmapQualityReviewPrompt, compactRoadmapContract } from './roadmap-review-prompt.js';
@@ -86,6 +88,14 @@ export class OpenAIProvider implements AIProvider {
       }
       await readProviderJson(response, 'OpenAI preflight');
     });
+  }
+
+  async assessValidationImpact(input: ValidationImpactInput): Promise<ValidationImpactResult> {
+    const response = await this.requestChat([
+      { role: 'system', content: 'You are a conservative read-only validation impact assessor. Decide whether the previous successful check remains valid after the supplied workspace input change. Return JSON only: {"reusable":boolean,"rationale":string}. Reuse only when the evidence proves the changed inputs cannot affect the check.' },
+      { role: 'user', content: JSON.stringify(input, (_key, value) => _key === 'signal' ? undefined : value) }
+    ], input.signal);
+    return parseValidationImpactResult(response.content);
   }
 
   async plan(input: PlanInput): Promise<PlanResult> {

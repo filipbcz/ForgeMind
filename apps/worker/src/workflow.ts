@@ -494,6 +494,7 @@ export async function runWorkerTask(input: WorkerTaskInput): Promise<WorkerTaskR
       }
       {
         const validationInputHash = await collectValidationInputHash(git, workspacePath);
+        const validationWorkspacePatch = await collectValidationWorkspacePatch(git, workspacePath);
         await input.hooks?.onIterationStarted?.({
           phase: 'validation',
           prompt: summarizeValidationChecks(validationChecks),
@@ -501,6 +502,8 @@ export async function runWorkerTask(input: WorkerTaskInput): Promise<WorkerTaskR
         });
         externalValidationChecks = validationChecks.filter((check) => check.target === 'windows');
         const localValidationChecks = validationChecks.filter((check) => check.target !== 'windows');
+        const impactRationales = new Map<string, string>();
+        const reusableResults = await selectReusableValidationResults(provider, localValidationChecks, passedValidationCheckResults, validationInputHash, validationWorkspacePatch, input.signal, impactRationales);
         validation = await runValidationChecks(localValidationChecks, workspacePath, async (activity) => {
           const checkLabel = `${activity.checkIndex}/${activity.checkCount}`;
           const checkpointKey = `validation:${hashCheckpointValue(activity.command)}`;
@@ -599,11 +602,20 @@ export async function runWorkerTask(input: WorkerTaskInput): Promise<WorkerTaskR
               stdout: activity.stdout ?? '',
               stderr: activity.stderr ?? '',
               criterion: activity.criterion ?? null,
-              rationale: activity.rationale ?? null
+              rationale: activity.rationale ?? null,
+              provenance: activity.provenance ? activity.provenance as unknown as JsonValue : null
             },
             errorMessage: activity.exitCode === 0 ? undefined : `Validation command exited with ${activity.exitCode ?? 1}.`
           });
-        }, passedValidationCheckResults, validationInputHash, input.signal);
+        }, reusableResults, validationInputHash, input.signal, (check, decision, decisionRationale) => ({
+          version: 1,
+          checkFingerprint: validationCheckFingerprint(check),
+          workspaceInputHash: validationInputHash,
+          workspacePatch: validationWorkspacePatch,
+          decision,
+          decisionRationale: impactRationales.get(validationCheckFingerprint(check)) ?? decisionRationale,
+          decidedAt: nowIso()
+        }));
         collectPassedValidationCheckResults(validation, passedValidationCheckResults);
         await input.hooks?.onIteration?.({
           phase: 'validation',
@@ -630,7 +642,8 @@ export async function runWorkerTask(input: WorkerTaskInput): Promise<WorkerTaskR
                 stderr: result.stderr,
                 passed: result.passed,
                 criterion: result.criterion ?? null,
-                rationale: result.rationale ?? null
+                rationale: result.rationale ?? null,
+                provenance: result.provenance ? result.provenance as unknown as JsonValue : null
               })),
             executedCheckCount: validation.executedCheckCount ?? 0,
             reusedCheckCount: validation.reusedCheckCount ?? 0,
@@ -1240,6 +1253,82 @@ async function collectValidationInputHash(git: SimpleGit, workspacePath: string)
     }
   }
   return hash.digest('hex');
+}
+
+export async function collectValidationWorkspacePatch(git: SimpleGit, workspacePath: string): Promise<string> {
+  let trackedPatch: string;
+  try {
+    trackedPatch = await git.diff(['HEAD', '--binary']);
+  } catch {
+    trackedPatch = await git.diff(['--binary']);
+  }
+  const status = await git.status();
+  const untrackedInputs: string[] = [];
+  for (const path of [...status.not_added].sort()) {
+    let contentBase64: string;
+    try {
+      contentBase64 = (await readFile(resolve(workspacePath, path))).toString('base64');
+    } catch {
+      contentBase64 = Buffer.from('[unreadable]').toString('base64');
+    }
+    untrackedInputs.push(JSON.stringify({ path, encoding: 'base64', content: contentBase64 }));
+  }
+  return [trackedPatch, untrackedInputs.length > 0 ? `--- untracked validation inputs (jsonl)\n${untrackedInputs.join('\n')}` : '']
+    .filter(Boolean)
+    .join('\n');
+}
+
+export function validationCheckFingerprint(check: ValidationCheck): string {
+  return createHash('sha256').update(JSON.stringify({
+    kind: check.kind,
+    command: normalizeValidationCommandForEnvironment(check.command),
+    shell: check.shell ?? 'system',
+    target: check.target ?? 'local',
+    requiredCapabilities: check.requiredCapabilities ?? []
+  })).digest('hex');
+}
+
+export async function selectReusableValidationResults(
+  provider: AIProvider,
+  checks: ValidationCheck[],
+  priorResults: ReadonlyMap<string, ValidationCheckExecutionResult>,
+  currentInputHash: string,
+  currentPatch: string,
+  signal?: AbortSignal,
+  impactRationales: Map<string, string> = new Map()
+): Promise<Map<string, ValidationCheckExecutionResult>> {
+  const selected = new Map<string, ValidationCheckExecutionResult>();
+  for (const check of checks) {
+    const shell = check.shell ?? 'system';
+    const fingerprint = validationCheckFingerprint(check);
+    const key = validationCheckResultKey(check.command, currentInputHash, shell);
+    const exact = priorResults.get(key);
+    if (exact?.passed && exact.provenance?.version === 1 && exact.provenance.checkFingerprint === fingerprint) {
+      selected.set(key, exact);
+      continue;
+    }
+    if (!provider.assessValidationImpact) continue;
+    const candidate = [...priorResults.values()].reverse().find((result) =>
+      result.passed && result.command === check.command && (result.shell ?? 'system') === shell
+      && result.provenance?.version === 1 && result.provenance.checkFingerprint === fingerprint);
+    if (!candidate?.provenance) continue;
+    const impact = await provider.assessValidationImpact({
+      check,
+      previousResult: { exitCode: candidate.exitCode, stdout: candidate.stdout, stderr: candidate.stderr, passed: candidate.passed, provenance: candidate.provenance },
+      previousWorkspacePatch: candidate.provenance.workspacePatch,
+      currentWorkspacePatch: currentPatch,
+      workspaceChange: `--- previous validation inputs\n${candidate.provenance.workspacePatch}\n--- current validation inputs\n${currentPatch}`,
+      signal
+    });
+    impactRationales.set(fingerprint, impact.rationale);
+    if (!impact.reusable) continue;
+    selected.set(key, {
+      ...candidate,
+      inputHash: currentInputHash,
+      provenance: { ...candidate.provenance, workspaceInputHash: currentInputHash, workspacePatch: currentPatch, decision: 'reused', decisionRationale: impact.rationale, decidedAt: nowIso() }
+    });
+  }
+  return selected;
 }
 
 async function collectRepositoryStateInputHash(git: SimpleGit, workspacePath: string): Promise<string> {

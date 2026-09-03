@@ -100,6 +100,35 @@ export interface ValidationCheck {
   rationale?: string;
 }
 
+export interface ValidationProvenance {
+  version: 1;
+  checkFingerprint: string;
+  workspaceInputHash: string;
+  workspacePatch: string;
+  decision: 'executed' | 'reused';
+  decisionRationale: string;
+  decidedAt: string;
+}
+
+export interface ValidationImpactInput {
+  check: ValidationCheck;
+  previousResult: { exitCode: number; stdout: string; stderr: string; passed: boolean; provenance: ValidationProvenance };
+  previousWorkspacePatch: string;
+  currentWorkspacePatch: string;
+  workspaceChange: string;
+  signal?: AbortSignal;
+}
+
+export interface ValidationImpactResult { reusable: boolean; rationale: string }
+
+export function parseValidationImpactResult(content: string): ValidationImpactResult {
+  const value = parseProviderJsonObject(content, 'validation impact');
+  if (typeof value.reusable !== 'boolean' || typeof value.rationale !== 'string' || !value.rationale.trim()) {
+    throw new ProviderContractError('Validation impact must contain reusable and a non-empty rationale.');
+  }
+  return { reusable: value.reusable, rationale: value.rationale.trim() };
+}
+
 export function normalizeValidationChecks(value: unknown): ValidationCheck[] {
   if (!Array.isArray(value)) return [];
 
@@ -595,6 +624,8 @@ export interface AIProvider {
   implement(input: ImplementInput): Promise<ImplementResult>;
   chat?(input: ChatInput): Promise<ChatResult>;
   review(input: ReviewInput): Promise<ReviewResult>;
+  /** Read-only semantic impact assessment; absence safely disables cross-input reuse. */
+  assessValidationImpact?(input: ValidationImpactInput): Promise<ValidationImpactResult>;
   auditCapability?(input: CapabilityAuditInput): Promise<CapabilityAuditResult>;
   auditRelease?(input: ReleaseAuditInput): Promise<ReleaseAuditResult>;
   estimateCost(input: CostEstimateInput): Promise<CostEstimateResult>;

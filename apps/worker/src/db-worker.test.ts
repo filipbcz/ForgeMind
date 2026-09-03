@@ -969,7 +969,16 @@ github:
           stdout: '42 tests passed',
           stderr: 'one compiler warning',
           criterion: 'The test suite passes.',
-          rationale: 'Runs the repository test suite.'
+          rationale: 'Runs the repository test suite.',
+          provenance: {
+            version: 1,
+            checkFingerprint: 'test-fingerprint',
+            workspaceInputHash: 'workspace-hash',
+            workspacePatch: 'diff --git a/src/a.ts',
+            decision: 'executed',
+            decisionRationale: 'Executed against this input.',
+            decidedAt: '2026-08-02T10:00:30.000Z'
+          }
         }
       }
     ]);
@@ -999,7 +1008,8 @@ github:
           passed: true,
           inputHash: 'workspace-hash',
           criterion: 'The test suite passes.',
-          rationale: 'Runs the repository test suite.'
+          rationale: 'Runs the repository test suite.',
+          provenance: expect.objectContaining({ version: 1, checkFingerprint: 'test-fingerprint' })
         }]
       })
     }));

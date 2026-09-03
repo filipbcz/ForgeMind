@@ -29,9 +29,11 @@ import type {
   ProviderSessionContext,
   ProviderUsageMeasurement,
   ReviewInput,
-  ReviewResult
+  ReviewResult,
+  ValidationImpactInput,
+  ValidationImpactResult
 } from './provider.js';
-import { ProviderContractError, normalizeProviderError, normalizeProviderPreflight, normalizeValidationChecks, parseChatResult, parseImplementResult, parsePlanResult, parseProviderJsonObject, parseReviewResult } from './provider.js';
+import { ProviderContractError, normalizeProviderError, normalizeProviderPreflight, normalizeValidationChecks, parseChatResult, parseImplementResult, parsePlanResult, parseProviderJsonObject, parseReviewResult, parseValidationImpactResult } from './provider.js';
 import { emitCapturedUsage, normalizeTokenBreakdown } from './provider-usage.js';
 import { buildReviewPrompt } from './review-prompt.js';
 import { buildRoadmapQualityReviewPrompt, compactRoadmapContract } from './roadmap-review-prompt.js';
@@ -545,6 +547,14 @@ export class CodexProvider implements AIProvider {
       }
       await readProviderJson(response, 'Codex preflight');
     });
+  }
+
+  async assessValidationImpact(input: ValidationImpactInput): Promise<ValidationImpactResult> {
+    const response = await this.requestResponses([
+      { role: 'system', content: 'You are a conservative read-only validation impact assessor. Return JSON only with reusable boolean and rationale string. Reuse only when the supplied evidence proves the workspace change cannot affect the successful check.' },
+      { role: 'user', content: JSON.stringify(input, (key, value) => key === 'signal' ? undefined : value) }
+    ], undefined, input.signal);
+    return parseValidationImpactResult(response.content);
   }
 
   async plan(input: PlanInput): Promise<PlanResult> {
