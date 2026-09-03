@@ -12,15 +12,15 @@ export const ROADMAP_QUALITY_CRITERIA = [
 
 export function compactRoadmapContract(
   contract: RoadmapQualityReviewInput['projectContract'],
-  allowedRequirementIds: string[]
+  relevantRequirementIds: string[]
 ): Record<string, unknown> {
-  const allowed = new Set(allowedRequirementIds);
+  const relevant = new Set(relevantRequirementIds);
   return {
     summary: contract.summary,
     invariants: contract.invariants,
     prohibitedSubstitutes: contract.prohibitedSubstitutes,
     requirements: activeProjectContractRequirements(contract)
-    .filter((requirement) => allowed.has(requirement.id))
+    .filter((requirement) => relevant.has(requirement.id))
     .map((requirement) => ({
       id: requirement.id,
       title: requirement.title,
@@ -32,7 +32,11 @@ export function compactRoadmapContract(
 }
 
 export function buildRoadmapQualityReviewPrompt(input: RoadmapQualityReviewInput): string {
-  const contract = compactRoadmapContract(input.projectContract, input.allowedRequirementIds);
+  const relevantRequirementIds = Array.from(new Set([
+    ...input.requiredRequirementIds,
+    ...input.implementationSteps.flatMap((step) => step.requirementIds)
+  ]));
+  const contract = compactRoadmapContract(input.projectContract, relevantRequirementIds);
 
   return [
     'Independently review the candidate implementation roadmap before it is persisted.',
@@ -47,6 +51,8 @@ export function buildRoadmapQualityReviewPrompt(input: RoadmapQualityReviewInput
     `Authoritative objective:\n${input.objective}`,
     '',
     `Relevant contract (compact JSON):\n${JSON.stringify(contract)}`,
+    '',
+    `Requirements that this roadmap must cover:\n${input.requiredRequirementIds.map((id) => `- ${id}`).join('\n') || '- none'}`,
     '',
     `Completed step titles that must not be recreated:\n${input.completedStepTitles.map((title) => `- ${title}`).join('\n') || '- none'}`,
     '',

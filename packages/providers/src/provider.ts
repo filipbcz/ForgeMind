@@ -78,7 +78,7 @@ export interface RoadmapRepairInput {
   validationError: string;
   implementationSteps: ImplementationStepPlan[];
   projectContract: ProjectContract;
-  allowedRequirementIds: string[];
+  requiredRequirementIds: string[];
   completedStepTitles: string[];
   migrationImpacts: string[];
   compatibilityImpacts: string[];
@@ -98,7 +98,7 @@ export interface RoadmapQualityReviewInput {
   objective: string;
   projectContract: ProjectContract;
   implementationSteps: ImplementationStepPlan[];
-  allowedRequirementIds: string[];
+  requiredRequirementIds: string[];
   completedStepTitles: string[];
   onActivity?: ProviderActivityHandler;
   signal?: AbortSignal;

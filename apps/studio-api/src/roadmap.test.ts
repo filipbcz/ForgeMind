@@ -387,28 +387,30 @@ describe('project roadmap generation', () => {
     expect(() => toImplementationStepBlueprints(plan, projectContract)).toThrow('oversized implementation step');
   });
 
-  it('rejects extension steps that cross the changed contract scope', () => {
+  it('allows a focused roadmap step to reference a related unchanged active requirement', () => {
     const plan: PlanResult = {
       summary: 'Scope crossing roadmap',
       steps: [],
       acceptanceCriteria: [],
       implementationSteps: [{
-        title: 'Rewrite documented scope',
-        description: 'Change an unrelated completed capability.',
-        acceptanceCriteria: ['Scope is rewritten.'],
-        inScope: ['Documentation'],
+        title: 'Integrate generator with documented scope',
+        description: 'Integrate the changed generator with the existing scope contract.',
+        acceptanceCriteria: ['Generator behavior remains within documented scope.'],
+        inScope: ['Generator integration'],
         outOfScope: [],
-        requirementIds: ['REQ-SCOPE'],
-        deliverables: ['Updated scope'],
-        changeRationale: 'Unrelated cleanup.',
+        requirementIds: ['REQ-GENERATOR', 'REQ-SCOPE'],
+        deliverables: ['Integrated generator'],
+        changeRationale: 'The changed generator must preserve the existing scope capability.',
         dependsOnStepTitles: [],
         validationFocus: ['implementation', 'regression']
       }]
     };
 
-    expect(() => toImplementationStepBlueprints(plan, projectContract, ['REQ-GENERATOR'], {
+    const blueprints = toImplementationStepBlueprints(plan, projectContract, ['REQ-GENERATOR'], {
       extension: true
-    })).toThrow('crosses the contract delta scope');
+    });
+
+    expect(blueprints[0]?.requirementIds).toEqual(['REQ-GENERATOR', 'REQ-SCOPE']);
   });
 
   it('allows a targeted provider repair with the relevant contract context', async () => {
@@ -442,7 +444,7 @@ describe('project roadmap generation', () => {
       objective: 'Extend generator',
       validationError: 'Missing rationale',
       projectContract,
-      allowedRequirementIds: ['REQ-GENERATOR'],
+      requiredRequirementIds: ['REQ-GENERATOR'],
       completedStepTitles: ['Document scope'],
       migrationImpacts: [],
       compatibilityImpacts: []
@@ -471,7 +473,7 @@ describe('project roadmap generation', () => {
         taskId: 'project_1',
         objective: 'Build qualification project',
         projectContract,
-        allowedRequirementIds: ['REQ-FOUNDATION'],
+        requiredRequirementIds: ['REQ-FOUNDATION'],
         completedStepTitles: [],
         migrationImpacts: [],
         compatibilityImpacts: []
@@ -520,11 +522,11 @@ describe('project roadmap generation', () => {
       plan: { summary: 'Roadmap', steps: [], acceptanceCriteria: [], implementationSteps: [originalStep] },
       repairInput: {
         taskId: 'project_1', objective: 'Build math practice', projectContract,
-        allowedRequirementIds: ['REQ-GENERATOR'], completedStepTitles: [], migrationImpacts: [], compatibilityImpacts: []
+        requiredRequirementIds: ['REQ-GENERATOR'], completedStepTitles: [], migrationImpacts: [], compatibilityImpacts: []
       },
       reviewInput: {
         taskId: 'project_1', objective: 'Build math practice', projectContract,
-        allowedRequirementIds: ['REQ-GENERATOR'], completedStepTitles: []
+        requiredRequirementIds: ['REQ-GENERATOR'], completedStepTitles: []
       },
       validate
     });

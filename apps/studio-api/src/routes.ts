@@ -1301,7 +1301,7 @@ export function registerRoutes(
           taskId: project.id,
           objective,
           projectContract,
-          allowedRequirementIds: requiredRequirementIds,
+          requiredRequirementIds,
           completedStepTitles: planning.completedSteps,
           migrationImpacts: contractDelta?.migrationImpacts ?? [],
           compatibilityImpacts: contractDelta?.compatibilityImpacts ?? []
@@ -1310,7 +1310,7 @@ export function registerRoutes(
           taskId: project.id,
           objective,
           projectContract,
-          allowedRequirementIds: requiredRequirementIds,
+          requiredRequirementIds,
           completedStepTitles: planning.completedSteps
         },
         validate: (candidate) => toImplementationStepBlueprints(
@@ -1416,7 +1416,7 @@ export function registerRoutes(
           taskId: project.id,
           objective,
           projectContract,
-          allowedRequirementIds: appliedContract.touchedRequirementIds,
+          requiredRequirementIds: appliedContract.touchedRequirementIds,
           completedStepTitles: planning.completedSteps,
           migrationImpacts: contractDelta.migrationImpacts,
           compatibilityImpacts: contractDelta.compatibilityImpacts
@@ -1425,7 +1425,7 @@ export function registerRoutes(
           taskId: project.id,
           objective,
           projectContract,
-          allowedRequirementIds: appliedContract.touchedRequirementIds,
+          requiredRequirementIds: appliedContract.touchedRequirementIds,
           completedStepTitles: planning.completedSteps
         },
         validate: (candidate) => toImplementationStepBlueprints(candidate, projectContract, appliedContract.touchedRequirementIds, roadmapValidationOptions)
@@ -1805,7 +1805,7 @@ export async function repairRoadmapOnce(
     objective: string;
     validationError: string;
     projectContract: ProjectContract;
-    allowedRequirementIds: string[];
+    requiredRequirementIds: string[];
     completedStepTitles: string[];
     migrationImpacts: string[];
     compatibilityImpacts: string[];
@@ -2157,7 +2157,6 @@ export function toImplementationStepBlueprints(
 
   const knownTitles = new Set<string>();
   const completedTitles = new Set((options.completedStepTitles ?? []).map(normalizeRoadmapIdentity));
-  const allowedRequirementIds = new Set(requiredRequirementIds);
   const blueprints = plan.implementationSteps.map((step, index) => {
     const title = step.title.trim();
     const description = step.description.trim();
@@ -2197,12 +2196,6 @@ export function toImplementationStepBlueprints(
     const invalidDependency = dependsOnStepTitles.find((dependency) => !knownTitles.has(normalizeRoadmapIdentity(dependency)));
     if (invalidDependency) {
       throw new Error(`Implementation step "${title}" depends on unknown or later step "${invalidDependency}".`);
-    }
-    if (options.extension) {
-      const scopeCrossingRequirement = requirementIds.find((id) => !allowedRequirementIds.has(id));
-      if (scopeCrossingRequirement) {
-        throw new Error(`Extension step "${title}" crosses the contract delta scope via requirement "${scopeCrossingRequirement}".`);
-      }
     }
     knownTitles.add(titleIdentity);
 

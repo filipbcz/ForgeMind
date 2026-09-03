@@ -591,11 +591,14 @@ export class CodexProvider implements AIProvider {
       'Each step may contain at most 3 requirementIds, 3 deliverables, 5 acceptanceCriteria, and 5 inScope items. Split an oversized step into ordered focused steps while preserving complete requirement coverage.',
       `Objective: ${input.objective}`,
       `Validation error: ${input.validationError}`,
-      `Allowed requirement ids: ${input.allowedRequirementIds.join(', ')}`,
+      `Requirement ids that must remain covered: ${input.requiredRequirementIds.join(', ')}`,
       `Completed step titles that must not be recreated: ${input.completedStepTitles.join(' | ') || 'none'}`,
       `Migration impacts: ${input.migrationImpacts.join(' | ') || 'none'}`,
       `Compatibility impacts: ${input.compatibilityImpacts.join(' | ') || 'none'}`,
-      `Relevant project contract (compact JSON):\n${JSON.stringify(compactRoadmapContract(input.projectContract, input.allowedRequirementIds))}`,
+      `Relevant project contract (compact JSON):\n${JSON.stringify(compactRoadmapContract(input.projectContract, Array.from(new Set([
+        ...input.requiredRequirementIds,
+        ...input.implementationSteps.flatMap((step) => step.requirementIds)
+      ]))))}`,
       `Invalid roadmap JSON:\n${JSON.stringify(input.implementationSteps)}`
     ].join('\n\n');
     let content: string;

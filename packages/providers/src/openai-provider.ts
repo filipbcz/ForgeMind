@@ -131,11 +131,14 @@ export class OpenAIProvider implements AIProvider {
         content: [
           `Objective: ${input.objective}`,
           `Validation error: ${input.validationError}`,
-          `Allowed requirement ids: ${input.allowedRequirementIds.join(', ')}`,
+          `Requirement ids that must remain covered: ${input.requiredRequirementIds.join(', ')}`,
           `Completed step titles that must not be recreated: ${input.completedStepTitles.join(' | ') || 'none'}`,
           `Migration impacts: ${input.migrationImpacts.join(' | ') || 'none'}`,
           `Compatibility impacts: ${input.compatibilityImpacts.join(' | ') || 'none'}`,
-          `Relevant project contract (compact JSON):\n${JSON.stringify(compactRoadmapContract(input.projectContract, input.allowedRequirementIds))}`,
+          `Relevant project contract (compact JSON):\n${JSON.stringify(compactRoadmapContract(input.projectContract, Array.from(new Set([
+            ...input.requiredRequirementIds,
+            ...input.implementationSteps.flatMap((step) => step.requirementIds)
+          ]))))}`,
           `Invalid roadmap JSON:\n${JSON.stringify(input.implementationSteps)}`
         ].join('\n\n')
       }
