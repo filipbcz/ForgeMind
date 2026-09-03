@@ -1656,6 +1656,7 @@ function TaskDetail(props: {
   const queueLabel = formatQueueLabel(props.task, props.queue);
   const workflowItems = buildTaskWorkflow(props.task, props.logs, latestRun?.id);
   const projectProgress = summarizeProjectProgress(props.roadmap, props.task.id);
+  const outcome = resolveTaskOutcome(props.task, props.logs);
   const ProjectProgressIcon = projectProgress.tone === 'completed'
     ? CheckCircle2
     : projectProgress.tone === 'attention'
@@ -1709,6 +1710,20 @@ function TaskDetail(props: {
           </div>
         </section>
       ) : null}
+
+      <section className="plain-section" aria-label="Výsledek implementace a předání">
+        <div className="section-heading">
+          <div>
+            <h3>Výsledek</h3>
+            <p>Implementace a GitHub předání jsou vyhodnoceny odděleně.</p>
+          </div>
+        </div>
+        <div className="task-overview-grid">
+          <MetricBlock label="Implementace" value={outcome.implementation} />
+          <MetricBlock label="Předání" value={outcome.delivery} />
+        </div>
+        {outcome.reason ? <p>{outcome.reason}</p> : null}
+      </section>
 
       {props.task.status === 'completed' && (props.task.deferredValidationCapabilities ?? []).length > 0 ? (
         <section className="task-deferred-validation" role="status">
@@ -1842,6 +1857,40 @@ function TaskDetail(props: {
       </div>
     </article>
   );
+}
+
+export function resolveTaskOutcome(task: TaskSummary, logs: AuditEventApi[]): {
+  implementation: string;
+  delivery: string;
+  reason?: string;
+} {
+  const readyEvent = [...logs].reverse().find((event) => (
+    event.taskId === task.id && event.eventType === 'task_status_ready_for_user_review' && isRecord(event.payload)
+  ));
+  const payload = readyEvent && isRecord(readyEvent.payload) ? readyEvent.payload : undefined;
+  const implementation = payload && isRecord(payload.implementationResult) ? payload.implementationResult : undefined;
+  const delivery = payload && isRecord(payload.deliveryResult) ? payload.deliveryResult : undefined;
+  const implementationLabel = implementation?.status === 'completed'
+    ? 'Dokončena, validace a review prošly'
+    : task.status === 'completed'
+      ? 'Historicky dokončena'
+      : 'Probíhá nebo není potvrzena';
+  const deliveryLabel = delivery?.status === 'completed' && delivery.mergeConfirmed === true
+    ? 'Potvrzeno'
+    : delivery?.status === 'failed'
+      ? 'Neúspěšné, lze opakovat'
+      : delivery?.status === 'not_requested'
+        ? 'Automatické předání vypnuto'
+        : task.status === 'completed'
+          ? 'Historicky dokončeno, stav předání není známý'
+        : task.status === 'ready_for_user_review'
+          ? 'Čeká na předání nebo převzetí'
+          : 'Dosud nezahájeno';
+  return {
+    implementation: implementationLabel,
+    delivery: deliveryLabel,
+    ...(typeof delivery?.reason === 'string' ? { reason: delivery.reason } : {})
+  };
 }
 
 type TaskRunApi = TaskUsageApi['runs'][number];

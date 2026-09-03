@@ -2882,7 +2882,9 @@ github:
 
     expect(repositoryMock.transitionTask).toHaveBeenNthCalledWith(1, 'task_1', 'ready_for_user_review', {
       pullRequestUrl: 'https://github.com/demo/repo/pull/1',
-      branchName: 'ai/1-task'
+      branchName: 'ai/1-task',
+      implementationResult: null,
+      deliveryResult: null
     });
     expect(repositoryMock.transitionTask).toHaveBeenNthCalledWith(2, 'task_1', 'completed');
     expect(advanceRoadmapAfterTaskCompletionMock).toHaveBeenCalledWith(repositoryMock, 'task_1');
