@@ -439,6 +439,57 @@ github: {}`;
     );
   });
 
+  it('does not rapidly requeue a task blocked by invalid provider authentication', async () => {
+    const authenticationError = Object.assign(new Error('Unauthorized. Reconnect the provider before retrying.'), { status: 401 });
+    createProviderMock.mockReturnValue({
+      kind: 'codex',
+      estimateCost: vi.fn(async () => ({ inputTokens: 0, outputTokens: 0, estimatedCostUsd: 0 })),
+      plan: vi.fn(async () => { throw authenticationError; }),
+      implement: vi.fn(),
+      review: vi.fn(),
+      supportsLocalRepo: () => true,
+      supportsGitHubNativeFlow: () => false
+    });
+    runWorkerTaskMock.mockImplementationOnce(async (input: { provider: { plan: (value: object) => Promise<unknown> } }) => {
+      await input.provider.plan({ taskId: 'task_1', title: 'Task', prompt: 'Prompt long enough' });
+    });
+
+    const { runDatabaseWorkerOnce } = await import('./db-worker.js');
+    await runDatabaseWorkerOnce();
+
+    expect(repositoryMock.finalizeQueueJob).toHaveBeenCalledWith(
+      'queue_1',
+      'failed',
+      expect.stringContaining('Reconnect the provider before retrying.'),
+      false
+    );
+  });
+
+  it('keeps transient provider timeouts eligible for checkpoint-safe queue retry', async () => {
+    const timeoutError = Object.assign(new Error('Provider timed out temporarily.'), { status: 504 });
+    createProviderMock.mockReturnValue({
+      kind: 'codex',
+      estimateCost: vi.fn(async () => ({ inputTokens: 0, outputTokens: 0, estimatedCostUsd: 0 })),
+      plan: vi.fn(async () => { throw timeoutError; }),
+      implement: vi.fn(),
+      review: vi.fn(),
+      supportsLocalRepo: () => true,
+      supportsGitHubNativeFlow: () => false
+    });
+    runWorkerTaskMock.mockImplementationOnce(async (input: { provider: { plan: (value: object) => Promise<unknown> } }) => {
+      await input.provider.plan({ taskId: 'task_1', title: 'Task', prompt: 'Prompt long enough' });
+    });
+
+    const { runDatabaseWorkerOnce } = await import('./db-worker.js');
+    await runDatabaseWorkerOnce();
+
+    expect(repositoryMock.finalizeQueueJob).toHaveBeenCalledWith(
+      'queue_1',
+      'failed',
+      expect.stringContaining('Provider timed out temporarily.')
+    );
+  });
+
   it('aborts active workflow work when the task is cancelled in the database', async () => {
     repositoryMock.getTask
       .mockResolvedValueOnce({ ...createClaimedTask().task, status: 'running_ai' })

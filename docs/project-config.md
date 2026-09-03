@@ -81,7 +81,6 @@ Tokeny, cena, pocet souboru, velikost diffu a cas behu jsou pouze telemetrie. Ch
 Tyto promenne nejsou soucasti YAML:
 
 - `FORGEMIND_QUEUE_CLAIM_TIMEOUT_MINUTES`
-- `FORGEMIND_QUEUE_MAX_ATTEMPTS`
 - `FORGEMIND_QUEUE_RETRY_BACKOFF_SECONDS`
 
-Retry je phase-aware. Dokoncene externi operace a uspesne validacni prikazy nad nezmenenym workspace se neopakuji.
+Technicke task retry nema limit poctu pokusu; backoff pouze ridi frekvenci dalsiho pokusu. Retry je phase-aware. Dokoncene externi operace a uspesne validacni prikazy nad nezmenenym workspace se neopakuji. Neobnovitelne chyby, jako neplatna autentizace nebo chybejici provider resource, zustanou zastavene s konkretnim duvodem, dokud uzivatel prekazku neodstrani a task znovu nespusti.
