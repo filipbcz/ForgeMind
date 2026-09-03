@@ -455,7 +455,7 @@ describe('project roadmap generation', () => {
     expect(plan.implementationSteps?.[0]?.changeRationale).toContain('changed generator');
   });
 
-  it('revalidates targeted roadmap repairs and allows one bounded follow-up repair', async () => {
+  it('revalidates every targeted roadmap repair', async () => {
     const repairRoadmap = vi.fn()
       .mockResolvedValueOnce({ implementationSteps: [{ title: 'still invalid' }] })
       .mockResolvedValueOnce({ implementationSteps: [{ title: 'valid' }] });

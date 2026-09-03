@@ -1,6 +1,6 @@
 import { PrismaClient } from '@prisma/client';
 import { applyProjectContractDelta } from '@forgemind/core';
-import type { ProjectContract, ProjectContractDelta } from '@forgemind/core';
+import type { ProjectContract, ProjectContractDelta, RoadmapGenerationCheckpoint } from '@forgemind/core';
 import { readFileSync, readdirSync } from 'node:fs';
 import { createRequire } from 'node:module';
 import path from 'node:path';
@@ -106,4 +106,29 @@ describe('roadmap regeneration lifecycle', () => {
     const supersededAudit = await prisma.auditLog.findFirst({ where: { eventType: 'project_roadmap_steps_superseded' } });
     expect(supersededAudit?.payload).toMatchObject({ replacementCycleId: second.cycles.at(-1)?.id });
   }, 30_000);
+
+  it('durably resumes only the latest matching draft and retains redacted review history', async () => {
+    const repository = new ForgeMindRepository(prisma);
+    const projectId = 'roadmap_regeneration_project';
+    const checkpoint: RoadmapGenerationCheckpoint = {
+      version: 1, phase: 'repair', revision: 3,
+      plan: { summary: 'Export draft', steps: [], acceptanceCriteria: [], implementationSteps: [] },
+      validationError: 'Resolve overlapping steps.',
+      qualityReview: { verdict: 'not_satisfied', summary: 'Overlap', blockers: ['Resolve overlapping steps.'] }
+    };
+    await repository.saveRoadmapGenerationCheckpoint(projectId, 'source-a', {
+      ...checkpoint,
+      plan: { ...checkpoint.plan, providerPrompt: 'not durable', providerResponse: 'not durable' },
+      qualityReview: { ...checkpoint.qualityReview!, providerPrompt: 'not durable' }
+    } as RoadmapGenerationCheckpoint);
+    const afterRestart = new ForgeMindRepository(prisma);
+    expect(await afterRestart.getRoadmapGenerationCheckpoint(projectId, 'source-a')).toEqual(checkpoint);
+    expect(await afterRestart.getRoadmapGenerationCheckpoint(projectId, 'source-b')).toBeUndefined();
+    await afterRestart.saveRoadmapGenerationCheckpoint(projectId, 'source-b', { ...checkpoint, revision: 0, phase: 'validate' });
+    expect(await afterRestart.getRoadmapGenerationCheckpoint(projectId, 'source-a')).toBeUndefined();
+    expect(await afterRestart.getRoadmapGenerationCheckpoint(projectId, 'source-b')).toMatchObject({ revision: 0, phase: 'validate' });
+    const events = await prisma.auditLog.findMany({ where: { projectId, eventType: 'project_roadmap_generation_checkpoint' } });
+    expect(events).toHaveLength(2);
+    expect(JSON.stringify(events)).not.toContain('not durable');
+  });
 });

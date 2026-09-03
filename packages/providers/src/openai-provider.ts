@@ -143,7 +143,7 @@ export class OpenAIProvider implements AIProvider {
         ].join('\n\n')
       }
     ];
-    const response = await this.requestChat(messages);
+    const response = await this.requestChat(messages, input.signal);
     await emitCapturedUsage(input.onActivity, response.usage);
     try {
       return {

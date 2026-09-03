@@ -1,5 +1,7 @@
 import { redactError } from '@forgemind/core';
-import type { AcceptanceEvidenceSource, AcceptanceEvidenceStatus, NormalizedProviderErrorDetails, NormalizedProviderErrorKind, ProjectArchitectureUpdate, ProjectContract, ProjectContractDelta, ProjectContractRequirement, ProviderKind, ProviderPreflightResult, TaskMode, ValidationCheckCategory } from '@forgemind/core';
+import type { ImplementationStepPlan, RoadmapCandidate, RoadmapQualityReview } from '@forgemind/core';
+export type { ImplementationStepPlan } from '@forgemind/core';
+import type { AcceptanceEvidenceSource, AcceptanceEvidenceStatus, NormalizedProviderErrorDetails, NormalizedProviderErrorKind, ProjectArchitectureUpdate, ProjectContract, ProjectContractRequirement, ProviderKind, ProviderPreflightResult, TaskMode, ValidationCheckCategory } from '@forgemind/core';
 
 export type { NormalizedProviderErrorDetails, NormalizedProviderErrorKind, ProviderPreflightResult } from '@forgemind/core';
 
@@ -47,29 +49,9 @@ export interface PlanInput {
   signal?: AbortSignal;
 }
 
-export interface PlanResult {
-  summary: string;
-  steps: string[];
-  acceptanceCriteria: string[];
-  implementationSteps?: ImplementationStepPlan[];
-  projectContract?: ProjectContract;
-  contractDelta?: ProjectContractDelta;
-  architectureUpdate?: ProjectArchitectureUpdate;
+export interface PlanResult extends RoadmapCandidate {
   providerPrompt?: string;
   providerResponse?: string;
-}
-
-export interface ImplementationStepPlan {
-  title: string;
-  description: string;
-  acceptanceCriteria: string[];
-  inScope: string[];
-  outOfScope: string[];
-  requirementIds: string[];
-  deliverables: string[];
-  changeRationale: string;
-  dependsOnStepTitles: string[];
-  validationFocus: Array<'implementation' | 'migration' | 'compatibility' | 'regression'>;
 }
 
 export interface RoadmapRepairInput {
@@ -82,6 +64,7 @@ export interface RoadmapRepairInput {
   completedStepTitles: string[];
   migrationImpacts: string[];
   compatibilityImpacts: string[];
+  signal?: AbortSignal;
   repositoryPath?: string;
   onActivity?: ProviderActivityHandler;
   session?: ProviderSessionContext;
@@ -238,15 +221,7 @@ export interface ReviewInput {
   signal?: AbortSignal;
 }
 
-export interface ReviewResult {
-  verdict: 'satisfied' | 'not_satisfied';
-  summary: string;
-  blockers: string[];
-  criterionResults?: Array<{
-    criterion: string;
-    status: 'satisfied' | 'not_satisfied' | 'insufficient_evidence' | 'deferred';
-    evidence: string[];
-  }>;
+export interface ReviewResult extends RoadmapQualityReview {
   providerPrompt?: string;
   providerResponse?: string;
 }

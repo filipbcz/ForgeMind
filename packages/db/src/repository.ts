@@ -32,6 +32,7 @@ import {
   type ProjectMemory,
   type ProjectRoadmapCycle,
   type ProjectRoadmapCycleStatus,
+  type RoadmapGenerationCheckpoint,
   type ProjectSpecificationSnapshot,
   type Project,
   type ProjectCapability,
@@ -1729,6 +1730,43 @@ export class ForgeMindRepository {
     }
 
     return (await this.getProjectRoadmap(input.projectId))!;
+  }
+
+  async getRoadmapGenerationCheckpoint(projectId: string, contextKey: string): Promise<RoadmapGenerationCheckpoint | undefined> {
+    // Only the latest candidate may resume; an older matching context must not
+    // resurrect a draft superseded by a subsequent generation attempt.
+    const event = await this.prisma.auditLog.findFirst({
+      where: { projectId, eventType: 'project_roadmap_generation_checkpoint' },
+      orderBy: { createdAt: 'desc' }
+    });
+    const payload = event?.payload as { contextKey?: string; checkpoint?: RoadmapGenerationCheckpoint } | undefined;
+    if (payload?.contextKey !== contextKey) return undefined;
+    if (payload.checkpoint?.version !== 1) throw new Error('Unsupported roadmap generation checkpoint version.');
+    return payload.checkpoint;
+  }
+
+  async saveRoadmapGenerationCheckpoint(projectId: string, contextKey: string, checkpoint: RoadmapGenerationCheckpoint): Promise<void> {
+    const { plan, qualityReview } = checkpoint;
+    // Explicit projection excludes raw provider prompts/responses from durable state.
+    await this.writeAudit({
+      actorType: 'system', eventType: 'project_roadmap_generation_checkpoint', projectId,
+      payload: JSON.parse(JSON.stringify({
+        contextKey,
+        checkpoint: {
+          version: checkpoint.version, phase: checkpoint.phase, revision: checkpoint.revision,
+          validationError: checkpoint.validationError,
+          plan: {
+            summary: plan.summary, steps: plan.steps, acceptanceCriteria: plan.acceptanceCriteria,
+            implementationSteps: plan.implementationSteps, projectContract: plan.projectContract,
+            contractDelta: plan.contractDelta, architectureUpdate: plan.architectureUpdate
+          },
+          qualityReview: qualityReview ? {
+            verdict: qualityReview.verdict, summary: qualityReview.summary,
+            blockers: qualityReview.blockers, criterionResults: qualityReview.criterionResults
+          } : undefined
+        }
+      }))
+    });
   }
 
   async assertProjectRoadmapRegenerationAllowed(projectId: string): Promise<void> {

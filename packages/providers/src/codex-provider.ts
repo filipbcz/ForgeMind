@@ -614,13 +614,14 @@ export class CodexProvider implements AIProvider {
           required: ['implementationSteps'],
           properties: { implementationSteps: implementationStepsJsonSchema() }
         },
+        signal: input.signal,
         prompt: providerPrompt
       });
     } else {
       const response = await this.requestResponses([
         { role: 'system', content: 'You repair only invalid roadmap items and return JSON only.' },
         { role: 'user', content: providerPrompt }
-      ], input.session);
+      ], input.session, input.signal);
       content = response.content;
       await emitCapturedUsage(input.onActivity, response.usage);
     }

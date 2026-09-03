@@ -72,6 +72,8 @@ Prompt implementačního tasku obsahuje pouze název, popis a požadované výst
 
 Vygenerovaná roadmapa před uložením prochází samostatným AI quality review proti aktuálnímu zadání a relevantní části project contractu. Review odmítne významové rozpory, překryvy, příliš široké kroky, neověřitelná kritéria nebo manuální release operace vydávané za implementaci; provider následně opraví pouze konkrétní blockery a opravená roadmapa se znovu zkontroluje. Při regeneraci jsou nedokončené kroky starších cyklů zachovány v historii jako `cancelled`, nikoli ponechány jako zdánlivě aktivní `pending` práce.
 
+Strukturální ani významové opravy roadmapy nemají pevný limit počtu pokusů. Kandidát, poslední review a další fáze se ukládají do auditních checkpointů; technická chyba, odpojení požadavku nebo restart API nepřijdou o již uložený návrh. Opakované potvrzení generování naváže na poslední checkpoint, pokud se nezměnilo zadání, kontrakt, stav roadmapy, architektura, provider nebo model. Schválený návrh čekající na uložení cyklu se znovu nereviewuje. Změněné vstupy vyžadují nový návrh; stará historie se nemaže. Checkpointy neobsahují surové provider prompty/odpovědi a používají stávající redakci secrets. Jedna instance API odmítá souběžné generování stejného projektu; zrušení požadavku se předává i do probíhající opravy/review. Stejné navázání platí pro potvrzené rozšíření projektu. Návrhy z neúspěšných běhů před zavedením checkpointů se automaticky neimportují z interních provider logů.
+
 ## 4. Hlavní cíle
 
 ### 4.1 Funkční cíle

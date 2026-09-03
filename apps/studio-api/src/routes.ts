@@ -2,7 +2,7 @@ import type { FastifyInstance, FastifyReply, FastifyRequest } from 'fastify';
 import { createHash } from 'node:crypto';
 import { z } from 'zod';
 import { buildProjectExtensionProposalPrompt, CodexExecutionTimeoutError, createProvider, formatProjectExtensionProposal, GitHubCopilotProvider, listCodexModels, listOpenAIModels } from '@forgemind/providers';
-import type { AIProvider, PlanResult, ProviderSessionContext, ReviewResult, RoadmapQualityReviewInput } from '@forgemind/providers';
+import type { AIProvider, PlanResult, ProviderSessionContext } from '@forgemind/providers';
 import {
   checkGitHubConnection,
   createGitHubBranch,
@@ -20,18 +20,21 @@ import type { AuthService } from './auth.js';
 import { completeCodexOAuthBrowserLogin, readCodexOAuthBrowserLoginStatus, readCodexOAuthStatus, resolveCodexHome, startCodexOAuthBrowserLogin } from './codex-oauth.js';
 import { createTaskDispatchService } from './dispatch.js';
 import { sendBadRequest, sendNotFound } from './http.js';
+import { buildReviewedImplementationStepBlueprints } from './roadmap-generation.js';
 import { advanceRoadmapAfterTaskCompletion, buildRoadmapStepTaskPrompt, composeApprovedExtensionSpecification, startNextRoadmapStep } from '@forgemind/db';
 import type { AIProviderConnectionKind, AIProviderConnectionSecret, ForgeMindRepository, WindowsRunnerCredentialAdapter, WindowsWorkerRepository } from '@forgemind/db';
 import { parseGitHubWebhookPayload, projectGitHubWebhookEvent, verifyGitHubWebhookSignature } from './webhook.js';
 import type { NotificationService } from './notifications.js';
-import { ROADMAP_GENERATION_CONFIRMATION, activeProjectContractRequirements, applyProjectContractDelta, buildSpecificationChangeImpactReview, redactSecrets } from '@forgemind/core';
-import type { ProviderConnectionRuntimeStatus } from '@forgemind/core';
+import { ROADMAP_GENERATION_CONFIRMATION, activeProjectContractRequirements, applyProjectContractDelta, buildSpecificationChangeImpactReview, redactError, redactSecrets } from '@forgemind/core';
+import type { ProviderConnectionRuntimeStatus, RoadmapGenerationCheckpoint } from '@forgemind/core';
 import type { Project, ProjectArchitectureUpdate, ProjectContract, ProjectContractDelta, TaskMode } from '@forgemind/core';
 import { readSessionId, registerAuthRoutes } from './routes/auth-routes.js';
 import { registerNotificationRoutes } from './routes/notification-routes.js';
 import { registerChatRoutes } from './routes/chat-routes.js';
 import { registerWorkerRoutes } from './routes/worker-routes.js';
 import { registerWindowsRunnerRoutes } from './routes/windows-runner-routes.js';
+
+export { repairRoadmapOnce, buildImplementationStepBlueprintsWithRepairs, buildReviewedImplementationStepBlueprints } from './roadmap-generation.js';
 
 const projectSchema = z.object({
   name: z.string().min(2),
@@ -302,6 +305,10 @@ export function registerRoutes(
 ) {
   const dispatcher = createTaskDispatchService(repository);
   const processedWebhookDeliveries = new Set<string>();
+  const roadmapRequests = new Map<string, AbortController>();
+  app.addHook('preClose', async () => {
+    for (const controller of roadmapRequests.values()) controller.abort(new Error('API is shutting down.'));
+  });
 
   app.addHook('preHandler', async (request, reply) => requireAuthorizedRequest(request, reply, repository, auth));
 
@@ -1219,6 +1226,7 @@ export function registerRoutes(
   });
 
   app.post('/api/projects/:id/implementation-steps/generate', async (request, reply) => {
+    let generation: ReturnType<typeof beginRoadmapRequest>;
     try {
       const { id } = idParamsSchema.parse(request.params);
       const input = roadmapGenerateSchema.parse(request.body ?? {});
@@ -1231,6 +1239,8 @@ export function registerRoutes(
           error: `Type "${ROADMAP_GENERATION_CONFIRMATION}" to confirm roadmap generation.`
         });
       }
+      generation = beginRoadmapRequest(roadmapRequests, id, request, reply);
+      if (!generation) return reply.code(409).send({ error: 'Roadmap generation is already running for this project.' });
       await repository.assertProjectRoadmapRegenerationAllowed(project.id);
 
       const objective = input.objective?.trim() || project.brief?.trim();
@@ -1268,7 +1278,9 @@ export function registerRoutes(
         objective,
         currentSpecification,
         previousContract,
-        recoveryBaseVersion?.id ?? latestContractVersion?.id
+        recoveryBaseVersion?.id ?? latestContractVersion?.id,
+        generation.signal,
+        { operation: 'regenerate', recovery }
       );
       let plan = planning.plan;
       const regeneratedContract = resolveRegeneratedProjectContract(
@@ -1297,6 +1309,9 @@ export function registerRoutes(
         provider: planning.provider,
         session: planning.session,
         plan,
+        checkpoint: planning.checkpoint,
+        onCheckpoint: planning.saveCheckpoint,
+        signal: generation.signal,
         repairInput: {
           taskId: project.id,
           objective,
@@ -1326,6 +1341,9 @@ export function registerRoutes(
         throw new Error('AI provider did not return any implementation steps.');
       }
 
+      generation.signal.throwIfAborted();
+      await planning.assertCurrentSource();
+      generation.signal.throwIfAborted();
       const roadmap = await repository.createProjectRoadmapCycle({
         projectId: project.id,
         objective,
@@ -1348,17 +1366,26 @@ export function registerRoutes(
 
       return reply.code(201).send((await repository.getProjectRoadmap(project.id))!);
     } catch (error) {
+      await recordRoadmapInterruption(repository, generation, error, request);
       return sendBadRequest(reply, error);
+    } finally {
+      generation?.release();
     }
   });
 
   app.post('/api/projects/:id/extension/decision', async (request, reply) => {
+    let generation: ReturnType<typeof beginRoadmapRequest>;
     try {
       const { id } = idParamsSchema.parse(request.params);
       const input = roadmapExtensionDecisionSchema.parse(request.body ?? {});
       const project = await repository.getProject(id);
       if (!project) {
         return sendNotFound(reply, `Project "${id}" not found`);
+      }
+
+      if (input.accepted) {
+        generation = beginRoadmapRequest(roadmapRequests, id, request, reply);
+        if (!generation) return reply.code(409).send({ error: 'Roadmap generation is already running for this project.' });
       }
 
       const roadmap = await repository.getProjectRoadmap(id);
@@ -1396,7 +1423,8 @@ export function registerRoutes(
       if (!project.projectContract) {
         throw new Error('A current project contract is required before an extension can be accepted. Regenerate the roadmap first.');
       }
-      const planning = await generateRoadmapPlan(repository, project, objective, nextSpecification, project.projectContract);
+      const planning = await generateRoadmapPlan(repository, project, objective, nextSpecification, project.projectContract,
+        undefined, generation!.signal, { operation: 'extension', cycleId: cycle.id });
       let plan = planning.plan;
       const contractDelta = toProjectContractDelta(plan);
       const appliedContract = applyProjectContractDelta(project.projectContract, contractDelta);
@@ -1412,6 +1440,9 @@ export function registerRoutes(
         provider: planning.provider,
         session: planning.session,
         plan,
+        checkpoint: planning.checkpoint,
+        onCheckpoint: planning.saveCheckpoint,
+        signal: generation!.signal,
         repairInput: {
           taskId: project.id,
           objective,
@@ -1436,6 +1467,9 @@ export function registerRoutes(
         throw new Error('AI provider did not return any implementation steps.');
       }
 
+      generation!.signal.throwIfAborted();
+      await planning.assertCurrentSource();
+      generation!.signal.throwIfAborted();
       const nextRoadmap = await repository.createProjectRoadmapCycle({
         projectId: project.id,
         objective,
@@ -1458,7 +1492,10 @@ export function registerRoutes(
 
       return (await repository.getProjectRoadmap(id))!;
     } catch (error) {
+      await recordRoadmapInterruption(repository, generation, error, request);
       return sendBadRequest(reply, error);
+    } finally {
+      generation?.release();
     }
   });
 
@@ -1734,19 +1771,81 @@ function buildTaskPrompt(input: z.infer<typeof createTaskSchema>): string {
   return input.prompt.trim();
 }
 
-async function generateRoadmapPlan(
+export function beginRoadmapRequest(
+  active: Map<string, AbortController>, projectId: string, request: FastifyRequest, reply: FastifyReply
+) {
+  if (active.has(projectId)) return undefined;
+  const controller = new AbortController();
+  active.set(projectId, controller);
+  const abort = () => controller.abort(new Error('Roadmap request was interrupted; retry to resume its saved checkpoint.'));
+  const close = () => { if (!reply.raw.writableEnded) abort(); };
+  request.raw.once('aborted', abort);
+  reply.raw.once('close', close);
+  if (request.raw.aborted || reply.raw.destroyed) abort();
+  return {
+    projectId,
+    signal: controller.signal,
+    release() {
+      request.raw.off('aborted', abort);
+      reply.raw.off('close', close);
+      active.delete(projectId);
+    }
+  };
+}
+
+async function recordRoadmapInterruption(
+  repository: ForgeMindRepository, generation: ReturnType<typeof beginRoadmapRequest>, error: unknown, request: FastifyRequest
+) {
+  if (!generation) return;
+  try {
+    await repository.writeAudit({
+      actorType: 'system', eventType: 'project_roadmap_generation_interrupted', projectId: generation.projectId,
+      payload: { error: redactError(error), cancelled: generation.signal.aborted }
+    });
+  } catch (auditError) {
+    request.log.error({ error: redactError(auditError) }, 'Could not record roadmap interruption');
+  }
+}
+
+async function roadmapSourceKey(repository: ForgeMindRepository, projectId: string): Promise<string> {
+  const [project, specifications, contracts, roadmap] = await Promise.all([
+    repository.getProject(projectId), repository.getProjectSpecifications(projectId),
+    repository.getProjectContracts(projectId), repository.getProjectRoadmap(projectId)
+  ]);
+  const connection = project?.aiProviderConnectionId
+    ? await readAIProviderConnectionSecretById(repository, project.aiProviderConnectionId)
+    : await readAIProviderConnectionSecret(repository);
+  return createHash('sha256').update(JSON.stringify({
+    name: project?.name, brief: project?.brief, configYaml: project?.configYaml,
+    githubOwner: project?.githubOwner, githubRepo: project?.githubRepo, defaultBranch: project?.defaultBranch,
+    currentContractVersionId: project?.currentContractVersionId,
+    architectureVersionId: project?.currentArchitectureVersionId,
+    specification: specifications?.current,
+    contract: contracts?.versions.at(-1),
+    connection: connection ? { id: connection.id, provider: connection.provider, model: connection.model } : null,
+    cycles: roadmap?.cycles,
+    steps: roadmap?.steps
+  })).digest('hex');
+}
+
+export async function generateRoadmapPlan(
   repository: ForgeMindRepository,
   project: Project,
   objective: string,
   currentSpecification?: string,
   currentContract?: ProjectContract,
-  sourceContractVersionId?: string
+  sourceContractVersionId?: string,
+  signal?: AbortSignal,
+  operation: Record<string, unknown> = { operation: 'regenerate' }
 ): Promise<{
   plan: PlanResult;
   provider: AIProvider;
   session: ProviderSessionContext;
   completedSteps: string[];
   unfinishedSteps: Array<{ title: string; requirementIds: string[] }>;
+  checkpoint: RoadmapGenerationCheckpoint;
+  saveCheckpoint: (checkpoint: RoadmapGenerationCheckpoint) => Promise<void>;
+  assertCurrentSource: () => Promise<void>;
 }> {
   const connection = project.aiProviderConnectionId
     ? await readAIProviderConnectionSecretById(repository, project.aiProviderConnectionId)
@@ -1765,6 +1864,29 @@ async function generateRoadmapPlan(
   const existingRoadmap = await repository.getProjectRoadmap(project.id);
   const completedSteps = existingRoadmap?.steps.filter((step) => step.status === 'completed').map((step) => step.title) ?? [];
   const unfinishedSteps = selectUnfinishedRoadmapSteps(existingRoadmap, sourceContractVersionId);
+  const sourceKey = await roadmapSourceKey(repository, project.id);
+  const contextKey = createHash('sha256').update(JSON.stringify({
+    sourceKey, objective, currentSpecification, currentContract, sourceContractVersionId, operation,
+    provider: connection.provider, model: connection.model, connectionId: connection.id
+  })).digest('hex');
+  const assertCurrentSource = async () => {
+    if (await roadmapSourceKey(repository, project.id) !== sourceKey) {
+      throw new Error('Project planning inputs changed during roadmap generation. Retry against the current specification and contract.');
+    }
+  };
+  const saveCheckpoint = async (checkpoint: RoadmapGenerationCheckpoint) => {
+    await assertCurrentSource();
+    await repository.saveRoadmapGenerationCheckpoint(project.id, contextKey, checkpoint);
+  };
+  const checkpoint = await repository.getRoadmapGenerationCheckpoint(project.id, contextKey);
+  if (checkpoint) {
+    signal?.throwIfAborted();
+    await repository.writeAudit({
+      actorType: 'system', eventType: 'project_roadmap_generation_resumed', projectId: project.id,
+      payload: { contextKey, phase: checkpoint.phase, revision: checkpoint.revision }
+    });
+    return { plan: checkpoint.plan, provider, session, completedSteps, unfinishedSteps, checkpoint, saveCheckpoint, assertCurrentSource };
+  }
   const planInput = {
     taskId: project.id,
     title: `Project roadmap for ${project.name}`,
@@ -1776,17 +1898,22 @@ async function generateRoadmapPlan(
       continuation: Boolean(session.id),
       currentContract
     }),
-    maxRuntimeMs: roadmapPlanningMaxRuntimeMs()
+    maxRuntimeMs: roadmapPlanningMaxRuntimeMs(),
+    signal
   };
   let plan: PlanResult;
   try {
+    signal?.throwIfAborted();
     plan = await provider.plan({ ...planInput, session });
   } catch (error) {
+    signal?.throwIfAborted();
     if (!(error instanceof CodexExecutionTimeoutError) || !session.id) throw error;
     session = createProjectPlanningSession(repository, project, connection, true);
     plan = await provider.plan({ ...planInput, session });
   }
-  return { plan, provider, session, completedSteps, unfinishedSteps };
+  const initial: RoadmapGenerationCheckpoint = { version: 1, phase: 'validate', revision: 0, plan };
+  await saveCheckpoint(initial);
+  return { plan, provider, session, completedSteps, unfinishedSteps, checkpoint: initial, saveCheckpoint, assertCurrentSource };
 }
 
 function roadmapPlanningMaxRuntimeMs(): number {
@@ -1796,104 +1923,6 @@ function roadmapPlanningMaxRuntimeMs(): number {
     : 15 * 60_000;
 }
 
-export async function repairRoadmapOnce(
-  provider: AIProvider,
-  session: ProviderSessionContext,
-  plan: PlanResult,
-  input: {
-    taskId: string;
-    objective: string;
-    validationError: string;
-    projectContract: ProjectContract;
-    requiredRequirementIds: string[];
-    completedStepTitles: string[];
-    migrationImpacts: string[];
-    compatibilityImpacts: string[];
-  }
-): Promise<PlanResult> {
-  if (!provider.repairRoadmap) {
-    throw new Error(`Roadmap validation failed and provider "${provider.kind}" does not support targeted repair: ${input.validationError}`);
-  }
-  const repaired = await provider.repairRoadmap({
-    ...input,
-    implementationSteps: plan.implementationSteps ?? [],
-    session
-  });
-  return { ...plan, implementationSteps: repaired.implementationSteps };
-}
-
-export async function buildImplementationStepBlueprintsWithRepairs<T>(input: {
-  provider: AIProvider;
-  session: ProviderSessionContext;
-  plan: PlanResult;
-  repairInput: Omit<Parameters<typeof repairRoadmapOnce>[3], 'validationError'>;
-  validate: (plan: PlanResult) => T;
-  maxRepairs?: number;
-}): Promise<{ plan: PlanResult; blueprints: T }> {
-  let plan = input.plan;
-  const maxRepairs = Math.max(0, input.maxRepairs ?? 2);
-  for (let repairAttempt = 0; ; repairAttempt += 1) {
-    try {
-      return { plan, blueprints: input.validate(plan) };
-    } catch (error) {
-      if (repairAttempt >= maxRepairs) throw error;
-      plan = await repairRoadmapOnce(input.provider, input.session, plan, {
-        ...input.repairInput,
-        validationError: errorMessage(error)
-      });
-    }
-  }
-}
-
-export async function buildReviewedImplementationStepBlueprints<T>(input: {
-  provider: AIProvider;
-  session: ProviderSessionContext;
-  plan: PlanResult;
-  repairInput: Omit<Parameters<typeof repairRoadmapOnce>[3], 'validationError'>;
-  reviewInput: Omit<RoadmapQualityReviewInput, 'implementationSteps'>;
-  validate: (plan: PlanResult) => T;
-  maxQualityRepairs?: number;
-}): Promise<{ plan: PlanResult; blueprints: T; qualityReview: ReviewResult }> {
-  if (!input.provider.reviewRoadmap) {
-    throw new Error(`AI provider "${input.provider.kind}" does not support independent roadmap quality review.`);
-  }
-
-  let structural = await buildImplementationStepBlueprintsWithRepairs({
-    provider: input.provider,
-    session: input.session,
-    plan: input.plan,
-    repairInput: input.repairInput,
-    validate: input.validate
-  });
-  const maxQualityRepairs = Math.max(0, input.maxQualityRepairs ?? 2);
-  for (let repairAttempt = 0; ; repairAttempt += 1) {
-    const qualityReview = await input.provider.reviewRoadmap({
-      ...input.reviewInput,
-      implementationSteps: structural.plan.implementationSteps ?? []
-    });
-    if (qualityReview.verdict === 'satisfied') {
-      return { ...structural, qualityReview };
-    }
-    if (repairAttempt >= maxQualityRepairs) {
-      throw new Error(`Roadmap quality review rejected the generated roadmap: ${qualityReview.blockers.join(' | ')}`);
-    }
-
-    const repairedPlan = await repairRoadmapOnce(input.provider, input.session, structural.plan, {
-      ...input.repairInput,
-      validationError: [
-        'Independent roadmap quality review rejected the candidate roadmap.',
-        ...qualityReview.blockers.map((blocker) => `- ${blocker}`)
-      ].join('\n')
-    });
-    structural = await buildImplementationStepBlueprintsWithRepairs({
-      provider: input.provider,
-      session: input.session,
-      plan: repairedPlan,
-      repairInput: input.repairInput,
-      validate: input.validate
-    });
-  }
-}
 
 function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
