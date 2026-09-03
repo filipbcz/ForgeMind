@@ -653,7 +653,9 @@ export async function runDatabaseWorkerOnce(options: { deferInterruptSignals?: b
     } else {
       await repository.transitionTask(claimed.task.id, 'ready_for_user_review', {
         pullRequestUrl: result.pullRequestUrl ?? null,
-        branchName: result.branchName
+        branchName: result.branchName,
+        implementationResult: result.implementationResult ?? null,
+        deliveryResult: result.deliveryResult ?? null
       });
       if (result.status === 'completed') {
         await repository.transitionTask(claimed.task.id, 'completed');

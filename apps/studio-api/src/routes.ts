@@ -1525,7 +1525,21 @@ export function registerRoutes(
   app.get('/api/tasks/:id', async (request, reply) => {
     const { id } = idParamsSchema.parse(request.params);
     const task = await repository.getTask(id);
-    return task ? task : sendNotFound(reply, `Task "${id}" not found`);
+    if (!task) return sendNotFound(reply, `Task "${id}" not found`);
+    const audit = await repository.listTaskAudit(id);
+    const readyPayload = [...audit].reverse().find((event) => event.eventType === 'task_status_ready_for_user_review')?.payload;
+    const outcomes = readyPayload && typeof readyPayload === 'object' && !Array.isArray(readyPayload)
+      ? readyPayload as Record<string, unknown>
+      : {};
+    return {
+      ...task,
+      implementationResult: outcomes.implementationResult ?? (task.status === 'completed'
+        ? { status: 'completed', historical: true }
+        : null),
+      deliveryResult: outcomes.deliveryResult ?? (task.status === 'completed'
+        ? { status: 'historical_completed', mergeConfirmed: null, historical: true }
+        : null)
+    };
   });
 
   app.post('/api/tasks/:id/start', async (request, reply) => {

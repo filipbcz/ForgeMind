@@ -150,6 +150,17 @@ export interface WorkerTaskResult {
   externalValidationChecks?: ValidationCheck[];
   commitSha?: string;
   summary: string;
+  implementationResult?: {
+    status: 'completed';
+    validationPassed: true;
+    reviewPassed: true;
+  };
+  deliveryResult?: {
+    status: 'not_requested' | 'pending' | 'completed' | 'failed';
+    operation?: GitHubOperation;
+    reason?: string;
+    mergeConfirmed: boolean;
+  };
   architectureUpdate?: ProjectArchitectureUpdate;
   completedAt: string;
 }
@@ -375,19 +386,22 @@ export async function runWorkerTask(input: WorkerTaskInput): Promise<WorkerTaskR
     completedAttempts = attempt;
     const previousReviewForCorrection = review?.blockers.length ? review : undefined;
     const implementationStartedAt = Date.now();
-    await emitTaskActivity(input.hooks, {
-      phase: 'implementation',
-      state: 'started',
-      title: 'AI implementuje změny',
-      detail: `Pokus ${attempt}`,
-      operation: 'provider_implement',
-      attempt
-    });
-    await input.hooks?.onIterationStarted?.({
-      phase: 'implementation',
-      prompt: executionPrompt,
-      attempt
-    });
+    const deliveryOnlyResume = input.resume?.resumeFrom === 'delivery' && Boolean(resumedImplementation);
+    if (!deliveryOnlyResume) {
+      await emitTaskActivity(input.hooks, {
+        phase: 'implementation',
+        state: 'started',
+        title: 'AI implementuje změny',
+        detail: `Pokus ${attempt}`,
+        operation: 'provider_implement',
+        attempt
+      });
+      await input.hooks?.onIterationStarted?.({
+        phase: 'implementation',
+        prompt: executionPrompt,
+        attempt
+      });
+    }
     const isResumedImplementation = Boolean(resumedImplementation);
     implementation = resumedImplementation
       ?? await provider.implement({
@@ -406,15 +420,17 @@ export async function runWorkerTask(input: WorkerTaskInput): Promise<WorkerTaskR
       });
     resumedImplementation = undefined;
 
-    await emitTaskActivity(input.hooks, {
-      phase: 'implementation',
-      state: 'completed',
-      title: 'Implementace AI skončila',
-      detail: implementation.summary,
-      operation: 'provider_implement',
-      attempt,
-      elapsedMs: Date.now() - implementationStartedAt
-    });
+    if (!deliveryOnlyResume) {
+      await emitTaskActivity(input.hooks, {
+        phase: 'implementation',
+        state: 'completed',
+        title: 'Implementace AI skončila',
+        detail: implementation.summary,
+        operation: 'provider_implement',
+        attempt,
+        elapsedMs: Date.now() - implementationStartedAt
+      });
+    }
 
     await writeProviderFiles(workspacePath, implementation);
     const implementationStatus = await git.status();
@@ -1082,39 +1098,48 @@ async function deliverWorkerAttempt(input: {
     if (!github?.mergePullRequest) {
       mergeFailure = 'The configured GitHub adapter does not support pull request merge.';
     } else {
-      const merge = await runGitHubOperation(
-        taskInput.hooks,
-        'merge_pr',
-        { pullRequestNumber: state.pullRequest.pullRequestNumber, targetBranch: taskInput.project.defaultBranch },
-        async () => {
-          const result = await github.mergePullRequest!(taskInput.project, state.pullRequest!.pullRequestNumber, taskInput.signal);
-          if (!result.merged) {
-            throw new Error(`Pull request #${state.pullRequest!.pullRequestNumber} was not merged: ${result.message}`);
-          }
-          return result;
-        },
-        taskInput.signal,
-        (result) => ({
-          pullRequestNumber: state.pullRequest!.pullRequestNumber,
-          targetBranch: taskInput.project.defaultBranch,
-          merged: true,
-          sha: result.sha ?? null
-        })
-      );
-      mergeConfirmed = merge.merged;
-      mergeCommitSha = merge.merged && merge.sha && /^[a-f0-9]{7,64}$/i.test(merge.sha)
-        ? merge.sha
-        : undefined;
-      if (!merge.merged) mergeFailure = merge.message;
+      try {
+        const merge = await runGitHubOperation(
+          taskInput.hooks,
+          'merge_pr',
+          { pullRequestNumber: state.pullRequest.pullRequestNumber, targetBranch: taskInput.project.defaultBranch },
+          async () => {
+            const result = await github.mergePullRequest!(taskInput.project, state.pullRequest!.pullRequestNumber, taskInput.signal);
+            if (!result.merged) {
+              throw new Error(`Pull request #${state.pullRequest!.pullRequestNumber} was not merged: ${result.message}`);
+            }
+            return result;
+          },
+          taskInput.signal,
+          (result) => ({
+            pullRequestNumber: state.pullRequest!.pullRequestNumber,
+            targetBranch: taskInput.project.defaultBranch,
+            merged: true,
+            sha: result.sha ?? null
+          })
+        );
+        mergeConfirmed = merge.merged;
+        mergeCommitSha = merge.merged && merge.sha && /^[a-f0-9]{7,64}$/i.test(merge.sha)
+          ? merge.sha
+          : undefined;
+      } catch (error) {
+        // Delivery is a separate, retryable phase. GitHub policy/permission failures
+        // must not discard the already validated and positively reviewed result.
+        mergeFailure = toErrorMessage(error);
+      }
     }
   }
   state.skipMergeFromResume = false;
 
   await emitTaskActivity(taskInput.hooks, {
     phase: 'completion',
-    state: 'completed',
-    title: config.autoCompleteTask && mergeConfirmed ? 'Task je dokonceny' : 'Vysledek je pripraveny k prevzeti',
-    detail: state.pullRequest?.pullRequestUrl,
+    state: mergeFailure ? 'failed' : 'completed',
+    title: mergeFailure
+      ? 'Implementace je hotova, predani se nezdarilo'
+      : config.autoCompleteTask && mergeConfirmed
+        ? 'Task je dokonceny'
+        : 'Vysledek je pripraveny k prevzeti',
+    detail: mergeFailure ?? state.pullRequest?.pullRequestUrl,
     operation: 'finish_task'
   });
   // A squash merge creates a different commit identity for the validated tree.
@@ -1133,6 +1158,24 @@ async function deliverWorkerAttempt(input: {
     summary: mergeFailure
       ? `${review.summary}\n\nAutomatic merge was not completed: ${mergeFailure}`
       : review.summary,
+    implementationResult: {
+      status: 'completed',
+      validationPassed: true,
+      reviewPassed: true
+    },
+    deliveryResult: {
+      status: mergeConfirmed
+        ? 'completed'
+        : mergeFailure
+          ? 'failed'
+          : config.autoMergePullRequest
+            ? 'pending'
+            : config.createPullRequest || config.autoPush
+              ? 'pending'
+              : 'not_requested',
+      ...(mergeFailure ? { operation: 'merge_pr' as const, reason: mergeFailure } : {}),
+      mergeConfirmed
+    },
     architectureUpdate: implementation.architectureUpdate,
     completedAt: nowIso()
   };
