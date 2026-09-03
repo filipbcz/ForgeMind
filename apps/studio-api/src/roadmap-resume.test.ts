@@ -11,8 +11,21 @@ vi.mock('@forgemind/providers', async (importOriginal) => ({
   ...await importOriginal<object>(), createProvider: vi.fn()
 }));
 
+let baselineSha = 'a'.repeat(40);
+vi.mock('@forgemind/github', async (importOriginal) => ({
+  ...await importOriginal<object>(),
+  prepareReadOnlyRepositoryBaseline: vi.fn(async () => ({
+    repositoryPath: '/tmp/read-only-baseline', commitSha: baselineSha,
+    evidence: `--- src/existing-feature.ts ---\nexport const existingFeature = true; // ${baselineSha}`,
+    cleanup: vi.fn(async () => undefined)
+  }))
+}));
+
 function fixture() {
-  const project = { id: 'project', name: 'Export', brief: 'Build export support.', aiProviderConnectionId: 'connection' } as Project;
+  const project = {
+    id: 'project', name: 'Export', brief: 'Build export support.', aiProviderConnectionId: 'connection',
+    githubOwner: 'owner', githubRepo: 'repository', defaultBranch: 'main'
+  } as Project;
   const specification = { id: 'spec-1', fullSpecification: project.brief };
   const connection = { id: 'connection', provider: 'openai', model: 'fixture-model', authMode: 'api_key' };
   let stored: { contextKey: string; checkpoint: RoadmapGenerationCheckpoint } | undefined;
@@ -22,6 +35,7 @@ function fixture() {
     getProjectContracts: vi.fn(async () => ({ versions: [] })),
     getProjectRoadmap: vi.fn(async () => ({ cycles: [], steps: [] })),
     getAIProviderConnectionSecretById: vi.fn(async () => connection),
+    getGitHubConnectionSecret: vi.fn(async () => ({ token: 'secret', apiBaseUrl: 'https://api.github.test' })),
     getRoadmapGenerationCheckpoint: vi.fn(async (_id: string, key: string) => stored?.contextKey === key ? structuredClone(stored.checkpoint) : undefined),
     saveRoadmapGenerationCheckpoint: vi.fn(async (_id: string, contextKey: string, checkpoint: RoadmapGenerationCheckpoint) => {
       stored = { contextKey, checkpoint: structuredClone(checkpoint) };
@@ -35,6 +49,14 @@ function fixture() {
 }
 
 describe('roadmap draft resume context', () => {
+  it('refuses planning when no commit-bound repository can be discovered', async () => {
+    const f = fixture();
+    f.project.githubOwner = undefined;
+    f.project.githubRepo = undefined;
+    await expect(f.run()).rejects.toThrow('connected repository is required');
+    expect(f.provider.plan).not.toHaveBeenCalled();
+  });
+
   it('loads the latest checkpoint instead of calling plan again', async () => {
     const f = fixture();
     const first = await f.run();
@@ -65,6 +87,18 @@ describe('roadmap draft resume context', () => {
     await expect(planning.assertCurrentSource()).rejects.toThrow('planning inputs changed');
     await expect(planning.saveCheckpoint(planning.checkpoint)).rejects.toThrow('planning inputs changed');
     expect(f.repository.saveRoadmapGenerationCheckpoint).toHaveBeenCalledTimes(1);
+  });
+
+  it('invalidates a checkpoint when code outside roadmap tasks changes at the tracked branch', async () => {
+    const f = fixture();
+    baselineSha = 'a'.repeat(40);
+    await f.run();
+    expect(f.provider.plan).toHaveBeenLastCalledWith(expect.objectContaining({
+      repositoryBaseline: expect.objectContaining({ commitSha: baselineSha, evidence: expect.stringContaining('existing-feature.ts') })
+    }));
+    baselineSha = 'b'.repeat(40);
+    await f.run();
+    expect(f.provider.plan).toHaveBeenCalledTimes(2);
   });
 
   it('does not create a cycle on provider failure and resumes the same draft through the authenticated endpoint', async () => {

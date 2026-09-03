@@ -14,7 +14,8 @@ import {
   listGitHubRepositoryOwners,
   listGitHubRepositories,
   normalizeGitHubRepositoryInput,
-  normalizeGitHubToken
+  normalizeGitHubToken,
+  prepareReadOnlyRepositoryBaseline
 } from '@forgemind/github';
 import type { AuthService } from './auth.js';
 import { completeCodexOAuthBrowserLogin, readCodexOAuthBrowserLoginStatus, readCodexOAuthStatus, resolveCodexHome, startCodexOAuthBrowserLogin } from './codex-oauth.js';
@@ -1326,7 +1327,8 @@ export function registerRoutes(
           objective,
           projectContract,
           requiredRequirementIds,
-          completedStepTitles: planning.completedSteps
+          completedStepTitles: planning.completedSteps,
+          repositoryBaseline: planning.repositoryBaseline
         },
         validate: (candidate) => toImplementationStepBlueprints(
           candidate,
@@ -1457,7 +1459,8 @@ export function registerRoutes(
           objective,
           projectContract,
           requiredRequirementIds: appliedContract.touchedRequirementIds,
-          completedStepTitles: planning.completedSteps
+          completedStepTitles: planning.completedSteps,
+          repositoryBaseline: planning.repositoryBaseline
         },
         validate: (candidate) => toImplementationStepBlueprints(candidate, projectContract, appliedContract.touchedRequirementIds, roadmapValidationOptions)
       });
@@ -1857,6 +1860,7 @@ export async function generateRoadmapPlan(
   session: ProviderSessionContext;
   completedSteps: string[];
   unfinishedSteps: Array<{ title: string; requirementIds: string[] }>;
+  repositoryBaseline: { commitSha: string; evidence: string };
   checkpoint: RoadmapGenerationCheckpoint;
   saveCheckpoint: (checkpoint: RoadmapGenerationCheckpoint) => Promise<void>;
   assertCurrentSource: () => Promise<void>;
@@ -1874,6 +1878,18 @@ export async function generateRoadmapPlan(
     model: connection.model,
     codexHome: connection.codexHome
   });
+  const discoverBaseline = async () => {
+    if (!project.githubOwner || !project.githubRepo) {
+      throw new Error('A connected repository is required for commit-bound roadmap planning.');
+    }
+    const githubConnection = await readGitHubConnectionSecret(repository);
+    if (!githubConnection) throw new Error('Connect GitHub before discovering the repository baseline for roadmap planning.');
+    return prepareReadOnlyRepositoryBaseline(
+      new GitHubAppAdapter({ token: githubConnection.token, apiBaseUrl: githubConnection.apiBaseUrl }), project, signal
+    );
+  };
+  const checkout = await discoverBaseline();
+  const repositoryBaseline = { commitSha: checkout.commitSha, evidence: checkout.evidence };
   let session = createProjectPlanningSession(repository, project, connection);
   const existingRoadmap = await repository.getProjectRoadmap(project.id);
   const completedSteps = existingRoadmap?.steps.filter((step) => step.status === 'completed').map((step) => step.title) ?? [];
@@ -1881,11 +1897,20 @@ export async function generateRoadmapPlan(
   const sourceKey = await roadmapSourceKey(repository, project.id);
   const contextKey = createHash('sha256').update(JSON.stringify({
     sourceKey, objective, currentSpecification, currentContract, sourceContractVersionId, operation,
+    repositoryCommitSha: repositoryBaseline?.commitSha,
     provider: connection.provider, model: connection.model, connectionId: connection.id
   })).digest('hex');
   const assertCurrentSource = async () => {
     if (await roadmapSourceKey(repository, project.id) !== sourceKey) {
       throw new Error('Project planning inputs changed during roadmap generation. Retry against the current specification and contract.');
+    }
+    {
+      const current = await discoverBaseline();
+      try {
+        if (current.commitSha !== repositoryBaseline.commitSha) {
+          throw new Error('Repository checkout changed during roadmap generation. Retry against the current commit.');
+        }
+      } finally { await current?.cleanup(); }
     }
   };
   const saveCheckpoint = async (checkpoint: RoadmapGenerationCheckpoint) => {
@@ -1899,7 +1924,8 @@ export async function generateRoadmapPlan(
       actorType: 'system', eventType: 'project_roadmap_generation_resumed', projectId: project.id,
       payload: { contextKey, phase: checkpoint.phase, revision: checkpoint.revision }
     });
-    return { plan: checkpoint.plan, provider, session, completedSteps, unfinishedSteps, checkpoint, saveCheckpoint, assertCurrentSource };
+    await checkout?.cleanup();
+    return { plan: checkpoint.plan, provider, session, completedSteps, unfinishedSteps, repositoryBaseline, checkpoint, saveCheckpoint, assertCurrentSource };
   }
   const planInput = {
     taskId: project.id,
@@ -1913,7 +1939,9 @@ export async function generateRoadmapPlan(
       currentContract
     }),
     maxRuntimeMs: roadmapPlanningMaxRuntimeMs(),
-    signal
+    signal,
+    repositoryPath: checkout?.repositoryPath,
+    repositoryBaseline
   };
   let plan: PlanResult;
   try {
@@ -1927,7 +1955,8 @@ export async function generateRoadmapPlan(
   }
   const initial: RoadmapGenerationCheckpoint = { version: 1, phase: 'validate', revision: 0, plan };
   await saveCheckpoint(initial);
-  return { plan, provider, session, completedSteps, unfinishedSteps, checkpoint: initial, saveCheckpoint, assertCurrentSource };
+  await checkout?.cleanup();
+  return { plan, provider, session, completedSteps, unfinishedSteps, repositoryBaseline, checkpoint: initial, saveCheckpoint, assertCurrentSource };
 }
 
 function roadmapPlanningMaxRuntimeMs(): number {
@@ -1995,6 +2024,7 @@ export function buildRoadmapPlanningPrompt(input: {
       'Preserve all unchanged active requirements. Include migrationImpacts and compatibilityImpacts, using empty arrays when there are none.',
       'Return implementationSteps needed to realize the delta and to finish all carried-forward work. Every added, updated, superseded, removed, or carried-forward active requirement must be referenced by at least one returned step.',
       'Every step must include a concrete changeRationale, dependsOnStepTitles referencing only earlier returned steps, and validationFocus. Include regression validation and add migration or compatibility validation when those impacts are declared.',
+      'Every changeRationale must cite repository evidence for the concrete missing behavior and name existing components, modules, or interfaces that the implementation will reuse.',
       'Keep each implementation step focused: at most 3 requirementIds, 3 deliverables, 5 acceptanceCriteria, and 5 inScope items. Split broader work into additional ordered steps.',
       'Return a compact architectureUpdate containing only architecture changes caused by this extension.'
     ].filter(Boolean).join('\n\n');
@@ -2023,6 +2053,7 @@ export function buildRoadmapPlanningPrompt(input: {
       'Every requirement id must use REQ-UPPERCASE format and describe one independently verifiable product capability, not an implementation layer.',
       'Each implementationSteps item must contain title, a distinct implementation-focused description, acceptanceCriteria, inScope, outOfScope, requirementIds, and concrete deliverables.',
       'Each implementationSteps item must also contain changeRationale, dependsOnStepTitles, and validationFocus. Dependencies may reference only earlier step titles. validationFocus uses implementation, migration, compatibility, or regression.',
+      'Every changeRationale must cite repository evidence for the concrete missing behavior and name existing components, modules, or interfaces that the implementation will reuse.',
       'Each implementation step must fit one focused pull request and cover at most three contract requirements. Split broad epics into multiple steps.',
       'Each implementation step may contain at most 3 deliverables, 5 acceptanceCriteria, and 5 inScope items.',
       'Every contract requirement must be referenced by at least one implementation step. Placeholder data, declarations, documentation, interfaces, or pass-valued evidence do not satisfy production capabilities unless explicitly required.',

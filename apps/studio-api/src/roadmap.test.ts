@@ -1,5 +1,6 @@
 import { describe, expect, it, vi } from 'vitest';
 import type { AIProvider, ImplementationStepPlan, PlanResult } from '@forgemind/providers';
+import { buildRoadmapQualityReviewPrompt } from '@forgemind/providers';
 import { buildImplementationStepBlueprintsWithRepairs, buildReviewedImplementationStepBlueprints, buildRoadmapPlanningPrompt, buildRoadmapStepTaskPrompt, collectRegeneratedRoadmapRequirementIds, createProjectPlanningSession, findFirstPendingStepForLatestCycle, repairRoadmapOnce, resolveRegeneratedProjectContract, resolveTaskMode, selectUnfinishedRoadmapSteps, toImplementationStepBlueprints, toProjectArchitectureUpdate, toProjectContract } from './routes.js';
 
 const projectContract = {
@@ -15,6 +16,19 @@ const projectContract = {
 };
 
 describe('project roadmap generation', () => {
+  it('binds independent review to concrete repository evidence beyond roadmap history', () => {
+    const prompt = buildRoadmapQualityReviewPrompt({
+      taskId: 'project', objective: 'Add CSV export', projectContract,
+      requiredRequirementIds: ['REQ-GENERATOR'], completedStepTitles: [], implementationSteps: [],
+      repositoryBaseline: {
+        commitSha: 'a'.repeat(40),
+        evidence: '--- src/export.ts ---\nexport function exportCsv() {}'
+      }
+    });
+    expect(prompt).toContain('a'.repeat(40));
+    expect(prompt).toContain('src/export.ts');
+    expect(prompt).toContain('Existing capabilities must not be recreated');
+  });
   it('requires a structured initial architecture from roadmap planning', () => {
     expect(toProjectArchitectureUpdate({
       summary: 'Roadmap', steps: [], acceptanceCriteria: [],
