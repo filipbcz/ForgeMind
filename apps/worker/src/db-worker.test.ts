@@ -93,6 +93,7 @@ const repositoryMock = {
   updateTaskProviderSession: vi.fn(async () => undefined),
   updateProjectPlanningSession: vi.fn(async () => undefined),
   recordCompletedTaskProjectMemory: vi.fn(async () => undefined),
+  setTaskDeferredValidationCapabilities: vi.fn(async () => undefined),
   recordProviderUsage: vi.fn(async () => undefined),
   transitionTask: vi.fn(async () => undefined),
   createApproval: vi.fn(async () => ({ id: 'approval_1' })),
@@ -2856,6 +2857,7 @@ github:
     await runDatabaseWorkerOnce();
 
     expect(repositoryMock.writeAudit).not.toHaveBeenCalledWith(expect.objectContaining({ eventType: 'windows_validation_not_enqueued' }));
+    expect(repositoryMock.setTaskDeferredValidationCapabilities).toHaveBeenCalledWith('task_1', ['windows', 'cmake', 'msvc']);
     expect(enqueueWindowsValidationMock).toHaveBeenCalledWith(expect.objectContaining({
       projectId: 'project_1',
       taskId: 'task_1',
@@ -2873,6 +2875,37 @@ github:
       payload: expect.objectContaining({ requestedCapabilities: ['windows', 'cmake', 'msvc'] })
     }));
     expect(repositoryMock.transitionTask).toHaveBeenLastCalledWith('task_1', 'completed');
+  });
+
+  it('queues Windows validation for a direct task without requiring a roadmap contract', async () => {
+    repositoryMock.claimNextSubmittedTask.mockResolvedValueOnce(createClaimedTask());
+    repositoryMock.getImplementationStepByTaskId.mockResolvedValue(undefined);
+    runWorkerTaskMock.mockResolvedValueOnce({
+      taskId: 'task_1',
+      status: 'completed',
+      issueUrl: 'https://github.com/demo/repo/issues/1',
+      branchName: 'ai/1-task',
+      pullRequestUrl: 'https://github.com/demo/repo/pull/1',
+      workspacePath: 'C:/tmp/worker',
+      commitSha: 'b'.repeat(40),
+      validation: { command: 'no-executable-checks', exitCode: 0, stdout: '', stderr: '', passed: true },
+      externalValidationChecks: [{
+        kind: 'command', command: 'pwsh ./scripts/native-smoke.ps1', shell: 'powershell', target: 'windows',
+        requiredCapabilities: ['windows'], timeoutMinutes: 10, category: 'smoke', criterion: 'Native Windows smoke passes.'
+      }],
+      summary: 'Merged successfully.',
+      completedAt: new Date().toISOString()
+    });
+
+    const { runDatabaseWorkerOnce } = await import('./db-worker.js');
+    await runDatabaseWorkerOnce();
+
+    expect(enqueueWindowsValidationMock).toHaveBeenCalledWith(expect.objectContaining({
+      taskId: 'task_1',
+      packet: expect.not.objectContaining({ evidenceContext: expect.anything() })
+    }));
+    expect(repositoryMock.setTaskDeferredValidationCapabilities).toHaveBeenCalledWith('task_1', ['windows']);
+    expect(repositoryMock.writeAudit).not.toHaveBeenCalledWith(expect.objectContaining({ eventType: 'windows_validation_not_enqueued' }));
   });
 
   it('runs capability and release audits before completing a roadmap cycle', async () => {

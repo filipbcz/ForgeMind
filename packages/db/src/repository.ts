@@ -250,6 +250,10 @@ export interface CreateProjectRoadmapCycleInput {
     reason: string;
   };
   architectureUpdate?: ProjectArchitectureUpdate;
+  qualityReview?: {
+    verdict: 'satisfied' | 'not_satisfied';
+    summary: string;
+  };
   approvedExtension?: {
     sourceCycleId: string;
     changeSummary?: string;
@@ -355,6 +359,7 @@ export interface CreateTaskInput {
   projectId: string;
   title: string;
   prompt: string;
+  acceptanceCriteria?: string[];
   mode: TaskMode;
   architectureVersionId?: string;
 }
@@ -1646,6 +1651,30 @@ export class ForgeMindRepository {
           }
         });
 
+        const supersededSteps = await tx.projectImplementationStep.findMany({
+          where: {
+            projectId: input.projectId,
+            cycleId: { not: cycle.id },
+            status: 'pending'
+          },
+          select: { id: true, cycleId: true, title: true }
+        });
+        if (supersededSteps.length > 0) {
+          await tx.projectImplementationStep.updateMany({
+            where: { id: { in: supersededSteps.map((step) => step.id) } },
+            data: { status: 'cancelled', completedAt: null }
+          });
+          await this.writeAuditTx(tx, {
+            actorType: 'system',
+            eventType: 'project_roadmap_steps_superseded',
+            projectId: input.projectId,
+            payload: {
+              replacementCycleId: cycle.id,
+              steps: supersededSteps
+            }
+          });
+        }
+
         if (input.steps.length > 0) {
           await tx.projectImplementationStep.createMany({
             data: input.steps.map((step, index) => ({
@@ -1676,6 +1705,9 @@ export class ForgeMindRepository {
             contractVersion: input.projectContract.version,
             contractVersionId: contractVersion.id,
             requirementCount: input.projectContract.requirements.length,
+            qualityReview: input.qualityReview
+              ? { verdict: input.qualityReview.verdict, summary: input.qualityReview.summary }
+              : null,
             specificationVersion: specificationVersion.version,
             architectureVersion: architectureVersion?.version ?? null,
             ...(input.approvedExtension
@@ -2064,6 +2096,7 @@ export class ForgeMindRepository {
           createdByUserId: LOCAL_USER_ID,
           title: input.title,
           prompt: input.prompt,
+          acceptanceCriteria: toPrismaJson(input.acceptanceCriteria ?? []),
           mode: input.mode,
           status: 'submitted',
           architectureVersionId,
@@ -3476,6 +3509,7 @@ export class ForgeMindRepository {
         createdByUserId: LOCAL_USER_ID,
         title: input.title,
         prompt: input.prompt,
+        acceptanceCriteria: toPrismaJson(input.acceptanceCriteria ?? []),
         mode: input.mode,
         status: 'draft',
         architectureVersionId
@@ -3689,6 +3723,15 @@ export class ForgeMindRepository {
       return transitionedTask;
     });
 
+    return toTask(updated);
+  }
+
+  async setTaskDeferredValidationCapabilities(taskId: string, capabilities: string[]): Promise<ForgeTask> {
+    const normalized = Array.from(new Set(capabilities.map((capability) => capability.trim()).filter(Boolean))).sort();
+    const updated = await this.prisma.task.update({
+      where: { id: taskId },
+      data: { deferredValidationCapabilities: toPrismaJson(normalized) }
+    });
     return toTask(updated);
   }
 

@@ -79,109 +79,36 @@ export async function startNextRoadmapStep(
   ));
   if (!nextStep) return undefined;
 
-  const currentIndex = cycleSteps.findIndex((candidate) => candidate.id === nextStep.id);
-  const completedSteps = cycleSteps
-    .filter((candidate) => candidate.status === 'completed')
-    .map((candidate) => candidate.title);
-  const futureSteps = cycleSteps.slice(currentIndex + 1).map((candidate) => candidate.title);
   return repository.createAndStartRoadmapStepTask(nextStep.id, {
       projectId: project.id,
       title: `${project.name}: ${nextStep.title}`,
       prompt: buildRoadmapStepTaskPrompt({
-        projectName: project.name,
-        objective: cycle.objective,
         stepTitle: nextStep.title,
         stepDescription: nextStep.description,
         acceptanceCriteria: nextStep.acceptanceCriteria,
-        requirementIds: nextStep.requirementIds,
-        deliverables: nextStep.deliverables,
-        changeRationale: nextStep.changeRationale,
-        dependsOnStepTitles: nextStep.dependsOnStepTitles,
-        validationFocus: nextStep.validationFocus,
-        projectContract: project.projectContract,
-        completedSteps,
-        futureSteps
+        deliverables: nextStep.deliverables
       }),
+      acceptanceCriteria: nextStep.acceptanceCriteria,
       mode: project.defaultTaskMode ?? 'safe',
       architectureVersionId: project.currentArchitectureVersionId ?? cycle.architectureVersionId
   });
 }
 
 export function buildRoadmapStepTaskPrompt(input: {
-  projectName: string;
-  objective: string;
   stepTitle: string;
   stepDescription: string;
   acceptanceCriteria: string[];
-  requirementIds?: string[];
   deliverables?: string[];
-  changeRationale?: string;
-  dependsOnStepTitles?: string[];
-  validationFocus?: ProjectImplementationStep['validationFocus'];
-  projectContract?: Project['projectContract'];
-  completedSteps: string[];
-  futureSteps: string[];
 }): string {
   const lines = [
-    `Project: ${input.projectName}`,
-    '',
-    'Parent objective:',
-    input.objective,
-  ];
-
-  if (input.projectContract) {
-    const requirements = input.projectContract.requirements.filter((requirement) =>
-      (input.requirementIds ?? []).includes(requirement.id)
-    );
-    lines.push(
-      '',
-      'Project contract:',
-      `Summary: ${input.projectContract.summary}`,
-      'Global invariants:',
-      ...input.projectContract.invariants.map((item) => `- ${item}`),
-      ...(input.projectContract.prohibitedSubstitutes.length > 0
-        ? ['Prohibited substitutes:', ...input.projectContract.prohibitedSubstitutes.map((item) => `- ${item}`)]
-        : []),
-      'Requirements covered by this work item:',
-      ...requirements.map((requirement) => `- ${requirement.id}: ${requirement.title} - ${requirement.description}`)
-    );
-  }
-
-  lines.push(
-    '',
-    'Current implementation step:',
+    'Implementation step:',
     input.stepTitle,
     '',
-    'Step description and scope:',
-    input.stepDescription,
-    '',
-    'Execution boundary:',
-    '- Implement only the current step and its acceptance criteria.',
-    '- Do not implement work assigned to future roadmap steps.',
-    '- Reuse existing functionality. If part of this step is already satisfied, verify it instead of rewriting it.',
-    '- Keep unrelated repository files unchanged.'
-  );
+    input.stepDescription.trim()
+  ];
 
   if (input.deliverables?.length) {
     lines.push('', 'Required deliverables:', ...input.deliverables.map((deliverable) => `- ${deliverable}`));
-  }
-  if (input.changeRationale) {
-    lines.push('', 'Reason this step exists in the current change:', input.changeRationale);
-  }
-  if (input.dependsOnStepTitles?.length) {
-    lines.push('', 'Required predecessor steps:', ...input.dependsOnStepTitles.map((title) => `- ${title}`));
-  }
-  if (input.validationFocus?.length) {
-    lines.push('', 'Required validation focus:', ...input.validationFocus.map((focus) => `- ${focus}`));
-  }
-
-  if (input.completedSteps.length > 0) {
-    lines.push('', 'Already completed roadmap steps (existing repository context):');
-    for (const completedStep of input.completedSteps) lines.push(`- ${completedStep}`);
-  }
-  if (input.futureSteps.length > 0) {
-    lines.push('', 'Future roadmap steps (explicitly out of scope):');
-    for (const futureStep of input.futureSteps) lines.push(`- ${futureStep}`);
   }
   if (input.acceptanceCriteria.length > 0) {
     lines.push('', 'Acceptance Criteria:');

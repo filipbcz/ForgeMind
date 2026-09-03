@@ -407,6 +407,7 @@ export function toTask(task: Task): ForgeTask {
     createdByUserId: task.createdByUserId,
     title: task.title,
     prompt: task.prompt,
+    acceptanceCriteria: jsonStringArray(task.acceptanceCriteria),
     mode: task.mode,
     status: task.status,
     deferredValidationCapabilities: jsonStringArray(task.deferredValidationCapabilities),

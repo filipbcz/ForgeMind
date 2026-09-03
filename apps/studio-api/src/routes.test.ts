@@ -1736,7 +1736,7 @@ describe('Studio API routes', () => {
     await app.close();
   });
 
-  it('accepts rich task fields and serializes them into prompt payload', async () => {
+  it('keeps the task prompt focused and stores acceptance criteria separately', async () => {
     const repository = {
       getCurrentUser: vi.fn(async () => ({ id: 'user_1', email: 'owner@example.com', name: 'Owner', role: 'owner' })),
       getWorkerStatus: vi.fn(async () => ({
@@ -1844,17 +1844,8 @@ describe('Studio API routes', () => {
         projectId: 'project_1',
         title: 'Rich task payload',
         mode: 'safe',
-        prompt: expect.stringContaining('Priority: high')
-      })
-    );
-    expect(repository.createTask).toHaveBeenCalledWith(
-      expect.objectContaining({
-        prompt: expect.stringContaining('Scope Files:\n- apps/mobile-pwa/src/App.tsx')
-      })
-    );
-    expect(repository.createTask).toHaveBeenCalledWith(
-      expect.objectContaining({
-        prompt: expect.stringContaining('Acceptance Criteria:\n- Build passes')
+        prompt: 'Implement feature according to spec.',
+        acceptanceCriteria: ['Build passes', 'Task reaches ready_for_user_review']
       })
     );
 
@@ -2716,6 +2707,7 @@ describe('Studio API routes', () => {
       createdByUserId: string;
       title: string;
       prompt: string;
+      acceptanceCriteria: string[];
       mode: 'safe' | 'auto' | 'full_auto';
       status: string;
       githubIssueNumber?: number;
@@ -2800,6 +2792,7 @@ describe('Studio API routes', () => {
           createdByUserId: user.id,
           title: input.title,
           prompt: input.prompt,
+          acceptanceCriteria: input.acceptanceCriteria ?? [],
           mode: input.mode,
           status: 'draft',
           maxIterations: input.maxIterations,
@@ -2938,8 +2931,9 @@ describe('Studio API routes', () => {
       }
     });
     expect(createTaskResponse.statusCode).toBe(201);
-    const createdTask = createTaskResponse.json() as { id: string; prompt: string; projectId: string; title: string; maxIterations: number; maxBudgetUsd: number; mode: 'safe' | 'auto' | 'full_auto'; status: string; createdAt: string; updatedAt: string; createdByUserId: string };
-    expect(createdTask.prompt).toContain('Acceptance Criteria:\n- Build passes');
+    const createdTask = createTaskResponse.json() as { id: string; prompt: string; acceptanceCriteria: string[]; projectId: string; title: string; maxIterations: number; maxBudgetUsd: number; mode: 'safe' | 'auto' | 'full_auto'; status: string; createdAt: string; updatedAt: string; createdByUserId: string };
+    expect(createdTask.prompt).toBe('Ship gallery improvements with acceptance criteria and limits.');
+    expect(createdTask.acceptanceCriteria).toEqual(['Build passes', 'PR is created']);
 
     const startResponse = await app.inject({
       method: 'POST',

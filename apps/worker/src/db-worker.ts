@@ -38,13 +38,22 @@ async function enqueueExternalWindowsValidations(
   const project = input.project;
   const contract = project.projectContract;
   const step = await repository.getImplementationStepByTaskId(input.taskId);
-  if (!input.commitSha || !/^(?:[a-f0-9]{40}|[a-f0-9]{64})$/i.test(input.commitSha) || !project.githubOwner || !project.githubRepo || !contract || !step) {
+  if (!input.commitSha || !/^(?:[a-f0-9]{40}|[a-f0-9]{64})$/i.test(input.commitSha) || !project.githubOwner || !project.githubRepo) {
     await repository.writeAudit({
       actorType: 'system', eventType: 'windows_validation_not_enqueued', projectId: project.id, taskId: input.taskId,
-      payload: { reason: 'Windows validation requires a delivered GitHub commit and a contract-linked roadmap step.', count: input.checks.length }
+      payload: { reason: 'Windows validation requires a delivered GitHub commit and repository.', count: input.checks.length }
     });
     return;
   }
+
+  const evidenceContext = contract && step
+    ? {
+        cycleId: step.cycleId,
+        stepId: step.id,
+        requirementIds: step.requirementIds,
+        contractVersion: contract.version
+      }
+    : undefined;
 
   for (const check of input.checks) {
     const jobId = randomUUID();
@@ -89,26 +98,22 @@ async function enqueueExternalWindowsValidations(
         expectedArtifacts: [],
         nonce: 'pending',
         inputHash,
-        evidenceContext: {
-          cycleId: step.cycleId,
-          stepId: step.id,
-          requirementIds: step.requirementIds,
-          contractVersion: contract.version
-        }
+        ...(evidenceContext ? { evidenceContext } : {})
       }
     });
+    if (!evidenceContext) continue;
     await repository.recordAcceptanceEvidence({
       projectId: project.id,
-      cycleId: step.cycleId,
-      stepId: step.id,
+      cycleId: evidenceContext.cycleId,
+      stepId: evidenceContext.stepId,
       taskId: input.taskId,
       taskRunId: input.taskRunId,
-      requirementIds: step.requirementIds,
+      requirementIds: evidenceContext.requirementIds,
       criterion: check.criterion ?? check.command,
       source: 'artifact',
       status: 'deferred',
       evidenceIdentity: `windows:${jobId}`,
-      contractVersion: contract.version,
+      contractVersion: evidenceContext.contractVersion,
       commitSha: input.commitSha,
       command: check.command,
       payload: { platform: 'windows', jobId, requestedCapabilities }
@@ -592,13 +597,18 @@ export async function runDatabaseWorkerOnce(options: { deferInterruptSignals?: b
       result
     });
     if (result.status !== 'failed' && result.status !== 'validation_failed') {
+      const externalChecks = result.externalValidationChecks ?? [];
+      await repository.setTaskDeferredValidationCapabilities(
+        claimed.task.id,
+        Array.from(new Set(externalChecks.flatMap((check) => ['windows', ...(check.requiredCapabilities ?? [])])))
+      );
       try {
         await enqueueExternalWindowsValidations(repository, windowsWorkers, {
           project: claimed.project,
           taskId: claimed.task.id,
           taskRunId: claimed.taskRun.id,
           commitSha: result.commitSha,
-          checks: result.externalValidationChecks ?? []
+          checks: externalChecks
         });
       } catch (error) {
         await repository.writeAudit({

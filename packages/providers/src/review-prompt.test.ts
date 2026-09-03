@@ -10,17 +10,36 @@ describe('review prompt', () => {
       repositoryPath: '/workspace',
       changedFiles: ['src/app.ts'],
       acceptanceCriteria: ['A profile can be selected.'],
-      diff: ''
+      diff: '',
+      localValidationCheckCount: 1
     });
 
     expect(prompt).toContain('Inspect the current repository in read-only mode');
-    expect(prompt).toContain('Validation already passed. Do not reassess, extend, or replace validation.');
+    expect(prompt).toContain('1 local validation check(s) passed.');
     expect(prompt).toContain('Do not run builds or tests');
     expect(prompt).toContain('Return blockers only for concrete missing or incorrect implementation.');
     expect(prompt).toContain('Return verdict "satisfied"');
     expect(prompt).toContain('A profile can be selected.');
     expect(prompt).not.toContain('npm test');
     expect(prompt).not.toContain('validationChecks');
+  });
+
+  it('does not send a diff to a provider with native read-only repository access', () => {
+    const prompt = buildReviewPrompt({
+      taskId: 'task-native',
+      taskTitle: 'Inspect repository',
+      taskPrompt: 'Implement the requested repository change.',
+      repositoryPath: '/workspace',
+      changedFiles: ['src/app.ts'],
+      acceptanceCriteria: [],
+      diff: 'SECRET LARGE DIFF',
+      nativeRepositoryAccess: true,
+      deferredValidationChecks: [{ command: 'cmake --build build', criterion: 'Windows build passes.' }]
+    });
+
+    expect(prompt).not.toContain('SECRET LARGE DIFF');
+    expect(prompt).toContain('No local executable validation ran; 1 environment-specific check(s) are deferred');
+    expect(prompt).toContain('Deferred environment-specific validation (not executed and not passed)');
   });
 
   it('rechecks the complete repository after a correction', () => {

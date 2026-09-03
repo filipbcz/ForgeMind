@@ -12,7 +12,7 @@ import type {
   ReviewInput,
   ReviewResult
 } from '@forgemind/providers';
-import { createDirectTaskPlan, runWorkerTask } from './workflow.js';
+import { buildTaskExecutionPrompt, createDirectTaskPlan, runWorkerTask } from './workflow.js';
 
 const projectConfig = `project:
   id: workflow-test
@@ -59,12 +59,8 @@ function createTask(projectId: string): ForgeTask {
     projectId,
     createdByUserId: 'user_local_owner',
     title: 'Implement status contract',
-    prompt: [
-      'Create status.txt with the required value.',
-      '',
-      'Acceptance Criteria:',
-      '- status.txt contains pass'
-    ].join('\n'),
+    prompt: 'Create status.txt with the required value.',
+    acceptanceCriteria: ['status.txt contains pass'],
     mode: 'safe',
     status: 'submitted',
     createdAt: now,
@@ -158,7 +154,7 @@ describe('simple autonomous worker workflow', () => {
     expect(plan).not.toHaveBeenCalled();
     expect(reviewInput).toMatchObject({
       taskId: task.id,
-      acceptanceCriteria: [],
+      acceptanceCriteria: ['status.txt contains pass'],
       repositoryPath: result.workspacePath
     });
     expect(reviewInput?.diff).toContain('status.txt');
@@ -251,11 +247,58 @@ describe('simple autonomous worker workflow', () => {
     expect(result.validation).toMatchObject({ passed: true, command: 'no-executable-checks' });
   }, workflowTestTimeoutMs);
 
-  it('builds a direct task plan without provider-side planning', () => {
-    expect(createDirectTaskPlan('Task', 'Do it.\n\nAcceptance Criteria:\n- first\n- second')).toEqual({
+  it('lets native review inspect the repository without sending a diff and marks Windows checks as deferred', async () => {
+    const project = createProject();
+    const task = createTask(project.id);
+    let reviewInput: ReviewInput | undefined;
+    const provider = createProvider({
+      supportsNativeRepositoryReview: () => true,
+      implement: vi.fn(async () => ({
+        ...implementation('pass\n'),
+        validationChecks: [{
+          kind: 'command' as const,
+          command: 'pwsh ./scripts/native-smoke.ps1',
+          target: 'windows' as const,
+          shell: 'powershell' as const,
+          criterion: 'Native Windows smoke passes.'
+        }]
+      })),
+      review: vi.fn(async (input) => {
+        reviewInput = input;
+        return review('satisfied');
+      })
+    });
+
+    const result = await runWorkerTask({
+      project,
+      task,
+      provider,
+      workspaceRoot: join(tmpdir(), `forgemind-native-review-${randomUUID()}`)
+    });
+
+    expect(result.validation).toMatchObject({ passed: true, command: 'no-executable-checks' });
+    expect(result.externalValidationChecks).toHaveLength(1);
+    expect(reviewInput).toMatchObject({
+      nativeRepositoryAccess: true,
+      diff: '',
+      localValidationCheckCount: 0,
+      deferredValidationChecks: [{
+        command: 'pwsh ./scripts/native-smoke.ps1',
+        criterion: 'Native Windows smoke passes.'
+      }]
+    });
+    expect(reviewInput?.repositoryEvidence).toBeUndefined();
+  }, workflowTestTimeoutMs);
+
+  it('builds a direct task plan from structured acceptance criteria', () => {
+    expect(createDirectTaskPlan('Task', ['first', 'second'])).toEqual({
       summary: 'Implement task: Task',
       steps: ['Implement the complete supplied task scope.'],
-      acceptanceCriteria: []
+      acceptanceCriteria: ['first', 'second']
     });
+  });
+
+  it('passes the task assignment to the provider without extra project context', () => {
+    expect(buildTaskExecutionPrompt('  Implement the current step.  ')).toBe('Implement the current step.');
   });
 });

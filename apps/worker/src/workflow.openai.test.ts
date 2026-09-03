@@ -63,6 +63,7 @@ const demoTask: ForgeTask = {
   createdByUserId: 'user_local_owner',
   title: 'OpenAI ForgeMind workflow',
   prompt: 'Simulate an OpenAI implementation and validate the worker lifecycle.',
+  acceptanceCriteria: [],
   mode: 'safe',
   status: 'submitted',
   createdAt: new Date().toISOString(),

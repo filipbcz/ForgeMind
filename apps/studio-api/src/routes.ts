@@ -2,7 +2,7 @@ import type { FastifyInstance, FastifyReply, FastifyRequest } from 'fastify';
 import { createHash } from 'node:crypto';
 import { z } from 'zod';
 import { buildProjectExtensionProposalPrompt, CodexExecutionTimeoutError, createProvider, formatProjectExtensionProposal, GitHubCopilotProvider, listCodexModels, listOpenAIModels } from '@forgemind/providers';
-import type { AIProvider, PlanResult, ProviderSessionContext } from '@forgemind/providers';
+import type { AIProvider, PlanResult, ProviderSessionContext, ReviewResult, RoadmapQualityReviewInput } from '@forgemind/providers';
 import {
   checkGitHubConnection,
   createGitHubBranch,
@@ -1293,17 +1293,25 @@ export function registerRoutes(
             extension: true
           }
         : { completedStepTitles: planning.completedSteps };
-      const repairedRoadmap = await buildImplementationStepBlueprintsWithRepairs({
+      const repairedRoadmap = await buildReviewedImplementationStepBlueprints({
         provider: planning.provider,
         session: planning.session,
         plan,
         repairInput: {
           taskId: project.id,
           objective,
+          projectContract,
           allowedRequirementIds: requiredRequirementIds,
           completedStepTitles: planning.completedSteps,
           migrationImpacts: contractDelta?.migrationImpacts ?? [],
           compatibilityImpacts: contractDelta?.compatibilityImpacts ?? []
+        },
+        reviewInput: {
+          taskId: project.id,
+          objective,
+          projectContract,
+          allowedRequirementIds: requiredRequirementIds,
+          completedStepTitles: planning.completedSteps
         },
         validate: (candidate) => toImplementationStepBlueprints(
           candidate,
@@ -1329,6 +1337,7 @@ export function registerRoutes(
           reason: recovery.reason
         } : undefined,
         architectureUpdate,
+        qualityReview: repairedRoadmap.qualityReview,
         steps: stepBlueprints
       });
 
@@ -1399,17 +1408,25 @@ export function registerRoutes(
         compatibilityImpacts: contractDelta.compatibilityImpacts,
         extension: true
       };
-      const repairedRoadmap = await buildImplementationStepBlueprintsWithRepairs({
+      const repairedRoadmap = await buildReviewedImplementationStepBlueprints({
         provider: planning.provider,
         session: planning.session,
         plan,
         repairInput: {
           taskId: project.id,
           objective,
+          projectContract,
           allowedRequirementIds: appliedContract.touchedRequirementIds,
           completedStepTitles: planning.completedSteps,
           migrationImpacts: contractDelta.migrationImpacts,
           compatibilityImpacts: contractDelta.compatibilityImpacts
+        },
+        reviewInput: {
+          taskId: project.id,
+          objective,
+          projectContract,
+          allowedRequirementIds: appliedContract.touchedRequirementIds,
+          completedStepTitles: planning.completedSteps
         },
         validate: (candidate) => toImplementationStepBlueprints(candidate, projectContract, appliedContract.touchedRequirementIds, roadmapValidationOptions)
       });
@@ -1426,6 +1443,7 @@ export function registerRoutes(
         contractDelta,
         contractChangeSummary: contractDelta.summary ?? objective,
         architectureUpdate,
+        qualityReview: repairedRoadmap.qualityReview,
         approvedExtension: {
           sourceCycleId: cycle.id,
           changeSummary: `Accepted extension for roadmap cycle ${cycle.cycleNumber + 1}.`
@@ -1458,6 +1476,7 @@ export function registerRoutes(
           projectId: input.projectId,
           title: input.title,
           prompt: buildTaskPrompt(input),
+          acceptanceCriteria: input.acceptanceCriteria,
           mode: resolveTaskMode(input.mode, project.defaultTaskMode)
         })
       );
@@ -1712,29 +1731,7 @@ function readSingleHeader(value: string | string[] | undefined): string | undefi
 }
 
 function buildTaskPrompt(input: z.infer<typeof createTaskSchema>): string {
-  const lines = [input.prompt.trim()];
-
-  lines.push('', `Priority: ${input.priority}`);
-
-  if (input.runtimeSummary?.trim()) {
-    lines.push('', 'Runtime Summary:', input.runtimeSummary.trim());
-  }
-
-  if (input.scopeFiles.length > 0) {
-    lines.push('', 'Scope Files:');
-    for (const file of input.scopeFiles) {
-      lines.push(`- ${file}`);
-    }
-  }
-
-  if (input.acceptanceCriteria.length > 0) {
-    lines.push('', 'Acceptance Criteria:');
-    for (const criterion of input.acceptanceCriteria) {
-      lines.push(`- ${criterion}`);
-    }
-  }
-
-  return lines.join('\n');
+  return input.prompt.trim();
 }
 
 async function generateRoadmapPlan(
@@ -1807,6 +1804,7 @@ export async function repairRoadmapOnce(
     taskId: string;
     objective: string;
     validationError: string;
+    projectContract: ProjectContract;
     allowedRequirementIds: string[];
     completedStepTitles: string[];
     migrationImpacts: string[];
@@ -1844,6 +1842,56 @@ export async function buildImplementationStepBlueprintsWithRepairs<T>(input: {
         validationError: errorMessage(error)
       });
     }
+  }
+}
+
+export async function buildReviewedImplementationStepBlueprints<T>(input: {
+  provider: AIProvider;
+  session: ProviderSessionContext;
+  plan: PlanResult;
+  repairInput: Omit<Parameters<typeof repairRoadmapOnce>[3], 'validationError'>;
+  reviewInput: Omit<RoadmapQualityReviewInput, 'implementationSteps'>;
+  validate: (plan: PlanResult) => T;
+  maxQualityRepairs?: number;
+}): Promise<{ plan: PlanResult; blueprints: T; qualityReview: ReviewResult }> {
+  if (!input.provider.reviewRoadmap) {
+    throw new Error(`AI provider "${input.provider.kind}" does not support independent roadmap quality review.`);
+  }
+
+  let structural = await buildImplementationStepBlueprintsWithRepairs({
+    provider: input.provider,
+    session: input.session,
+    plan: input.plan,
+    repairInput: input.repairInput,
+    validate: input.validate
+  });
+  const maxQualityRepairs = Math.max(0, input.maxQualityRepairs ?? 2);
+  for (let repairAttempt = 0; ; repairAttempt += 1) {
+    const qualityReview = await input.provider.reviewRoadmap({
+      ...input.reviewInput,
+      implementationSteps: structural.plan.implementationSteps ?? []
+    });
+    if (qualityReview.verdict === 'satisfied') {
+      return { ...structural, qualityReview };
+    }
+    if (repairAttempt >= maxQualityRepairs) {
+      throw new Error(`Roadmap quality review rejected the generated roadmap: ${qualityReview.blockers.join(' | ')}`);
+    }
+
+    const repairedPlan = await repairRoadmapOnce(input.provider, input.session, structural.plan, {
+      ...input.repairInput,
+      validationError: [
+        'Independent roadmap quality review rejected the candidate roadmap.',
+        ...qualityReview.blockers.map((blocker) => `- ${blocker}`)
+      ].join('\n')
+    });
+    structural = await buildImplementationStepBlueprintsWithRepairs({
+      provider: input.provider,
+      session: input.session,
+      plan: repairedPlan,
+      repairInput: input.repairInput,
+      validate: input.validate
+    });
   }
 }
 

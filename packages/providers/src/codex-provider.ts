@@ -22,6 +22,7 @@ import type {
   ProviderPreflightResult,
   ReleaseAuditInput,
   ReleaseAuditResult,
+  RoadmapQualityReviewInput,
   RoadmapRepairInput,
   RoadmapRepairResult,
   ProviderActivityHandler,
@@ -33,6 +34,7 @@ import type {
 import { ProviderContractError, normalizeProviderError, normalizeProviderPreflight, normalizeValidationChecks, parseChatResult, parseImplementResult, parsePlanResult, parseProviderJsonObject, parseReviewResult } from './provider.js';
 import { emitCapturedUsage, normalizeTokenBreakdown } from './provider-usage.js';
 import { buildReviewPrompt } from './review-prompt.js';
+import { buildRoadmapQualityReviewPrompt, compactRoadmapContract } from './roadmap-review-prompt.js';
 import { buildCapabilityAuditPrompt, buildReleaseAuditPrompt, normalizeAuditContentWithSingleRepair, normalizeCapabilityAuditResult, normalizeReleaseAuditResult } from './audit-prompt.js';
 import type { ProviderRuntimeConfig } from './index.js';
 import { buildRepositoryChatPrompt } from './chat-prompt.js';
@@ -593,6 +595,7 @@ export class CodexProvider implements AIProvider {
       `Completed step titles that must not be recreated: ${input.completedStepTitles.join(' | ') || 'none'}`,
       `Migration impacts: ${input.migrationImpacts.join(' | ') || 'none'}`,
       `Compatibility impacts: ${input.compatibilityImpacts.join(' | ') || 'none'}`,
+      `Relevant project contract (compact JSON):\n${JSON.stringify(compactRoadmapContract(input.projectContract, input.allowedRequirementIds))}`,
       `Invalid roadmap JSON:\n${JSON.stringify(input.implementationSteps)}`
     ].join('\n\n');
     let content: string;
@@ -621,6 +624,39 @@ export class CodexProvider implements AIProvider {
     try {
       return {
         ...parseProviderJsonObject(content, 'Codex roadmap repair') as unknown as RoadmapRepairResult,
+        providerPrompt,
+        providerResponse: content
+      };
+    } catch (error) {
+      throw normalizeProviderError(this.kind, error);
+    }
+  }
+
+  async reviewRoadmap(input: RoadmapQualityReviewInput): Promise<ReviewResult> {
+    const providerPrompt = buildRoadmapQualityReviewPrompt(input);
+    let content: string;
+    if (this.authMode === 'oauth') {
+      content = await this.runCodexExec({
+        sandbox: 'read-only',
+        onActivity: input.onActivity,
+        signal: input.signal,
+        schema: buildCodexReviewSchema(),
+        prompt: providerPrompt
+      });
+    } else {
+      const response = await this.requestResponses([
+        {
+          role: 'system',
+          content: 'You are an independent roadmap quality reviewer. Assess only roadmap quality against the supplied objective and contract. Return JSON only.'
+        },
+        { role: 'user', content: providerPrompt }
+      ], undefined, input.signal);
+      content = response.content;
+      await emitCapturedUsage(input.onActivity, response.usage);
+    }
+    try {
+      return {
+        ...parseReviewResult(content, 'Codex roadmap quality review'),
         providerPrompt,
         providerResponse: content
       };

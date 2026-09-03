@@ -9,10 +9,10 @@ Produktová řada: **ForgeMind Studio**, **ForgeMind Agent**, **ForgeMind Mobile
 
 Původní návrh MVP počítal s příkazovým allowlistem, runtime sandbox policy a schvalováním rizikových operací. Aktuální implementace tento model zjednodušuje a následující pravidla mají přednost před staršími návrhovými pasážemi v tomto dokumentu:
 
-1. Task vstupuje přímo do implementace. AI analyzuje repozitář, provede změny a ve stejné odpovědi navrhne autoritativní sadu spustitelných validačních příkazů.
-2. Validační příkazy nesmí pocházet z `agent.config.yaml`, plánování ani projektové architektury. Worker spustí všechny neprázdné příkazy bez obsahového allowlistu, sandbox filtru nebo capability odkladu.
+1. Task vstupuje přímo do implementace. Jeho prompt obsahuje pouze zadání aktuálního kroku; akceptační kritéria jsou uložena a předávána samostatně. AI analyzuje aktuální repozitář, provede změny a ve stejné odpovědi navrhne autoritativní sadu spustitelných validačních příkazů.
+2. Validační příkazy nesmí pocházet z `agent.config.yaml`, plánování ani projektové architektury. Worker spustí všechny neprázdné lokální příkazy bez obsahového allowlistu nebo sandbox filtru. Kontroly výslovně vyžadující Windows zařadí jako neblokující externí validaci přesného dodaného commitu.
 3. Při selhání validace dostane implementační AI celý příkaz, exit code, stdout a stderr. Opraví implementaci nebo navrhne odpovídající novou validaci.
-4. Review má read-only přístup k repozitáři a posuzuje pouze to, zda výsledek odpovídá zadání a akceptačním kritériím. Validaci neopakuje. Blocker vrací v plném znění implementační AI.
+4. Review má read-only přístup k repozitáři a posuzuje pouze to, zda výsledek odpovídá zadání a akceptačním kritériím. Nativní Codex review si stav načte přímo z repozitáře a ForgeMind mu neposílá celý diff ani projektovou architekturu. Validaci neopakuje. Blocker vrací v plném znění implementační AI.
 5. Po úspěšném review následuje GitHub delivery. Retry pokračuje od první nedokončené fáze a neopakuje hotové externí operace ani platné validační checkpointy.
 6. Runtime approval mechanismus byl odstraněn. Autentizace, autorizace API, oprávnění uložených integrací, audit a izolace hostitelského worker prostředí zůstávají zachovány.
 
@@ -68,7 +68,9 @@ AI má volnost zvolit implementaci i validační příkazy potřebné ke splněn
 Provozní oprávnění vymezuje účet, kontejner a uložené integrace workeru.
 ```
 
-Codex podporuje projektové instrukce přes `AGENTS.md`, které čte před zahájením práce, takže ForgeMind má pro každý repozitář generovat nebo udržovat tento soubor jako součást projektových instrukcí.
+Prompt implementačního tasku obsahuje pouze název, popis a požadované výstupy aktuálního kroku. Akceptační kritéria jsou samostatná strukturovaná data. Projektový brief, roadmapa, paměť ani architektonický souhrn se do promptu automaticky nepřidávají; aktuální stav projektu je zdrojem přímo v pracovním repozitáři.
+
+Vygenerovaná roadmapa před uložením prochází samostatným AI quality review proti aktuálnímu zadání a relevantní části project contractu. Review odmítne významové rozpory, překryvy, příliš široké kroky, neověřitelná kritéria nebo manuální release operace vydávané za implementaci; provider následně opraví pouze konkrétní blockery a opravená roadmapa se znovu zkontroluje. Při regeneraci jsou nedokončené kroky starších cyklů zachovány v historii jako `cancelled`, nikoli ponechány jako zdánlivě aktivní `pending` práce.
 
 ## 4. Hlavní cíle
 
@@ -265,7 +267,6 @@ GitHub App je preferovaný způsob integrace, protože GitHub Apps mají jemně 
 Každý repozitář musí mít vlastní konfiguraci chování agenta. Doporučené soubory:
 
 ```text
-AGENTS.md
 agent.config.yaml
 .github/ISSUE_TEMPLATE/ai-task.yml
 .github/PULL_REQUEST_TEMPLATE/ai-agent.md
@@ -304,37 +305,6 @@ github:
   issue_label: "ai-task"
   branch_prefix: "ai/"
   pr_draft: true
-```
-
-### 8.2 `AGENTS.md`
-
-Ukázka:
-
-```markdown
-# AGENTS.md
-
-## Účel projektu
-
-Tento repozitář obsahuje statickou webovou galerii pro STARPANT.
-
-## Pravidla pro AI agenta
-
-- Respektuj zadání, projektové invarianty a existující architekturu.
-- Po implementaci navrhni minimální sadu spustitelných validačních příkazů.
-- Pokud testy selžou, oprav chybu a spusť je znovu.
-- Neměň nesouvisející části projektu.
-
-## Done when
-
-Úkol je hotový pouze tehdy, když:
-
-- build skončí exit code 0,
-- lint skončí exit code 0,
-- testy skončí exit code 0,
-- změny odpovídají zadání,
-- nevznikly změny mimo scope,
-- je vytvořen draft pull request,
-- PR obsahuje shrnutí změn, test report a rizika.
 ```
 
 ## 9. Režimy autonomie
@@ -387,7 +357,7 @@ validation_failed
 6. Spusť všechny navržené příkazy bez obsahového omezení.
 7. Pokud validace selže, pošli implementační AI celý příkaz, exit code, stdout a stderr.
 8. AI opraví implementaci nebo validační sadu; platné checkpointy nad nezměněným workspace se neopakují.
-9. Pokud validace projde, spusť read-only AI review pouze proti zadání a akceptačním kritériím.
+9. Pokud lokální validace projde, spusť read-only AI review pouze proti zadání a akceptačním kritériím; případné Windows kontroly označ jako odložené, nikoli jako úspěšné.
 10. Pokud review najde blocker, vrať jeho celé znění implementační AI.
 11. Bez blockeru pushni branch, otevři pull request a zapiš shrnutí a výsledek.
 ```
@@ -596,9 +566,7 @@ Požadavky:
 
 * použít Codex SDK nebo CLI,
 * pracovat nad lokálním worktree,
-* předávat prompt se zadáním,
-* předávat relevantní kontext,
-* respektovat `AGENTS.md`,
+* předávat jako obsah tasku pouze zadání aktuálního kroku,
 * běžet bez `sudo`,
 * běžet v provozně izolovaném worker prostředí.
 

@@ -34,6 +34,7 @@ const taskFixture = {
   createdByUserId: 'user_1',
   title: 'Implement feature X',
   prompt: 'Add feature X with tests.',
+  acceptanceCriteria: [],
   mode: 'safe' as const,
   status: 'draft' as const,
   createdAt: new Date().toISOString(),
@@ -700,33 +701,16 @@ describe('GitHub helpers', () => {
     expect(body).toContain('Apply suggested null guard');
   });
 
-  it('renders the complete task prompt without parsing optional headings', () => {
+  it('renders the task assignment and structured acceptance criteria separately', () => {
     const body = renderIssueBody({
       ...taskFixture,
-      prompt: [
-        'Implement gallery grouping by day and fullscreen navigation.',
-        '',
-        'Priority: high',
-        '',
-        'Runtime Summary:',
-        'No backend changes, keep nginx-only runtime.',
-        '',
-        'Scope Files:',
-        '- apps/mobile-pwa/src/App.tsx',
-        '- apps/mobile-pwa/src/styles.css',
-        '',
-        'Acceptance Criteria:',
-        '- Build passes without warnings',
-        '- No console errors during gallery navigation'
-      ].join('\n')
+      prompt: 'Implement gallery grouping by day and fullscreen navigation.',
+      acceptanceCriteria: ['Build passes without warnings', 'No console errors during gallery navigation']
     });
 
     expect(body).toContain('## Zadání');
     expect(body).toContain('Implement gallery grouping by day and fullscreen navigation.');
-    expect(body).toContain('Priority: high');
-    expect(body).toContain('Runtime Summary:\nNo backend changes, keep nginx-only runtime.');
-    expect(body).toContain('Scope Files:\n- apps/mobile-pwa/src/App.tsx');
-    expect(body).toContain('Acceptance Criteria:\n- Build passes without warnings');
+    expect(body).toContain('## Akceptační kritéria\n- Build passes without warnings');
   });
 
   it('renders a plain task prompt without synthetic fallback sections', () => {

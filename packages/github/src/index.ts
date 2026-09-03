@@ -981,6 +981,9 @@ export function renderIssueBody(task: ForgeTask): string {
     '',
     '## Zadání',
     task.prompt.trim(),
+    ...(task.acceptanceCriteria.length > 0
+      ? ['', '## Akceptační kritéria', ...task.acceptanceCriteria.map((criterion) => `- ${criterion}`)]
+      : []),
     '',
     '## Režim',
     task.mode

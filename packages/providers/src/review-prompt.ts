@@ -10,7 +10,8 @@ export function buildReviewPrompt(input: ReviewInput): string {
     'Review purpose:',
     '- Compare the complete current repository state with the original task and every acceptance criterion.',
     '- Return blockers only for concrete missing or incorrect implementation.',
-    '- Validation already passed. Do not reassess, extend, or replace validation.',
+    validationStatus(input),
+    '- Do not reassess, extend, or replace validation.',
     '',
     'Review constraints:',
     '- Do not modify files.',
@@ -33,19 +34,11 @@ export function buildReviewPrompt(input: ReviewInput): string {
     '',
     'Acceptance criteria:',
     renderList(input.acceptanceCriteria, 'No explicit acceptance criteria were provided.'),
-    ...(input.architectureContext
+    ...(input.deferredValidationChecks?.length
       ? [
           '',
-          'Relevant project architecture:',
-          input.architectureContext,
-          'Verify that the diff respects these boundaries. A deliberate boundary change must be accurately represented by the architecture update.'
-        ]
-      : []),
-    ...(input.architectureUpdate
-      ? [
-          '',
-          'Proposed architecture delta:',
-          JSON.stringify(input.architectureUpdate).slice(0, 3_000)
+          'Deferred environment-specific validation (not executed and not passed):',
+          ...input.deferredValidationChecks.map((check) => `- ${check.criterion ? `${check.criterion}: ` : ''}${check.command}`)
         ]
       : []),
     ...(input.previousReviewBlockers?.length
@@ -61,9 +54,13 @@ export function buildReviewPrompt(input: ReviewInput): string {
     '',
     'Changed files:',
     renderChangedFiles(input.changedFiles),
-    '',
-    'Change overview (supporting context only; inspect the repository for the authoritative state):',
-    input.diff || '(empty diff)',
+    ...(!input.nativeRepositoryAccess && input.diff
+      ? [
+          '',
+          'Change overview (supporting context only; inspect the repository for the authoritative state):',
+          input.diff
+        ]
+      : []),
     ...(input.repositoryEvidence
       ? [
           '',
@@ -72,6 +69,17 @@ export function buildReviewPrompt(input: ReviewInput): string {
         ]
       : [])
   ].join('\n');
+}
+
+function validationStatus(input: ReviewInput): string {
+  const localCount = input.localValidationCheckCount ?? 0;
+  const deferredCount = input.deferredValidationChecks?.length ?? 0;
+  if (localCount > 0 && deferredCount > 0) {
+    return `- ${localCount} local validation check(s) passed; ${deferredCount} environment-specific check(s) are deferred and must not be treated as passed.`;
+  }
+  if (localCount > 0) return `- ${localCount} local validation check(s) passed.`;
+  if (deferredCount > 0) return `- No local executable validation ran; ${deferredCount} environment-specific check(s) are deferred and must not be treated as passed.`;
+  return '- No executable validation was applicable.';
 }
 
 function renderList(items: string[], emptyMessage: string): string {

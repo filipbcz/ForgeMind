@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from 'vitest';
 import type { AIProvider, ImplementationStepPlan, PlanResult } from '@forgemind/providers';
-import { buildImplementationStepBlueprintsWithRepairs, buildRoadmapPlanningPrompt, buildRoadmapStepTaskPrompt, collectRegeneratedRoadmapRequirementIds, createProjectPlanningSession, findFirstPendingStepForLatestCycle, repairRoadmapOnce, resolveRegeneratedProjectContract, resolveTaskMode, selectUnfinishedRoadmapSteps, toImplementationStepBlueprints, toProjectArchitectureUpdate, toProjectContract } from './routes.js';
+import { buildImplementationStepBlueprintsWithRepairs, buildReviewedImplementationStepBlueprints, buildRoadmapPlanningPrompt, buildRoadmapStepTaskPrompt, collectRegeneratedRoadmapRequirementIds, createProjectPlanningSession, findFirstPendingStepForLatestCycle, repairRoadmapOnce, resolveRegeneratedProjectContract, resolveTaskMode, selectUnfinishedRoadmapSteps, toImplementationStepBlueprints, toProjectArchitectureUpdate, toProjectContract } from './routes.js';
 
 const projectContract = {
   version: 1,
@@ -411,7 +411,7 @@ describe('project roadmap generation', () => {
     })).toThrow('crosses the contract delta scope');
   });
 
-  it('allows exactly one targeted provider repair without resending the contract', async () => {
+  it('allows a targeted provider repair with the relevant contract context', async () => {
     const invalidSteps: ImplementationStepPlan[] = [{
       title: 'Build generator',
       description: 'Implement generator.',
@@ -441,6 +441,7 @@ describe('project roadmap generation', () => {
       taskId: 'project_1',
       objective: 'Extend generator',
       validationError: 'Missing rationale',
+      projectContract,
       allowedRequirementIds: ['REQ-GENERATOR'],
       completedStepTitles: ['Document scope'],
       migrationImpacts: [],
@@ -448,7 +449,7 @@ describe('project roadmap generation', () => {
     });
 
     expect(repairRoadmap).toHaveBeenCalledTimes(1);
-    expect(repairRoadmap.mock.calls[0]![0]).not.toHaveProperty('projectContract');
+    expect(repairRoadmap.mock.calls[0]![0].projectContract).toBe(projectContract);
     expect(plan.implementationSteps?.[0]?.changeRationale).toContain('changed generator');
   });
 
@@ -469,6 +470,7 @@ describe('project roadmap generation', () => {
       repairInput: {
         taskId: 'project_1',
         objective: 'Build qualification project',
+        projectContract,
         allowedRequirementIds: ['REQ-FOUNDATION'],
         completedStepTitles: [],
         migrationImpacts: [],
@@ -482,21 +484,73 @@ describe('project roadmap generation', () => {
     expect(result.blueprints).toEqual(['validated']);
   });
 
-  it('makes completed and future step boundaries explicit without duplicating the title', () => {
+  it('repairs semantic roadmap blockers and requires a clean independent review', async () => {
+    const originalStep: ImplementationStepPlan = {
+      title: 'Build all features',
+      description: 'Implement several unrelated features.',
+      acceptanceCriteria: ['Everything works.'],
+      inScope: ['Generator'],
+      outOfScope: [],
+      requirementIds: ['REQ-GENERATOR'],
+      deliverables: ['Generator'],
+      changeRationale: 'Implement the generator requirement.',
+      dependsOnStepTitles: [],
+      validationFocus: ['implementation']
+    };
+    const repairedStep = {
+      ...originalStep,
+      title: 'Build exercise generator',
+      description: 'Implement only grade-specific exercise generation.',
+      acceptanceCriteria: ['Generated exercises obey the selected grade rules.']
+    };
+    const reviewRoadmap = vi.fn()
+      .mockResolvedValueOnce({
+        verdict: 'not_satisfied',
+        summary: 'The step is too broad.',
+        blockers: ['Step "Build all features" must be split into one focused generator task.']
+      })
+      .mockResolvedValueOnce({ verdict: 'satisfied', summary: 'Roadmap is actionable.', blockers: [] });
+    const repairRoadmap = vi.fn().mockResolvedValue({ implementationSteps: [repairedStep] });
+    const provider = { kind: 'codex', reviewRoadmap, repairRoadmap } as unknown as AIProvider;
+    const validate = vi.fn((plan: PlanResult) => plan.implementationSteps?.map((step) => step.title) ?? []);
+
+    const result = await buildReviewedImplementationStepBlueprints({
+      provider,
+      session: { id: 'planning_session' },
+      plan: { summary: 'Roadmap', steps: [], acceptanceCriteria: [], implementationSteps: [originalStep] },
+      repairInput: {
+        taskId: 'project_1', objective: 'Build math practice', projectContract,
+        allowedRequirementIds: ['REQ-GENERATOR'], completedStepTitles: [], migrationImpacts: [], compatibilityImpacts: []
+      },
+      reviewInput: {
+        taskId: 'project_1', objective: 'Build math practice', projectContract,
+        allowedRequirementIds: ['REQ-GENERATOR'], completedStepTitles: []
+      },
+      validate
+    });
+
+    expect(reviewRoadmap).toHaveBeenCalledTimes(2);
+    expect(repairRoadmap).toHaveBeenCalledTimes(1);
+    expect(repairRoadmap.mock.calls[0]![0].validationError).toContain('must be split');
+    expect(result.blueprints).toEqual(['Build exercise generator']);
+    expect(result.qualityReview.verdict).toBe('satisfied');
+  });
+
+  it('builds a task prompt from only the current implementation step', () => {
     const prompt = buildRoadmapStepTaskPrompt({
-      projectName: 'Mathematica',
-      objective: 'Build a math practice app.',
       stepTitle: 'Build exercise generator',
       stepDescription: 'Implement grade-specific generation.\n\nIn scope:\n- Generator\n\nOut of scope:\n- UI',
       acceptanceCriteria: ['Generator tests pass.'],
-      completedSteps: ['Document MVP scope'],
-      futureSteps: ['Build practice UI']
+      deliverables: ['Generator module']
     });
 
     expect(prompt.match(/Build exercise generator/g)).toHaveLength(1);
-    expect(prompt).toContain('Already completed roadmap steps (existing repository context):\n- Document MVP scope');
-    expect(prompt).toContain('Future roadmap steps (explicitly out of scope):\n- Build practice UI');
-    expect(prompt).toContain('Do not implement work assigned to future roadmap steps.');
+    expect(prompt).toContain('Implement grade-specific generation.');
+    expect(prompt).toContain('Required deliverables:\n- Generator module');
+    expect(prompt).toContain('Acceptance Criteria:\n- Generator tests pass.');
+    expect(prompt).not.toContain('Parent objective');
+    expect(prompt).not.toContain('Project contract');
+    expect(prompt).not.toContain('roadmap steps');
   });
 
   it('starts only the first pending step from the latest roadmap cycle', () => {

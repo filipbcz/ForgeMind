@@ -8,7 +8,6 @@ import type {
   Project,
   ProjectArchitecture,
   ProjectArchitectureUpdate,
-  ProjectMemory,
   ProviderKind,
   TaskActivity,
   TaskStatus
@@ -162,7 +161,7 @@ export async function runWorkerTask(input: WorkerTaskInput): Promise<WorkerTaskR
   const provider = input.provider ?? createProvider(config.providerKind);
   const reviewProvider = input.reviewProvider ?? provider;
   const taskPrompt = input.task.prompt.trim();
-  const executionPrompt = buildTaskExecutionPrompt(taskPrompt, input.project.projectMemory, input.project.projectArchitecture);
+  const executionPrompt = buildTaskExecutionPrompt(taskPrompt);
   const github = input.github;
   if ((config.createIssue || config.createBranch || config.createPullRequest || config.autoPush) && !github) {
     throw new Error('GitHub adapter is required for the configured workflow.');
@@ -299,8 +298,8 @@ export async function runWorkerTask(input: WorkerTaskInput): Promise<WorkerTaskR
   await input.hooks?.onStatus?.('running_ai', isResumeRun && input.resume ? { resumed: true, kind: input.resume.kind } : undefined);
   const rerunPlanning = input.resume?.resumeFrom === 'planning';
   const plan = input.resume && !rerunPlanning
-    ? createResumePlan(input.resume, createDirectTaskPlan(input.task.title, executionPrompt))
-    : createDirectTaskPlan(input.task.title, executionPrompt);
+    ? createResumePlan(input.resume, createDirectTaskPlan(input.task.title, input.task.acceptanceCriteria))
+    : createDirectTaskPlan(input.task.title, input.task.acceptanceCriteria);
   if (!input.resume || rerunPlanning) {
     await emitTaskActivity(input.hooks, {
       phase: 'planning',
@@ -659,8 +658,6 @@ export async function runWorkerTask(input: WorkerTaskInput): Promise<WorkerTaskR
         workspacePath,
         input.task.prompt,
         plan.acceptanceCriteria,
-        input.project.projectArchitecture,
-        implementation.architectureUpdate,
         reviewProvider.kind,
         input.reviewProviderSession?.model
       );
@@ -699,14 +696,15 @@ export async function runWorkerTask(input: WorkerTaskInput): Promise<WorkerTaskR
             status: 'started',
             inputHash: reviewInputHash
           });
+          const nativeRepositoryReview = reviewProvider.supportsNativeRepositoryReview?.() === true;
           const reviewPacket = await collectReviewPacket(
             git,
             workspacePath,
             undefined,
-            input.project.defaultBranch
+            input.project.defaultBranch,
+            !nativeRepositoryReview
           );
           const reviewChangedFiles = reviewPacket.changedFiles;
-          const nativeRepositoryReview = reviewProvider.supportsNativeRepositoryReview?.() === true;
           const repositoryEvidence = nativeRepositoryReview
             ? undefined
             : await collectCompleteRepositorySnapshot(git, workspacePath);
@@ -722,11 +720,12 @@ export async function runWorkerTask(input: WorkerTaskInput): Promise<WorkerTaskR
             diff: reviewPacket.diff,
             reviewMode: satisfactionReview ? 'existing_state' : 'changes',
             repositoryEvidence,
-            architectureContext: formatProjectArchitectureContext(
-              input.project.projectArchitecture,
-              reviewChangedFiles.join(' ')
-            ),
-            architectureUpdate: implementation.architectureUpdate,
+            nativeRepositoryAccess: nativeRepositoryReview,
+            localValidationCheckCount: validation.checkResults?.length ?? 0,
+            deferredValidationChecks: externalValidationChecks.map((check) => ({
+              command: check.command,
+              criterion: check.criterion
+            })),
             session: input.reviewProviderSession,
             signal: input.signal,
             onActivity: (activity) => input.hooks?.onProviderActivity?.({ phase: 'review', attempt, ...activity })
@@ -1170,41 +1169,8 @@ function throwIfTaskAborted(signal?: AbortSignal): void {
   throw signal.reason instanceof Error ? signal.reason : new Error('Task execution was cancelled.');
 }
 
-export function buildTaskExecutionPrompt(
-  prompt: string,
-  memory?: ProjectMemory,
-  architecture?: ProjectArchitecture
-): string {
-  const architectureContext = formatProjectArchitectureContext(architecture, prompt);
-  const promptWithArchitecture = architectureContext
-    ? `${prompt}\n\n${architectureContext}`
-    : prompt;
-  if (!memory?.recentWork.length) return promptWithArchitecture;
-
-  const promptTerms = new Set(normalizeMemoryTerms(prompt));
-  const ranked = memory.recentWork
-    .map((entry, index) => ({
-      entry,
-      index,
-      score: normalizeMemoryTerms(`${entry.title} ${entry.summary} ${entry.changedFiles.join(' ')}`)
-        .reduce((total, term) => total + (promptTerms.has(term) ? 1 : 0), 0)
-    }))
-    .sort((left, right) => right.score - left.score || left.index - right.index);
-  const matching = ranked.filter((candidate) => candidate.score > 0);
-  const relevant = (matching.length > 0 ? matching : ranked.slice(0, 1))
-    .slice(0, 3)
-    .map(({ entry }) => [
-      `- ${entry.title}: ${entry.summary.slice(0, 600)}`,
-      entry.changedFiles.length ? `  Changed files: ${entry.changedFiles.slice(0, 12).join(', ')}` : '',
-      entry.commitSha ? `  Commit: ${entry.commitSha}` : ''
-    ].filter(Boolean).join('\n'));
-
-  return [
-    promptWithArchitecture,
-    'Project memory (supporting context only; inspect the current repository and prefer it when memory is stale):',
-    ...relevant,
-    memory.baseCommitSha ? `Last recorded successful commit: ${memory.baseCommitSha}` : ''
-  ].filter(Boolean).join('\n\n').slice(0, prompt.length + 8_000);
+export function buildTaskExecutionPrompt(prompt: string): string {
+  return prompt.trim();
 }
 
 export function formatProjectArchitectureContext(
@@ -1249,11 +1215,11 @@ function normalizeMemoryTerms(value: string): string[] {
     .filter((term) => term.length >= 4);
 }
 
-export function createDirectTaskPlan(title: string, prompt: string): PlanResult {
+export function createDirectTaskPlan(title: string, acceptanceCriteria: string[] = []): PlanResult {
   return {
     summary: `Implement task: ${title}`,
     steps: ['Implement the complete supplied task scope.'],
-    acceptanceCriteria: []
+    acceptanceCriteria: [...acceptanceCriteria]
   };
 }
 
@@ -1308,8 +1274,6 @@ async function collectReviewInputHash(
   workspacePath: string,
   taskPrompt: string,
   acceptanceCriteria: string[],
-  projectArchitecture: ProjectArchitecture | undefined,
-  architectureUpdate: ProjectArchitectureUpdate | undefined,
   reviewProviderKind: ProviderKind,
   reviewProviderModel: string | undefined
 ): Promise<string> {
@@ -1317,8 +1281,6 @@ async function collectReviewInputHash(
     repositoryContentHash: await collectRepositoryContentHash(git, workspacePath),
     taskPrompt,
     acceptanceCriteria,
-    projectArchitecture,
-    architectureUpdate,
     reviewProviderKind,
     reviewProviderModel
   })).digest('hex');
@@ -1767,7 +1729,8 @@ async function collectReviewPacket(
   git: SimpleGit,
   workspacePath: string,
   requestedPaths: string[] | undefined,
-  baseBranch: string
+  baseBranch: string,
+  includeDiff = true
 ): Promise<{ changedFiles: string[]; diff: string }> {
   const status = await git.status();
   const requestedPathSet = requestedPaths
@@ -1784,6 +1747,9 @@ async function collectReviewPacket(
         .filter((path) => !requestedPathSet || requestedPathSet.has(normalizeRepoPath(path)))
     : [];
   const changedPaths = uniqueStrings([...committedPaths, ...workspaceChangedPaths]);
+  if (!includeDiff) {
+    return { changedFiles: changedPaths, diff: '' };
+  }
   const summaryOnlyPaths = changedPaths.filter(isReviewSummaryOnlyPath);
   const reviewPaths = changedPaths.filter((path) => !isReviewSummaryOnlyPath(path));
   const untrackedPaths = new Set(status.not_added.map(normalizeRepoPath));

@@ -430,6 +430,7 @@ export interface TaskApi {
   createdByUserId: string;
   title: string;
   prompt: string;
+  acceptanceCriteria: string[];
   mode: 'safe' | 'auto' | 'full_auto';
   status: TaskStatus;
   deferredValidationCapabilities?: string[];
@@ -912,6 +913,7 @@ export interface TaskSummary {
   projectId: string;
   title: string;
   prompt: string;
+  acceptanceCriteria: string[];
   status: TaskStatus;
   currentStep: string;
   mode: TaskApi['mode'];

@@ -529,6 +529,7 @@ export function toTaskSummary(task: TaskApi): TaskSummary {
     projectId: task.projectId,
     title: task.title,
     prompt: task.prompt,
+    acceptanceCriteria: task.acceptanceCriteria ?? [],
     status: task.status,
     currentStep: currentStep(task.status),
     mode: task.mode,

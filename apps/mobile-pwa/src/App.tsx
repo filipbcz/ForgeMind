@@ -1779,6 +1779,16 @@ function TaskDetail(props: {
         </summary>
         <div className="task-disclosure-body task-brief"><p>{props.task.prompt}</p></div>
       </details>
+      {props.task.acceptanceCriteria.length > 0 ? (
+        <details className="task-disclosure">
+          <summary>
+            <span><strong>Akceptační kritéria</strong><small>{props.task.acceptanceCriteria.length}</small></span>
+          </summary>
+          <div className="task-disclosure-body task-brief">
+            <ul>{props.task.acceptanceCriteria.map((criterion) => <li key={criterion}>{criterion}</li>)}</ul>
+          </div>
+        </details>
+      ) : null}
 
       <details className="task-disclosure">
         <summary>

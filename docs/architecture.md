@@ -113,8 +113,9 @@ Brief-to-release gate:
 8. Audit ze specifikace znovu odvozuje podstatne produktove povinnosti. Project cycle nelze dokoncit bez konkretniho repository evidence pro kazdou z nich a pro kazde release kriterium.
 9. Pokud contract nekterou podstatnou povinnost opomenul, audit vrati atomicky novy `REQ-*` a minimalni opravny krok. Repository amendment vytvori novou contract verzi, zrusi pouze dotcene capability/release evidence a zachova dukazy hotovych pozadavku.
 10. Navrh volitelneho rozsireni se vytvori az po uspesnem `Original brief coverage` evidence na aktualnim commitu.
-11. Roadmap krok nese `changeRationale`, explicitni zavislosti na drivejsich krocich a `validationFocus`. Pri regeneraci se z cyklu vybrane zakladni contract verze prenesou vsechny nedokoncene kroky; novy cyklus musi vedle delty pokryt i vsechny jejich stale aktivni `REQ-*`. Pred ulozenim se deterministicky kontroluje toto pokryti, duplicita, poradi zavislosti, prekroceni povoleneho rozsahu a migracni, kompatibilitni a regresni odpovednost.
-12. Neplatna roadmapa dostane nejvyse jeden cileny AI repair pouze nad chybnymi kroky a validacni chybou. Pokud oprava znovu neprojde, nevytvori se cyklus ani prvni task.
+11. Roadmap krok nese `changeRationale`, explicitni zavislosti na drivejsich krocich a `validationFocus`. Pri regeneraci se z cyklu vybrane zakladni contract verze prenesou vsechny nedokoncene kroky; novy cyklus musi vedle delty pokryt i vsechny jejich stale aktivni `REQ-*`. Pred ulozenim se deterministicky kontroluje pokryti, duplicita, poradi zavislosti a strukturalni limity kroku.
+12. Strukturalne platnou roadmapu posoudi v cerstvem kontextu nezavisle AI quality review proti zadani a relevantni casti contractu. Kontroluje uplnost vlastniho zadani kazdeho kroku, rozpory, prekryvy, skutecnou velikost, overitelnost kriterii, zavislosti a oddeleni implementace od manualnich release operaci. Konkretni blockery se vrati cilenemu roadmap repair a opraveny vysledek znovu projde strukturalni i vyznamovou kontrolou. Bez uspesneho review se cyklus ani prvni task nevytvori.
+13. Vytvoreni nahradniho cyklu atomicky oznaci vsechny dosud `pending` kroky starsich cyklu jako `cancelled`, zachova jejich tasky a historii a zapise auditni vazbu na novy cyklus.
 
 ## 5) Runtime rozhodovani
 

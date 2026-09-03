@@ -617,6 +617,7 @@ export interface ForgeTask {
   createdByUserId: string;
   title: string;
   prompt: string;
+  acceptanceCriteria: string[];
   mode: TaskMode;
   status: TaskStatus;
   deferredValidationCapabilities?: string[];

@@ -437,6 +437,7 @@ model Task {
   createdByUserId                String        @map("created_by_user_id")
   title                          String
   prompt                         String
+  acceptanceCriteria             Json          @default("[]") @map("acceptance_criteria")
   mode                           TaskMode      @default(safe)
   status                         TaskStatus    @default(draft)
   deferredValidationCapabilities Json          @default("[]") @map("deferred_validation_capabilities")

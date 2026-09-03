@@ -15,6 +15,7 @@ import type {
   ProviderPreflightResult,
   ReleaseAuditInput,
   ReleaseAuditResult,
+  RoadmapQualityReviewInput,
   RoadmapRepairInput,
   RoadmapRepairResult,
   ReviewInput,
@@ -23,6 +24,7 @@ import type {
 import { ProviderContractError, normalizeProviderError, normalizeProviderPreflight, normalizeValidationChecks, parseChatResult, parseImplementResult, parsePlanResult, parseProviderJsonObject, parseReviewResult } from './provider.js';
 import { emitCapturedUsage, normalizeTokenBreakdown } from './provider-usage.js';
 import { buildReviewPrompt } from './review-prompt.js';
+import { buildRoadmapQualityReviewPrompt, compactRoadmapContract } from './roadmap-review-prompt.js';
 import { buildCapabilityAuditPrompt, buildReleaseAuditPrompt, normalizeAuditContentWithSingleRepair, normalizeCapabilityAuditResult, normalizeReleaseAuditResult } from './audit-prompt.js';
 import type { ProviderRuntimeConfig } from './index.js';
 import { buildRepositoryChatPrompt } from './chat-prompt.js';
@@ -133,6 +135,7 @@ export class OpenAIProvider implements AIProvider {
           `Completed step titles that must not be recreated: ${input.completedStepTitles.join(' | ') || 'none'}`,
           `Migration impacts: ${input.migrationImpacts.join(' | ') || 'none'}`,
           `Compatibility impacts: ${input.compatibilityImpacts.join(' | ') || 'none'}`,
+          `Relevant project contract (compact JSON):\n${JSON.stringify(compactRoadmapContract(input.projectContract, input.allowedRequirementIds))}`,
           `Invalid roadmap JSON:\n${JSON.stringify(input.implementationSteps)}`
         ].join('\n\n')
       }
@@ -142,6 +145,28 @@ export class OpenAIProvider implements AIProvider {
     try {
       return {
         ...parseProviderJsonObject(response.content, 'OpenAI roadmap repair') as unknown as RoadmapRepairResult,
+        providerPrompt: serializeMessages(messages),
+        providerResponse: response.content
+      };
+    } catch (error) {
+      throw normalizeProviderError(this.kind, error);
+    }
+  }
+
+  async reviewRoadmap(input: RoadmapQualityReviewInput): Promise<ReviewResult> {
+    const providerPrompt = buildRoadmapQualityReviewPrompt(input);
+    const messages: Array<{ role: 'system' | 'user' | 'assistant'; content: string }> = [
+      {
+        role: 'system',
+        content: 'You are an independent roadmap quality reviewer. Assess only roadmap quality against the supplied objective and contract. Return verdict satisfied or not_satisfied with concrete blockers as JSON.'
+      },
+      { role: 'user', content: providerPrompt }
+    ];
+    const response = await this.requestChat(messages, input.signal);
+    await emitCapturedUsage(input.onActivity, response.usage);
+    try {
+      return {
+        ...parseReviewResult(response.content, 'OpenAI roadmap quality review'),
         providerPrompt: serializeMessages(messages),
         providerResponse: response.content
       };

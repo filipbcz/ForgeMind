@@ -41,6 +41,7 @@ function task(overrides: Partial<TaskSummary> = {}): TaskSummary {
     projectId: 'project_1',
     title: 'Windows validation',
     prompt: '',
+    acceptanceCriteria: [],
     status: 'submitted',
     currentStep: '',
     mode: 'safe',

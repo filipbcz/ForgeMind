@@ -77,6 +77,7 @@ export interface RoadmapRepairInput {
   objective: string;
   validationError: string;
   implementationSteps: ImplementationStepPlan[];
+  projectContract: ProjectContract;
   allowedRequirementIds: string[];
   completedStepTitles: string[];
   migrationImpacts: string[];
@@ -90,6 +91,17 @@ export interface RoadmapRepairResult {
   implementationSteps: ImplementationStepPlan[];
   providerPrompt?: string;
   providerResponse?: string;
+}
+
+export interface RoadmapQualityReviewInput {
+  taskId: string;
+  objective: string;
+  projectContract: ProjectContract;
+  implementationSteps: ImplementationStepPlan[];
+  allowedRequirementIds: string[];
+  completedStepTitles: string[];
+  onActivity?: ProviderActivityHandler;
+  signal?: AbortSignal;
 }
 
 export interface ValidationCheck {
@@ -218,8 +230,9 @@ export interface ReviewInput {
   diff: string;
   reviewMode?: 'changes' | 'existing_state';
   repositoryEvidence?: string;
-  architectureContext?: string;
-  architectureUpdate?: ProjectArchitectureUpdate;
+  nativeRepositoryAccess?: boolean;
+  localValidationCheckCount?: number;
+  deferredValidationChecks?: Array<{ command: string; criterion?: string }>;
   onActivity?: ProviderActivityHandler;
   session?: ProviderSessionContext;
   signal?: AbortSignal;
@@ -603,6 +616,7 @@ export interface AIProvider {
   preflight(signal?: AbortSignal): Promise<ProviderPreflightResult>;
   plan(input: PlanInput): Promise<PlanResult>;
   repairRoadmap?(input: RoadmapRepairInput): Promise<RoadmapRepairResult>;
+  reviewRoadmap?(input: RoadmapQualityReviewInput): Promise<ReviewResult>;
   implement(input: ImplementInput): Promise<ImplementResult>;
   chat?(input: ChatInput): Promise<ChatResult>;
   review(input: ReviewInput): Promise<ReviewResult>;

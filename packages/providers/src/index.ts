@@ -1,5 +1,6 @@
 export * from './provider.js';
 export * from './review-prompt.js';
+export * from './roadmap-review-prompt.js';
 export * from './audit-prompt.js';
 export * from './extension-prompt.js';
 export * from './openai-provider.js';
