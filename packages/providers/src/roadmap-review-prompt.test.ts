@@ -38,6 +38,7 @@ describe('roadmap quality review prompt', () => {
       projectContract: contract,
       requiredRequirementIds: ['REQ-GENERATOR'],
       completedStepTitles: ['Document scope'],
+      repositoryBaseline: { commitSha: 'a'.repeat(40), evidence: 'src/generator.ts lacks grade-specific rules and exports createExercise().' },
       implementationSteps: [{
         title: 'Build generator', description: 'Implement generation.', acceptanceCriteria: ['Grade rules are enforced.'],
         inScope: ['Generator'], outOfScope: ['UI'], requirementIds: ['REQ-GENERATOR', 'REQ-HISTORY'], deliverables: ['Generator module'],
@@ -52,6 +53,14 @@ describe('roadmap quality review prompt', () => {
     expect(prompt).toContain('Requirements that this roadmap must cover');
     expect(prompt).toContain('observable outcomes');
     expect(prompt).toContain(`one result for each quality criterion`);
-    expect(ROADMAP_QUALITY_CRITERIA).toHaveLength(6);
+    expect(prompt).toContain('existing repository components');
+    expect(ROADMAP_QUALITY_CRITERIA).toHaveLength(7);
+  });
+
+  it('rejects review without commit-bound repository evidence', () => {
+    expect(() => buildRoadmapQualityReviewPrompt({
+      taskId: 'project_1', objective: 'Build exercises.', projectContract: contract,
+      requiredRequirementIds: ['REQ-GENERATOR'], completedStepTitles: [], implementationSteps: []
+    })).toThrow('Commit-bound repository baseline is required');
   });
 });

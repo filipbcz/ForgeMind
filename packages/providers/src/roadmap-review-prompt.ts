@@ -7,6 +7,7 @@ export const ROADMAP_QUALITY_CRITERIA = [
   'Steps are focused, do not overlap, and do not recreate completed work.',
   'Acceptance criteria describe observable outcomes and leave validation command selection to implementation.',
   'Dependencies are complete, ordered, and reference only genuine implementation prerequisites.',
+  'Every proposed step identifies a concrete baseline-proven gap and names existing repository components, modules, or interfaces it will reuse.',
   'Manual verification, release decisions, and audits are represented as evidence or gates rather than implementation tasks.'
 ] as const;
 
@@ -32,6 +33,9 @@ export function compactRoadmapContract(
 }
 
 export function buildRoadmapQualityReviewPrompt(input: RoadmapQualityReviewInput): string {
+  if (!input.repositoryBaseline?.commitSha || !input.repositoryBaseline.evidence.trim()) {
+    throw new Error('Commit-bound repository baseline is required for roadmap quality review.');
+  }
   const relevantRequirementIds = Array.from(new Set([
     ...input.requiredRequirementIds,
     ...input.implementationSteps.flatMap((step) => step.requirementIds)
@@ -40,7 +44,8 @@ export function buildRoadmapQualityReviewPrompt(input: RoadmapQualityReviewInput
 
   return [
     'Independently review the candidate implementation roadmap before it is persisted.',
-    'Do not design a different product and do not inspect or modify a repository.',
+    'Do not design a different product or modify the repository. Use the supplied commit-bound repository baseline as evidence.',
+    'Reject any step that lacks a concrete gap proven by the baseline. Existing capabilities must not be recreated merely because requirement IDs or completed-step titles differ.',
     'Return verdict "satisfied" only when every quality criterion below is met.',
     'Return verdict "not_satisfied" with concrete blockers when changes are required. Each blocker must name the affected step or missing step and state the exact correction needed.',
     'Do not report stylistic preferences or validation results as blockers.',
@@ -55,6 +60,9 @@ export function buildRoadmapQualityReviewPrompt(input: RoadmapQualityReviewInput
     `Requirements that this roadmap must cover:\n${input.requiredRequirementIds.map((id) => `- ${id}`).join('\n') || '- none'}`,
     '',
     `Completed step titles that must not be recreated:\n${input.completedStepTitles.map((title) => `- ${title}`).join('\n') || '- none'}`,
+    '',
+    `Repository baseline commit: ${input.repositoryBaseline.commitSha}`,
+    `Repository evidence:\n${input.repositoryBaseline.evidence}`,
     '',
     `Candidate roadmap JSON:\n${JSON.stringify(input.implementationSteps)}`,
     '',

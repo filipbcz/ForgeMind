@@ -573,7 +573,8 @@ export class CodexProvider implements AIProvider {
       {
         role: 'user',
         content: [
-          `Create a plan for task "${input.title}". Prompt:\n${input.prompt}`
+          `Create a plan for task "${input.title}". Prompt:\n${input.prompt}`,
+          input.repositoryBaseline ? `Read-only repository baseline at commit ${input.repositoryBaseline.commitSha}:\n${input.repositoryBaseline.evidence}` : ''
         ]
           .filter(Boolean)
           .join('\n\n')
@@ -651,6 +652,7 @@ export class CodexProvider implements AIProvider {
     let content: string;
     if (this.authMode === 'oauth') {
       content = await this.runCodexExec({
+        repositoryPath: input.repositoryPath,
         sandbox: 'read-only',
         onActivity: input.onActivity,
         signal: input.signal,

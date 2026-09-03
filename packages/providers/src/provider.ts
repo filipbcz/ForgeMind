@@ -43,6 +43,7 @@ export interface PlanInput {
   title: string;
   prompt: string;
   repositoryPath?: string;
+  repositoryBaseline?: RepositoryBaseline;
   maxRuntimeMs?: number;
   onActivity?: ProviderActivityHandler;
   session?: ProviderSessionContext;
@@ -66,6 +67,7 @@ export interface RoadmapRepairInput {
   compatibilityImpacts: string[];
   signal?: AbortSignal;
   repositoryPath?: string;
+  repositoryBaseline?: RepositoryBaseline;
   onActivity?: ProviderActivityHandler;
   session?: ProviderSessionContext;
 }
@@ -83,8 +85,16 @@ export interface RoadmapQualityReviewInput {
   implementationSteps: ImplementationStepPlan[];
   requiredRequirementIds: string[];
   completedStepTitles: string[];
+  repositoryPath?: string;
+  repositoryBaseline?: RepositoryBaseline;
   onActivity?: ProviderActivityHandler;
   signal?: AbortSignal;
+}
+
+export interface RepositoryBaseline {
+  commitSha: string;
+  /** Complete, read-only repository packet for providers without native checkout access. */
+  evidence: string;
 }
 
 export interface ValidationCheck {

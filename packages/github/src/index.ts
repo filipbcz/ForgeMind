@@ -1,6 +1,9 @@
 import { simpleGit } from 'simple-git';
 import { createSign } from 'node:crypto';
-import { readFile } from 'node:fs/promises';
+import { mkdtemp, readFile, rm } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { createHash } from 'node:crypto';
 import type { ForgeTask, Project } from '@forgemind/core';
 
 export interface CreateIssueInput {
@@ -49,6 +52,36 @@ export interface GitHubAdapter {
   getPullRequestState?(project: Project, pullRequestNumber: number): Promise<PullRequestState>;
   commentOnIssue(project: Project, issueNumber: number, body: string, signal?: AbortSignal): Promise<void>;
   readCheckStatus(project: Project, ref: string): Promise<'pending' | 'success' | 'failure'>;
+}
+
+/** Immutable, read-only checkout used by planning and audits. */
+export async function prepareReadOnlyRepositoryBaseline(
+  adapter: GitHubAdapter,
+  project: Project,
+  signal?: AbortSignal
+): Promise<{ repositoryPath: string; commitSha: string; evidence: string; cleanup: () => Promise<void> }> {
+  const remoteUrl = adapter.getRemoteUrl?.(project);
+  if (!remoteUrl) throw new Error('GitHub remote URL is required for repository baseline discovery.');
+  signal?.throwIfAborted();
+  const repositoryPath = await mkdtemp(join(tmpdir(), 'forgemind-roadmap-baseline-'));
+  try {
+    await simpleGit().clone(remoteUrl, repositoryPath, ['--branch', project.defaultBranch, '--single-branch', '--depth', '1']);
+    signal?.throwIfAborted();
+    const git = simpleGit({ baseDir: repositoryPath });
+    const commitSha = (await git.revparse(['HEAD'])).trim();
+    const paths = (await git.raw(['ls-files', '-z'])).split('\0').filter(Boolean).sort();
+    const sections = [`Complete repository snapshot at ${commitSha} (${paths.length} tracked files):\n${paths.join('\n')}`];
+    for (const path of paths) {
+      const content = await readFile(join(repositoryPath, path));
+      sections.push(content.includes(0)
+        ? `--- ${path} ---\n[binary: ${content.length} bytes, sha256=${createHash('sha256').update(content).digest('hex')}]`
+        : `--- ${path} ---\n${content.toString('utf8')}`);
+    }
+    return { repositoryPath, commitSha, evidence: sections.join('\n\n'), cleanup: () => rm(repositoryPath, { recursive: true, force: true }) };
+  } catch (error) {
+    await rm(repositoryPath, { recursive: true, force: true });
+    throw error;
+  }
 }
 
 export interface GitHubAppAdapterOptions {

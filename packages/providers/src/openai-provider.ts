@@ -109,7 +109,8 @@ export class OpenAIProvider implements AIProvider {
       {
         role: 'user',
         content: [
-          `Create a plan for the task titled "${input.title}" with the prompt:\n${input.prompt}`
+          `Create a plan for the task titled "${input.title}" with the prompt:\n${input.prompt}`,
+          input.repositoryBaseline ? `Read-only repository baseline at commit ${input.repositoryBaseline.commitSha}:\n${input.repositoryBaseline.evidence}` : ''
         ]
           .filter(Boolean)
           .join('\n\n')
