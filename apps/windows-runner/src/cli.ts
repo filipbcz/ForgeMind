@@ -81,6 +81,7 @@ export async function main(args = process.argv.slice(2)): Promise<void> {
             observedCapabilities: probes.capabilities,
             signal: context.signal,
             allowedFixtureExecutablePaths: adapterPolicy.allowedFixtureExecutablePaths,
+            pinnedFixtureTools: adapterPolicy.pinnedFixtureTools,
             pinnedUnrealTools: adapterPolicy.pinnedUnrealTools,
             approvedUnrealProfiles: adapterPolicy.approvedUnrealProfiles,
             showLocally: (summary) => stdout.write(`${summary}\n`),
@@ -105,16 +106,18 @@ export async function main(args = process.argv.slice(2)): Promise<void> {
 
 interface LocalAdapterPolicy {
   allowedFixtureExecutablePaths: string[];
+  pinnedFixtureTools: import('./executor.js').PinnedFixtureTool[];
   pinnedUnrealTools: import('./unreal-adapter.js').PinnedUnrealTool[];
   approvedUnrealProfiles: import('./unreal-adapter.js').ApprovedUnrealProfile[];
 }
 
 function readLocalAdapterPolicy(): LocalAdapterPolicy {
   const raw = process.env.FORGEMIND_WINDOWS_ADAPTER_POLICY;
-  if (!raw) return { allowedFixtureExecutablePaths: [], pinnedUnrealTools: [], approvedUnrealProfiles: [] };
+  if (!raw) return { allowedFixtureExecutablePaths: [], pinnedFixtureTools: [], pinnedUnrealTools: [], approvedUnrealProfiles: [] };
   const value = JSON.parse(raw) as Partial<LocalAdapterPolicy>;
   return {
     allowedFixtureExecutablePaths: Array.isArray(value.allowedFixtureExecutablePaths) ? value.allowedFixtureExecutablePaths : [],
+    pinnedFixtureTools: Array.isArray(value.pinnedFixtureTools) ? value.pinnedFixtureTools : [],
     pinnedUnrealTools: Array.isArray(value.pinnedUnrealTools) ? value.pinnedUnrealTools : [],
     approvedUnrealProfiles: Array.isArray(value.approvedUnrealProfiles) ? value.approvedUnrealProfiles : []
   };

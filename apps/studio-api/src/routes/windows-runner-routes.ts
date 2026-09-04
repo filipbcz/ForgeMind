@@ -40,7 +40,7 @@ const sha = z.string().regex(/^[a-f0-9]{64}$/i);
 const gitCommitSha = z.string().regex(/^(?:[a-f0-9]{40}|[a-f0-9]{64})$/i);
 const evidenceUpload = z.object({ schemaVersion: z.literal(1), jobId: z.string().uuid(), leaseId: z.string().uuid(), inputHash: sha, commitSha: gitCommitSha,
   log: z.object({ text: z.string(), sizeBytes: z.number().int().nonnegative(), sha256: sha }), artifacts: z.array(z.object({ name: z.string().min(1).max(200),
-    relativePath: z.string().min(1).max(500), sizeBytes: z.number().int().nonnegative(), sha256: sha, contentBase64: z.string(), criterion: z.string().min(1).max(2000) })).max(WINDOWS_EVIDENCE_MAX_ARTIFACTS) });
+    relativePath: z.string().min(1).max(500), mimeType: z.string().min(1).max(200).optional(), sizeBytes: z.number().int().nonnegative(), sha256: sha, contentBase64: z.string(), criterion: z.string().min(1).max(2000) })).max(WINDOWS_EVIDENCE_MAX_ARTIFACTS) });
 
 export function registerWindowsRunnerRoutes(app: FastifyInstance, repository: ForgeMindRepository, credentials: WindowsRunnerCredentialAdapter, workers: WindowsWorkerRepository) {
   app.post('/api/windows-runner/enrollments', async (request) => {
