@@ -290,6 +290,11 @@ export interface ProjectAuditJobApi {
   attemptCount: number;
   nextAttemptAt?: string;
   errorMessage?: string;
+  gapProposal?: import('@forgemind/core').AuditGapProposal;
+  gapProposalStatus?: 'proposed' | 'activating' | 'activated' | 'dismissed';
+  gapProposalReview?: { verdict: 'satisfied' | 'not_satisfied'; summary: string; blockers: string[] };
+  gapProposalDecidedAt?: string;
+  gapProposalHistory?: import('@forgemind/core').AuditGapProposalHistoryEntry[];
   createdAt: string;
   updatedAt: string;
   claimedAt?: string;

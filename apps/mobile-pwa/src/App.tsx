@@ -71,6 +71,7 @@ import {
   logout as logoutRequest,
   retryTask as retryTaskRequest,
   retryProjectAudit,
+  decideAuditGapProposal,
   revokeWindowsRunner,
   reviewProjectSpecificationChange,
   startProjectAudit,
@@ -646,6 +647,11 @@ function AuthenticatedApp({ auth }: { auth: AuthSessionResponse }) {
     mutationFn: startProjectAudit,
     onSuccess: (roadmap) => invalidateProjectData(roadmap.projectId)
   });
+  const decideAuditGapMutation = useMutation({
+    mutationFn: ({ projectId, auditJobId, accepted }: { projectId: string; auditJobId: string; accepted: boolean }) =>
+      decideAuditGapProposal(projectId, auditJobId, accepted),
+    onSuccess: (roadmap) => invalidateProjectData(roadmap.projectId)
+  });
 
   const startNextProjectRoadmapStepMutation = useMutation({
     mutationFn: startNextProjectRoadmapStep,
@@ -1051,6 +1057,7 @@ function AuthenticatedApp({ auth }: { auth: AuthSessionResponse }) {
             decidingExtension={decideProjectRoadmapExtensionMutation.isPending}
             retryingAudit={retryProjectAuditMutation.isPending}
             startingAudit={startProjectAuditMutation.isPending}
+            decidingAuditGap={decideAuditGapMutation.isPending}
             startingRoadmapStep={startNextProjectRoadmapStepMutation.isPending}
             deletingProject={deleteProjectMutation.isPending}
             deleteProjectError={deleteProjectMutation.error ? formatUiError(deleteProjectMutation.error) : undefined}
@@ -1079,6 +1086,7 @@ function AuthenticatedApp({ auth }: { auth: AuthSessionResponse }) {
             onDecideExtension={(projectId, input) => decideProjectRoadmapExtensionMutation.mutate({ projectId, input })}
             onRetryAudit={(projectId) => retryProjectAuditMutation.mutate(projectId)}
             onStartAudit={(projectId) => startProjectAuditMutation.mutate(projectId)}
+            onDecideAuditGap={(projectId, auditJobId, accepted) => decideAuditGapMutation.mutate({ projectId, auditJobId, accepted })}
             onStartNextRoadmapStep={(projectId) => startNextProjectRoadmapStepMutation.mutate(projectId)}
             onDeleteProject={(projectId, input) => {
               deleteProjectMutation.reset();
@@ -2751,6 +2759,7 @@ export function ProjectsPanel(props: {
   decidingExtension: boolean;
   retryingAudit: boolean;
   startingAudit: boolean;
+  decidingAuditGap?: boolean;
   startingRoadmapStep: boolean;
   deletingProject: boolean;
   deleteProjectError?: string;
@@ -2764,6 +2773,7 @@ export function ProjectsPanel(props: {
   onDecideExtension: (projectId: string, input: DecideProjectRoadmapExtensionRequest) => void;
   onRetryAudit: (projectId: string) => void;
   onStartAudit: (projectId: string) => void;
+  onDecideAuditGap?: (projectId: string, auditJobId: string, accepted: boolean) => void;
   onStartNextRoadmapStep: (projectId: string) => void;
   onDeleteProject: (projectId: string, input: DeleteProjectRequest) => void;
   githubRepositories: GitHubRepositoryApi[];
@@ -3479,6 +3489,30 @@ export function ProjectsPanel(props: {
                     </summary>
                     <div className="audit-body">
                       {auditJob.errorMessage ? <pre className="error-detail">{auditJob.errorMessage}</pre> : null}
+                      {auditJob.gapProposal ? (
+                        <div className="prompt-response-panel">
+                          <strong>Neaktivní návrh mezer ({auditJob.gapProposal.steps.length})</strong>
+                          <p>{auditJob.gapProposal.summary}</p>
+                          <small>Baseline: {auditJob.gapProposal.commitSha} | stav: {auditJob.gapProposalStatus}</small>
+                          {auditJob.gapProposalReview ? <p>Review: {auditJob.gapProposalReview.verdict} — {auditJob.gapProposalReview.summary}</p> : null}
+                          {auditJob.gapProposalStatus === 'proposed' ? <div className="actions">
+                            <button className="primary-action" type="button" disabled={props.decidingAuditGap} onClick={() => props.onDecideAuditGap?.(selectedProject.id, auditJob.id, true)}>Review a aktivovat</button>
+                            <button className="secondary-action" type="button" disabled={props.decidingAuditGap} onClick={() => props.onDecideAuditGap?.(selectedProject.id, auditJob.id, false)}>Zamítnout</button>
+                          </div> : null}
+                        </div>
+                      ) : null}
+                      {(auditJob.gapProposalHistory?.length ?? 0) > 0 ? (
+                        <details>
+                          <summary>Historické gap návrhy ({auditJob.gapProposalHistory!.length})</summary>
+                          {auditJob.gapProposalHistory!.map((entry, index) => (
+                            <div className="timeline-row" key={`${entry.archivedAt}-${index}`}>
+                              <strong>{entry.proposal.kind}: {entry.proposal.summary}</strong>
+                              <small>{entry.status} | baseline {entry.proposal.commitSha} | {entry.proposal.steps.length} kroků</small>
+                              {entry.review ? <small>Review: {entry.review.verdict} — {entry.review.summary}</small> : null}
+                            </div>
+                          ))}
+                        </details>
+                      ) : null}
                       {(auditJob.status === 'failed' || auditJob.status === 'blocked') && auditJob.cycleId === latestCycle?.id ? (
                         <div className="actions">
                           <button

@@ -105,6 +105,7 @@ const commentSchema = z.object({
 const retrySchema = z.object({
   start: z.boolean().default(true)
 });
+const auditGapDecisionSchema = z.object({ auditJobId: z.string().min(1), accepted: z.boolean() }).strict();
 
 const roadmapGenerateSchema = z.object({
   objective: z.string().min(20).optional(),
@@ -1180,6 +1181,54 @@ export function registerRoutes(
     }
   });
 
+  app.post('/api/projects/:id/audit/gaps/decision', async (request, reply) => {
+    let checkout: Awaited<ReturnType<typeof prepareReadOnlyRepositoryBaseline>> | undefined;
+    try {
+      const { id } = idParamsSchema.parse(request.params);
+      const input = auditGapDecisionSchema.parse(request.body ?? {});
+      const [project, roadmap] = await Promise.all([repository.getProject(id), repository.getProjectRoadmap(id)]);
+      if (!project || !roadmap) return sendNotFound(reply, `Project "${id}" not found`);
+      const job = roadmap.auditJobs.find((item) => item.id === input.auditJobId);
+      if (!job?.gapProposal) return reply.code(404).send({ error: 'Audit gap proposal was not found.' });
+      if (job.gapProposalStatus === 'activated' || job.gapProposalStatus === 'dismissed') return roadmap;
+      if (!input.accepted) {
+        await repository.decideProjectAuditGapProposal({ projectId: id, auditJobId: job.id, accepted: false });
+        return (await repository.getProjectRoadmap(id))!;
+      }
+      if (!project.projectContract) throw new Error('A current project contract is required before audit gaps can be activated.');
+      const connection = project.aiProviderConnectionId
+        ? await readAIProviderConnectionSecretById(repository, project.aiProviderConnectionId)
+        : await readAIProviderConnectionSecret(repository);
+      if (!connection) throw new Error('Connect an AI provider before reviewing audit gaps.');
+      if (!project.githubOwner || !project.githubRepo) throw new Error('A connected repository is required for audit gap review.');
+      const githubConnection = await readGitHubConnectionSecret(repository);
+      if (!githubConnection) throw new Error('Connect GitHub before reviewing audit gaps.');
+      checkout = await prepareReadOnlyRepositoryBaseline(new GitHubAppAdapter({ token: githubConnection.token, apiBaseUrl: githubConnection.apiBaseUrl }), project);
+      if (checkout.commitSha !== job.gapProposal.commitSha) {
+        return reply.code(409).send({ error: 'Repository baseline changed since the audit. Run the audit again before activation.' });
+      }
+      const provider = createProvider(connection.provider, { apiKey: connection.apiKey, authMode: connection.authMode, model: connection.model, codexHome: connection.codexHome });
+      if (!provider.reviewRoadmap) throw new Error(`AI provider "${provider.kind}" does not support independent roadmap quality review.`);
+      const reviewContract = buildAuditGapReviewContract(project.projectContract, job.gapProposal.newRequirements);
+      const review = await provider.reviewRoadmap({
+        taskId: `audit-gap:${job.id}`,
+        objective: `Review ${job.gapProposal.kind} audit gaps against the current project scope.`,
+        authoritativeSpecification: (await repository.getProjectSpecifications(id))?.current.fullSpecification ?? project.brief ?? project.name,
+        projectContract: reviewContract,
+        requiredRequirementIds: Array.from(new Set(job.gapProposal.steps.flatMap((step) => step.requirementIds))),
+        completedStepTitles: roadmap.steps.filter((step) => step.status === 'completed').map((step) => step.title),
+        implementationSteps: job.gapProposal.steps.map((step) => ({ ...step, inScope: [], outOfScope: [] })),
+        repositoryBaseline: { commitSha: checkout.commitSha, evidence: checkout.evidence }
+      });
+      await repository.saveProjectAuditGapReview({ projectId: id, auditJobId: job.id, review });
+      if (review.verdict !== 'satisfied') return reply.code(409).send({ error: review.summary, blockers: review.blockers });
+      await repository.decideProjectAuditGapProposal({ projectId: id, auditJobId: job.id, accepted: true, review });
+      return (await repository.getProjectRoadmap(id))!;
+    } catch (error) {
+      return sendBadRequest(reply, error);
+    } finally { await checkout?.cleanup(); }
+  });
+
   app.post('/api/projects/:id/implementation-steps/start-next', async (request, reply) => {
     try {
       const { id } = idParamsSchema.parse(request.params);
@@ -2073,6 +2122,28 @@ export function buildRoadmapPlanningPrompt(input: {
       'A documentation or scope-definition step must change documentation only and must not implement application code.',
       'Order dependencies explicitly so each task starts from the repository state produced by earlier tasks.'
     ].filter(Boolean).join('\n');
+}
+
+export function buildAuditGapReviewContract(
+  current: ProjectContract,
+  newRequirements: ProjectContract['requirements']
+): ProjectContract {
+  if (newRequirements.length === 0) return current;
+  const requirementIds = new Set(current.requirements.map((requirement) => requirement.id));
+  const nextVersion = current.version + 1;
+  const additions = newRequirements.map((requirement) => {
+    if (requirementIds.has(requirement.id)) {
+      throw new Error(`Audit gap requirement "${requirement.id}" duplicates the current contract.`);
+    }
+    requirementIds.add(requirement.id);
+    return {
+      ...requirement,
+      status: 'active' as const,
+      introducedInVersion: nextVersion,
+      lastChangedInVersion: nextVersion
+    };
+  });
+  return { ...current, version: nextVersion, requirements: [...current.requirements, ...additions] };
 }
 
 function compactProjectContract(contract: ProjectContract): ProjectContract {

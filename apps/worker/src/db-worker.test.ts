@@ -87,6 +87,7 @@ const repositoryMock = {
   recordAcceptanceEvidence: vi.fn(async () => undefined),
   finalizeProjectAudit: vi.fn(async () => ({ retryScheduled: false })),
   appendProjectImplementationSteps: vi.fn(async (): Promise<Array<{ id: string }>> => []),
+  saveProjectAuditGapProposal: vi.fn(async (_id: string, proposal: unknown) => proposal),
   updateProjectRoadmapCycleStatus: vi.fn(async () => undefined),
   setProjectRoadmapCycleExtensionProposal: vi.fn(async () => undefined),
   updateTaskRunProvider: vi.fn(async () => undefined),
@@ -3109,7 +3110,7 @@ github:
     expect(repositoryMock.finalizeProjectAudit).toHaveBeenCalledWith('audit_1', 'succeeded');
   });
 
-  it('schedules only missing brief scope and appends its requirement to the contract', async () => {
+  it('persists missing brief scope as an inactive proposal without scheduling implementation', async () => {
     const contract = {
       version: 1,
       summary: 'Demo project',
@@ -3147,17 +3148,16 @@ github:
       verdict: 'partial', summary: 'Export was omitted.', criteria: [], briefCoverage: [],
       contractAmendments: [newRequirement], gapWorkItems: [gapWorkItem]
     });
-    repositoryMock.appendProjectImplementationSteps.mockResolvedValueOnce([{ id: 'step_export' }]);
-
     const { runDatabaseWorkerOnce } = await import('./db-worker.js');
     const result = await runDatabaseWorkerOnce();
 
-    expect(result).toMatchObject({ status: 'release_gaps_scheduled', gapStepCount: 1 });
-    expect(repositoryMock.appendProjectImplementationSteps).toHaveBeenCalledWith(expect.objectContaining({
-      projectId: 'project_1',
-      cycleId: 'cycle_1',
+    expect(result).toMatchObject({ status: 'release_gaps_proposed', gapStepCount: 1 });
+    expect(repositoryMock.saveProjectAuditGapProposal).toHaveBeenCalledWith('audit_2', expect.objectContaining({
+      kind: 'release',
       newRequirements: [newRequirement],
       steps: [expect.objectContaining({ requirementIds: ['REQ-EXPORT'] })]
     }));
+    expect(repositoryMock.appendProjectImplementationSteps).not.toHaveBeenCalled();
+    expect(startNextRoadmapStepMock).not.toHaveBeenCalled();
   });
 });
