@@ -19,6 +19,7 @@ const packet: WindowsExecutionPacket = {
 describe('Windows worker shared contracts', () => {
   it('validates a versioned packet and rejects mutable source identities', () => {
     expect(isWindowsExecutionPacket(packet)).toBe(true);
+    expect(isWindowsExecutionPacket({ ...packet, expectedArtifacts: [{ name: 'legacy', relativePath: 'result.txt', required: true }] })).toBe(true);
     expect(isWindowsExecutionPacket({ ...packet, schemaVersion: 1 })).toBe(false);
     expect(isWindowsExecutionPacket({ ...packet, commitSha: 'main' })).toBe(false);
     expect(classifyWindowsExecutionPacket({ ...packet, schemaVersion: 1, dispatch: undefined })).toMatchObject({
@@ -37,10 +38,11 @@ describe('Windows worker shared contracts', () => {
       exitCode: 0, summary: 'ok', logHash: hash, artifacts: []
     };
     expect(isWindowsExecutionResult(result)).toBe(true);
+    expect(isWindowsExecutionResult({ ...result, artifacts: [{ name: 'legacy', relativePath: 'legacy.txt', sizeBytes: 1, sha256: hash }] })).toBe(true);
     expect(isWindowsExecutionResult({ ...result, inputHash: 'invalid' })).toBe(false);
     expect(isWindowsExecutionResult({ ...result, exitCode: 1.5 })).toBe(false);
     expect(isWindowsExecutionResult({ ...result, status: 'unknown' })).toBe(false);
-    expect(isWindowsExecutionResult({ ...result, artifacts: [{ name: 'log', relativePath: 'log.txt', sizeBytes: -1, sha256: hash }] })).toBe(false);
+    expect(isWindowsExecutionResult({ ...result, artifacts: [{ name: 'log', relativePath: 'log.txt', mimeType: 'text/plain', sizeBytes: -1, sha256: hash }] })).toBe(false);
     expect(isWindowsExecutionResult({ ...result, observedCapabilities: [{ key: '' }] })).toBe(false);
     expect(isWindowsExecutionResult({ ...result, observedCapabilities: [{ key: 'windows', metadata: { probe: () => true } }] })).toBe(false);
     expect(isWindowsExecutionResult({ ...result, observedCapabilities: [{ key: 'windows', metadata: new Map([['version', '11']]) }] })).toBe(false);

@@ -4,11 +4,13 @@ import { mkdir, readFile, realpath, rm, stat } from 'node:fs/promises';
 import { basename, dirname, isAbsolute, relative, resolve } from 'node:path';
 import type {
   ExecutionArtifactResult,
+  ExecutionToolVersionEvidence,
   WindowsEvidenceUpload,
   WindowsExecutionPacket,
   WindowsExecutionResult,
   WorkerCapability
 } from '@forgemind/core';
+import { redactSecrets } from '@forgemind/core';
 import { SafeFixtureExecutor } from './fixture-executor.js';
 import { PinnedUnrealCommandAdapter, type ApprovedUnrealProfile, type PinnedUnrealTool } from './unreal-adapter.js';
 
@@ -17,6 +19,7 @@ interface ProcessResult {
   exitCode?: number;
   stdout: string;
   stderr: string;
+  toolVersions?: ExecutionToolVersionEvidence[];
 }
 
 export interface WindowsExecutionContext {
@@ -27,11 +30,14 @@ export interface WindowsExecutionContext {
   observedCapabilities: WorkerCapability[];
   signal?: AbortSignal;
   allowedFixtureExecutablePaths?: readonly string[];
+  pinnedFixtureTools?: readonly PinnedFixtureTool[];
   pinnedUnrealTools?: readonly PinnedUnrealTool[];
   approvedUnrealProfiles?: readonly ApprovedUnrealProfile[];
   confirmLargeUnrealJob?: (summary: string) => Promise<boolean>;
   showLocally?: (summary: string) => void;
 }
+
+export interface PinnedFixtureTool { canonicalPath: string; version: string }
 
 export interface ExecutedWindowsValidation {
   evidence: WindowsEvidenceUpload;
@@ -45,17 +51,8 @@ export async function executeWindowsValidation(
 ): Promise<ExecutedWindowsValidation> {
   if (process.platform !== 'win32') throw new Error('Windows validation can run only on Windows.');
   if (packet.schemaVersion !== 2) throw new Error('Legacy or unsupported Windows execution packet is deferred for manual-local handling.');
-  const workspacePath = resolveManagedPath(context.workspaceRoot, packet.jobId);
-  const artifactPath = resolveManagedPath(context.artifactRoot, packet.jobId);
-  await rm(workspacePath, { recursive: true, force: true });
-  await rm(artifactPath, { recursive: true, force: true });
-  await mkdir(dirname(workspacePath), { recursive: true });
-  await mkdir(artifactPath, { recursive: true });
-  const approvedWorkspaceRoot = await realpath(dirname(workspacePath));
-  const approvedArtifactRoot = await realpath(artifactPath);
-  if (resolve(approvedWorkspaceRoot, packet.jobId) !== workspacePath || approvedArtifactRoot !== artifactPath) {
-    throw new Error('Runner-managed roots could not be canonicalized to the approved local roots.');
-  }
+  const workspacePath = await prepareManagedDirectory(context.workspaceRoot, packet.jobId, true);
+  const artifactPath = await prepareManagedDirectory(context.artifactRoot, packet.jobId, true);
 
   const startedAt = new Date();
   const preparation: ProcessResult = packet.dispatch.kind === 'deferred'
@@ -99,12 +96,12 @@ export async function executeWindowsValidation(
       stderr: [execution.stderr, error instanceof Error ? error.message : String(error)].filter(Boolean).join('\n')
     };
   }
-  const logText = truncateUtf8([
+  const logText = truncateUtf8(redactSecrets([
     `[intent] ${packet.check.command}`,
     `[adapter] ${packet.dispatch.kind}`,
     execution.stdout ? `[stdout]\n${execution.stdout}` : '',
     execution.stderr ? `[stderr]\n${execution.stderr}` : ''
-  ].filter(Boolean).join('\n\n'), packet.resourcePolicy.maxLogBytes);
+  ].filter(Boolean).join('\n\n')), packet.resourcePolicy.maxLogBytes);
   const logHash = sha256(Buffer.from(logText));
   const evidence: WindowsEvidenceUpload = {
     schemaVersion: 1,
@@ -130,7 +127,7 @@ export async function executeWindowsValidation(
     inputHash: packet.inputHash,
     commitSha: packet.commitSha,
     observedCapabilities: context.observedCapabilities,
-    toolVersions: [],
+    toolVersions: execution.toolVersions ?? [],
     status: execution.status,
     ...(execution.status === 'deferred' ? {
       deferredReason: packet.dispatch.kind === 'deferred' ? packet.dispatch.reason : 'manual_local_required' as const
@@ -148,10 +145,7 @@ export async function executeWindowsValidation(
 }
 
 export async function cleanupWindowsValidationWorkspace(workspaceRoot: string, artifactRoot: string, jobId: string): Promise<void> {
-  await Promise.all([
-    rm(resolveManagedPath(workspaceRoot, jobId), { recursive: true, force: true }),
-    rm(resolveManagedPath(artifactRoot, jobId), { recursive: true, force: true })
-  ]);
+  await Promise.all([removeManagedDirectory(workspaceRoot, jobId), removeManagedDirectory(artifactRoot, jobId)]);
 }
 
 async function runValidationAdapter(packet: WindowsExecutionPacket, cwd: string, context: WindowsExecutionContext): Promise<ProcessResult> {
@@ -168,18 +162,20 @@ async function runValidationAdapter(packet: WindowsExecutionPacket, cwd: string,
     const fixtureTarget = mapFixtureArtifactPath(cwd, dispatch.artifactRelativePath);
     const fixtureArtifactRoot = fixtureTarget.artifactRoot;
     await mkdir(fixtureArtifactRoot, { recursive: true });
+    const fixtureTool = await findPinnedFixtureTool(dispatch.executablePath, context.pinnedFixtureTools ?? []);
+    if (!fixtureTool) return { status: 'failed', exitCode: 2, stdout: '', stderr: 'Fixture executable has no canonical pinned version metadata.' };
     const result = await new SafeFixtureExecutor().execute({
       kind: 'fixture-validation', executablePath: dispatch.executablePath,
       inputRelativePath: dispatch.inputRelativePath, artifactRelativePath: fixtureTarget.artifactRelativePath
     }, {
       workspaceRoot: cwd,
       artifactRoot: fixtureArtifactRoot,
-      allowedExecutablePaths: context.allowedFixtureExecutablePaths ?? [],
+      allowedExecutablePaths: [...(context.allowedFixtureExecutablePaths ?? []), fixtureTool.canonicalPath],
       timeoutMs: packet.resourcePolicy.timeoutSeconds * 1_000,
       minimumFreeSpaceBytes: dispatch.minimumFreeSpaceBytes,
       maxConcurrentProcesses: dispatch.maxConcurrentProcesses
     }, context.signal);
-    return { ...result, stdout: '', stderr: '' };
+    return { ...result, stdout: '', stderr: '', toolVersions: [{ tool: `fixture:${basename(fixtureTool.canonicalPath)}`, version: fixtureTool.version }] };
   }
   const workingDirectory = resolve(cwd, dispatch.workingDirectoryRelativePath);
   const prepared = await new PinnedUnrealCommandAdapter({
@@ -195,7 +191,8 @@ async function runValidationAdapter(packet: WindowsExecutionPacket, cwd: string,
     minimumLargeJobFreeSpaceBytes: dispatch.minimumLargeJobFreeSpaceBytes
   });
   if (prepared.status !== 'ready') return { status: 'failed', exitCode: 2, stdout: '', stderr: `${prepared.status}: ${prepared.reason}: ${prepared.message}` };
-  return runProcess(prepared.executablePath, [...prepared.args], processOptions(packet, prepared.workingDirectory, context.signal));
+  const result = await runProcess(prepared.executablePath, [...prepared.args], processOptions(packet, prepared.workingDirectory, context.signal));
+  return { ...result, toolVersions: [{ tool: dispatch.tool, version: prepared.toolVersion }] };
 }
 
 export function mapFixtureArtifactPath(workspacePath: string, workspaceRelativePath: string): { artifactRoot: string; artifactRelativePath: string } {
@@ -260,17 +257,22 @@ async function collectArtifacts(packet: WindowsExecutionPacket, workspacePath: s
   const results: Array<ExecutionArtifactResult & { contentBase64: string }> = [];
   let totalBytes = 0;
   for (const expected of packet.expectedArtifacts) {
+    assertSafeArtifactPath(expected.relativePath);
     const source = resolveContained(workspacePath, expected.relativePath);
     try {
-      const info = await stat(source);
+      const canonicalSource = await realpath(source);
+      ensureCanonicalWithin(await realpath(workspacePath), canonicalSource, 'Artifact');
+      const info = await stat(canonicalSource);
       if (!info.isFile()) throw new Error(`Expected artifact is not a file: ${expected.relativePath}`);
       totalBytes += info.size;
       if (totalBytes > packet.resourcePolicy.maxArtifactBytes) throw new Error('Windows validation artifacts exceed the configured limit.');
-      const content = await readFile(source);
-      resolveContained(artifactPath, expected.relativePath);
+      const content = await readFile(canonicalSource);
+      if (redactSecrets(content.toString('utf8')) !== content.toString('utf8')) throw new Error(`Expected artifact contains secret-like content: ${expected.relativePath}`);
+      resolveContained(await realpath(artifactPath), expected.relativePath);
       results.push({
         name: expected.name,
         relativePath: expected.relativePath,
+        mimeType: expected.mimeType ?? inferArtifactMimeType(expected.relativePath),
         sizeBytes: content.length,
         sha256: sha256(content),
         contentBase64: content.toString('base64')
@@ -286,8 +288,73 @@ function resolveManagedPath(root: string, child: string): string {
   const resolvedRoot = resolve(root);
   const candidate = resolve(resolvedRoot, child);
   const childPath = relative(resolvedRoot, candidate);
-  if (!childPath || childPath.startsWith('..') || isAbsolute(childPath)) throw new Error('Managed Windows worker path escapes its configured root.');
+  if (!childPath || childPath.startsWith('..') || isAbsolute(childPath) || dirname(candidate) !== resolvedRoot) throw new Error('Managed Windows worker path escapes its configured root or is not a direct child.');
   return candidate;
+}
+
+async function prepareManagedDirectory(root: string, child: string, recreate: boolean): Promise<string> {
+  await mkdir(root, { recursive: true });
+  const canonicalRoot = await realpath(root);
+  if (!equalCanonicalPath(canonicalRoot, root)) throw new Error('Runner-managed root is a symlink or junction.');
+  const candidate = resolveManagedPath(canonicalRoot, child);
+  await rejectRedirectedManagedTarget(canonicalRoot, candidate);
+  if (recreate) await rm(candidate, { recursive: true, force: true });
+  await mkdir(candidate, { recursive: true });
+  const canonicalCandidate = await realpath(candidate);
+  if (!equalCanonicalPath(canonicalCandidate, candidate)) throw new Error('Runner-managed path is redirected outside its exact approved target.');
+  ensureCanonicalWithin(canonicalRoot, canonicalCandidate, 'Runner-managed path');
+  return canonicalCandidate;
+}
+
+async function removeManagedDirectory(root: string, child: string): Promise<void> {
+  let canonicalRoot: string;
+  try { canonicalRoot = await realpath(root); } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return;
+    throw error;
+  }
+  if (!equalCanonicalPath(canonicalRoot, root)) throw new Error('Runner-managed root is a symlink or junction.');
+  const candidate = resolveManagedPath(canonicalRoot, child);
+  await rejectRedirectedManagedTarget(canonicalRoot, candidate);
+  await rm(candidate, { recursive: true, force: true });
+}
+
+async function rejectRedirectedManagedTarget(canonicalRoot: string, candidate: string): Promise<void> {
+  const { lexical, canonical } = await deepestExistingAncestor(candidate);
+  if (!equalCanonicalPath(canonicalRoot, canonical)) ensureCanonicalWithin(canonicalRoot, canonical, 'Runner-managed path');
+  if (!equalCanonicalPath(canonical, lexical)) throw new Error('Runner-managed path contains a symlink or junction and will not be removed.');
+}
+
+async function deepestExistingAncestor(candidate: string): Promise<{ lexical: string; canonical: string }> {
+  let current = candidate;
+  while (true) {
+    try { return { lexical: current, canonical: await realpath(current) }; }
+    catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+      const parent = dirname(current);
+      if (parent === current) throw error;
+      current = parent;
+    }
+  }
+}
+
+export async function findPinnedFixtureTool(executablePath: string, tools: readonly PinnedFixtureTool[]): Promise<PinnedFixtureTool | undefined> {
+  const executable = await realpath(executablePath);
+  for (const tool of tools) if (equalCanonicalPath(await realpath(tool.canonicalPath), executable) && tool.version.trim()) return tool;
+  return undefined;
+}
+
+function ensureCanonicalWithin(root: string, candidate: string, label: string): void {
+  const childPath = relative(root, candidate);
+  if (!childPath || childPath.startsWith('..') || isAbsolute(childPath)) throw new Error(`${label} escapes its approved root.`);
+}
+
+function equalCanonicalPath(left: string, right: string): boolean {
+  return resolve(left).toLocaleLowerCase('en-US') === resolve(right).toLocaleLowerCase('en-US');
+}
+
+function assertSafeArtifactPath(relativePath: string): void {
+  const forbidden = /(^|[\\/])(?:\.git|Users?|home|workspace)(?:[\\/]|$)|(?:^|[\\/])(?:\.env|environment)(?:\.|[\\/]|$)/i;
+  if (forbidden.test(relativePath)) throw new Error(`Artifact path is prohibited: ${relativePath}`);
 }
 
 function resolveContained(root: string, relativePath: string): string {
@@ -317,6 +384,16 @@ function mergeProcessResults(left: ProcessResult, right: ProcessResult): Process
     status: right.status,
     exitCode: right.exitCode,
     stdout: [left.stdout, right.stdout].filter(Boolean).join('\n'),
-    stderr: [left.stderr, right.stderr].filter(Boolean).join('\n')
+    stderr: [left.stderr, right.stderr].filter(Boolean).join('\n'),
+    toolVersions: right.toolVersions ?? left.toolVersions
   };
+}
+
+function inferArtifactMimeType(relativePath: string): string {
+  const extension = relativePath.slice(relativePath.lastIndexOf('.')).toLocaleLowerCase('en-US');
+  return ({
+    '.json': 'application/json', '.txt': 'text/plain', '.log': 'text/plain', '.xml': 'application/xml',
+    '.html': 'text/html', '.csv': 'text/csv', '.png': 'image/png', '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg',
+    '.zip': 'application/zip', '.pdf': 'application/pdf'
+  } as Record<string, string>)[extension] ?? 'application/octet-stream';
 }

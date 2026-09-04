@@ -137,6 +137,7 @@ export interface ExecutionResourcePolicy {
 export interface ExpectedExecutionArtifact {
   name: string;
   relativePath: string;
+  mimeType?: string;
   required: boolean;
 }
 
@@ -173,6 +174,7 @@ export interface WindowsExecutionPacket {
 export interface ExecutionArtifactResult {
   name: string;
   relativePath: string;
+  mimeType?: string;
   sizeBytes: number;
   sha256: string;
 }
@@ -283,9 +285,10 @@ const areCapabilityKeys = (value: unknown): value is string[] => Array.isArray(v
 const capabilityKeysEqual = (left: string[], right: string[]): boolean => left.length === right.length
   && left.every((capability, index) => capability === right[index]);
 const isExpectedArtifact = (value: unknown): value is ExpectedExecutionArtifact => isRecord(value) && isNonEmpty(value.name)
-  && isNonEmpty(value.relativePath) && typeof value.required === 'boolean';
+  && isNonEmpty(value.relativePath) && (value.mimeType === undefined || isNonEmpty(value.mimeType)) && typeof value.required === 'boolean';
 const isArtifactResult = (value: unknown): value is ExecutionArtifactResult => isRecord(value) && isNonEmpty(value.name)
-  && isNonEmpty(value.relativePath) && Number.isInteger(value.sizeBytes) && (value.sizeBytes as number) >= 0 && isSha256(value.sha256);
+  && isNonEmpty(value.relativePath) && (value.mimeType === undefined || isNonEmpty(value.mimeType))
+  && Number.isInteger(value.sizeBytes) && (value.sizeBytes as number) >= 0 && isSha256(value.sha256);
 const isToolVersion = (value: unknown): value is ExecutionToolVersionEvidence => isRecord(value) && isNonEmpty(value.tool)
   && isNonEmpty(value.version) && (value.driverVersion === undefined || isNonEmpty(value.driverVersion));
 export function isWindowsExecutionPacket(value: unknown): value is WindowsExecutionPacket {
