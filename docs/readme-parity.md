@@ -1,6 +1,6 @@
 # README Parity Checklist
 
-Posledni aktualizace: 2026-09-01
+Posledni aktualizace: 2026-09-04
 
 Tento dokument mapuje aktualni README pozadavky na runtime implementaci a executable test evidence.
 
@@ -19,6 +19,11 @@ Tento dokument mapuje aktualni README pozadavky na runtime implementaci a execut
 | Plna chyba validace a review blocker zpet do implementace | `implemented` | `tested` | `deferred` | `apps/worker/src/workflow.ts`; `apps/worker/src/db-worker/checkpoints.ts`; `apps/worker/src/workflow.test.ts` |
 | Phase-aware retry a checkpointy bez opakovani uspesnych operaci | `implemented` | `tested` | `deferred` | `apps/worker/src/db-worker/checkpoints.ts`; `packages/db/src/repository.ts`; `apps/worker/src/db-worker.test.ts` |
 | Runtime bez approval vetvi; historicke approval zaznamy pouze pro audit | `implemented` | `tested` | `deferred` | `apps/studio-api/src/routes.ts`; `apps/worker/src/workflow.ts`; `packages/db/prisma/migrations/20260831150000_remove_runtime_approvals/migration.sql` |
+| Selektivni reuse validace podle workspace a semantic impact provenance | `implemented` | `tested` | `deferred` | `apps/worker/src/workflow.ts`; `apps/worker/src/validation.ts`; `apps/worker/src/workflow.test.ts`; `apps/worker/src/validation.test.ts` |
+| Technicky retry bez budget/iteration/retry capu | `implemented` | `tested` | `deferred` | `packages/db/src/repository.ts`; `packages/db/src/repository.task-run.test.ts`; `apps/worker/src/db-worker.test.ts` |
+| Delivery-only recovery bez opakovani implementace a platne validace | `implemented` | `tested` | `deferred` | `apps/worker/src/db-worker.ts`; `apps/worker/src/db-worker.test.ts`; `packages/github/src/index.test.ts` |
+| Repository-grounded planning a nezavisle review roadmapy | `implemented` | `tested` | `deferred` | `apps/studio-api/src/roadmap.ts`; `apps/studio-api/src/roadmap.test.ts`; `apps/studio-api/src/roadmap-resume.test.ts`; `packages/providers/src/roadmap-review-prompt.test.ts` |
+| Audit gap proposals zustavaji neaktivni do review a rozhodnuti | `implemented` | `tested` | `deferred` | `apps/worker/src/db-worker.ts`; `packages/db/src/repository.ts`; `apps/worker/src/db-worker.test.ts`; `apps/studio-api/src/routes.test.ts` |
 | GitHub adapter kontrakt a idempotentni delivery | `implemented` | `tested` | `deferred` | `packages/github/src/index.ts`; `packages/github/src/index.test.ts` |
 | Provider abstraction, Codex primary a fallback | `implemented` | `tested` | `deferred` | `packages/providers/src/provider.ts`; `packages/providers/src/codex-provider.ts`; `apps/worker/src/db-worker.test.ts` |
 | Queue persistence, pause, claim/finalize/recovery a audit | `implemented` | `tested` | `deferred` | `packages/db/src/repository.ts`; `apps/worker/src/db-worker.ts`; `packages/db/src/repository.task-run.test.ts` |
@@ -48,4 +53,4 @@ Tato coverage je `tested`, ne `production-verified`.
 - Architektura a runtime: `docs/architecture.md`, `docs/project-config.md`, `docs/security.md`
 - AI Chat: `docs/ai-chat-specification.md`
 - Implementacni historie: `docs/implementation-tracker.md`
-- Autoritativni root validace: `npm run build`, `npm run typecheck`, `npm test`, `npm run test:migrations`
+- Root/CI test foundation: `npm run build`, `npm run typecheck`, `npm test`, `npm run test:migrations`. Tyto prikazy a migracni matrix zustavaji dostupne pro release/CI; nejsou automaticky predepsanou validation sadou kazdeho tasku. Autoritativni task checks voli implementacni AI podle konkretni zmeny.

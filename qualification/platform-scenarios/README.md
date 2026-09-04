@@ -16,7 +16,7 @@ The command prints deterministic JSON evidence with per-scenario definition hash
 - Diagnostic exports must pass through central redaction before attachment.
 - Artifacts should be bounded transcripts, state timelines, record counts, hashes, and audit event identifiers.
 - Real runs must reference exact commits. Scenario definitions are stable and versioned in `qualification/platform-scenarios/scenarios.mjs`.
-- Fixture scenario evidence cannot unlock final audit by itself; the same revision must also have a passed BOREK-FILIP Unreal artifact backed by its exact successful Windows execution, the canonical `borek-filip` profile, manual device/session and probe provenance, and separate human approval resolved before the execution lease was claimed.
+- Fixture scenario evidence proves only typed execution and safe upload. It cannot unlock final audit or claim physical verification by itself; a `production-verified` BOREK-FILIP claim needs a successful canonical `borek-filip` execution for the exact revision plus real device, manual session, local probe and artifact provenance. This physical run is deferred and is not a runtime approval gate.
 - Manual final audit remains a user action after qualification evidence exists.
 
 ## Scenario catalog
@@ -53,13 +53,13 @@ Expected audit events: provider preflight or external operation failure, fallbac
 
 Recovery procedure: keep provider fallback within the same approved provider kind and resolved model; allow backoff or retry through the existing endpoint; verify idempotency lookup before retrying delivery.
 
-### approval-pause-resume
+### runtime-access-without-approval
 
-Expected states: submitted task, running run, task needs approval, pending approval, queue paused for approval, approved approval, resubmitted task, pending queue job, completed task.
+Expected states: submitted task, running run, accepted access, implementation, validation, review, delivery, no runtime approval record, completed task.
 
-Expected audit events: needs-approval transition, approval creation, approval approval, task resubmission, queue job creation, task completion.
+Expected audit events: access check, iteration, validation, review and GitHub operation completion, task completion.
 
-Recovery procedure: leave the task paused until a task-scoped approval is approved or rejected; resume through the existing approval endpoint; keep rejection rationale on the terminal blocked or failed state.
+Recovery procedure: reject failed authentication or role checks; otherwise continue without creating an approval; handle execution failure through ordinary phase-aware retry.
 
 ### specification-change-regeneration
 
@@ -79,7 +79,7 @@ Recovery procedure: never auto-start final audit; use the manual action after co
 
 ### disk-exhaustion-artifact-bounds
 
-Expected states: submitted task, running run, bounded artifact capture, failed or truncated artifact capture, failed run, backoff or failed-after-limit queue result, operator cleanup required, task retryable after cleanup.
+Expected states: submitted task, running run, bounded artifact capture, failed or truncated artifact capture, failed run, pending queue result with backoff, operator cleanup required, task retryable after cleanup.
 
 Expected audit events: artifact upload start, artifact truncation or failure, validation failure, queue finalization, operator recovery required.
 
@@ -100,3 +100,15 @@ Expected states: enrolled runner, active manual session, current probe evidence,
 Expected audit events: enrollment redemption, manual session start, execution lease, result submission, evidence reconciliation.
 
 Recovery procedure: keep validation deferred without a fresh session and probe; expire stale leases before manual reactivation; rerun only the bounded fixture for the same exact commit and reconcile once.
+
+### Targeted regression scenarios
+
+The catalog also binds the consolidated runtime claims to existing executable coverage:
+
+- `selective-validation-reuse` -> `apps/worker/src/validation.test.ts` and `apps/worker/src/workflow.test.ts`
+- `unbounded-technical-retry` -> `packages/db/src/repository.task-run.test.ts` and `apps/worker/src/db-worker.test.ts`
+- `delivery-only-recovery` -> `apps/worker/src/db-worker.test.ts` and `packages/github/src/index.test.ts`
+- `repository-grounded-planning` -> `apps/studio-api/src/roadmap-resume.test.ts`, `apps/studio-api/src/roadmap.test.ts` and `packages/providers/src/roadmap-review-prompt.test.ts`
+- `audit-gap-proposal-decision` -> `apps/worker/src/db-worker.test.ts`, `packages/db/src/acceptance-evidence.test.ts` and `apps/studio-api/src/routes.test.ts`
+
+These scenario definitions are `tested` contract evidence when their linked tests pass. They are not production results and do not rewrite stored results from earlier qualification runs.

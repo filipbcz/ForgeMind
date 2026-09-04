@@ -24,7 +24,7 @@ Statusy v tomto dokumentu maji stejny vyznam jako v `docs/readme-parity.md`: `im
 | Persistent GitHub credential encryption | `implemented`, `tested` | `packages/db/src/credentials.ts`; `packages/db/src/repository.ts`; `apps/studio-api/src/routes.ts`; `apps/studio-api/src/routes.test.ts` |
 | Windows runner enrollment auth, manual session a outbound-only API transport | `implemented`, `tested` | `packages/db/src/windows-runner-credentials.ts`; `apps/studio-api/src/routes/windows-runner-routes.ts`; `apps/windows-runner/src/transport.ts`; `packages/db/src/windows-runner-credentials.test.ts`; `apps/studio-api/src/routes/windows-runner-routes.integration.test.ts` |
 | Windows typed fixture/Unreal execution, canonical path policy, cancel a bounded/redacted evidence | `implemented`, `tested` | `apps/windows-runner/src/fixture-executor.ts`; `apps/windows-runner/src/unreal-adapter.ts`; `apps/windows-runner/src/fixture-executor.test.ts`; `apps/windows-runner/src/unreal-adapter.test.ts`; `apps/studio-api/src/routes/windows-runner-routes.test.ts` |
-| BOREK-FILIP Unreal production verification | `deferred` | Musi vzniknout realnou lokalni rucni session po samostatnem approval a uspesnem probe; fixture evidence ji nenahrazuje |
+| BOREK-FILIP Unreal production verification | `deferred` | Musi vzniknout realnou lokalni rucni session, uspesnym lokalnim probe a fyzickym typed execution na presnem commitu; fixture evidence ji nenahrazuje a runtime approval se nepouziva |
 | Central secret redaction across all provider output and logs | `deferred` | Future roadmap step "Redact Secrets From Logs Audits And Provider Output" |
 | Production verification of these controls | `deferred` | Future controlled production verification in `docs/roadmap-quality-implementation-plan.md` |
 
@@ -91,7 +91,7 @@ Doporucene doplneni pred produkci:
 ## 8) Incident response minimum
 
 1. Kazdy provider/github fail musi zapsat audit event s operation typem.
-2. Pri opakovanych selhanich queue jobu po limitu pokusu zustane job ve failed a musi byt viditelny v operacnim feedu.
+2. Pri opakovanych technickych selhanich queue zachova diagnostiku, backoff a phase checkpoint; konkretni neobnovitelna prekazka zustane zastavena a viditelna v operacnim feedu do zasahu uzivatele.
 3. Pri incidentu musi byt dohledatelne:
 - task id
 - task run id

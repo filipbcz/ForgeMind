@@ -3,12 +3,17 @@ export const requiredScenarioAreas = [
   'repair',
   'restart',
   'outage',
-  'approval_pause_resume',
+  'runtime_access',
   'specification_change',
   'audit_recovery',
   'disk_exhaustion',
   'windows_validation_fixture',
-  'database_restore'
+  'database_restore',
+  'selective_reuse',
+  'technical_retry',
+  'delivery_recovery',
+  'repository_planning',
+  'audit_proposals'
 ];
 
 export const qualificationScenarios = [
@@ -161,40 +166,40 @@ export const qualificationScenarios = [
     ]
   },
   {
-    id: 'approval-pause-resume',
-    area: 'approval_pause_resume',
-    title: 'Risky operation pauses until explicit approval',
-    objective: 'Verify risky work enters needs_approval, records task-scoped approval, and resumes only after approval.',
-    activation: 'Run a task whose provider outcome requests a risky operation allowed only by explicit approval.',
+    id: 'runtime-access-without-approval',
+    area: 'runtime_access',
+    title: 'Authenticated runtime proceeds without an approval branch',
+    objective: 'Verify an authorized task proceeds directly and does not create or consume runtime approval records.',
+    activation: 'Run an authenticated task containing an operation that legacy policy classified as risky.',
     expectedStates: [
       'task:submitted',
       'run:running',
-      'task:needs_approval',
-      'approval:pending',
-      'queue:paused_for_approval',
-      'approval:approved',
-      'task:submitted_after_approval',
-      'queue:pending',
+      'access:accepted',
+      'iteration:implementation',
+      'iteration:validation',
+      'iteration:review',
+      'delivery:running',
+      'approval_record:not_created',
       'task:completed'
     ],
     expectedAuditEvents: [
-      'task_status_needs_approval',
-      'approval_created',
-      'approval_approved',
-      'task_status_submitted',
-      'task_queue_job_created',
+      'task_access_checked',
+      'task_iteration_completed',
+      'task_validation_completed',
+      'task_review_completed',
+      'task_github_operation_completed',
       'task_status_completed'
     ],
     evidenceArtifacts: [
-      'approval record',
-      'approval audit trail',
-      'pre-approval paused queue snapshot',
-      'post-approval resumed run'
+      'authenticated request record',
+      'task state timeline',
+      'absence-of-runtime-approval assertion',
+      'completed run transcript'
     ],
     recoveryProcedure: [
-      'Leave the task in needs_approval until a user approves or rejects the task-scoped approval.',
-      'If approval is granted, use the existing approval endpoint so resume is audited and re-enqueued.',
-      'If approval is rejected, keep the terminal blocked or failed state with the rejection rationale.'
+      'Reject the request when authentication or role access checks fail.',
+      'For an authorized request, continue from the current phase checkpoint without creating an approval record.',
+      'If execution fails technically, retain the failure reason and use ordinary phase-aware retry.'
     ]
   },
   {
@@ -278,7 +283,7 @@ export const qualificationScenarios = [
       'artifact_capture:bounded',
       'artifact_capture:failed_or_truncated',
       'run:failed',
-      'queue:pending_with_backoff_or_task:failed_after_limit',
+      'queue:pending_with_backoff',
       'operator_cleanup:required',
       'task:retryable_after_cleanup'
     ],
@@ -367,5 +372,50 @@ export const qualificationScenarios = [
       'Run the forward-only migration validator before starting application workers.',
       'Start API first, verify read paths, then resume workers after queue and audit counts are consistent.'
     ]
+  },
+  {
+    id: 'selective-validation-reuse', area: 'selective_reuse', title: 'Only unaffected successful validation is reused',
+    objective: 'Verify semantic impact selection reuses an unaffected passed check while rerunning failed or affected checks.',
+    activation: 'Repair a failed validation and provide a changed workspace plus prior per-check provenance.',
+    expectedStates: ['validation:failed', 'workspace:repaired', 'unaffected_check:reused', 'affected_check:executed', 'validation:succeeded'],
+    expectedAuditEvents: ['task_validation_failed', 'task_validation_recovery_decision_recorded', 'task_checkpoint_skipped', 'task_validation_completed'],
+    evidenceArtifacts: ['workspace input hashes', 'per-check execution and reuse provenance', 'validation transcript'],
+    recoveryProcedure: ['Compare the current workspace hash with stored provenance.', 'Ask semantic impact assessment only for otherwise reusable checks.', 'Execute every failed, missing, or affected check.']
+  },
+  {
+    id: 'unbounded-technical-retry', area: 'technical_retry', title: 'Technical retry is checkpoint-safe and has no orchestration cap',
+    objective: 'Verify a transient failure remains retryable after former attempt limits while preserving diagnostics and completed checkpoints.',
+    activation: 'Finalize a retryable queue failure whose attempt count exceeds the retired maximum.',
+    expectedStates: ['run:failed', 'diagnostics:persisted', 'queue:pending_with_backoff', 'checkpoint:preserved', 'task:submitted'],
+    expectedAuditEvents: ['task_queue_job_finalized', 'task_queue_job_requeued', 'task_checkpoint_skipped'],
+    evidenceArtifacts: ['attempt diagnostics', 'next-attempt metadata', 'checkpoint list'],
+    recoveryProcedure: ['Classify concrete external failures as stopped until corrected.', 'For technical failures, retain diagnostics and schedule backoff.', 'Resume from the first incomplete phase without applying an iteration or retry cap.']
+  },
+  {
+    id: 'delivery-only-recovery', area: 'delivery_recovery', title: 'Completed implementation resumes at delivery only',
+    objective: 'Verify a delivery failure reuses successful implementation and local validation without another provider implementation call.',
+    activation: 'Retry a completed but unmerged task or a task whose GitHub delivery operation failed.',
+    expectedStates: ['implementation:succeeded', 'validation:succeeded', 'delivery:failed', 'delivery:resumed', 'task:completed'],
+    expectedAuditEvents: ['task_github_operation_failed', 'task_external_effect_skipped_on_retry', 'task_github_operation_completed'],
+    evidenceArtifacts: ['delivery checkpoint', 'provider call count', 'GitHub idempotency result'],
+    recoveryProcedure: ['Read the last successful local validation checkpoint.', 'Skip implementation and validation when their workspace evidence remains valid.', 'Retry only the first incomplete GitHub operation.']
+  },
+  {
+    id: 'repository-grounded-planning', area: 'repository_planning', title: 'Planning is bound to current repository evidence',
+    objective: 'Verify roadmap planning requires a discoverable commit and cites concrete baseline gaps and reusable components.',
+    activation: 'Request confirmed roadmap generation against a repository-bound project contract.',
+    expectedStates: ['repository:discovered', 'commit:bound', 'baseline:inspected', 'roadmap:reviewed', 'roadmap:persisted'],
+    expectedAuditEvents: ['project_planning_started', 'project_roadmap_validation_completed', 'project_roadmap_cycle_created'],
+    evidenceArtifacts: ['commit identity', 'repository evidence references', 'independent roadmap review'],
+    recoveryProcedure: ['Stop planning when no commit-bound repository is available.', 'Invalidate the checkpoint when tracked repository inputs change.', 'Regenerate and independently review every targeted repair.']
+  },
+  {
+    id: 'audit-gap-proposal-decision', area: 'audit_proposals', title: 'Audit gaps remain proposals until reviewed and accepted',
+    objective: 'Verify a capability or release audit persists grounded gap work as inactive proposals and does not schedule implementation automatically.',
+    activation: 'Complete an audit with a concrete unsatisfied requirement and proposed focused work items.',
+    expectedStates: ['audit:running', 'gap:identified', 'proposal:persisted', 'proposal:awaiting_decision', 'implementation:not_scheduled'],
+    expectedAuditEvents: ['project_audit_started', 'project_audit_gap_proposed', 'project_audit_completed'],
+    evidenceArtifacts: ['audit criterion evidence', 'commit-bound gap proposal', 'proposal decision history'],
+    recoveryProcedure: ['Keep the proposal inactive after audit completion.', 'Require independent roadmap quality review before acceptance.', 'Schedule focused work only after an explicit proposal decision.']
   }
 ];
