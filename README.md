@@ -1336,6 +1336,8 @@ Aktualni stav tohoto repozitare:
 
 Windows runner je pouze validacni executor pro presny commit SHA a verzovane schema z `packages/core`. Neni obecny remote shell: nesmi planovat ani implementovat, pouzivat Git push, merge, PR nebo deploy, pristupovat primo do databaze, provozovat Docker, bezet bezobsluzne jako sluzba ani menit UAC, restart nebo security konfiguraci.
 
+Lokalni adapter policy se runneru predava v `FORGEMIND_WINDOWS_ADAPTER_POLICY` jako JSON s poli `allowedFixtureExecutablePaths`, `pinnedUnrealTools` a `approvedUnrealProfiles`. Prazdna nebo chybejici policy nic nespusti. Velky Unreal profil navic vyzaduje interaktivni TTY potvrzeni a diskovy preflight; server nema approval frontu.
+
 Autoritativni release validace pro MVP delta:
 
 - `npm run build`

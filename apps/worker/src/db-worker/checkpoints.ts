@@ -1,5 +1,5 @@
 import type { ProjectArchitectureUpdate } from '@forgemind/core';
-import type { ReviewResult, ValidationCheck } from '@forgemind/providers';
+import { normalizeValidationChecks as normalizeProviderValidationChecks, type ReviewResult, type ValidationCheck } from '@forgemind/providers';
 import type { JsonValue } from '@forgemind/shared';
 import { formatValidationFailure } from '../validation.js';
 import type { WorkerTaskResume } from '../workflow.js';
@@ -33,6 +33,9 @@ export interface PlannedValidationCheckSnapshot {
   shell?: string;
   continueOnFailure?: boolean;
   timeoutMinutes?: number;
+  target?: string;
+  requiredCapabilities?: unknown;
+  windowsAdapter?: unknown;
 }
 
 export interface TaskCheckpointSnapshot {
@@ -531,29 +534,7 @@ function extractValidationChecks(validationResult: unknown): WorkerTaskResume['v
 }
 
 function normalizeValidationCheckSnapshot(item: unknown): ValidationCheck | undefined {
-  if (!item || typeof item !== 'object' || Array.isArray(item)) {
-    return undefined;
-  }
-
-  const check = item as PlannedValidationCheckSnapshot;
-  if (check.kind === 'command' && typeof check.command === 'string' && check.command.trim()) {
-    return {
-      kind: 'command' as const,
-      command: check.command.trim(),
-      shell: check.shell === 'powershell' || check.shell === 'cmd' || check.shell === 'bash' || check.shell === 'sh'
-        ? check.shell
-        : 'system',
-      continueOnFailure: check.continueOnFailure === true,
-      timeoutMinutes: typeof check.timeoutMinutes === 'number' ? check.timeoutMinutes : undefined,
-      category: check.category === 'setup' || check.category === 'build' || check.category === 'database' || check.category === 'api' || check.category === 'browser' || check.category === 'smoke'
-        ? check.category
-        : undefined,
-      criterion: typeof check.criterion === 'string' && check.criterion.trim() ? check.criterion.trim() : undefined,
-      rationale: typeof check.rationale === 'string' && check.rationale.trim() ? check.rationale.trim() : undefined,
-    };
-  }
-
-  return undefined;
+  return normalizeProviderValidationChecks([item])[0];
 }
 
 function findLastIteration<T extends { phase: string }>(iterations: T[], phase: string): T | undefined {

@@ -1,7 +1,7 @@
 import { createHash } from 'node:crypto';
 import { spawn } from 'node:child_process';
-import { mkdir, readFile, rm, stat } from 'node:fs/promises';
-import { dirname, isAbsolute, relative, resolve } from 'node:path';
+import { mkdir, readFile, realpath, rm, stat } from 'node:fs/promises';
+import { basename, dirname, isAbsolute, relative, resolve } from 'node:path';
 import type {
   ExecutionArtifactResult,
   WindowsEvidenceUpload,
@@ -9,9 +9,11 @@ import type {
   WindowsExecutionResult,
   WorkerCapability
 } from '@forgemind/core';
+import { SafeFixtureExecutor } from './fixture-executor.js';
+import { PinnedUnrealCommandAdapter, type ApprovedUnrealProfile, type PinnedUnrealTool } from './unreal-adapter.js';
 
 interface ProcessResult {
-  status: 'succeeded' | 'failed' | 'cancelled' | 'timed_out';
+  status: 'succeeded' | 'failed' | 'cancelled' | 'timed_out' | 'deferred';
   exitCode?: number;
   stdout: string;
   stderr: string;
@@ -24,6 +26,11 @@ export interface WindowsExecutionContext {
   artifactRoot: string;
   observedCapabilities: WorkerCapability[];
   signal?: AbortSignal;
+  allowedFixtureExecutablePaths?: readonly string[];
+  pinnedUnrealTools?: readonly PinnedUnrealTool[];
+  approvedUnrealProfiles?: readonly ApprovedUnrealProfile[];
+  confirmLargeUnrealJob?: (summary: string) => Promise<boolean>;
+  showLocally?: (summary: string) => void;
 }
 
 export interface ExecutedWindowsValidation {
@@ -37,20 +44,28 @@ export async function executeWindowsValidation(
   context: WindowsExecutionContext
 ): Promise<ExecutedWindowsValidation> {
   if (process.platform !== 'win32') throw new Error('Windows validation can run only on Windows.');
+  if (packet.schemaVersion !== 2) throw new Error('Legacy or unsupported Windows execution packet is deferred for manual-local handling.');
   const workspacePath = resolveManagedPath(context.workspaceRoot, packet.jobId);
   const artifactPath = resolveManagedPath(context.artifactRoot, packet.jobId);
   await rm(workspacePath, { recursive: true, force: true });
   await rm(artifactPath, { recursive: true, force: true });
   await mkdir(dirname(workspacePath), { recursive: true });
   await mkdir(artifactPath, { recursive: true });
+  const approvedWorkspaceRoot = await realpath(dirname(workspacePath));
+  const approvedArtifactRoot = await realpath(artifactPath);
+  if (resolve(approvedWorkspaceRoot, packet.jobId) !== workspacePath || approvedArtifactRoot !== artifactPath) {
+    throw new Error('Runner-managed roots could not be canonicalized to the approved local roots.');
+  }
 
   const startedAt = new Date();
-  const preparation = await runProcess('git.exe', ['clone', '--no-checkout', '--filter=blob:none', packet.sourceUrl, workspacePath], {
-    cwd: context.workspaceRoot,
-    timeoutMs: packet.resourcePolicy.timeoutSeconds * 1_000,
-    maxOutputBytes: packet.resourcePolicy.maxLogBytes,
-    signal: context.signal
-  });
+  const preparation: ProcessResult = packet.dispatch.kind === 'deferred'
+    ? { status: 'deferred', stdout: '', stderr: `Deferred (${packet.dispatch.handling}): ${packet.dispatch.reason}. No process was executed.` }
+    : await runProcess('git.exe', ['clone', '--no-checkout', '--filter=blob:none', packet.sourceUrl, workspacePath], {
+        cwd: context.workspaceRoot,
+        timeoutMs: packet.resourcePolicy.timeoutSeconds * 1_000,
+        maxOutputBytes: packet.resourcePolicy.maxLogBytes,
+        signal: context.signal
+      });
   let execution = preparation;
   if (preparation.status === 'succeeded') {
     const checkout = await runProcess('git.exe', ['checkout', '--detach', packet.commitSha], {
@@ -60,9 +75,16 @@ export async function executeWindowsValidation(
       signal: context.signal
     });
     execution = mergeProcessResults(preparation, checkout);
+    if (checkout.status === 'succeeded') {
+      const verified = await runProcess('git.exe', ['rev-parse', 'HEAD'], processOptions(packet, workspacePath, context.signal));
+      execution = mergeProcessResults(execution, verified);
+      if (verified.status === 'succeeded' && verified.stdout.trim().toLocaleLowerCase('en-US') !== packet.commitSha.toLocaleLowerCase('en-US')) {
+        execution = mergeProcessResults(execution, { status: 'failed', exitCode: 1, stdout: '', stderr: 'Checked-out commit does not match the packet commit.' });
+      }
+    }
   }
   if (execution.status === 'succeeded') {
-    const validation = await runValidationCommand(packet, workspacePath, context.signal);
+    const validation = await runValidationAdapter(packet, workspacePath, context);
     execution = mergeProcessResults(execution, validation);
   }
 
@@ -78,7 +100,8 @@ export async function executeWindowsValidation(
     };
   }
   const logText = truncateUtf8([
-    `[command] ${packet.check.command}`,
+    `[intent] ${packet.check.command}`,
+    `[adapter] ${packet.dispatch.kind}`,
     execution.stdout ? `[stdout]\n${execution.stdout}` : '',
     execution.stderr ? `[stderr]\n${execution.stderr}` : ''
   ].filter(Boolean).join('\n\n'), packet.resourcePolicy.maxLogBytes);
@@ -109,6 +132,9 @@ export async function executeWindowsValidation(
     observedCapabilities: context.observedCapabilities,
     toolVersions: [],
     status: execution.status,
+    ...(execution.status === 'deferred' ? {
+      deferredReason: packet.dispatch.kind === 'deferred' ? packet.dispatch.reason : 'manual_local_required' as const
+    } : {}),
     startedAt: startedAt.toISOString(),
     completedAt: completedAt.toISOString(),
     exitCode: execution.exitCode,
@@ -128,12 +154,55 @@ export async function cleanupWindowsValidationWorkspace(workspaceRoot: string, a
   ]);
 }
 
-async function runValidationCommand(packet: WindowsExecutionPacket, cwd: string, signal?: AbortSignal): Promise<ProcessResult> {
-  const shell = packet.check.shell ?? 'system';
-  if (shell === 'powershell') return runProcess('powershell.exe', ['-NoLogo', '-NoProfile', '-NonInteractive', '-Command', packet.check.command], processOptions(packet, cwd, signal));
-  if (shell === 'bash') return runProcess('bash.exe', ['-lc', packet.check.command], processOptions(packet, cwd, signal));
-  if (shell === 'sh') return runProcess('sh.exe', ['-lc', packet.check.command], processOptions(packet, cwd, signal));
-  return runProcess('cmd.exe', ['/d', '/s', '/c', packet.check.command], processOptions(packet, cwd, signal));
+async function runValidationAdapter(packet: WindowsExecutionPacket, cwd: string, context: WindowsExecutionContext): Promise<ProcessResult> {
+  const dispatch = packet.dispatch;
+  context.showLocally?.(`Windows validation intent: ${packet.check.command}\nAdapter: ${dispatch.kind}`);
+  if (dispatch.kind === 'deferred') return {
+    status: 'deferred', stdout: '',
+    stderr: `Deferred (${dispatch.handling}): ${dispatch.reason}. No command was executed.`
+  };
+  if (dispatch.kind === 'fixture-validation') {
+    // Packet artifact paths are workspace-relative, while SafeFixtureExecutor's
+    // artifact path is relative to artifactRoot. Split the path at that boundary
+    // instead of applying the workspace-relative prefix twice.
+    const fixtureTarget = mapFixtureArtifactPath(cwd, dispatch.artifactRelativePath);
+    const fixtureArtifactRoot = fixtureTarget.artifactRoot;
+    await mkdir(fixtureArtifactRoot, { recursive: true });
+    const result = await new SafeFixtureExecutor().execute({
+      kind: 'fixture-validation', executablePath: dispatch.executablePath,
+      inputRelativePath: dispatch.inputRelativePath, artifactRelativePath: fixtureTarget.artifactRelativePath
+    }, {
+      workspaceRoot: cwd,
+      artifactRoot: fixtureArtifactRoot,
+      allowedExecutablePaths: context.allowedFixtureExecutablePaths ?? [],
+      timeoutMs: packet.resourcePolicy.timeoutSeconds * 1_000,
+      minimumFreeSpaceBytes: dispatch.minimumFreeSpaceBytes,
+      maxConcurrentProcesses: dispatch.maxConcurrentProcesses
+    }, context.signal);
+    return { ...result, stdout: '', stderr: '' };
+  }
+  const workingDirectory = resolve(cwd, dispatch.workingDirectoryRelativePath);
+  const prepared = await new PinnedUnrealCommandAdapter({
+    canonicalize: realpath,
+    async freeSpaceBytes(value) { const { statfs } = await import('node:fs/promises'); const info = await statfs(value, { bigint: true }); return Number(info.bavail * info.bsize); },
+    confirmLargeJob: context.confirmLargeUnrealJob ?? (async () => false),
+    showLocally: context.showLocally ?? ((summary) => process.stdout.write(`${summary}\n`))
+  }).prepare({
+    kind: 'unreal-validation', profileId: dispatch.profileId, tool: dispatch.tool,
+    executablePath: dispatch.executablePath, workingDirectory, args: dispatch.args, size: dispatch.size
+  }, {
+    workspaceRoot: cwd, pinnedTools: context.pinnedUnrealTools ?? [], approvedProfiles: context.approvedUnrealProfiles ?? [],
+    minimumLargeJobFreeSpaceBytes: dispatch.minimumLargeJobFreeSpaceBytes
+  });
+  if (prepared.status !== 'ready') return { status: 'failed', exitCode: 2, stdout: '', stderr: `${prepared.status}: ${prepared.reason}: ${prepared.message}` };
+  return runProcess(prepared.executablePath, [...prepared.args], processOptions(packet, prepared.workingDirectory, context.signal));
+}
+
+export function mapFixtureArtifactPath(workspacePath: string, workspaceRelativePath: string): { artifactRoot: string; artifactRelativePath: string } {
+  return {
+    artifactRoot: resolve(workspacePath, dirname(workspaceRelativePath)),
+    artifactRelativePath: basename(workspaceRelativePath)
+  };
 }
 
 function processOptions(packet: WindowsExecutionPacket, cwd: string, signal?: AbortSignal) {

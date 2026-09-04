@@ -61,7 +61,7 @@ async function enqueueExternalWindowsValidations(
     const requestedCapabilities = Array.from(new Set((check.requiredCapabilities ?? []).map((capability) => capability.trim()).filter(Boolean)));
     const requiredCapabilities = Array.from(new Set(['windows', ...requestedCapabilities]));
     const inputHash = createHash('sha256')
-      .update(JSON.stringify({ commitSha: input.commitSha, command: check.command, shell: check.shell ?? 'system', requestedCapabilities }))
+      .update(JSON.stringify({ commitSha: input.commitSha, command: check.command, shell: check.shell ?? 'system', requestedCapabilities, windowsAdapter: check.windowsAdapter ?? null }))
       .digest('hex');
     await windowsWorkers.enqueue({
       id: jobId,
@@ -70,7 +70,7 @@ async function enqueueExternalWindowsValidations(
       runId: input.taskRunId,
       requiredCapabilities,
       packet: {
-        schemaVersion: 1,
+        schemaVersion: 2,
         projectId: project.id,
         taskId: input.taskId,
         runId: input.taskRunId,
@@ -88,6 +88,11 @@ async function enqueueExternalWindowsValidations(
           category: check.category ?? 'smoke',
           criterion: check.criterion,
           requiredCapabilities
+        },
+        dispatch: check.windowsAdapter ?? {
+          kind: 'deferred',
+          reason: 'unsupported_validation_intent',
+          handling: 'manual-local'
         },
         requiredCapabilities,
         resourcePolicy: {

@@ -59,9 +59,10 @@ describe('Windows runner real transport and persistence flow', () => {
       schemaVersion: 1, capability: { key: 'windows' }, status: 'supported', probedAt: new Date().toISOString(), probeVersion: 'fixture-1', summary: 'supported', evidenceHash: 'c'.repeat(64)
     }] });
     await workers.enqueue({ id: ids.job, projectId: ids.project, taskId: ids.task, runId: ids.run, requiredCapabilities: ['windows'], packet: {
-      schemaVersion: 1, projectId: ids.project, taskId: ids.task, runId: ids.run, checkId, jobId: ids.job, leaseId: 'pending', repository: 'owner/repo',
+      schemaVersion: 2, projectId: ids.project, taskId: ids.task, runId: ids.run, checkId, jobId: ids.job, leaseId: 'pending', repository: 'owner/repo',
       sourceUrl: 'https://example.test/owner/repo.git', commitSha, workspaceRoot: 'C:\\fixture', artifactRoot: 'C:\\fixture\\artifacts',
       check: { command: 'fixture.exe --validate', category: 'smoke', requiredCapabilities: ['windows'] }, requiredCapabilities: ['windows'],
+      dispatch: { kind: 'deferred', reason: 'unsupported_validation_intent', handling: 'manual-local' },
       resourcePolicy: { timeoutSeconds: 30, maxLogBytes: 1024, maxArtifactBytes: 1024 }, expectedArtifacts: [], nonce: 'pending', inputHash
     } });
 

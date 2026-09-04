@@ -66,7 +66,8 @@ describe('repository chat contract', () => {
         target: 'windows',
         requiredCapabilities: ['cmake', 'msvc'],
         timeoutMinutes: 45,
-        category: 'build'
+        category: 'build',
+        windowsAdapter: { kind: 'unreal-validation', profileId: 'cook', tool: 'automation-tool', executablePath: 'C:\\UE\\RunUAT.bat', workingDirectoryRelativePath: 'Game', args: ['BuildCookRun'], size: 'large', minimumLargeJobFreeSpaceBytes: 1024 }
       }],
       fileUpdates: [],
       forgeMindActions: []
@@ -76,7 +77,8 @@ describe('repository chat contract', () => {
       target: 'windows',
       shell: 'powershell',
       requiredCapabilities: ['windows', 'cmake', 'msvc'],
-      timeoutMinutes: 45
+      timeoutMinutes: 45,
+      windowsAdapter: { kind: 'unreal-validation', profileId: 'cook', tool: 'automation-tool', executablePath: 'C:\\UE\\RunUAT.bat', workingDirectoryRelativePath: 'Game', args: ['BuildCookRun'], size: 'large', minimumLargeJobFreeSpaceBytes: 1024 }
     })]);
   });
 });

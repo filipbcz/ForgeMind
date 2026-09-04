@@ -4,6 +4,7 @@ import { release as osRelease } from 'node:os';
 import { join } from 'node:path';
 import { stdin, stdout } from 'node:process';
 import { pathToFileURL } from 'node:url';
+import { classifyWindowsExecutionPacket } from '@forgemind/core';
 import { WindowsCredentialStore } from './credential-store.js';
 import { cleanupWindowsValidationWorkspace, executeWindowsValidation } from './executor.js';
 import { runCapabilityProbes, windowsRunnerCapabilityProbes } from './probes.js';
@@ -59,11 +60,17 @@ export async function main(args = process.argv.slice(2)): Promise<void> {
     stdout.write(`${JSON.stringify(probes.evidence, null, 2)}\n`); return;
   }
   if (parsed.command === 'session-start') {
+    const adapterPolicy = readLocalAdapterPolicy();
     await transport.publishDevice(auth, { runnerVersion: RUNNER_VERSION, displayName: process.env.COMPUTERNAME ?? 'Windows runner', capabilities: probes.capabilities, probeEvidence: probes.evidence });
     const controller = new AbortController(); process.once('SIGINT', () => controller.abort());
     await runManualSession(transport, auth, { durationMinutes: parsed.minutes, signal: controller.signal,
       onClaim: async (claim, context) => {
         if (!claim.job || !claim.lease) return;
+        const disposition = classifyWindowsExecutionPacket(claim.job.packet);
+        if (disposition.status === 'deferred' && claim.job.packet.dispatch?.kind !== 'deferred') {
+          stdout.write(`Deferred (${disposition.handling}/${disposition.reason}): ${disposition.message} No process was started.\n`);
+          return;
+        }
         stdout.write(`Running Windows validation ${claim.job.packet.checkId}: ${claim.job.packet.check.command}\n`);
         try {
           const executed = await executeWindowsValidation(claim.job.packet, {
@@ -72,7 +79,17 @@ export async function main(args = process.argv.slice(2)): Promise<void> {
             workspaceRoot: parsed.workspaceRoot,
             artifactRoot: parsed.artifactRoot,
             observedCapabilities: probes.capabilities,
-            signal: context.signal
+            signal: context.signal,
+            allowedFixtureExecutablePaths: adapterPolicy.allowedFixtureExecutablePaths,
+            pinnedUnrealTools: adapterPolicy.pinnedUnrealTools,
+            approvedUnrealProfiles: adapterPolicy.approvedUnrealProfiles,
+            showLocally: (summary) => stdout.write(`${summary}\n`),
+            confirmLargeUnrealJob: async (summary) => {
+              if (!process.stdin.isTTY || !process.stdout.isTTY) return false;
+              const terminal = createInterface({ input: stdin, output: stdout });
+              try { return (await terminal.question(`${summary}\nConfirm this large local Unreal job [y/N]: `)).trim().toLowerCase() === 'y'; }
+              finally { terminal.close(); }
+            }
           });
           await transport.uploadEvidence(auth, executed.evidence);
           await transport.submitResult(auth, executed.result);
@@ -84,6 +101,23 @@ export async function main(args = process.argv.slice(2)): Promise<void> {
     return;
   }
   if (parsed.command === 'session-drain') { await transport.drain(auth, parsed.sessionId); return; }
+}
+
+interface LocalAdapterPolicy {
+  allowedFixtureExecutablePaths: string[];
+  pinnedUnrealTools: import('./unreal-adapter.js').PinnedUnrealTool[];
+  approvedUnrealProfiles: import('./unreal-adapter.js').ApprovedUnrealProfile[];
+}
+
+function readLocalAdapterPolicy(): LocalAdapterPolicy {
+  const raw = process.env.FORGEMIND_WINDOWS_ADAPTER_POLICY;
+  if (!raw) return { allowedFixtureExecutablePaths: [], pinnedUnrealTools: [], approvedUnrealProfiles: [] };
+  const value = JSON.parse(raw) as Partial<LocalAdapterPolicy>;
+  return {
+    allowedFixtureExecutablePaths: Array.isArray(value.allowedFixtureExecutablePaths) ? value.allowedFixtureExecutablePaths : [],
+    pinnedUnrealTools: Array.isArray(value.pinnedUnrealTools) ? value.pinnedUnrealTools : [],
+    approvedUnrealProfiles: Array.isArray(value.approvedUnrealProfiles) ? value.approvedUnrealProfiles : []
+  };
 }
 
 function option(args: string[], name: string): string | undefined { const index = args.indexOf(name); return index >= 0 ? args[index + 1] : undefined; }

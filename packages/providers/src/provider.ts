@@ -115,7 +115,12 @@ export interface ValidationCheck {
   timeoutMinutes?: number;
   criterion?: string;
   rationale?: string;
+  windowsAdapter?: WindowsValidationAdapter;
 }
+
+export type WindowsValidationAdapter =
+  | { kind: 'fixture-validation'; executablePath: string; inputRelativePath: string; artifactRelativePath: string; minimumFreeSpaceBytes: number; maxConcurrentProcesses: number }
+  | { kind: 'unreal-validation'; profileId: string; tool: 'unreal-editor-cmd' | 'build-bat' | 'automation-tool' | 'project-script'; executablePath: string; workingDirectoryRelativePath: string; args: string[]; size: 'standard' | 'large'; minimumLargeJobFreeSpaceBytes: number };
 
 export interface ValidationProvenance {
   version: 1;
@@ -165,13 +170,31 @@ export function normalizeValidationChecks(value: unknown): ValidationCheck[] {
       ? Array.from(new Set(check.requiredCapabilities.filter((item): item is string => typeof item === 'string' && item.trim().length > 0).map((item) => item.trim())))
       : [];
     if (check.kind === 'command' && typeof check.command === 'string' && check.command.trim()) {
+      const windowsAdapter = target === 'windows' ? normalizeWindowsValidationAdapter(check.windowsAdapter) : undefined;
       return [{
         kind: 'command', command: check.command.trim(), shell, target, continueOnFailure, category, criterion, rationale, timeoutMinutes,
-        requiredCapabilities: target === 'windows' ? Array.from(new Set(['windows', ...requiredCapabilities])) : []
+        requiredCapabilities: target === 'windows' ? Array.from(new Set(['windows', ...requiredCapabilities])) : [],
+        ...(windowsAdapter ? { windowsAdapter } : {})
       }];
     }
     return [];
   });
+}
+
+function normalizeWindowsValidationAdapter(value: unknown): WindowsValidationAdapter | undefined {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return undefined;
+  const item = value as Record<string, unknown>;
+  if (item.kind === 'fixture-validation' && typeof item.executablePath === 'string' && typeof item.inputRelativePath === 'string'
+    && typeof item.artifactRelativePath === 'string' && Number.isSafeInteger(item.minimumFreeSpaceBytes) && Number.isSafeInteger(item.maxConcurrentProcesses)) {
+    return item as unknown as WindowsValidationAdapter;
+  }
+  if (item.kind === 'unreal-validation' && typeof item.profileId === 'string' && typeof item.executablePath === 'string'
+    && typeof item.workingDirectoryRelativePath === 'string' && Array.isArray(item.args) && item.args.every((arg) => typeof arg === 'string')
+    && ['unreal-editor-cmd', 'build-bat', 'automation-tool', 'project-script'].includes(item.tool as string)
+    && ['standard', 'large'].includes(item.size as string) && Number.isSafeInteger(item.minimumLargeJobFreeSpaceBytes)) {
+    return item as unknown as WindowsValidationAdapter;
+  }
+  return undefined;
 }
 
 function isValidationShell(value: unknown): value is NonNullable<ValidationCheck['shell']> {

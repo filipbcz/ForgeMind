@@ -23,9 +23,10 @@ interface PostgreSqlClient {
 }
 const ids = { user: 'lease_test_user', project: 'lease_test_project', task: 'lease_test_task', run: 'lease_test_run', device: 'lease_test_device', session: 'lease_test_session', job: 'lease_test_job' };
 const digest = 'a'.repeat(64);
-const integrationPacket = { schemaVersion: 1 as const, projectId: ids.project, taskId: ids.task, runId: ids.run, checkId: 'lease_test_check', jobId: ids.job,
+const integrationPacket = { schemaVersion: 2 as const, projectId: ids.project, taskId: ids.task, runId: ids.run, checkId: 'lease_test_check', jobId: ids.job,
   leaseId: 'pending', repository: 'owner/repo', sourceUrl: 'https://example.test/repo.git', commitSha: digest, workspaceRoot: 'C:\\work', artifactRoot: 'C:\\artifacts',
   check: { command: 'fixture.exe', category: 'smoke' as const, requiredCapabilities: ['windows'] }, requiredCapabilities: ['windows'],
+  dispatch: { kind: 'deferred' as const, reason: 'unsupported_validation_intent' as const, handling: 'manual-local' as const },
   resourcePolicy: { timeoutSeconds: 60, maxLogBytes: 1024, maxArtifactBytes: 1024 }, expectedArtifacts: [], nonce: 'pending', inputHash: digest };
 let first: PrismaClient;
 let second: PrismaClient;

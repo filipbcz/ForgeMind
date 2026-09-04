@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import {
-  WINDOWS_WORKER_SCHEMA_VERSION, canTransitionExecutionJob, canTransitionWorkerDevice,
+  WINDOWS_WORKER_SCHEMA_VERSION, canTransitionExecutionJob, canTransitionWorkerDevice, classifyWindowsExecutionPacket,
   canTransitionWorkerSession, isWindowsExecutionPacket, isWindowsExecutionResult,
   type WindowsExecutionPacket, type WindowsExecutionResult
 } from './windows-worker.js';
@@ -8,18 +8,25 @@ import {
 const hash = 'a'.repeat(64);
 const commitSha = 'b'.repeat(40);
 const packet: WindowsExecutionPacket = {
-  schemaVersion: WINDOWS_WORKER_SCHEMA_VERSION, projectId: 'p', taskId: 't', runId: 'r', checkId: 'c', jobId: 'j', leaseId: 'l',
+  schemaVersion: 2, projectId: 'p', taskId: 't', runId: 'r', checkId: 'c', jobId: 'j', leaseId: 'l',
   repository: 'owner/repo', sourceUrl: 'https://github.com/owner/repo.git', commitSha,
   workspaceRoot: 'C:\\ForgeMind\\work', artifactRoot: 'C:\\ForgeMind\\artifacts',
   check: { command: 'fixture validate', category: 'smoke', requiredCapabilities: ['windows'] }, requiredCapabilities: ['windows'],
+  dispatch: { kind: 'deferred', reason: 'unsupported_validation_intent', handling: 'manual-local' },
   resourcePolicy: { timeoutSeconds: 60, maxLogBytes: 1024, maxArtifactBytes: 2048 }, expectedArtifacts: [], nonce: 'nonce', inputHash: hash
 };
 
 describe('Windows worker shared contracts', () => {
   it('validates a versioned packet and rejects mutable source identities', () => {
     expect(isWindowsExecutionPacket(packet)).toBe(true);
-    expect(isWindowsExecutionPacket({ ...packet, schemaVersion: 2 })).toBe(false);
+    expect(isWindowsExecutionPacket({ ...packet, schemaVersion: 1 })).toBe(false);
     expect(isWindowsExecutionPacket({ ...packet, commitSha: 'main' })).toBe(false);
+    expect(classifyWindowsExecutionPacket({ ...packet, schemaVersion: 1, dispatch: undefined })).toMatchObject({
+      status: 'deferred', reason: 'legacy_unsafe_packet', handling: 'manual-local'
+    });
+    expect(classifyWindowsExecutionPacket(packet)).toMatchObject({
+      status: 'deferred', reason: 'unsupported_validation_intent', handling: 'manual-local'
+    });
   });
 
   it('validates correlated results', () => {
@@ -63,6 +70,7 @@ describe('Windows worker shared contracts', () => {
     expect(isWindowsExecutionPacket({ ...packet, expectedArtifacts: [{ name: 'log', relativePath: '', required: true }] })).toBe(false);
     expect(isWindowsExecutionPacket({ ...packet, resourcePolicy: { ...packet.resourcePolicy, maxLogBytes: -1 } })).toBe(false);
     expect(isWindowsExecutionPacket({ ...packet, check: { ...packet.check, shell: 'unknown' } })).toBe(false);
+    expect(isWindowsExecutionPacket({ ...packet, dispatch: { kind: 'raw-shell', command: 'whoami' } })).toBe(false);
     expect(isWindowsExecutionPacket({ ...packet, evidenceContext: { cycleId: 'cycle', stepId: 'step', requirementIds: [], contractVersion: 0 } })).toBe(false);
   });
 });
