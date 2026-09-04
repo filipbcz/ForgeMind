@@ -5,12 +5,13 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, expect, it, vi } from 'vitest';
 import { ROADMAP_GENERATION_CONFIRMATION } from '@forgemind/core';
+import type { ProjectContract } from '@forgemind/core';
 import type { AIProvider, CostEstimateResult, ImplementInput, ImplementResult, PlanInput, PlanResult, ReviewInput, ReviewResult } from '@forgemind/providers';
 import type { GitHubAdapter } from '@forgemind/github';
 import { createAuthService } from './auth.js';
 import type { AuthService, AuthUser } from './auth.js';
 import { createNotificationService } from './notifications.js';
-import { registerRoutes } from './routes.js';
+import { buildAuditGapReviewContract, registerRoutes } from './routes.js';
 import { signGitHubWebhookPayload } from './webhook.js';
 
 function restoreEnv(name: string, previous: string | undefined) {
@@ -179,6 +180,34 @@ const authenticatedReadEndpointInventory = [
   '/api/worker/events',
   '/api/metrics'
 ] as const;
+
+describe('audit gap quality review contract', () => {
+  const current: ProjectContract = {
+    version: 2, summary: 'Current scope', invariants: ['Persist data'], prohibitedSubstitutes: [],
+    requirements: [{
+      id: 'REQ-CURRENT', title: 'Current', description: 'Current capability', acceptanceCriteria: ['It works'],
+      status: 'active', introducedInVersion: 1, lastChangedInVersion: 1
+    }],
+    releaseCriteria: ['Build passes']
+  };
+
+  it('includes proposed requirements in the non-persisted contract reviewed before activation', () => {
+    const proposed = {
+      id: 'REQ-EXPORT', title: 'Export', description: 'Export persisted data',
+      acceptanceCriteria: ['Users can export data'], briefReferences: ['export results'],
+      status: 'active' as const, introducedInVersion: 1, lastChangedInVersion: 1
+    };
+    const candidate = buildAuditGapReviewContract(current, [proposed]);
+    expect(candidate.version).toBe(3);
+    expect(candidate.requirements).toEqual([current.requirements[0], { ...proposed, introducedInVersion: 3, lastChangedInVersion: 3 }]);
+    expect(current.requirements).toHaveLength(1);
+  });
+
+  it('rejects a proposed requirement that shadows current contract scope', () => {
+    expect(() => buildAuditGapReviewContract(current, [{ ...current.requirements[0]! }]))
+      .toThrow('duplicates the current contract');
+  });
+});
 
 describe('Studio API routes', () => {
   it('rejects mutating API requests when auth service is not configured', async () => {

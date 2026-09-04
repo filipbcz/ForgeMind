@@ -850,9 +850,23 @@ async function runNextProjectAudit(input: {
         return { claimed: true, kind: 'project_audit', projectId: claimed.project.id, status: 'blocked', provider: getLastProviderKind() };
       }
       if (audit.verdict === 'partial') {
-        const created = await input.repository.appendProjectImplementationSteps({
-          projectId: claimed.project.id,
-          cycleId: claimed.cycle.id,
+        const steps = audit.gapWorkItems.map((step) => ({
+          title: step.title,
+          description: formatGapStepDescription(step),
+          acceptanceCriteria: step.acceptanceCriteria,
+          requirementIds: step.requirementIds,
+          deliverables: step.deliverables,
+          changeRationale: step.changeRationale,
+          dependsOnStepTitles: step.dependsOnStepTitles,
+          validationFocus: step.validationFocus
+        }));
+        if (steps.length === 0) {
+          const message = 'Capability audit found a gap but did not produce a new, traceable work item.';
+          await input.repository.finalizeProjectAudit(claimed.job.id, 'blocked', message);
+          return { claimed: true, kind: 'project_audit', projectId: claimed.project.id, status: 'blocked', provider: getLastProviderKind() };
+        }
+        await input.repository.saveProjectAuditGapProposal(claimed.job.id, {
+          kind: 'capability', summary: audit.summary, commitSha: workspace.commitSha, newRequirements: [],
           steps: audit.gapWorkItems.map((step) => ({
             title: step.title,
             description: formatGapStepDescription(step),
@@ -864,20 +878,14 @@ async function runNextProjectAudit(input: {
             validationFocus: step.validationFocus
           }))
         });
-        if (created.length === 0) {
-          const message = 'Capability audit found a gap but did not produce a new, traceable work item.';
-          await input.repository.finalizeProjectAudit(claimed.job.id, 'blocked', message);
-          return { claimed: true, kind: 'project_audit', projectId: claimed.project.id, status: 'blocked', provider: getLastProviderKind() };
-        }
+        await input.repository.updateProjectRoadmapCycleStatus(claimed.cycle.id, 'partial');
         await input.repository.finalizeProjectAudit(claimed.job.id, 'succeeded');
-        const nextTask = await startNextRoadmapStep(input.repository, claimed.project.id, claimed.cycle.id);
         return {
           claimed: true,
           kind: 'project_audit',
           projectId: claimed.project.id,
-          status: 'gaps_scheduled',
-          gapStepCount: created.length,
-          nextTaskId: nextTask?.id,
+          status: 'gaps_proposed',
+          gapStepCount: steps.length,
           provider: getLastProviderKind()
         };
       }
@@ -921,9 +929,18 @@ async function runNextProjectAudit(input: {
         return { claimed: true, kind: 'project_audit', projectId: claimed.project.id, status: 'blocked', provider: getLastProviderKind() };
       }
       if (releaseAudit.verdict === 'partial') {
-        const created = await input.repository.appendProjectImplementationSteps({
-          projectId: claimed.project.id,
-          cycleId: claimed.cycle.id,
+        const steps = releaseAudit.gapWorkItems.map((step) => ({
+          title: step.title, description: formatGapStepDescription(step), acceptanceCriteria: step.acceptanceCriteria,
+          requirementIds: step.requirementIds, deliverables: step.deliverables, changeRationale: step.changeRationale,
+          dependsOnStepTitles: step.dependsOnStepTitles, validationFocus: step.validationFocus
+        }));
+        if (steps.length === 0) {
+          const message = 'Release audit found a gap but did not produce a new, traceable work item.';
+          await input.repository.finalizeProjectAudit(claimed.job.id, 'blocked', message);
+          return { claimed: true, kind: 'project_audit', projectId: claimed.project.id, status: 'blocked', provider: getLastProviderKind() };
+        }
+        await input.repository.saveProjectAuditGapProposal(claimed.job.id, {
+          kind: 'release', summary: releaseAudit.summary, commitSha: workspace.commitSha,
           newRequirements: releaseAudit.contractAmendments,
           steps: releaseAudit.gapWorkItems.map((step) => ({
             title: step.title,
@@ -936,20 +953,14 @@ async function runNextProjectAudit(input: {
             validationFocus: step.validationFocus
           }))
         });
-        if (created.length === 0) {
-          const message = 'Release audit found a gap but did not produce a new, traceable work item.';
-          await input.repository.finalizeProjectAudit(claimed.job.id, 'blocked', message);
-          return { claimed: true, kind: 'project_audit', projectId: claimed.project.id, status: 'blocked', provider: getLastProviderKind() };
-        }
+        await input.repository.updateProjectRoadmapCycleStatus(claimed.cycle.id, 'partial');
         await input.repository.finalizeProjectAudit(claimed.job.id, 'succeeded');
-        const nextTask = await startNextRoadmapStep(input.repository, claimed.project.id, claimed.cycle.id);
         return {
           claimed: true,
           kind: 'project_audit',
           projectId: claimed.project.id,
-          status: 'release_gaps_scheduled',
-          gapStepCount: created.length,
-          nextTaskId: nextTask?.id,
+          status: 'release_gaps_proposed',
+          gapStepCount: steps.length,
           provider: getLastProviderKind()
         };
       }

@@ -537,6 +537,21 @@ export type ProjectRoadmapCycleStatus =
 
 export type ProjectAuditJobStatus = 'pending' | 'claimed' | 'succeeded' | 'blocked' | 'failed';
 
+export interface AuditGapProposal {
+  kind: 'capability' | 'release';
+  summary: string;
+  commitSha: string;
+  newRequirements: ProjectContractRequirement[];
+  steps: Array<Omit<ProjectImplementationStep, 'id' | 'projectId' | 'cycleId' | 'sequenceNumber' | 'status' | 'taskId' | 'createdAt' | 'updatedAt' | 'completedAt'>>;
+}
+export interface AuditGapProposalHistoryEntry {
+  proposal: AuditGapProposal;
+  status: 'proposed' | 'activated' | 'dismissed';
+  review?: { verdict: 'satisfied' | 'not_satisfied'; summary: string; blockers: string[] };
+  decidedAt?: IsoDateString;
+  archivedAt: IsoDateString;
+}
+
 export interface ProjectAuditJob {
   id: string;
   projectId: string;
@@ -547,6 +562,11 @@ export interface ProjectAuditJob {
   attemptCount: number;
   nextAttemptAt?: IsoDateString;
   errorMessage?: string;
+  gapProposal?: AuditGapProposal;
+  gapProposalStatus?: 'proposed' | 'activating' | 'activated' | 'dismissed';
+  gapProposalReview?: { verdict: 'satisfied' | 'not_satisfied'; summary: string; blockers: string[] };
+  gapProposalDecidedAt?: IsoDateString;
+  gapProposalHistory?: AuditGapProposalHistoryEntry[];
   createdAt: IsoDateString;
   updatedAt: IsoDateString;
   claimedAt?: IsoDateString;

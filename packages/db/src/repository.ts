@@ -14,6 +14,7 @@ import {
   type AcceptanceEvidenceStatus,
   assertTaskTransition,
   type AuditEvent,
+  type AuditGapProposal,
   type ChatMessage,
   type ChatRun,
   type ChatThread,
@@ -1999,17 +2000,6 @@ export class ForgeMindRepository {
           });
         }
       }
-      const invalidatedRequirementIds = Array.from(new Set(uniqueSteps.flatMap((step) => step.requirementIds)));
-      await tx.acceptanceEvidence.deleteMany({
-        where: {
-          cycleId: input.cycleId,
-          source: 'repository_audit',
-          OR: [
-            { requirementId: { in: invalidatedRequirementIds } },
-            { criterion: { startsWith: 'Release: ' } }
-          ]
-        }
-      });
       const created: ProjectImplementationStep[] = [];
       for (const [index, step] of uniqueSteps.entries()) {
         const record = await tx.projectImplementationStep.create({
@@ -2919,6 +2909,99 @@ export class ForgeMindRepository {
       });
     });
     return { retryScheduled: false };
+  }
+
+  async saveProjectAuditGapProposal(auditJobId: string, proposal: AuditGapProposal): Promise<ProjectAuditJob> {
+    const job = await this.prisma.projectAuditJob.findUnique({ where: { id: auditJobId } });
+    if (!job || job.status !== 'claimed') throw new Error('Only a claimed audit can store gap proposals.');
+    const history = Array.isArray(job.gapProposalHistory) ? [...job.gapProposalHistory] : [];
+    if (job.gapProposal && job.gapProposalStatus) {
+      history.push({
+        proposal: job.gapProposal,
+        status: job.gapProposalStatus === 'activating' ? 'proposed' : job.gapProposalStatus,
+        review: job.gapProposalReview,
+        decidedAt: job.gapProposalDecidedAt?.toISOString(),
+        archivedAt: new Date().toISOString()
+      });
+    }
+    const updated = await this.prisma.projectAuditJob.update({
+      where: { id: auditJobId },
+      data: {
+        gapProposal: toPrismaJson(proposal as unknown as JsonValue),
+        gapProposalStatus: 'proposed',
+        gapProposalReview: Prisma.DbNull,
+        gapProposalDecidedAt: null,
+        gapProposalHistory: toPrismaJson(history as unknown as JsonValue)
+      }
+    });
+    await this.writeAudit({
+      actorType: 'agent', eventType: 'project_audit_gap_proposed', projectId: job.projectId,
+      taskId: job.triggerTaskId ?? undefined,
+      payload: { auditJobId, cycleId: job.cycleId, kind: proposal.kind, commitSha: proposal.commitSha, stepCount: proposal.steps.length }
+    });
+    return toProjectAuditJob(updated);
+  }
+
+  async decideProjectAuditGapProposal(input: {
+    projectId: string;
+    auditJobId: string;
+    accepted: boolean;
+    review?: { verdict: 'satisfied' | 'not_satisfied'; summary: string; blockers: string[] };
+  }): Promise<ProjectAuditJob> {
+    const job = await this.prisma.projectAuditJob.findUnique({ where: { id: input.auditJobId } });
+    if (!job || job.projectId !== input.projectId || !job.gapProposal) throw new Error('Audit gap proposal was not found.');
+    if (job.gapProposalStatus !== 'proposed') return toProjectAuditJob(job);
+    if (input.accepted && input.review?.verdict !== 'satisfied') throw new Error('Audit gap proposal requires a satisfied independent roadmap quality review.');
+    const reserved = await this.prisma.projectAuditJob.updateMany({
+      where: { id: job.id, projectId: input.projectId, gapProposalStatus: 'proposed' },
+      data: {
+        gapProposalStatus: input.accepted ? 'activating' : 'dismissed',
+        gapProposalReview: input.review ? toPrismaJson(input.review as unknown as JsonValue) : Prisma.DbNull,
+        gapProposalDecidedAt: input.accepted ? null : new Date()
+      }
+    });
+    if (reserved.count === 0) {
+      const current = await this.prisma.projectAuditJob.findUnique({ where: { id: job.id } });
+      if (!current) throw new Error('Audit gap proposal was not found.');
+      return toProjectAuditJob(current);
+    }
+    if (input.accepted) {
+      const proposal = job.gapProposal as unknown as AuditGapProposal;
+      try {
+        await this.appendProjectImplementationSteps({
+          projectId: input.projectId, cycleId: job.cycleId,
+          newRequirements: proposal.newRequirements, steps: proposal.steps
+        });
+      } catch (error) {
+        await this.prisma.projectAuditJob.updateMany({
+          where: { id: job.id, gapProposalStatus: 'activating' },
+          data: { gapProposalStatus: 'proposed', gapProposalDecidedAt: null }
+        });
+        throw error;
+      }
+    }
+    const updated = await this.prisma.projectAuditJob.update({
+      where: { id: job.id },
+      data: {
+        gapProposalStatus: input.accepted ? 'activated' : 'dismissed',
+        gapProposalReview: input.review ? toPrismaJson(input.review as unknown as JsonValue) : Prisma.DbNull,
+        gapProposalDecidedAt: new Date()
+      }
+    });
+    await this.writeAudit({
+      actorType: 'user', eventType: input.accepted ? 'project_audit_gap_activated' : 'project_audit_gap_dismissed',
+      projectId: input.projectId,
+      payload: { auditJobId: job.id, cycleId: job.cycleId, review: input.review ?? null }
+    });
+    return toProjectAuditJob(updated);
+  }
+
+  async saveProjectAuditGapReview(input: { projectId: string; auditJobId: string; review: { verdict: 'satisfied' | 'not_satisfied'; summary: string; blockers: string[] } }): Promise<ProjectAuditJob> {
+    const job = await this.prisma.projectAuditJob.findUnique({ where: { id: input.auditJobId } });
+    if (!job || job.projectId !== input.projectId || job.gapProposalStatus !== 'proposed') throw new Error('Active audit gap proposal was not found.');
+    const updated = await this.prisma.projectAuditJob.update({ where: { id: job.id }, data: { gapProposalReview: toPrismaJson(input.review as unknown as JsonValue) } });
+    await this.writeAudit({ actorType: 'system', eventType: 'project_audit_gap_reviewed', projectId: input.projectId, payload: { auditJobId: job.id, cycleId: job.cycleId, ...input.review } });
+    return toProjectAuditJob(updated);
   }
 
   async recoverStuckProjectAudits(claimTimeoutMinutes = 2): Promise<number> {

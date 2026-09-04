@@ -254,6 +254,12 @@ export async function startProjectAudit(projectId: string): Promise<ProjectRoadm
   return request<ProjectRoadmapApi>(`/api/projects/${projectId}/audit/start`, { method: 'POST' });
 }
 
+export async function decideAuditGapProposal(projectId: string, auditJobId: string, accepted: boolean): Promise<ProjectRoadmapApi> {
+  return request<ProjectRoadmapApi>(`/api/projects/${projectId}/audit/gaps/decision`, {
+    method: 'POST', body: JSON.stringify({ auditJobId, accepted })
+  });
+}
+
 export async function generateProjectRoadmap(projectId: string, input: GenerateProjectRoadmapRequest): Promise<ProjectRoadmapApi> {
   return request<ProjectRoadmapApi>(`/api/projects/${projectId}/implementation-steps/generate`, {
     method: 'POST',
