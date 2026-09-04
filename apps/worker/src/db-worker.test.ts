@@ -2925,10 +2925,11 @@ github:
       projectId: 'project_1',
       taskId: 'task_1',
       runId: 'run_1',
-      requiredCapabilities: ['windows'],
+      requiredCapabilities: ['windows', 'cmake', 'msvc'],
       packet: expect.objectContaining({
         commitSha: 'a'.repeat(40),
-        check: expect.objectContaining({ command: 'cmake --build --preset windows-release', shell: 'powershell' }),
+        requiredCapabilities: ['windows', 'cmake', 'msvc'],
+        check: expect.objectContaining({ command: 'cmake --build --preset windows-release', shell: 'powershell', requiredCapabilities: ['windows', 'cmake', 'msvc'] }),
         resourcePolicy: expect.objectContaining({ timeoutSeconds: 2700 }),
         evidenceContext: { cycleId: 'cycle_1', stepId: 'step_1', requirementIds: ['REQ-WIN'], contractVersion: 3 }
       })

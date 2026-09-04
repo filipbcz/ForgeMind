@@ -6,7 +6,7 @@ import { stdin, stdout } from 'node:process';
 import { pathToFileURL } from 'node:url';
 import { WindowsCredentialStore } from './credential-store.js';
 import { cleanupWindowsValidationWorkspace, executeWindowsValidation } from './executor.js';
-import { runCapabilityProbes } from './probes.js';
+import { runCapabilityProbes, windowsRunnerCapabilityProbes } from './probes.js';
 import { runManualSession } from './session.js';
 import { WindowsRunnerTransport } from './transport.js';
 
@@ -53,7 +53,7 @@ export async function main(args = process.argv.slice(2)): Promise<void> {
     stdout.write(`Enrolled device ${credential.deviceId}.\n`); return;
   }
   const auth = await store.load(); if (!auth) throw new Error('Runner is not enrolled.');
-  const probes = await runCapabilityProbes([{ capability: { key: 'windows', version: osRelease() } }]);
+  const probes = await runCapabilityProbes(windowsRunnerCapabilityProbes(osRelease()));
   if (parsed.command === 'probe') {
     await transport.publishDevice(auth, { runnerVersion: RUNNER_VERSION, displayName: process.env.COMPUTERNAME ?? 'Windows runner', capabilities: probes.capabilities, probeEvidence: probes.evidence });
     stdout.write(`${JSON.stringify(probes.evidence, null, 2)}\n`); return;

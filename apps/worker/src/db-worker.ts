@@ -58,8 +58,8 @@ async function enqueueExternalWindowsValidations(
   for (const check of input.checks) {
     const jobId = randomUUID();
     const checkId = randomUUID();
-    const requestedCapabilities = Array.from(new Set(check.requiredCapabilities ?? []));
-    const requiredCapabilities = ['windows'];
+    const requestedCapabilities = Array.from(new Set((check.requiredCapabilities ?? []).map((capability) => capability.trim()).filter(Boolean)));
+    const requiredCapabilities = Array.from(new Set(['windows', ...requestedCapabilities]));
     const inputHash = createHash('sha256')
       .update(JSON.stringify({ commitSha: input.commitSha, command: check.command, shell: check.shell ?? 'system', requestedCapabilities }))
       .digest('hex');
