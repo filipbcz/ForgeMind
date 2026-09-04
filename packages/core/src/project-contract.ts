@@ -3,7 +3,10 @@ import type {
   ProjectContractCollectionDelta,
   ProjectContractDelta,
   ProjectContractRequirement,
-  ProjectContractRequirementDraft
+  ProjectContractRequirementDraft,
+  ProjectContractRequirementRemoval,
+  ProjectContractRequirementSupersession,
+  ProjectContractRequirementUpdate
 } from './model.js';
 
 export interface AppliedProjectContractDelta {
@@ -17,6 +20,84 @@ export function isActiveProjectContractRequirement(requirement: ProjectContractR
 
 export function activeProjectContractRequirements(contract: ProjectContract): ProjectContractRequirement[] {
   return contract.requirements.filter(isActiveProjectContractRequirement);
+}
+
+/** Collapse a corrected candidate into one persistable version change against the current stored contract. */
+export function deriveProjectContractDelta(
+  base: ProjectContract,
+  target: ProjectContract,
+  rationale: string,
+  migrationImpacts: string[] = [],
+  compatibilityImpacts: string[] = []
+): ProjectContractDelta {
+  const baseById = new Map(base.requirements.map((item) => [item.id, item]));
+  const targetById = new Map(target.requirements.map((item) => [item.id, item]));
+  const replacementIds = new Set<string>();
+  const supersedeRequirements: ProjectContractRequirementSupersession[] = [];
+  const removeRequirements: ProjectContractRequirementRemoval[] = [];
+  const updateRequirements: ProjectContractRequirementUpdate[] = [];
+
+  for (const existing of activeProjectContractRequirements(base)) {
+    const next = targetById.get(existing.id);
+    if (!next || next.status === 'removed') {
+      removeRequirements.push({ id: existing.id, rationale: next?.lifecycleReason?.trim() || rationale });
+      continue;
+    }
+    if (next.status === 'superseded' && next.supersededByRequirementId) {
+      const replacement = targetById.get(next.supersededByRequirementId);
+      if (!replacement) throw new Error(`Corrected contract is missing replacement "${next.supersededByRequirementId}".`);
+      replacementIds.add(replacement.id);
+      supersedeRequirements.push({
+        id: existing.id, replacement: requirementDraft(replacement),
+        rationale: next.lifecycleReason?.trim() || rationale
+      });
+      continue;
+    }
+    if (next.status === 'active' && !sameRequirementSemantics(existing, next)) {
+      updateRequirements.push({
+        id: existing.id, title: next.title, description: next.description,
+        acceptanceCriteria: [...next.acceptanceCriteria],
+        briefReferences: next.briefReferences ? [...next.briefReferences] : undefined,
+        rationale: next.lifecycleReason?.trim() || rationale
+      });
+    }
+  }
+
+  const addRequirements = activeProjectContractRequirements(target)
+    .filter((item) => !baseById.has(item.id) && !replacementIds.has(item.id))
+    .map(requirementDraft);
+  return {
+    baseVersion: base.version,
+    summary: target.summary !== base.summary ? target.summary : undefined,
+    addRequirements, updateRequirements, supersedeRequirements, removeRequirements,
+    invariantChanges: deriveCollectionDelta(base.invariants, target.invariants, rationale),
+    prohibitedSubstituteChanges: deriveCollectionDelta(base.prohibitedSubstitutes, target.prohibitedSubstitutes, rationale),
+    releaseCriteriaChanges: deriveCollectionDelta(base.releaseCriteria, target.releaseCriteria, rationale),
+    migrationImpacts: [...migrationImpacts], compatibilityImpacts: [...compatibilityImpacts]
+  };
+}
+
+function requirementDraft(requirement: ProjectContractRequirement): ProjectContractRequirementDraft {
+  return {
+    id: requirement.id, title: requirement.title, description: requirement.description,
+    acceptanceCriteria: [...requirement.acceptanceCriteria],
+    briefReferences: requirement.briefReferences ? [...requirement.briefReferences] : undefined
+  };
+}
+
+function sameRequirementSemantics(left: ProjectContractRequirement, right: ProjectContractRequirement): boolean {
+  return left.title === right.title && left.description === right.description
+    && sameStringList(left.acceptanceCriteria, right.acceptanceCriteria)
+    && sameStringList(left.briefReferences ?? [], right.briefReferences ?? []);
+}
+
+function deriveCollectionDelta(current: string[], target: string[], rationale: string): ProjectContractCollectionDelta {
+  const currentSet = new Set(current);
+  const targetSet = new Set(target);
+  return {
+    add: target.filter((value) => !currentSet.has(value)),
+    remove: current.filter((value) => !targetSet.has(value)).map((value) => ({ value, rationale }))
+  };
 }
 
 export function applyProjectContractDelta(

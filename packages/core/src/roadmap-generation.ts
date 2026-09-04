@@ -36,7 +36,8 @@ export interface RoadmapQualityReview {
 }
 
 export interface RoadmapGenerationCheckpoint {
-  version: 1;
+  /** Version 2 adds resumable targeted contract correction; readers also accept version 1. */
+  version: 1 | 2;
   phase: 'validate' | 'repair' | 'review' | 'ready';
   revision: number;
   plan: RoadmapCandidate;

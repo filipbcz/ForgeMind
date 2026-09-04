@@ -1,7 +1,7 @@
 import { redactError } from '@forgemind/core';
 import type { ImplementationStepPlan, RoadmapCandidate, RoadmapQualityReview } from '@forgemind/core';
 export type { ImplementationStepPlan } from '@forgemind/core';
-import type { AcceptanceEvidenceSource, AcceptanceEvidenceStatus, NormalizedProviderErrorDetails, NormalizedProviderErrorKind, ProjectArchitectureUpdate, ProjectContract, ProjectContractRequirement, ProviderKind, ProviderPreflightResult, TaskMode, ValidationCheckCategory } from '@forgemind/core';
+import type { AcceptanceEvidenceSource, AcceptanceEvidenceStatus, NormalizedProviderErrorDetails, NormalizedProviderErrorKind, ProjectArchitectureUpdate, ProjectContract, ProjectContractDelta, ProjectContractRequirement, ProviderKind, ProviderPreflightResult, TaskMode, ValidationCheckCategory } from '@forgemind/core';
 
 export type { NormalizedProviderErrorDetails, NormalizedProviderErrorKind, ProviderPreflightResult } from '@forgemind/core';
 
@@ -61,6 +61,10 @@ export interface RoadmapRepairInput {
   validationError: string;
   implementationSteps: ImplementationStepPlan[];
   projectContract: ProjectContract;
+  /** Last persisted contract, when one exists; repair output is composed against this base before persistence. */
+  persistedProjectContract?: ProjectContract;
+  /** Complete current specification; historical contract text is context, not an active instruction. */
+  authoritativeSpecification?: string;
   requiredRequirementIds: string[];
   completedStepTitles: string[];
   migrationImpacts: string[];
@@ -74,6 +78,8 @@ export interface RoadmapRepairInput {
 
 export interface RoadmapRepairResult {
   implementationSteps: ImplementationStepPlan[];
+  /** Present only when the validation blocker is a stale derived-contract obligation. */
+  contractDelta?: ProjectContractDelta;
   providerPrompt?: string;
   providerResponse?: string;
 }
@@ -81,6 +87,7 @@ export interface RoadmapRepairResult {
 export interface RoadmapQualityReviewInput {
   taskId: string;
   objective: string;
+  authoritativeSpecification?: string;
   projectContract: ProjectContract;
   implementationSteps: ImplementationStepPlan[];
   requiredRequirementIds: string[];

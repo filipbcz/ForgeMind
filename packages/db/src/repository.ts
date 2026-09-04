@@ -1741,7 +1741,9 @@ export class ForgeMindRepository {
     });
     const payload = event?.payload as { contextKey?: string; checkpoint?: RoadmapGenerationCheckpoint } | undefined;
     if (payload?.contextKey !== contextKey) return undefined;
-    if (payload.checkpoint?.version !== 1) throw new Error('Unsupported roadmap generation checkpoint version.');
+    if (payload.checkpoint && payload.checkpoint.version !== 1 && payload.checkpoint.version !== 2) {
+      throw new Error('Unsupported roadmap generation checkpoint version.');
+    }
     return payload.checkpoint;
   }
 

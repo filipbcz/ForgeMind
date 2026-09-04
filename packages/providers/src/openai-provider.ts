@@ -135,12 +135,13 @@ export class OpenAIProvider implements AIProvider {
     const messages: Array<{ role: 'system' | 'user' | 'assistant'; content: string }> = [
       {
         role: 'system',
-        content: 'Repair only the supplied invalid implementation roadmap. Return JSON containing implementationSteps only. Preserve valid steps and do not regenerate the brief, contract, architecture, or objective. Each step may contain at most 3 requirementIds, 3 deliverables, 5 acceptanceCriteria, and 5 inScope items; split oversized work while preserving complete requirement coverage.'
+        content: 'Repair only the supplied invalid implementation roadmap, except when the blocker proves the derived contract contradicts the complete current specification. Return JSON containing implementationSteps and contractDelta (null unless a targeted contract correction is necessary). The CURRENT SPECIFICATION is authoritative; the existing contract is historical derived context, not a current normative instruction. Preserve valid steps and untouched requirement IDs and semantics. Never turn an obsolete obligation into roadmap work. A contract correction must be the smallest explicit delta against the supplied version and give a non-empty rationale for every update, supersession, or removal. Do not broadly regenerate the contract. Each step may contain at most 3 requirementIds, 3 deliverables, 5 acceptanceCriteria, and 5 inScope items; split oversized work while preserving complete requirement coverage.'
       },
       {
         role: 'user',
         content: [
           `Objective: ${input.objective}`,
+          `CURRENT SPECIFICATION (authoritative, complete):\n${input.authoritativeSpecification ?? input.objective}`,
           `Validation error: ${input.validationError}`,
           `Requirement ids that must remain covered: ${input.requiredRequirementIds.join(', ')}`,
           `Completed step titles that must not be recreated: ${input.completedStepTitles.join(' | ') || 'none'}`,

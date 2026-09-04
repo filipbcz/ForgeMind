@@ -3,7 +3,7 @@ import type { FastifyReply, FastifyRequest } from 'fastify';
 import { describe, expect, it, vi } from 'vitest';
 import type { RoadmapGenerationCheckpoint } from '@forgemind/core';
 import type { AIProvider, ImplementationStepPlan, PlanResult } from '@forgemind/providers';
-import { buildReviewedImplementationStepBlueprints, buildImplementationStepBlueprintsWithRepairs } from './roadmap-generation.js';
+import { buildReviewedImplementationStepBlueprints, buildImplementationStepBlueprintsWithRepairs, repairRoadmapOnce } from './roadmap-generation.js';
 import { beginRoadmapRequest } from './routes.js';
 
 const step: ImplementationStepPlan = {
@@ -32,6 +32,76 @@ function fixture() {
 }
 
 describe('resumable roadmap correction', () => {
+  it('applies an explicit contract removal instead of adding obsolete approval work', async () => {
+    const staleContract = {
+      version: 1, summary: 'Export', invariants: [], prohibitedSubstitutes: [], releaseCriteria: [],
+      requirements: [{
+        id: 'REQ-APPROVAL', title: 'Approval', description: 'Require approval before export.',
+        acceptanceCriteria: ['An approval is recorded.'], status: 'active' as const,
+        introducedInVersion: 1, lastChangedInVersion: 1
+      }]
+    };
+    const provider = {
+      kind: 'codex', repairRoadmap: vi.fn().mockResolvedValue({
+        implementationSteps: [],
+        contractDelta: {
+          baseVersion: 1, addRequirements: [], updateRequirements: [], supersedeRequirements: [],
+          removeRequirements: [{ id: 'REQ-APPROVAL', rationale: 'The complete current specification explicitly removed approval.' }],
+          invariantChanges: { add: [], remove: [] },
+          prohibitedSubstituteChanges: { add: [], remove: [] },
+          releaseCriteriaChanges: { add: [], remove: [] },
+          migrationImpacts: [], compatibilityImpacts: []
+        }
+      })
+    } as unknown as AIProvider;
+    const repaired = await repairRoadmapOnce(provider, {}, {
+      ...plan, implementationSteps: [{ ...step, requirementIds: ['REQ-APPROVAL'] }]
+    }, {
+      taskId: 'project', objective: 'Export immediately', authoritativeSpecification: 'Export has no approval gate.',
+      validationError: 'Contract contradicts the current specification.', projectContract: staleContract,
+      requiredRequirementIds: ['REQ-APPROVAL'], completedStepTitles: [], migrationImpacts: [], compatibilityImpacts: []
+    });
+
+    expect(repaired.projectContract?.version).toBe(1);
+    expect(repaired.projectContract?.requirements[0]).toMatchObject({
+      id: 'REQ-APPROVAL', status: 'removed', introducedInVersion: 1, lastChangedInVersion: 1
+    });
+    expect(repaired.contractDelta).toBeUndefined();
+    expect(repaired.implementationSteps).toEqual([]);
+  });
+
+  it('preserves the latest-plus-one output version when repairing from a historical recovery base', async () => {
+    const historical = {
+      version: 1, summary: 'Export', invariants: [], prohibitedSubstitutes: [], releaseCriteria: [],
+      requirements: [{
+        id: 'REQ-APPROVAL', title: 'Approval', description: 'Require approval.',
+        acceptanceCriteria: ['Approval is recorded.'], status: 'active' as const,
+        introducedInVersion: 1, lastChangedInVersion: 1
+      }]
+    };
+    const candidate = { ...historical, version: 4, sourceBriefHash: 'current-hash', sourceBriefSnapshot: 'No approval.' };
+    const repairDelta = {
+      baseVersion: 4, addRequirements: [], updateRequirements: [], supersedeRequirements: [],
+      removeRequirements: [{ id: 'REQ-APPROVAL', rationale: 'Current specification removed approval.' }],
+      invariantChanges: { add: [], remove: [] }, prohibitedSubstituteChanges: { add: [], remove: [] },
+      releaseCriteriaChanges: { add: [], remove: [] }, migrationImpacts: [], compatibilityImpacts: []
+    };
+    const provider = {
+      kind: 'codex', repairRoadmap: vi.fn().mockResolvedValue({ implementationSteps: [], contractDelta: repairDelta })
+    } as unknown as AIProvider;
+
+    const repaired = await repairRoadmapOnce(provider, {}, plan, {
+      taskId: 'project', objective: 'Recover export', authoritativeSpecification: 'No approval.',
+      validationError: 'Stale approval.', projectContract: candidate, persistedProjectContract: historical,
+      requiredRequirementIds: ['REQ-APPROVAL'], completedStepTitles: [], migrationImpacts: [], compatibilityImpacts: []
+    });
+
+    expect(repaired.projectContract).toMatchObject({
+      version: 4, sourceBriefHash: 'current-hash', sourceBriefSnapshot: 'No approval.'
+    });
+    expect(repaired.contractDelta).toMatchObject({ baseVersion: 1, removeRequirements: [{ id: 'REQ-APPROVAL' }] });
+  });
+
   it('continues beyond two quality repairs and keeps every independent review outcome', async () => {
     const f = fixture();
     f.reviewRoadmap.mockResolvedValueOnce(rejected).mockResolvedValueOnce(rejected).mockResolvedValueOnce(rejected);

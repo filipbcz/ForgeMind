@@ -597,10 +597,12 @@ export class CodexProvider implements AIProvider {
 
   async repairRoadmap(input: RoadmapRepairInput): Promise<RoadmapRepairResult> {
     const providerPrompt = [
-      'Repair only the supplied invalid implementation roadmap. Return JSON with implementationSteps only.',
-      'Do not regenerate the project contract, architecture, brief, or objective. Preserve valid steps and change only what the validation error requires.',
+      'Repair only the supplied invalid implementation roadmap, except when the blocker proves the derived contract contradicts the complete current specification. Return implementationSteps and contractDelta (null unless that targeted contract correction is necessary).',
+      'The CURRENT SPECIFICATION is authoritative. The existing contract is historical derived context, not a current normative instruction. Preserve valid steps and untouched requirement IDs and semantics. Never turn an obsolete contract obligation into roadmap work.',
+      'For a contract contradiction, return the smallest explicit delta against the supplied contract version, with a non-empty rationale on every update, supersession, or removal. Do not broadly regenerate the contract.',
       'Each step may contain at most 3 requirementIds, 3 deliverables, 5 acceptanceCriteria, and 5 inScope items. Split an oversized step into ordered focused steps while preserving complete requirement coverage.',
       `Objective: ${input.objective}`,
+      `CURRENT SPECIFICATION (authoritative, complete):\n${input.authoritativeSpecification ?? input.objective}`,
       `Validation error: ${input.validationError}`,
       `Requirement ids that must remain covered: ${input.requiredRequirementIds.join(', ')}`,
       `Completed step titles that must not be recreated: ${input.completedStepTitles.join(' | ') || 'none'}`,
@@ -622,15 +624,18 @@ export class CodexProvider implements AIProvider {
         schema: {
           type: 'object',
           additionalProperties: false,
-          required: ['implementationSteps'],
-          properties: { implementationSteps: implementationStepsJsonSchema() }
+          required: ['implementationSteps', 'contractDelta'],
+          properties: {
+            implementationSteps: implementationStepsJsonSchema(),
+            contractDelta: { anyOf: [projectContractDeltaJsonSchema(), { type: 'null' }] }
+          }
         },
         signal: input.signal,
         prompt: providerPrompt
       });
     } else {
       const response = await this.requestResponses([
-        { role: 'system', content: 'You repair only invalid roadmap items and return JSON only.' },
+        { role: 'system', content: 'You perform targeted roadmap repair and, only for a proven specification contradiction, a minimal explicit contract-delta repair. Return JSON only.' },
         { role: 'user', content: providerPrompt }
       ], input.session, input.signal);
       content = response.content;

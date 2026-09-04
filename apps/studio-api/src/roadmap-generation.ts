@@ -1,5 +1,5 @@
 import type { RoadmapGenerationCheckpoint } from '@forgemind/core';
-import { redactError } from '@forgemind/core';
+import { activeProjectContractRequirements, applyProjectContractDelta, deriveProjectContractDelta, redactError } from '@forgemind/core';
 import { setImmediate } from 'node:timers/promises';
 import type { AIProvider, PlanResult, ProviderSessionContext, ReviewResult, RoadmapQualityReviewInput, RoadmapRepairInput } from '@forgemind/providers';
 
@@ -16,7 +16,38 @@ export async function repairRoadmapOnce(
     throw new Error(`Roadmap validation failed and provider "${provider.kind}" does not support targeted repair: ${input.validationError}`);
   }
   const repaired = await provider.repairRoadmap({ ...input, implementationSteps: plan.implementationSteps ?? [], session });
-  return { ...plan, implementationSteps: repaired.implementationSteps };
+  if (!repaired.contractDelta) return { ...plan, implementationSteps: repaired.implementationSteps };
+  const correctedCandidate = applyProjectContractDelta(input.projectContract, repaired.contractDelta).contract;
+  const composedDelta = input.persistedProjectContract
+    ? deriveProjectContractDelta(
+        input.persistedProjectContract, correctedCandidate,
+        repaired.contractDelta.summary?.trim() || 'Targeted correction against the authoritative current specification.',
+        repaired.contractDelta.migrationImpacts, repaired.contractDelta.compatibilityImpacts
+      )
+    : undefined;
+  const corrected = composedDelta
+    ? {
+        ...applyProjectContractDelta(input.persistedProjectContract!, composedDelta).contract,
+        version: input.projectContract.version,
+        sourceBriefHash: correctedCandidate.sourceBriefHash,
+        sourceBriefSnapshot: correctedCandidate.sourceBriefSnapshot
+      }
+    : {
+        ...correctedCandidate,
+        version: 1,
+        requirements: correctedCandidate.requirements.map((requirement) => ({
+          ...requirement, introducedInVersion: 1, lastChangedInVersion: 1
+        }))
+      };
+  const activeIds = new Set(activeProjectContractRequirements(corrected).map((requirement) => requirement.id));
+  return {
+    ...plan,
+    projectContract: corrected,
+    contractDelta: composedDelta,
+    implementationSteps: repaired.implementationSteps.map((step) => ({
+      ...step, requirementIds: step.requirementIds.filter((id) => activeIds.has(id))
+    })).filter((step) => step.requirementIds.length > 0)
+  };
 }
 
 export async function buildImplementationStepBlueprintsWithRepairs<T>(input: {
@@ -49,7 +80,7 @@ export async function buildReviewedImplementationStepBlueprints<T>(input: {
   plan: PlanResult;
   repairInput: RepairContext;
   reviewInput: Omit<RoadmapQualityReviewInput, 'implementationSteps'>;
-  validate: (plan: PlanResult) => T;
+  validate: (plan: PlanResult, contract?: RoadmapRepairInput['projectContract'], requiredRequirementIds?: string[]) => T;
   checkpoint?: RoadmapGenerationCheckpoint;
   onCheckpoint?: (checkpoint: RoadmapGenerationCheckpoint) => Promise<void>;
   signal?: AbortSignal;
@@ -64,28 +95,36 @@ export async function buildReviewedImplementationStepBlueprints<T>(input: {
     await input.onCheckpoint?.(next);
     state = next;
   };
+  const effectiveContext = () => {
+    const contract = state.plan.projectContract ?? input.repairInput.projectContract;
+    const activeIds = new Set(activeProjectContractRequirements(contract).map((item) => item.id));
+    return { contract, requiredRequirementIds: input.repairInput.requiredRequirementIds.filter((id) => activeIds.has(id)) };
+  };
   await save(state);
   for (;;) {
     await setImmediate(undefined, { signal: input.signal });
     switch (state.phase) {
       case 'validate': {
         let validationError: string | undefined;
-        try { input.validate(state.plan); } catch (error) { validationError = redactError(error); }
+        const effective = effectiveContext();
+        try { input.validate(state.plan, effective.contract, effective.requiredRequirementIds); } catch (error) { validationError = redactError(error); }
         await save({ ...state, phase: validationError ? 'repair' : 'review', validationError });
         break;
       }
       case 'repair': {
         if (!state.validationError) throw new Error('Roadmap repair checkpoint is missing its blocker.');
+        const effective = effectiveContext();
         const plan = await repairRoadmapOnce(input.provider, input.session, state.plan, {
-          ...input.repairInput, validationError: state.validationError, signal: input.signal
+          ...input.repairInput, ...effective, validationError: state.validationError, signal: input.signal
         });
         // Persist the response even if cancellation arrived just as the provider finished.
-        await save({ version: 1, phase: 'validate', revision: state.revision + 1, plan });
+        await save({ version: 2, phase: 'validate', revision: state.revision + 1, plan });
         break;
       }
       case 'review': {
+        const effective = effectiveContext();
         const qualityReview = await input.provider.reviewRoadmap({
-          ...input.reviewInput, implementationSteps: state.plan.implementationSteps ?? [], signal: input.signal
+          ...input.reviewInput, ...effective, implementationSteps: state.plan.implementationSteps ?? [], signal: input.signal
         });
         await save({
           ...state, qualityReview,
@@ -100,7 +139,8 @@ export async function buildReviewedImplementationStepBlueprints<T>(input: {
       }
       case 'ready': {
         if (state.qualityReview?.verdict !== 'satisfied') throw new Error('Roadmap checkpoint has no satisfied quality review.');
-        return { plan: state.plan, blueprints: input.validate(state.plan), qualityReview: state.qualityReview };
+        const effective = effectiveContext();
+        return { plan: state.plan, blueprints: input.validate(state.plan, effective.contract, effective.requiredRequirementIds), qualityReview: state.qualityReview };
       }
       default: throw new Error('Unsupported roadmap checkpoint phase.');
     }
