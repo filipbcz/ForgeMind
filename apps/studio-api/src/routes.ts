@@ -1316,7 +1316,9 @@ export function registerRoutes(
         repairInput: {
           taskId: project.id,
           objective,
+          authoritativeSpecification: currentSpecification,
           projectContract,
+          persistedProjectContract: previousContract,
           requiredRequirementIds,
           completedStepTitles: planning.completedSteps,
           migrationImpacts: contractDelta?.migrationImpacts ?? [],
@@ -1325,19 +1327,22 @@ export function registerRoutes(
         reviewInput: {
           taskId: project.id,
           objective,
+          authoritativeSpecification: currentSpecification,
           projectContract,
           requiredRequirementIds,
           completedStepTitles: planning.completedSteps,
           repositoryBaseline: planning.repositoryBaseline
         },
-        validate: (candidate) => toImplementationStepBlueprints(
+        validate: (candidate, effectiveContract = projectContract, effectiveRequiredIds = requiredRequirementIds) => toImplementationStepBlueprints(
           candidate,
-          projectContract,
-          requiredRequirementIds,
+          effectiveContract,
+          effectiveRequiredIds,
           roadmapValidationOptions
         )
       });
       plan = repairedRoadmap.plan;
+      const repairedProjectContract = plan.projectContract ?? projectContract;
+      const repairedContractDelta = plan.contractDelta ?? contractDelta;
       const stepBlueprints = repairedRoadmap.blueprints;
       if (stepBlueprints.length === 0) {
         throw new Error('AI provider did not return any implementation steps.');
@@ -1349,9 +1354,9 @@ export function registerRoutes(
       const roadmap = await repository.createProjectRoadmapCycle({
         projectId: project.id,
         objective,
-        projectContract,
-        contractDelta,
-        contractChangeSummary: contractDelta?.summary ?? 'Initial generated project contract.',
+        projectContract: repairedProjectContract,
+        contractDelta: repairedContractDelta,
+        contractChangeSummary: repairedContractDelta?.summary ?? 'Initial generated project contract.',
         contractRecovery: recovery ? {
           baseVersion: recovery.baseVersion,
           reason: recovery.reason
@@ -1448,7 +1453,9 @@ export function registerRoutes(
         repairInput: {
           taskId: project.id,
           objective,
+          authoritativeSpecification: nextSpecification,
           projectContract,
+          persistedProjectContract: project.projectContract,
           requiredRequirementIds: appliedContract.touchedRequirementIds,
           completedStepTitles: planning.completedSteps,
           migrationImpacts: contractDelta.migrationImpacts,
@@ -1457,14 +1464,18 @@ export function registerRoutes(
         reviewInput: {
           taskId: project.id,
           objective,
+          authoritativeSpecification: nextSpecification,
           projectContract,
           requiredRequirementIds: appliedContract.touchedRequirementIds,
           completedStepTitles: planning.completedSteps,
           repositoryBaseline: planning.repositoryBaseline
         },
-        validate: (candidate) => toImplementationStepBlueprints(candidate, projectContract, appliedContract.touchedRequirementIds, roadmapValidationOptions)
+        validate: (candidate, effectiveContract = projectContract, effectiveRequiredIds = appliedContract.touchedRequirementIds) =>
+          toImplementationStepBlueprints(candidate, effectiveContract, effectiveRequiredIds, roadmapValidationOptions)
       });
       plan = repairedRoadmap.plan;
+      const repairedProjectContract = plan.projectContract ?? projectContract;
+      const repairedContractDelta = plan.contractDelta ?? contractDelta;
       const stepBlueprints = repairedRoadmap.blueprints;
       if (stepBlueprints.length === 0) {
         throw new Error('AI provider did not return any implementation steps.');
@@ -1476,9 +1487,9 @@ export function registerRoutes(
       const nextRoadmap = await repository.createProjectRoadmapCycle({
         projectId: project.id,
         objective,
-        projectContract,
-        contractDelta,
-        contractChangeSummary: contractDelta.summary ?? objective,
+        projectContract: repairedProjectContract,
+        contractDelta: repairedContractDelta,
+        contractChangeSummary: repairedContractDelta.summary ?? objective,
         architectureUpdate,
         qualityReview: repairedRoadmap.qualityReview,
         approvedExtension: {

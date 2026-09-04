@@ -55,6 +55,11 @@ export function buildRoadmapQualityReviewPrompt(input: RoadmapQualityReviewInput
     '',
     `Authoritative objective:\n${input.objective}`,
     '',
+    ...(input.authoritativeSpecification ? [
+      `CURRENT SPECIFICATION (authoritative, complete):\n${input.authoritativeSpecification}`,
+      'The contract is a derived historical artifact. Report a contract contradiction when it requires behavior removed by the current specification; do not demand that obsolete behavior be added to implementation steps.',
+      ''
+    ] : []),
     `Relevant contract (compact JSON):\n${JSON.stringify(contract)}`,
     '',
     `Requirements that this roadmap must cover:\n${input.requiredRequirementIds.map((id) => `- ${id}`).join('\n') || '- none'}`,

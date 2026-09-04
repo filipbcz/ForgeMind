@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import type { ProjectContract, ProjectContractDelta } from './model.js';
-import { activeProjectContractRequirements, applyProjectContractDelta } from './project-contract.js';
+import { activeProjectContractRequirements, applyProjectContractDelta, deriveProjectContractDelta } from './project-contract.js';
 
 const current: ProjectContract = {
   version: 2,
@@ -47,6 +47,22 @@ function delta(overrides: Partial<ProjectContractDelta> = {}): ProjectContractDe
 }
 
 describe('project contract delta', () => {
+  it('collapses a second-order correction into one delta against the persisted base', () => {
+    const planned = applyProjectContractDelta(current, delta({
+      updateRequirements: [{ id: 'REQ-TASKS', description: 'Tasks require approval.', rationale: 'Planned change.' }]
+    })).contract;
+    const corrected = applyProjectContractDelta(planned, delta({
+      baseVersion: 3,
+      updateRequirements: [{ id: 'REQ-TASKS', description: 'Tasks need no approval.', rationale: 'Current specification removed approval.' }]
+    })).contract;
+    const composed = deriveProjectContractDelta(current, corrected, 'Spec-first correction.');
+    const persisted = applyProjectContractDelta(current, composed).contract;
+
+    expect(composed.baseVersion).toBe(2);
+    expect(persisted.version).toBe(3);
+    expect(persisted.requirements.find((item) => item.id === 'REQ-TASKS')?.description).toBe('Tasks need no approval.');
+  });
+
   it('applies additions, updates and supersessions deterministically while preserving history', () => {
     const input = delta({
       summary: 'Task ledger with scheduling',
