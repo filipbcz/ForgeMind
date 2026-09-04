@@ -69,10 +69,7 @@ Worker flow (apps/worker/src/db-worker.ts):
 8. review blocker se v plnem zneni vrati implementacni AI. Bez blockeru workflow pokracuje do GitHub delivery. Ve stejne implementacni odpovedi provider vraci malou `architectureUpdate` deltu, takze nevznika dalsi AI volani.
 9. runWorkerTask provede implementation/validation/review/GitHub kroky.
 10. hooks zapisuji status prechody, iteration data, GitHub IDs a audit eventy.
-11. finalizeQueueJob pouzije retry/backoff semantiku:
-- failed a attempt < max -> task submitted + queue reason phase_retry + pending s exponential backoff do next_attempt_at
-- failed po limitu -> final failed
-- succeeded/cancelled -> final stav
+11. `finalizeQueueJob` pouzije retry/backoff semantiku: technicke `failed` zustava `submitted` s queue reason `phase_retry`, diagnostikou a exponential backoff v `next_attempt_at`, bez orchestration retry capu. Konkretni neobnovitelna externi prekazka zastavi beh s duvodem do zasahu uzivatele; `succeeded` a `cancelled` jsou finalni stavy.
 
 Retry a obnova workeru jsou phase-aware. Z iteration checkpointu a audit udalosti se urci posledni nedokoncena faze. Implementation, validation, review a delivery se obnovuji samostatne; uspesne predchozi faze ani dokoncene commit/push operace se neopakuji. U validacni sady se zachovaji jednotlive uspesne prikazy nad stejnym otiskem workspace. Selhana validace nebo review vraci task do implementace s plnym chybovym vystupem, ale neopakuje pripravu repozitare ani dokoncene externi operace.
 

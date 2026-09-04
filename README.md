@@ -88,7 +88,7 @@ ForgeMind musí umožnit:
 * spuštění AI agenta nad repozitářem,
 * opakované iterace implementace,
 * spouštění validačních příkazů,
-* sledování limitů,
+* sledování spotřeby a technických timeoutů,
 * zobrazení průběhu na mobilu,
 * vytvoření draft pull requestu,
 * zápis výsledků do PR,
@@ -110,18 +110,18 @@ Systém musí být:
 * odolný proti zacyklení,
 * navržený tak, aby šel časem rozšířit o více workerů.
 
-## 5. Co není cílem MVP
+## 5. Hranice rozsahu MVP
 
-V první verzi není cílem:
+V první verzi nejsou součástí produktového rozsahu:
 
-* automatický deploy do produkce,
-* automatický merge do `main`,
+* obecný deploy engine pro produkční prostředí spravovaných projektů; konkrétní task jej ale může změnit nebo spustit, pokud to požaduje zadání a dovolují oprávnění integrace,
+* vynucení jediného merge režimu; GitHub delivery respektuje projektové `auto_merge` a stav pull requestu,
 * vlastní trénování modelu,
 * nahrazení GitHubu,
 * vlastní IDE,
 * komplexní multi-user enterprise správa práv.
 
-Tyto funkce mohou být řešeny až ve verzích v1/v2.
+Tyto body nejsou plošným zákazem nakonfigurovaného merge, existujícího platformního deploye ani tasku, který má deployment výslovně ve scope.
 
 ## 6. Cílové prostředí
 
@@ -190,7 +190,7 @@ Mobilní PWA pro:
 * zadávání promptů,
 * výběr projektu,
 * sledování běžících úkolů,
-* potvrzování rizikových změn,
+* zobrazení review blockerů a auditních rozhodnutí,
 * sledování metrik a historie pokusů,
 * otevření PR v GitHubu,
 * čtení logů a výsledků testů.
@@ -201,7 +201,7 @@ Webové rozhraní pro desktop/tablet:
 
 * správa projektů,
 * správa providerů,
-* správa limitů,
+* přehled spotřeby a technických timeoutů,
 * přehled tasků,
 * audit,
 * konfigurace GitHub integrace,
@@ -231,8 +231,8 @@ Linux worker:
 * aplikuje změny,
 * spouští build/test/lint,
 * sbírá logy,
-* počítá iterace,
-* kontroluje limity,
+* eviduje iterace a spotřebu pro audit,
+* používá technické timeouty proti opuštěným procesům bez task budget stopu,
 * pushuje branch,
 * vytváří PR.
 
@@ -394,8 +394,7 @@ Projekt
 Název úkolu
 Komplexní zadání
 Režim autonomie
-Max. rozpočet
-Max. počet iterací
+Priorita a provozní metadata
 Priorita
 Volitelné soubory / oblasti projektu
 ```
@@ -486,9 +485,8 @@ Issue body musí obsahovat:
 ## Režim
 safe
 
-## Limity
-- max iterací:
-- max rozpočet:
+## Provozní evidence
+- spotřeba a iterace se reportují, ale nezastavují task
 ```
 
 ### 14.3 Branch naming
@@ -915,9 +913,9 @@ s jakým výsledkem
 Testovat:
 
 * parsování konfigurace,
-* validaci limitů,
+* validaci telemetry a technických timeoutů,
 * stavový automat,
-* budget tracker,
+* token/cost usage reporting bez runtime stopu,
 * phase-aware checkpoint a retry pravidla,
 * provider adapter interface,
 * GitHub payload parser.
@@ -982,7 +980,7 @@ task lifecycle
 phase-aware retry a audit
 draft PR workflow
 základní logy a audit
-základní budget/iteration limity
+token/cost/iteration reporting bez rozhodovacích limitů
 ```
 
 ### 21.1 MVP user story
@@ -1003,12 +1001,12 @@ MVP je hotové, když:
 * worker spustí provider,
 * worker spustí validační příkaz,
 * systém uloží logy,
-* systém hlídá max iterace,
+* systém reportuje iterace a spotřebu bez rozhodovacího capu,
 * systém vytvoří draft PR,
 * mobilní UI zobrazí stav,
 * validace a review vrací úplnou zpětnou vazbu implementaci,
 * konfigurace projektu se načítá z YAML,
-* systém odmítne zakázanou akci.
+* systém vynucuje autentizaci, oprávnění integrací a izolaci worker prostředí.
 
 ## 22. Roadmapa
 
@@ -1019,8 +1017,7 @@ MVP je hotové, když:
 * GitHub App,
 * základní PWA,
 * CodexProvider nebo MockProvider,
-* draft PR,
-* ruční merge mimo ForgeMind,
+* GitHub delivery přes pull request; merge může zůstat ruční nebo použít projektové `auto_merge`,
 
 ### Fáze 2 – v1
 
@@ -1250,10 +1247,8 @@ Akceptační kritéria:
 Režim:
 safe
 
-Limity:
-max 10 iterací
-max 20 změněných souborů
-max rozpočet 2 USD
+Provozní evidence:
+reportuj iterace, počet změněných souborů a spotřebu; tyto metriky task nezastavují
 ```
 
 ## 27. Definice hotovo pro ForgeMind MVP
@@ -1282,9 +1277,9 @@ Tyto požadavky nesmí být vynechány:
 
 ```text
 - Žádný nekontrolovaný sudo/root přístup.
-- Žádný automatický produkční deploy v MVP.
+- Merge a deploy se řídí konkrétním zadáním, projektovým nastavením a oprávněními integrace; neexistuje plošný runtime zákaz.
 - Všechny změny přes Git branch.
-- Každý task má limity.
+- Metriky spotřeby, iterací a velikosti změny jsou reporting; technický timeout chrání pouze před opuštěným procesem.
 - Každý běh má audit.
 - Každý retry naváže od první nedokončené operace.
 - AI provider je vyměnitelný.
@@ -1332,17 +1327,19 @@ Aktualni stav tohoto repozitare:
 - `implemented`: uzce omezeny Windows CLI runner, odchozi Studio API transport, manualni session, capability probe, lease/cancel/result flow, bezpecny fixture executor, upload logu a artefaktu a pinned Unreal command adapter jsou v `apps/windows-runner/src`, `apps/studio-api/src/routes/windows-runner-routes.ts`, `packages/core/src/windows-worker.ts` a `packages/db/src/windows-worker-repository.ts`.
 - `tested`: schema a policy testy jsou v `packages/core/src/windows-worker.test.ts`; runner testy v `apps/windows-runner/src/*.test.ts`; API a fake-runner tok v `apps/studio-api/src/routes/windows-runner-routes.test.ts` a `apps/studio-api/src/routes/windows-runner-routes.integration.test.ts`; persistence lease toku v `packages/db/src/windows-worker-repository.test.ts` a `packages/db/src/windows-worker-repository.integration.test.ts`.
 - `production-verified`: zadna cast Windows/Unreal rollout zatim tento status nema.
-- `deferred`: realna BOREK-FILIP Unreal validace vyzaduje lokalni rucni session, samostatne schvaleni dlouhe Unreal prace a lokalne pripnute/probed tooling. Jeji provedeni i manualni finalni audit jsou dalsi rucne spoustene kroky; fixture ani staticka evidence je nenahrazuji.
+- `deferred`: realna BOREK-FILIP Unreal validace vyzaduje lokalni rucni session, fyzicky dostupne lokalne pripnute/probed tooling a uspesne typed execution na presnem commitu. Jeji provedeni i manualni finalni audit jsou rucne spoustene produkcni kroky, nikoli runtime approval gate; fixture ani staticka evidence je nenahrazuji.
 
 Windows runner je pouze validacni executor pro presny commit SHA a verzovane schema z `packages/core`. Neni obecny remote shell: nesmi planovat ani implementovat, pouzivat Git push, merge, PR nebo deploy, pristupovat primo do databaze, provozovat Docker, bezet bezobsluzne jako sluzba ani menit UAC, restart nebo security konfiguraci.
 
 Lokalni adapter policy se runneru predava v `FORGEMIND_WINDOWS_ADAPTER_POLICY` jako JSON s poli `allowedFixtureExecutablePaths`, `pinnedUnrealTools` a `approvedUnrealProfiles`. Prazdna nebo chybejici policy nic nespusti. Velky Unreal profil navic vyzaduje interaktivni TTY potvrzeni a diskovy preflight; server nema approval frontu.
 
-Autoritativni release validace pro MVP delta:
+Root/CI test foundation pro release a migracni matrix zustava dostupny:
 
 - `npm run build`
 - `npm run typecheck`
 - `npm test`
+
+Tento seznam se automaticky nepredepisuje jako task validation sada. Implementacni AI vraci jen prikazy primerene konkretni zmene; worker je spusti beze zmeny.
 
 ## 31. Produkcni provoz ForgeMind
 

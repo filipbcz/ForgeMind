@@ -24,15 +24,15 @@
     },
     "scenarioCount": {
       "type": "integer",
-      "const": 10
+      "const": 15
     },
     "requiredAreas": {
       "type": "array",
       "items": {
         "type": "string"
       },
-      "minItems": 10,
-      "maxItems": 10,
+      "minItems": 15,
+      "maxItems": 15,
       "uniqueItems": true,
       "allOf": [
         {
@@ -62,7 +62,7 @@
         },
         {
           "contains": {
-            "const": "approval_pause_resume"
+            "const": "runtime_access"
           }
         },
         {
@@ -84,13 +84,28 @@
           "contains": {
             "const": "database_restore"
           }
+        },
+        {
+          "contains": { "const": "selective_reuse" }
+        },
+        {
+          "contains": { "const": "technical_retry" }
+        },
+        {
+          "contains": { "const": "delivery_recovery" }
+        },
+        {
+          "contains": { "const": "repository_planning" }
+        },
+        {
+          "contains": { "const": "audit_proposals" }
         }
       ]
     },
     "scenarios": {
       "type": "array",
-      "minItems": 10,
-      "maxItems": 10,
+      "minItems": 15,
+      "maxItems": 15,
       "items": {
         "type": "object",
         "additionalProperties": false,
@@ -114,12 +129,17 @@
               "repair",
               "restart",
               "outage",
-              "approval_pause_resume",
+              "runtime_access",
               "specification_change",
               "audit_recovery",
               "disk_exhaustion",
               "windows_validation_fixture",
-              "database_restore"
+              "database_restore",
+              "selective_reuse",
+              "technical_retry",
+              "delivery_recovery",
+              "repository_planning",
+              "audit_proposals"
             ]
           },
           "expectedStateCount": {
