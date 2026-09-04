@@ -2910,7 +2910,8 @@ github:
       validation: { command: 'npm test', exitCode: 0, stdout: 'passed', stderr: '', passed: true },
       externalValidationChecks: [{
         kind: 'command', command: 'cmake --build --preset windows-release', shell: 'powershell', target: 'windows',
-        requiredCapabilities: ['windows', 'cmake', 'msvc'], timeoutMinutes: 45, category: 'build', criterion: 'Windows build passes.'
+        requiredCapabilities: ['windows', 'cmake', 'msvc'], timeoutMinutes: 45, category: 'build', criterion: 'Windows build passes.',
+        windowsAdapter: { kind: 'fixture-validation', executablePath: 'C:\\tools\\fixture.exe', inputRelativePath: 'fixtures/input.json', artifactRelativePath: 'artifacts/result.json', minimumFreeSpaceBytes: 1024, maxConcurrentProcesses: 1 }
       }],
       summary: 'Merged successfully.',
       completedAt: new Date().toISOString()
@@ -2930,6 +2931,7 @@ github:
         commitSha: 'a'.repeat(40),
         requiredCapabilities: ['windows', 'cmake', 'msvc'],
         check: expect.objectContaining({ command: 'cmake --build --preset windows-release', shell: 'powershell', requiredCapabilities: ['windows', 'cmake', 'msvc'] }),
+        dispatch: { kind: 'fixture-validation', executablePath: 'C:\\tools\\fixture.exe', inputRelativePath: 'fixtures/input.json', artifactRelativePath: 'artifacts/result.json', minimumFreeSpaceBytes: 1024, maxConcurrentProcesses: 1 },
         resourcePolicy: expect.objectContaining({ timeoutSeconds: 2700 }),
         evidenceContext: { cycleId: 'cycle_1', stepId: 'step_1', requirementIds: ['REQ-WIN'], contractVersion: 3 }
       })

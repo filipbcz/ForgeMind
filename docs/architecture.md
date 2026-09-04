@@ -83,7 +83,7 @@ Validacni prostredi:
 3. Kazdy prikaz ma checkpoint s otiskem skutecneho workspace. Restart nad nezmenenym workspace uspesny prikaz neprovede znovu; zmena relevantniho workspace zneplatni stary dukaz.
 4. Prazdna sada se eviduje jako preskocena validace. Manualni kriterium ForgeMind automaticky nevyhodnocuje.
 5. Pokud implementacni AI oznaci kontrolu jako `target: windows`, Linux worker ji nespousti ani kvuli ni neblokuje task. Po doruceni konkretniho commitu ulozi odlozeny acceptance evidence a zaradi kontrolu pro autentizovany Windows runner.
-6. Jedinou claim podminkou je Windows prostredi; AI deklarovane nastroje se eviduji, ale nejsou hardcoded capability gate. Windows runner klonuje presny commit, bez command allowlistu spusti prikaz dodany AI, nahraje omezeny hashovany log a deklarovane artefakty a aktualizuje stejny evidence zaznam. Vysledek znovu nespousti implementaci; je vstupem pro pozdejsi projektovy audit.
+6. Claim vyzaduje aktivni lokalni Windows session a probed capabilities. Provider muze k Windows validation checku pridat strukturovany `windowsAdapter`; worker jej beze zmeny prenese do packetu v2. Fixture nebo Unreal profil se provede pres existujici adapter proti lokalne povolenym/pinned executable a presnym argumentum; obecny AI shell zustane `deferred/manual-local`. Legacy nebo poskozeny ulozeny packet repository pri claimu karantenizuje do neexecutable v2 deferred packetu, aby runner odeslal korelovany vysledek a uzavrel lease. Pouze pred skutecnym adapterem runner klonuje a overi presny commit. Vysledek znovu nespousti implementaci; je vstupem pro pozdejsi projektovy audit.
 
 Trvale checkpointy a idempotence:
 

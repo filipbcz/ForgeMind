@@ -3,9 +3,10 @@ import { WindowsWorkerRepository } from './windows-worker-repository.js';
 
 const packetDigest = 'a'.repeat(64);
 const queuedPacket = {
-  schemaVersion: 1, projectId: 'project_1', taskId: 'task_1', runId: 'run_1', checkId: 'check_1', jobId: 'job_1', leaseId: 'pending',
+  schemaVersion: 2, projectId: 'project_1', taskId: 'task_1', runId: 'run_1', checkId: 'check_1', jobId: 'job_1', leaseId: 'pending',
   repository: 'owner/repo', sourceUrl: 'https://example.test/repo.git', commitSha: packetDigest, workspaceRoot: 'C:\\work', artifactRoot: 'C:\\artifacts',
   check: { command: 'npm test', category: 'smoke', requiredCapabilities: ['windows'] }, requiredCapabilities: ['windows'],
+  dispatch: { kind: 'deferred', reason: 'unsupported_validation_intent', handling: 'manual-local' },
   resourcePolicy: { timeoutSeconds: 60, maxLogBytes: 1024, maxArtifactBytes: 1024 }, expectedArtifacts: [], nonce: 'pending', inputHash: packetDigest
 };
 
@@ -84,13 +85,14 @@ describe('WindowsWorkerRepository capability leases', () => {
   });
 
   it('atomically locks and reserves only the compatible job returned by the database query', async () => {
+    const legacyPacket = { ...queuedPacket, schemaVersion: 1, dispatch: undefined };
     const tx: any = {
       $executeRaw: vi.fn(async () => 1),
       $queryRaw: vi.fn().mockResolvedValueOnce([{ device_id: 'device_1' }]).mockResolvedValueOnce([{ job_id: 'job_1' }]),
       windowsExecutionLease: {
         findUnique: vi.fn().mockResolvedValueOnce(null).mockResolvedValueOnce(leaseRow), create: vi.fn(async () => undefined)
       },
-      windowsExecutionJob: { findUniqueOrThrow: vi.fn(async () => ({ packet: queuedPacket })), update: vi.fn(async () => undefined) },
+      windowsExecutionJob: { findUniqueOrThrow: vi.fn(async () => ({ packet: legacyPacket })), update: vi.fn(async () => undefined) },
       workerDevice: { update: vi.fn(async () => undefined) }
     };
     const prisma: any = { $transaction: vi.fn(async (work: (client: unknown) => unknown) => work(tx)) };
@@ -98,7 +100,7 @@ describe('WindowsWorkerRepository capability leases', () => {
     expect(claim?.job.id).toBe('job_1');
     expect(tx.windowsExecutionLease.create).toHaveBeenCalledTimes(1);
     expect(tx.windowsExecutionJob.update).toHaveBeenCalledWith({
-      where: { id: 'job_1' }, data: { status: 'leased', packet: { ...queuedPacket, leaseId: expect.any(String), nonce: 'request_1' } }
+      where: { id: 'job_1' }, data: { status: 'leased', packet: { ...queuedPacket, dispatch: { kind: 'deferred', reason: 'legacy_unsafe_packet', handling: 'manual-local' }, leaseId: expect.any(String), nonce: 'request_1' } }
     });
   });
 
@@ -179,10 +181,11 @@ describe('WindowsWorkerRepository capability leases', () => {
   it('rejects result evidence whose immutable identity differs from the persisted execution packet', async () => {
     const digest = 'a'.repeat(64);
     const packet = {
-      schemaVersion: 1, projectId: 'project_1', taskId: 'task_1', runId: 'run_1', checkId: 'check_1',
+      schemaVersion: 2, projectId: 'project_1', taskId: 'task_1', runId: 'run_1', checkId: 'check_1',
       jobId: 'job_1', leaseId: 'lease_1', repository: 'owner/repo', sourceUrl: 'https://example.test/repo.git',
       commitSha: digest, workspaceRoot: 'C:\\work', artifactRoot: 'C:\\artifacts',
       check: { command: 'npm test', category: 'smoke', requiredCapabilities: ['windows'] },
+      dispatch: { kind: 'deferred', reason: 'unsupported_validation_intent', handling: 'manual-local' },
       requiredCapabilities: ['windows'], resourcePolicy: { timeoutSeconds: 60, maxLogBytes: 1024, maxArtifactBytes: 1024 },
       expectedArtifacts: [], nonce: 'nonce_1', inputHash: digest,
       evidenceUpload: { schemaVersion: 1, jobId: 'job_1', leaseId: 'lease_1', inputHash: digest, commitSha: digest,
@@ -207,10 +210,11 @@ describe('WindowsWorkerRepository capability leases', () => {
   it('accepts the exact deferred check result without restarting the completed task', async () => {
     const digest = 'b'.repeat(64);
     const packet = {
-      schemaVersion: 1, projectId: 'project_1', taskId: 'task_1', runId: 'run_1', checkId: 'validation:windows',
+      schemaVersion: 2, projectId: 'project_1', taskId: 'task_1', runId: 'run_1', checkId: 'validation:windows',
       jobId: 'job_1', leaseId: 'lease_1', repository: 'owner/repo', sourceUrl: 'https://example.test/repo.git',
       commitSha: digest, workspaceRoot: 'C:\\work', artifactRoot: 'C:\\artifacts',
       check: { command: 'fixture.exe --validate', category: 'smoke', requiredCapabilities: ['windows'] },
+      dispatch: { kind: 'deferred', reason: 'unsupported_validation_intent', handling: 'manual-local' },
       requiredCapabilities: ['windows'], resourcePolicy: { timeoutSeconds: 60, maxLogBytes: 1024, maxArtifactBytes: 1024 },
       expectedArtifacts: [], nonce: 'nonce_1', inputHash: digest,
       evidenceUpload: { schemaVersion: 1, jobId: 'job_1', leaseId: 'lease_1', inputHash: digest, commitSha: digest,
@@ -223,13 +227,13 @@ describe('WindowsWorkerRepository capability leases', () => {
     };
     const prisma: any = { $transaction: vi.fn(async (work: (client: unknown) => unknown) => work(tx)) };
     const result = { schemaVersion: 1 as const, projectId: 'project_1', taskId: 'task_1', runId: 'run_1', checkId: 'validation:windows', jobId: 'job_1', leaseId: 'lease_1',
-      deviceId: 'device_1', sessionId: 'session_1', nonce: 'nonce_1', inputHash: digest, commitSha: digest, observedCapabilities: [], toolVersions: [], status: 'succeeded' as const,
+      deviceId: 'device_1', sessionId: 'session_1', nonce: 'nonce_1', inputHash: digest, commitSha: digest, observedCapabilities: [], toolVersions: [], status: 'deferred' as const, deferredReason: 'unsupported_validation_intent' as const,
       startedAt: '2026-09-01T00:00:00.000Z', completedAt: '2026-09-01T00:01:00.000Z', summary: 'fixture passed', logHash: digest, artifacts: [] };
 
     const repository = new WindowsWorkerRepository(prisma);
     expect(await repository.submitResult('device_1', result)).toEqual({ accepted: true, packet });
     expect(tx.windowsExecutionJob.updateMany).toHaveBeenCalledWith({
-      where: { id: 'job_1', status: { in: ['leased', 'running'] } }, data: { status: 'succeeded' }
+      where: { id: 'job_1', status: { in: ['leased', 'running'] } }, data: { status: 'failed' }
     });
   });
 

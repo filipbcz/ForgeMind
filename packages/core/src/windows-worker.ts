@@ -3,6 +3,8 @@ import type { ValidationCheckCategory } from './model.js';
 
 export const WINDOWS_WORKER_SCHEMA_VERSION = 1 as const;
 export type WindowsWorkerSchemaVersion = typeof WINDOWS_WORKER_SCHEMA_VERSION;
+export const WINDOWS_EXECUTION_PACKET_VERSION = 2 as const;
+export type WindowsExecutionPacketVersion = typeof WINDOWS_EXECUTION_PACKET_VERSION;
 
 export interface WorkerCapability {
   key: string;
@@ -70,6 +72,33 @@ export interface WindowsValidationCheck {
   requiredCapabilities: string[];
 }
 
+/** A validation intent is executable only after a Windows runner matches it to a
+ * locally pinned adapter policy. Command is retained solely for display/evidence. */
+export type WindowsExecutionDispatch =
+  | {
+      kind: 'fixture-validation';
+      executablePath: string;
+      inputRelativePath: string;
+      artifactRelativePath: string;
+      minimumFreeSpaceBytes: number;
+      maxConcurrentProcesses: number;
+    }
+  | {
+      kind: 'unreal-validation';
+      profileId: string;
+      tool: 'unreal-editor-cmd' | 'build-bat' | 'automation-tool' | 'project-script';
+      executablePath: string;
+      workingDirectoryRelativePath: string;
+      args: string[];
+      size: 'standard' | 'large';
+      minimumLargeJobFreeSpaceBytes: number;
+    }
+  | {
+      kind: 'deferred';
+      reason: 'unsupported_validation_intent' | 'legacy_unsafe_packet';
+      handling: 'manual-local';
+    };
+
 export type ExecutionJobStatus = 'queued' | 'leased' | 'running' | 'succeeded' | 'failed' | 'cancelled' | 'expired';
 
 export interface WindowsExecutionJob {
@@ -119,7 +148,7 @@ export interface WindowsExecutionEvidenceContext {
 }
 
 export interface WindowsExecutionPacket {
-  schemaVersion: WindowsWorkerSchemaVersion;
+  schemaVersion: WindowsExecutionPacketVersion;
   projectId: string;
   taskId: string;
   runId: string;
@@ -132,6 +161,7 @@ export interface WindowsExecutionPacket {
   workspaceRoot: string;
   artifactRoot: string;
   check: WindowsValidationCheck;
+  dispatch: WindowsExecutionDispatch;
   requiredCapabilities: string[];
   resourcePolicy: ExecutionResourcePolicy;
   expectedArtifacts: ExpectedExecutionArtifact[];
@@ -190,7 +220,8 @@ export interface WindowsExecutionResult {
   commitSha: string;
   observedCapabilities: WorkerCapability[];
   toolVersions: ExecutionToolVersionEvidence[];
-  status: 'succeeded' | 'failed' | 'cancelled' | 'timed_out';
+  status: 'succeeded' | 'failed' | 'cancelled' | 'timed_out' | 'deferred';
+  deferredReason?: 'unsupported_validation_intent' | 'legacy_unsafe_packet' | 'manual_local_required';
   startedAt: IsoDateString;
   completedAt: IsoDateString;
   exitCode?: number;
@@ -258,7 +289,7 @@ const isArtifactResult = (value: unknown): value is ExecutionArtifactResult => i
 const isToolVersion = (value: unknown): value is ExecutionToolVersionEvidence => isRecord(value) && isNonEmpty(value.tool)
   && isNonEmpty(value.version) && (value.driverVersion === undefined || isNonEmpty(value.driverVersion));
 export function isWindowsExecutionPacket(value: unknown): value is WindowsExecutionPacket {
-  if (!isRecord(value) || value.schemaVersion !== WINDOWS_WORKER_SCHEMA_VERSION) return false;
+  if (!isRecord(value) || value.schemaVersion !== WINDOWS_EXECUTION_PACKET_VERSION) return false;
   const required = ['projectId', 'taskId', 'runId', 'checkId', 'jobId', 'leaseId', 'repository', 'sourceUrl', 'workspaceRoot', 'artifactRoot', 'nonce'];
   if (!required.every((key) => isNonEmpty(value[key])) || !isGitCommitSha(value.commitSha) || !isSha256(value.inputHash)) return false;
   if (!areCapabilityKeys(value.requiredCapabilities)) return false;
@@ -268,6 +299,7 @@ export function isWindowsExecutionPacket(value: unknown): value is WindowsExecut
     || !areCapabilityKeys(value.check.requiredCapabilities)
     || !capabilityKeysEqual(value.requiredCapabilities, value.check.requiredCapabilities)
     || (value.check.criterion !== undefined && !isNonEmpty(value.check.criterion))) return false;
+  if (!isExecutionDispatch(value.dispatch)) return false;
   if (value.evidenceContext !== undefined && (!isRecord(value.evidenceContext)
     || !isNonEmpty(value.evidenceContext.cycleId)
     || !isNonEmpty(value.evidenceContext.stepId)
@@ -280,12 +312,70 @@ export function isWindowsExecutionPacket(value: unknown): value is WindowsExecut
     && Array.isArray(value.expectedArtifacts) && value.expectedArtifacts.every(isExpectedArtifact);
 }
 
+export type WindowsPacketDisposition =
+  | { status: 'supported'; packet: WindowsExecutionPacket }
+  | { status: 'deferred'; reason: 'unsupported_validation_intent' | 'legacy_unsafe_packet'; handling: 'manual-local'; message: string };
+
+/** Compatibility boundary used by transports/runners. Legacy command packets are
+ * deliberately described as local manual work instead of being interpreted. */
+export function classifyWindowsExecutionPacket(value: unknown): WindowsPacketDisposition {
+  if (isWindowsExecutionPacket(value)) {
+    if (value.dispatch.kind === 'deferred') return {
+      status: 'deferred', reason: value.dispatch.reason, handling: value.dispatch.handling,
+      message: 'Validation intent has no supported pinned adapter; handle it manually in the active local session.'
+    };
+    return { status: 'supported', packet: value };
+  }
+  const legacy = isRecord(value) && value.schemaVersion === 1 && isRecord(value.check) && isNonEmpty(value.check.command);
+  return {
+    status: 'deferred', reason: legacy ? 'legacy_unsafe_packet' : 'unsupported_validation_intent', handling: 'manual-local',
+    message: legacy
+      ? 'Legacy shell-command packet is unsafe and must be handled manually in a local session.'
+      : 'Unsupported execution packet must be handled manually in a local session.'
+  };
+}
+
+/** Converts a structurally valid v1 command packet into a non-executable v2
+ * packet so an already persisted lease can be reconciled normally. */
+export function deferLegacyWindowsExecutionPacket(value: unknown): WindowsExecutionPacket | undefined {
+  if (!isRecord(value) || value.schemaVersion !== 1) return undefined;
+  const candidate = {
+    ...value,
+    schemaVersion: WINDOWS_EXECUTION_PACKET_VERSION,
+    dispatch: { kind: 'deferred', reason: 'legacy_unsafe_packet', handling: 'manual-local' }
+  };
+  return isWindowsExecutionPacket(candidate) ? candidate : undefined;
+}
+
+function isSafeRelativePath(value: unknown): value is string {
+  return isNonEmpty(value) && !/^(?:[a-z]:|[\\/])/i.test(value) && !/(?:^|[\\/])\.\.(?:[\\/]|$)/.test(value);
+}
+
+function isExecutionDispatch(value: unknown): value is WindowsExecutionDispatch {
+  if (!isRecord(value) || !isNonEmpty(value.kind)) return false;
+  if (value.kind === 'deferred') return ['unsupported_validation_intent', 'legacy_unsafe_packet'].includes(value.reason as string)
+    && value.handling === 'manual-local';
+  if (value.kind === 'fixture-validation') return isNonEmpty(value.executablePath)
+    && isSafeRelativePath(value.inputRelativePath) && isSafeRelativePath(value.artifactRelativePath)
+    && Number.isSafeInteger(value.minimumFreeSpaceBytes) && (value.minimumFreeSpaceBytes as number) >= 0
+    && Number.isSafeInteger(value.maxConcurrentProcesses) && (value.maxConcurrentProcesses as number) > 0;
+  if (value.kind === 'unreal-validation') return isNonEmpty(value.profileId)
+    && ['unreal-editor-cmd', 'build-bat', 'automation-tool', 'project-script'].includes(value.tool as string)
+    && isNonEmpty(value.executablePath) && isSafeRelativePath(value.workingDirectoryRelativePath)
+    && Array.isArray(value.args) && value.args.every((arg) => isNonEmpty(arg) && !/[\r\n\0]/.test(arg as string))
+    && ['standard', 'large'].includes(value.size as string)
+    && Number.isSafeInteger(value.minimumLargeJobFreeSpaceBytes) && (value.minimumLargeJobFreeSpaceBytes as number) >= 0;
+  return false;
+}
+
 export function isWindowsExecutionResult(value: unknown): value is WindowsExecutionResult {
   if (!isRecord(value) || value.schemaVersion !== WINDOWS_WORKER_SCHEMA_VERSION) return false;
   const required = ['projectId', 'taskId', 'runId', 'checkId', 'jobId', 'leaseId', 'deviceId', 'sessionId', 'nonce', 'summary'];
   return required.every((key) => isNonEmpty(value[key])) && isSha256(value.inputHash) && isGitCommitSha(value.commitSha) && isSha256(value.logHash)
     && isIsoDate(value.startedAt) && isIsoDate(value.completedAt)
-    && ['succeeded', 'failed', 'cancelled', 'timed_out'].includes(value.status as string)
+    && ['succeeded', 'failed', 'cancelled', 'timed_out', 'deferred'].includes(value.status as string)
+    && (value.deferredReason === undefined || ['unsupported_validation_intent', 'legacy_unsafe_packet', 'manual_local_required'].includes(value.deferredReason as string))
+    && (value.status === 'deferred' ? isNonEmpty(value.deferredReason) : value.deferredReason === undefined)
     && (value.exitCode === undefined || Number.isInteger(value.exitCode))
     && areCapabilities(value.observedCapabilities)
     && Array.isArray(value.toolVersions) && value.toolVersions.every(isToolVersion)

@@ -1,6 +1,6 @@
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import type { Prisma, PrismaClient } from '@prisma/client';
-import { isWindowsExecutionPacket, WINDOWS_DEVICE_OFFLINE_AFTER_MS } from '@forgemind/core';
+import { deferLegacyWindowsExecutionPacket, isWindowsExecutionPacket, WINDOWS_DEVICE_OFFLINE_AFTER_MS } from '@forgemind/core';
 import type {
   WorkerCapability, WorkerProbeEvidence, WindowsExecutionJob, WindowsExecutionLease,
   WindowsExecutionPacket, WindowsExecutionResult
@@ -204,16 +204,17 @@ export class WindowsWorkerRepository {
       const selected = jobs[0];
       if (!selected) return undefined;
 
+      const selectedJob = await tx.windowsExecutionJob.findUniqueOrThrow({ where: { id: selected.job_id } });
+      const selectedPacket = selectedJob.packet;
+      const leasedPacket = isWindowsExecutionPacket(selectedPacket)
+        ? selectedPacket
+        : deferLegacyWindowsExecutionPacket(selectedPacket) ?? quarantineInvalidPacket(selectedJob, selectedPacket);
       const leaseId = randomUUID();
       const expiresAt = new Date(Date.now() + leaseSeconds * 1_000);
       await tx.windowsExecutionLease.create({ data: {
         id: leaseId, jobId: selected.job_id, deviceId: session.device_id, sessionId,
         expiresAt, nonce: requestId
       } });
-      const selectedJob = await tx.windowsExecutionJob.findUniqueOrThrow({ where: { id: selected.job_id } });
-      const selectedPacket = selectedJob.packet;
-      if (!isWindowsExecutionPacket(selectedPacket)) throw new Error('Queued execution job contains an invalid packet.');
-      const leasedPacket = selectedPacket as unknown as WindowsExecutionPacket;
       await tx.windowsExecutionJob.update({
         where: { id: selected.job_id },
         data: { status: 'leased', packet: asJson({ ...leasedPacket, leaseId, nonce: requestId }) }
@@ -380,4 +381,31 @@ export class WindowsWorkerRepository {
     }));
     return required.length === requiredValue.length && required.every((key) => capabilities.has(key) && supported.has(key));
   }
+}
+
+function quarantineInvalidPacket(
+  job: { id: string; projectId: string; taskId: string; runId: string; requiredCapabilities: unknown },
+  value: unknown
+): WindowsExecutionPacket {
+  const raw = value && typeof value === 'object' && !Array.isArray(value) ? value as Record<string, unknown> : {};
+  const rawCheck = raw.check && typeof raw.check === 'object' && !Array.isArray(raw.check) ? raw.check as Record<string, unknown> : {};
+  const capabilities = Array.isArray(job.requiredCapabilities)
+    ? Array.from(new Set(job.requiredCapabilities.filter((item): item is string => typeof item === 'string' && item.trim().length > 0).map((item) => item.trim())))
+    : [];
+  if (!capabilities.includes('windows')) capabilities.unshift('windows');
+  const commitSha = typeof raw.commitSha === 'string' && /^(?:[a-f0-9]{40}|[a-f0-9]{64})$/i.test(raw.commitSha) ? raw.commitSha : '0'.repeat(40);
+  const inputHash = typeof raw.inputHash === 'string' && /^[a-f0-9]{64}$/i.test(raw.inputHash)
+    ? raw.inputHash
+    : createHash('sha256').update(JSON.stringify(value ?? null)).digest('hex');
+  return {
+    schemaVersion: 2, projectId: job.projectId, taskId: job.taskId, runId: job.runId,
+    checkId: typeof raw.checkId === 'string' && raw.checkId.trim() ? raw.checkId : `invalid:${job.id}`,
+    jobId: job.id, leaseId: 'pending', repository: typeof raw.repository === 'string' && raw.repository.trim() ? raw.repository : 'invalid/packet',
+    sourceUrl: typeof raw.sourceUrl === 'string' && raw.sourceUrl.trim() ? raw.sourceUrl : 'invalid-packet', commitSha,
+    workspaceRoot: 'runner-managed', artifactRoot: 'runner-managed',
+    check: { command: typeof rawCheck.command === 'string' && rawCheck.command.trim() ? rawCheck.command : 'Invalid Windows validation packet',
+      category: 'smoke', requiredCapabilities: capabilities },
+    dispatch: { kind: 'deferred', reason: raw.schemaVersion === 1 ? 'legacy_unsafe_packet' : 'unsupported_validation_intent', handling: 'manual-local' }, requiredCapabilities: capabilities,
+    resourcePolicy: { timeoutSeconds: 60, maxLogBytes: 256_000, maxArtifactBytes: 0 }, expectedArtifacts: [], nonce: 'pending', inputHash
+  };
 }

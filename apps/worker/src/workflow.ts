@@ -1468,6 +1468,7 @@ export function normalizeValidationChecks(value: unknown): ValidationCheck[] {
 
     if (item.kind === 'command' && typeof item.command === 'string' && item.command.trim()) {
       const command = item.command.trim();
+      const windowsAdapter = normalizeWindowsAdapter(item.windowsAdapter);
       checks.push({
         kind: 'command',
         command,
@@ -1485,6 +1486,7 @@ export function normalizeValidationChecks(value: unknown): ValidationCheck[] {
         timeoutMinutes: typeof item.timeoutMinutes === 'number' ? item.timeoutMinutes : undefined,
         criterion: typeof item.criterion === 'string' && item.criterion.trim() ? item.criterion.trim() : undefined,
         rationale: typeof item.rationale === 'string' && item.rationale.trim() ? item.rationale.trim() : undefined,
+        ...(windowsAdapter ? { windowsAdapter } : {}),
       });
       continue;
     }
@@ -1492,6 +1494,22 @@ export function normalizeValidationChecks(value: unknown): ValidationCheck[] {
   }
 
   return checks;
+}
+
+function normalizeWindowsAdapter(value: unknown): ValidationCheck['windowsAdapter'] {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return undefined;
+  const item = value as Record<string, unknown>;
+  if (item.kind === 'fixture-validation' && typeof item.executablePath === 'string' && typeof item.inputRelativePath === 'string'
+    && typeof item.artifactRelativePath === 'string' && Number.isSafeInteger(item.minimumFreeSpaceBytes) && Number.isSafeInteger(item.maxConcurrentProcesses)) {
+    return item as ValidationCheck['windowsAdapter'];
+  }
+  if (item.kind === 'unreal-validation' && typeof item.profileId === 'string' && typeof item.executablePath === 'string'
+    && typeof item.workingDirectoryRelativePath === 'string' && Array.isArray(item.args) && item.args.every((arg) => typeof arg === 'string')
+    && ['unreal-editor-cmd', 'build-bat', 'automation-tool', 'project-script'].includes(item.tool as string)
+    && ['standard', 'large'].includes(item.size as string) && Number.isSafeInteger(item.minimumLargeJobFreeSpaceBytes)) {
+    return item as ValidationCheck['windowsAdapter'];
+  }
+  return undefined;
 }
 
 function validationChecksToJson(checks: ValidationCheck[]): JsonValue[] {
@@ -1503,6 +1521,7 @@ function validationChecksToJson(checks: ValidationCheck[]): JsonValue[] {
     requiredCapabilities: check.requiredCapabilities ?? [],
     continueOnFailure: check.continueOnFailure === true,
     category: check.category ?? null,
+    windowsAdapter: check.windowsAdapter ?? null,
     timeoutMinutes: check.timeoutMinutes ?? 10,
     criterion: check.criterion ?? null,
     rationale: check.rationale ?? null

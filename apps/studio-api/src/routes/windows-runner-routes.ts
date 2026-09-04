@@ -120,7 +120,7 @@ export function registerWindowsRunnerRoutes(app: FastifyInstance, repository: Fo
           requirementIds: context.requirementIds,
           criterion: outcome.packet.check.criterion ?? outcome.packet.check.command,
           source: 'artifact',
-          status: request.body.status === 'succeeded' ? 'passed' : 'failed',
+          status: request.body.status === 'succeeded' ? 'passed' : request.body.status === 'deferred' ? 'deferred' : 'failed',
           evidenceIdentity: `windows:${request.body.jobId}`,
           contractVersion: context.contractVersion,
           commitSha: request.body.commitSha,
