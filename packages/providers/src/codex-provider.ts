@@ -191,10 +191,10 @@ function validationChecksJsonSchema(): Record<string, unknown> {
             { type: 'null' },
             { type: 'object', additionalProperties: false,
               required: ['kind', 'executablePath', 'inputRelativePath', 'artifactRelativePath', 'minimumFreeSpaceBytes', 'maxConcurrentProcesses'],
-              properties: { kind: { const: 'fixture-validation' }, executablePath: { type: 'string' }, inputRelativePath: { type: 'string' }, artifactRelativePath: { type: 'string' }, minimumFreeSpaceBytes: { type: 'integer', minimum: 0 }, maxConcurrentProcesses: { type: 'integer', minimum: 1 } } },
+              properties: { kind: { type: 'string', const: 'fixture-validation' }, executablePath: { type: 'string' }, inputRelativePath: { type: 'string' }, artifactRelativePath: { type: 'string' }, minimumFreeSpaceBytes: { type: 'integer', minimum: 0 }, maxConcurrentProcesses: { type: 'integer', minimum: 1 } } },
             { type: 'object', additionalProperties: false,
               required: ['kind', 'profileId', 'tool', 'executablePath', 'workingDirectoryRelativePath', 'args', 'size', 'minimumLargeJobFreeSpaceBytes'],
-              properties: { kind: { const: 'unreal-validation' }, profileId: { type: 'string' }, tool: { enum: ['unreal-editor-cmd', 'build-bat', 'automation-tool', 'project-script'] }, executablePath: { type: 'string' }, workingDirectoryRelativePath: { type: 'string' }, args: { type: 'array', items: { type: 'string' } }, size: { enum: ['standard', 'large'] }, minimumLargeJobFreeSpaceBytes: { type: 'integer', minimum: 0 } } }
+              properties: { kind: { type: 'string', const: 'unreal-validation' }, profileId: { type: 'string' }, tool: { type: 'string', enum: ['unreal-editor-cmd', 'build-bat', 'automation-tool', 'project-script'] }, executablePath: { type: 'string' }, workingDirectoryRelativePath: { type: 'string' }, args: { type: 'array', items: { type: 'string' } }, size: { type: 'string', enum: ['standard', 'large'] }, minimumLargeJobFreeSpaceBytes: { type: 'integer', minimum: 0 } } }
           ]
         }
       }

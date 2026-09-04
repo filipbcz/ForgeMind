@@ -1,6 +1,72 @@
 import { describe, expect, it, vi } from 'vitest';
 import { buildCodexImplementationPrompt, buildCodexReviewSchema, CodexProvider, isNoisyWorkspaceActivityPath, parseCodexCliTotalTokens, runCodexProcess } from './codex-provider.js';
 
+describe('Codex structured output schemas', () => {
+  it.each(['implementation', 'chat'] as const)('serializes typed Windows adapters in the actual %s request schema', async (operation) => {
+    const provider = new CodexProvider({ authMode: 'codex_oauth' });
+    const intercepted = new Error('Stop before invoking Codex.');
+    const execute = vi.spyOn(provider as unknown as {
+      runCodexExec: (input: { schema: JsonSchema }) => Promise<string>;
+    }, 'runCodexExec').mockRejectedValue(intercepted);
+    try {
+      const result = operation === 'implementation'
+        ? provider.implement({
+            taskId: 'schema-test', prompt: 'Implement the current task.', repositoryPath: process.cwd(),
+            plan: { summary: 'Current task', steps: ['Implement it.'], acceptanceCriteria: ['It works.'] }
+          })
+        : provider.chat({
+            runId: 'schema-test', message: 'Inspect the repository.', conversationContext: '',
+            repositoryPath: process.cwd(), repositoryAttached: true, mode: 'safe'
+          });
+      await expect(result).rejects.toBe(intercepted);
+      expect(execute).toHaveBeenCalledTimes(1);
+      // Check the JSON sent to the CLI, not just a standalone schema fixture.
+      const schema = JSON.parse(JSON.stringify(execute.mock.calls[0]![0].schema)) as JsonSchema;
+      expectStrictResponseSchema(schema);
+      const adapters = schema.properties!.validationChecks!.items!.properties!.windowsAdapter!.anyOf!;
+      expect(adapters).toHaveLength(3);
+      expect(adapters[0]).toEqual({ type: 'null' });
+      expect(adapters[1]!.properties!.kind).toEqual({ type: 'string', const: 'fixture-validation' });
+      expect(adapters[2]!.properties).toMatchObject({
+        kind: { type: 'string', const: 'unreal-validation' },
+        tool: { type: 'string', enum: ['unreal-editor-cmd', 'build-bat', 'automation-tool', 'project-script'] },
+        size: { type: 'string', enum: ['standard', 'large'] }
+      });
+    } finally {
+      execute.mockRestore();
+    }
+  });
+});
+
+interface JsonSchema {
+  type?: string | string[];
+  properties?: Record<string, JsonSchema>;
+  required?: string[];
+  additionalProperties?: boolean;
+  items?: JsonSchema;
+  anyOf?: JsonSchema[];
+}
+
+// Structured Outputs requires every anyOf branch to satisfy the same schema rules.
+function expectStrictResponseSchema(schema: JsonSchema, path = '$'): void {
+  if (schema.anyOf) {
+    schema.anyOf.forEach((branch, index) => expectStrictResponseSchema(branch, `${path}.anyOf[${index}]`));
+    return;
+  }
+  expect(schema.type, `${path} must declare its type`).toBeDefined();
+  if (schema.type === 'object') {
+    expect(schema.additionalProperties, path).toBe(false);
+    expect([...(schema.required ?? [])].sort(), path).toEqual(Object.keys(schema.properties ?? {}).sort());
+    for (const [name, property] of Object.entries(schema.properties ?? {})) {
+      expectStrictResponseSchema(property, `${path}.${name}`);
+    }
+  }
+  if (schema.type === 'array') {
+    expect(schema.items, `${path}.items`).toBeDefined();
+    expectStrictResponseSchema(schema.items!, `${path}.items`);
+  }
+}
+
 describe('Codex process activity timeouts', () => {
   it('builds a strict review schema accepted by Codex structured output', () => {
     expectStrictObjectSchemas(buildCodexReviewSchema());
