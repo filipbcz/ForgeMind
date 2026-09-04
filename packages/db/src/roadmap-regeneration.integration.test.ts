@@ -6,6 +6,7 @@ import { createRequire } from 'node:module';
 import path from 'node:path';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { ForgeMindRepository } from './repository.js';
+import { advanceRoadmapAfterTaskCompletion, startNextRoadmapStep } from './roadmap.js';
 
 const databaseUrl = process.env.MIGRATION_DATABASE_URL ?? process.env.DATABASE_URL
   ?? 'postgresql://forgemind:forgemind@127.0.0.1:5432/forgemind_validation';
@@ -131,4 +132,91 @@ describe('roadmap regeneration lifecycle', () => {
     expect(events).toHaveLength(2);
     expect(JSON.stringify(events)).not.toContain('not durable');
   });
+
+  it('advances exactly once after an automatic retry without losing completed checkpoints', async () => {
+    const repository = new ForgeMindRepository(prisma);
+    const project = await prisma.project.create({
+      data: { name: 'Retry roadmap', slug: 'retry-roadmap', brief: 'Build a ledger.' }
+    });
+    const roadmap = await repository.createProjectRoadmapCycle({
+      projectId: project.id, objective: 'Build a ledger.', projectContract: initialContract,
+      steps: ['First', 'Second'].map((title, index) => ({
+        title, description: `Implement ${title}.`, acceptanceCriteria: ['Entries persist.'],
+        requirementIds: ['REQ-LEDGER'], deliverables: ['Ledger module'], changeRationale: 'Implements the ledger.',
+        dependsOnStepTitles: index === 0 ? [] : ['First'], validationFocus: ['implementation']
+      }))
+    });
+    const cycleId = roadmap.cycles.at(-1)!.id;
+    const task = (await startNextRoadmapStep(repository, project.id, cycleId))!;
+    const queue = await prisma.taskQueueJob.findFirstOrThrow({ where: { taskId: task.id } });
+    await prisma.taskQueueJob.update({ where: { id: queue.id }, data: { status: 'claimed', attemptCount: 1 } });
+    const checkpoint = await prisma.taskCheckpoint.create({
+      data: { taskId: task.id, key: 'git_push', phase: 'git', status: 'completed', inputHash: 'commit-sha', outputJson: { pushed: true }, completedAt: new Date() }
+    });
+
+    await repository.failTask(task.id, 'GitHub rejected the PR description.');
+    expect((await repository.getImplementationStepByTaskId(task.id))?.status).toBe('cancelled');
+    await repository.finalizeQueueJob(queue.id, 'failed', 'GitHub rejected the PR description.');
+
+    expect((await repository.getImplementationStepByTaskId(task.id))?.status).toBe('running');
+    expect((await repository.getTask(task.id))?.status).toBe('submitted');
+    expect(await prisma.taskCheckpoint.findUnique({ where: { id: checkpoint.id } })).toEqual(checkpoint);
+    expect(await prisma.auditLog.findFirst({
+      where: { taskId: task.id, eventType: 'project_implementation_step_status_updated', payload: { path: ['reason'], equals: 'task_queue_retry_scheduled' } }
+    })).not.toBeNull();
+
+    // Reproduce the worker's completion path after delivery succeeds on retry.
+    await prisma.task.update({ where: { id: task.id }, data: { status: 'ready_for_user_review' } });
+    await repository.transitionTask(task.id, 'completed');
+    const first = await advanceRoadmapAfterTaskCompletion(repository, task.id);
+    const second = await advanceRoadmapAfterTaskCompletion(repository, task.id);
+    await repository.finalizeQueueJob(queue.id, 'succeeded');
+
+    expect(first.nextTask?.id).toBeTruthy();
+    expect(second.nextTask).toBeUndefined();
+    const steps = (await repository.getProjectRoadmap(project.id))!.steps;
+    expect(steps.map((step) => step.status)).toEqual(['completed', 'running']);
+    expect(await prisma.task.count({ where: { projectId: project.id } })).toBe(2);
+    expect(await prisma.taskQueueJob.count({ where: { taskId: first.nextTask!.id } })).toBe(1);
+    expect(await prisma.taskCheckpoint.findUnique({ where: { id: checkpoint.id } })).toEqual(checkpoint);
+  }, 30_000);
+
+  it('does not reopen superseded cycles or explicitly cancelled tasks during automatic retry', async () => {
+    const repository = new ForgeMindRepository(prisma);
+    for (const scenario of ['superseded', 'cancelled-task'] as const) {
+      const project = await prisma.project.create({
+        data: { name: scenario, slug: `retry-${scenario}`, brief: 'Build a ledger.' }
+      });
+      const roadmap = await repository.createProjectRoadmapCycle({
+        projectId: project.id, objective: 'Build a ledger.', projectContract: initialContract,
+        steps: [{
+          title: 'First', description: 'Build the ledger.', acceptanceCriteria: ['Entries persist.'],
+          requirementIds: ['REQ-LEDGER'], deliverables: ['Ledger module'], changeRationale: 'Implements the ledger.',
+          dependsOnStepTitles: [], validationFocus: ['implementation']
+        }]
+      });
+      const cycleId = roadmap.cycles.at(-1)!.id;
+      const task = (await startNextRoadmapStep(repository, project.id, cycleId))!;
+      const queue = await prisma.taskQueueJob.findFirstOrThrow({ where: { taskId: task.id } });
+      await prisma.taskQueueJob.update({ where: { id: queue.id }, data: { status: 'claimed', attemptCount: 1 } });
+      await repository.failTask(task.id, 'temporary error');
+      if (scenario === 'superseded') {
+        await repository.updateProjectRoadmapCycleStatus(cycleId, 'completed');
+      } else {
+        // A cancellation raced with finalization; the task must not be revived.
+        await prisma.task.update({ where: { id: task.id }, data: { status: 'cancelled' } });
+      }
+
+      await repository.finalizeQueueJob(queue.id, 'failed', 'temporary error');
+
+      expect((await repository.getImplementationStepByTaskId(task.id))?.status).toBe('cancelled');
+      expect(await prisma.auditLog.findFirst({
+        where: { taskId: task.id, eventType: 'project_implementation_step_status_updated', payload: { path: ['reason'], equals: 'task_queue_retry_scheduled' } }
+      })).toBeNull();
+      if (scenario === 'cancelled-task') {
+        expect((await repository.getTask(task.id))?.status).toBe('cancelled');
+        expect((await prisma.taskQueueJob.findUniqueOrThrow({ where: { id: queue.id } })).status).toBe('cancelled');
+      }
+    }
+  }, 30_000);
 });

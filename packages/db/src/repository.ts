@@ -3973,6 +3973,25 @@ export class ForgeMindRepository {
           });
           return;
         }
+        // failTask closes the linked step before this retry decision is made.
+        // Reopen it in the same transaction as the task and queue, otherwise a
+        // successful retry cannot advance the roadmap. Superseded cycles stay closed.
+        const reopenedSteps = await tx.projectImplementationStep.updateMany({
+          where: {
+            taskId: queueJob.taskId,
+            status: 'cancelled',
+            cycle: { status: 'active' }
+          },
+          data: { status: 'running', completedAt: null }
+        });
+        if (reopenedSteps.count > 0) {
+          await this.writeAuditTx(tx, {
+            actorType: 'system',
+            eventType: 'project_implementation_step_status_updated',
+            taskId: queueJob.taskId,
+            payload: { status: 'running', reason: 'task_queue_retry_scheduled', queueJobId }
+          });
+        }
         await tx.taskQueueJob.update({
           where: { id: queueJobId },
           data: {

@@ -1037,7 +1037,7 @@ describe('ForgeMindRepository task runs', () => {
     });
   });
 
-  it('requeues a failed queue job with backoff while retries remain', async () => {
+  it('requeues a failed queue job and reopens its active roadmap step with an audit trail', async () => {
     const { prisma, taskQueueJobFindUnique } = createMockPrisma();
     taskQueueJobFindUnique.mockResolvedValueOnce({
       id: 'queue_1',
@@ -1068,6 +1068,17 @@ describe('ForgeMindRepository task runs', () => {
         status: 'submitted',
         finishedAt: null
       }
+    });
+    expect(prisma.projectImplementationStep.updateMany).toHaveBeenCalledWith({
+      where: { taskId: 'task_1', status: 'cancelled', cycle: { status: 'active' } },
+      data: { status: 'running', completedAt: null }
+    });
+    expect(prisma.auditLog.create).toHaveBeenCalledWith({
+      data: expect.objectContaining({
+        eventType: 'project_implementation_step_status_updated',
+        taskId: 'task_1',
+        payload: { status: 'running', reason: 'task_queue_retry_scheduled', queueJobId: 'queue_1' }
+      })
     });
     expect(prisma.auditLog.create).toHaveBeenCalledWith({
       data: expect.objectContaining({
@@ -1135,6 +1146,23 @@ describe('ForgeMindRepository task runs', () => {
     });
     expect(prisma.auditLog.create).not.toHaveBeenCalledWith({
       data: expect.objectContaining({ eventType: 'task_queue_retry_scheduled' })
+    });
+    expect(prisma.projectImplementationStep.updateMany).not.toHaveBeenCalled();
+  });
+
+  it('does not report a reopened step when retrying a standalone task or a superseded step', async () => {
+    const { prisma } = createMockPrisma();
+    prisma.projectImplementationStep.updateMany.mockResolvedValueOnce({ count: 0 });
+    const repository = new ForgeMindRepository(prisma);
+
+    await repository.finalizeQueueJob('queue_1', 'failed', 'temporary error');
+
+    expect(prisma.auditLog.create).not.toHaveBeenCalledWith({
+      data: expect.objectContaining({ eventType: 'project_implementation_step_status_updated' })
+    });
+    expect(prisma.taskQueueJob.update).toHaveBeenCalledWith({
+      where: { id: 'queue_1' },
+      data: expect.objectContaining({ status: 'pending', reason: 'phase_retry' })
     });
   });
 
