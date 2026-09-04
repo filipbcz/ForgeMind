@@ -123,6 +123,23 @@ describe('summarizeProjectProgress', () => {
 });
 
 describe('summarizeProjectOperationalOverview', () => {
+  it('offers the recorded audit proposal instead of claiming there is no manual action', () => {
+    const source = roadmap();
+    source.cycles[0]!.status = 'partial';
+    source.steps.forEach(step => { step.status = 'completed'; });
+    source.auditJobs = [{
+      id: 'audit_1', projectId: 'project_1', cycleId: 'cycle_1', requirementIds: [], status: 'succeeded',
+      attemptCount: 1, createdAt: '', updatedAt: '', gapProposalStatus: 'proposed',
+      gapProposal: { kind: 'capability', commitSha: 'a'.repeat(40), summary: 'Repair docs.', steps: [], newRequirements: [] }
+    }];
+    expect(summarizeProjectOperationalOverview(source)).toMatchObject({
+      tone: 'attention', state: 'Audit navrhuje opravu', primaryAction: 'review_audit_gaps'
+    });
+    expect(summarizeProjectProgress(source, 'task_1').headline).toBe('Audit navrhuje opravu');
+    source.auditJobs[0]!.gapProposalStatus = 'dismissed';
+    expect(summarizeProjectOperationalOverview(source).primaryAction).toBe('none');
+  });
+
   it('puts the next active step and start action first', () => {
     expect(summarizeProjectOperationalOverview(roadmap())).toMatchObject({
       tone: 'active',

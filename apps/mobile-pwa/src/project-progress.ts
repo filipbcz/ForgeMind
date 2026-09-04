@@ -1,4 +1,5 @@
 import type { ProjectRoadmapApi, TaskSummary } from './types.js';
+import { hasPendingAuditGapProposal } from './project-roadmap-domain.js';
 
 export type ProjectProgressTone = 'active' | 'attention' | 'completed' | 'idle';
 export type ProjectOperationalAction =
@@ -7,6 +8,7 @@ export type ProjectOperationalAction =
   | 'start_audit'
   | 'retry_audit'
   | 'review_extension'
+  | 'review_audit_gaps'
   | 'none';
 
 export interface ProjectProgressSummary {
@@ -121,6 +123,13 @@ export function summarizeProjectProgress(
     };
   }
 
+  if (hasPendingAuditGapProposal(auditJob)) {
+    return {
+      ...base, tone: 'attention', headline: 'Audit navrhuje opravu',
+      detail: 'Návrh čeká na rozhodnutí v přehledu projektu. Task zatím nebyl vytvořen.'
+    };
+  }
+
   if (latestCycle.status === 'partial' || latestCycle.status === 'blocked') {
     return {
       ...base,
@@ -218,6 +227,14 @@ export function summarizeProjectOperationalOverview(
       blockers,
       primaryAction: 'retry_audit',
       primaryActionLabel: 'Opakovat pouze audit'
+    };
+  }
+
+  if (hasPendingAuditGapProposal(auditJob)) {
+    return {
+      tone: 'attention', state: 'Audit navrhuje opravu',
+      activeStep: `${auditJob!.gapProposal!.steps.length} navržených kroků čeká na rozhodnutí. Task zatím nevznikl.`,
+      blockers, primaryAction: 'review_audit_gaps', primaryActionLabel: 'Zobrazit návrh opravy'
     };
   }
 

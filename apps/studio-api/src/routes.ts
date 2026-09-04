@@ -1195,6 +1195,9 @@ export function registerRoutes(
         await repository.decideProjectAuditGapProposal({ projectId: id, auditJobId: job.id, accepted: false });
         return (await repository.getProjectRoadmap(id))!;
       }
+      if (job.status !== 'succeeded' || job.gapProposalStatus !== 'proposed') {
+        return reply.code(409).send({ error: 'The audit proposal is not ready for activation. Wait for the current audit or activation to finish.' });
+      }
       if (!project.projectContract) throw new Error('A current project contract is required before audit gaps can be activated.');
       const connection = project.aiProviderConnectionId
         ? await readAIProviderConnectionSecretById(repository, project.aiProviderConnectionId)
@@ -1204,15 +1207,18 @@ export function registerRoutes(
       const githubConnection = await readGitHubConnectionSecret(repository);
       if (!githubConnection) throw new Error('Connect GitHub before reviewing audit gaps.');
       checkout = await prepareReadOnlyRepositoryBaseline(new GitHubAppAdapter({ token: githubConnection.token, apiBaseUrl: githubConnection.apiBaseUrl }), project);
-      if (checkout.commitSha !== job.gapProposal.commitSha) {
-        return reply.code(409).send({ error: 'Repository baseline changed since the audit. Run the audit again before activation.' });
-      }
       const provider = createProvider(connection.provider, { apiKey: connection.apiKey, authMode: connection.authMode, model: connection.model, codexHome: connection.codexHome });
       if (!provider.reviewRoadmap) throw new Error(`AI provider "${provider.kind}" does not support independent roadmap quality review.`);
       const reviewContract = buildAuditGapReviewContract(project.projectContract, job.gapProposal.newRequirements);
       const review = await provider.reviewRoadmap({
         taskId: `audit-gap:${job.id}`,
-        objective: `Review ${job.gapProposal.kind} audit gaps against the current project scope.`,
+        objective: [
+          `Review ${job.gapProposal.kind} audit gaps against the current project scope and repository.`,
+          `The proposal was recorded at commit ${job.gapProposal.commitSha}; this review uses current commit ${checkout.commitSha}.`,
+          'A different commit ID alone is not a blocker: squash merges may preserve identical content.',
+          'Reassess every proposed step against the current repository baseline. Reject work that is already implemented, no longer needed, or outside the current specification and contract.',
+          'Approve only concrete remaining gaps; historical audit findings are context, not proof that the gap still exists.'
+        ].join('\n'),
         authoritativeSpecification: (await repository.getProjectSpecifications(id))?.current.fullSpecification ?? project.brief ?? project.name,
         projectContract: reviewContract,
         requiredRequirementIds: Array.from(new Set(job.gapProposal.steps.flatMap((step) => step.requirementIds))),
@@ -1221,6 +1227,10 @@ export function registerRoutes(
         repositoryBaseline: { commitSha: checkout.commitSha, evidence: checkout.evidence }
       });
       await repository.saveProjectAuditGapReview({ projectId: id, auditJobId: job.id, review });
+      await repository.writeAudit({
+        actorType: 'system', eventType: 'project_audit_gap_review_baseline', projectId: id,
+        payload: { auditJobId: job.id, proposalCommitSha: job.gapProposal.commitSha, reviewCommitSha: checkout.commitSha, verdict: review.verdict }
+      });
       if (review.verdict !== 'satisfied') return reply.code(409).send({ error: review.summary, blockers: review.blockers });
       await repository.decideProjectAuditGapProposal({ projectId: id, auditJobId: job.id, accepted: true, review });
       return (await repository.getProjectRoadmap(id))!;

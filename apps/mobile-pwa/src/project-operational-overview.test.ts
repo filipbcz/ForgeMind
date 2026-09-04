@@ -1,5 +1,5 @@
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
-import { createElement } from 'react';
+import { createElement, type ComponentProps } from 'react';
 import { renderToStaticMarkup } from 'react-dom/server';
 import { describe, expect, it, vi } from 'vitest';
 import {
@@ -93,7 +93,8 @@ const roadmap: ProjectRoadmapApi = {
 
 function renderProjectsPanel(
   sourceRoadmap: ProjectRoadmapApi = roadmap,
-  specificationReview?: SpecificationChangeImpactReviewApi
+  specificationReview?: SpecificationChangeImpactReviewApi,
+  overrides: Partial<ComponentProps<typeof ProjectsPanel>> = {}
 ): string {
   const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
 
@@ -135,18 +136,67 @@ function renderProjectsPanel(
         onDecideExtension: vi.fn(),
         onRetryAudit: vi.fn(),
         onStartAudit: vi.fn(),
+        onDecideAuditGap: vi.fn(),
         onStartNextRoadmapStep: vi.fn(),
         onDeleteProject: vi.fn(),
         githubRepositories: [],
         githubRepositoriesLoading: false,
         githubRepositoryOwners: [],
-        githubRepositoryOwnersLoading: false
+        githubRepositoryOwnersLoading: false,
+        ...overrides
       })
     )
   );
 }
 
 describe('project operational overview layout', () => {
+  const auditWithProposal: ProjectAuditJobApi = {
+    id: 'audit_1', projectId: project.id, cycleId: 'cycle_1', requirementIds: ['REQ-DOCS'],
+    status: 'succeeded', attemptCount: 1, createdAt: '', updatedAt: '', gapProposalStatus: 'proposed',
+    gapProposal: {
+      kind: 'capability', commitSha: 'a'.repeat(40), summary: 'Repair obsolete evidence references.', newRequirements: [],
+      steps: [{ title: 'Correct documentation references', description: 'Repair the tracker and parity checklist.',
+        acceptanceCriteria: ['Every reference exists.'], deliverables: ['Corrected tracker'], requirementIds: ['REQ-DOCS'],
+        dependsOnStepTitles: [], validationFocus: ['regression'], changeRationale: 'Current references are invalid.' }]
+    }
+  };
+
+  it('shows the pending audit proposal before metrics without opening the audit tab or changing filters', () => {
+    const markup = renderProjectsPanel({ ...roadmap, auditJobs: [auditWithProposal] });
+    expect(markup.indexOf('Audit navrhuje opravu')).toBeGreaterThan(-1);
+    expect(markup.indexOf('Audit navrhuje opravu')).toBeLessThan(markup.indexOf('Open PR'));
+    expect(markup).toContain('Correct documentation references');
+    expect(markup).toContain('Every reference exists.');
+    expect(markup).toContain('Zkontrolovat a aktivovat návrh');
+    expect(markup).toContain('Task zatím nevznikl');
+    expect(markup).toContain('Spustit další krok');
+  });
+
+  it('keeps pending audit decisions in active and waiting filters instead of hiding them among completed audits', () => {
+    expect(projectAuditMatchesStatusFilter(auditWithProposal, 'active')).toBe(true);
+    expect(projectAuditMatchesStatusFilter(auditWithProposal, 'waiting')).toBe(true);
+    expect(projectAuditMatchesStatusFilter(auditWithProposal, 'completed')).toBe(false);
+    expect(projectAuditMatchesStatusFilter({ ...auditWithProposal, gapProposalStatus: 'activated' }, 'completed')).toBe(true);
+    expect(projectAuditMatchesStatusFilter({ ...auditWithProposal, gapProposalStatus: 'dismissed' }, 'active')).toBe(false);
+  });
+
+  it('shows activation errors beside the proposal and disables actions while its review runs', () => {
+    const markup = renderProjectsPanel({ ...roadmap, auditJobs: [auditWithProposal] }, undefined, {
+      auditGapError: 'Review service unavailable.', decidingAuditGap: true
+    });
+    expect(markup).toContain('role="alert"');
+    expect(markup).toContain('Review service unavailable.');
+    expect(markup).toContain('Probíhá kontrola návrhu');
+    expect(markup).toMatch(/<button[^>]*disabled=""[^>]*>Probíhá kontrola návrhu/);
+  });
+
+  it('does not offer an obsolete proposal while the audit is being rerun', () => {
+    const job = { ...auditWithProposal, status: 'claimed' as const };
+    const markup = renderProjectsPanel({ ...roadmap, auditJobs: [job] });
+    expect(markup).not.toContain('Zkontrolovat a aktivovat návrh');
+    expect(projectAuditMatchesStatusFilter(job, 'active')).toBe(true);
+  });
+
   it('renders current state and primary action before project metrics and roadmap history', () => {
     const markup = renderProjectsPanel();
 

@@ -47,10 +47,15 @@ export function projectAuditMatchesStatusFilter(
   job: ProjectAuditJobApi,
   filter: ProjectItemStatusFilter
 ): boolean {
-  if (filter === 'active') return job.status === 'claimed';
-  if (filter === 'waiting') return job.status === 'pending';
+  if (filter === 'active') return job.status === 'claimed' || hasPendingAuditGapProposal(job);
+  if (filter === 'waiting') return job.status === 'pending' || (hasPendingAuditGapProposal(job) && job.gapProposalStatus === 'proposed');
   if (filter === 'failed') return job.status === 'failed' || job.status === 'blocked';
-  return job.status === 'succeeded';
+  return job.status === 'succeeded' && !hasPendingAuditGapProposal(job);
+}
+
+export function hasPendingAuditGapProposal(job: ProjectAuditJobApi | undefined): boolean {
+  return Boolean(job?.status === 'succeeded' && job.gapProposal
+    && (job.gapProposalStatus === 'proposed' || job.gapProposalStatus === 'activating'));
 }
 
 export function projectEvidenceMatchesStatusFilter(

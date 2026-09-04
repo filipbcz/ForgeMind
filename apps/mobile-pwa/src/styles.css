@@ -1847,6 +1847,32 @@ a {
   padding: 0 14px 14px;
 }
 
+.audit-gap-proposal {
+  padding: 16px;
+  border-color: #0f766e;
+  overflow-wrap: anywhere;
+}
+
+.audit-gap-steps {
+  padding-left: 24px;
+}
+
+.audit-gap-steps > li + li {
+  margin-top: 16px;
+}
+
+.audit-gap-description {
+  white-space: pre-wrap;
+}
+
+.audit-expand-icon {
+  flex-shrink: 0;
+}
+
+.audit-entry[open] > summary .audit-expand-icon {
+  transform: rotate(180deg);
+}
+
 .error-detail {
   border: 1px solid #fecaca;
   border-radius: 8px;
