@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from 'vitest';
-import { buildCodexImplementationPrompt, buildCodexReviewSchema, CodexProvider, isNoisyWorkspaceActivityPath, parseCodexCliTotalTokens, runCodexProcess } from './codex-provider.js';
+import { buildCodexImplementationPrompt, buildCodexReviewSchema, codexProcessActivity, CodexProvider, isNoisyWorkspaceActivityPath, parseCodexCliTotalTokens, runCodexProcess } from './codex-provider.js';
 
 describe('Codex structured output schemas', () => {
   it.each(['implementation', 'chat'] as const)('serializes typed Windows adapters in the actual %s request schema', async (operation) => {
@@ -93,6 +93,14 @@ function expectStrictResponseSchema(schema: JsonSchema, path = '$'): void {
 }
 
 describe('Codex process activity timeouts', () => {
+  it('preserves separate command streams and never relabels aggregated output as stdout', () => {
+    expect(codexProcessActivity({ type: 'item.completed', item: { type: 'command_execution', id: 'check-1', command: 'cmd /c build', exit_code: 7,
+      stdout: 'build output', stderr: 'build error', aggregated_output: 'build outputbuild error' } })).toEqual({
+      event: 'completed', id: 'check-1', command: 'cmd /c build', exitCode: 7, stdout: 'build output', stderr: 'build error'
+    });
+    expect(codexProcessActivity({ type: 'item.completed', item: { type: 'command_execution', command: 'legacy', aggregated_output: 'combined' } }))
+      .toMatchObject({ stdout: undefined, stderr: undefined });
+  });
   it('builds a strict review schema accepted by Codex structured output', () => {
     expectStrictObjectSchemas(buildCodexReviewSchema());
   });

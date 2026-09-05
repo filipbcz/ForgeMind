@@ -81,6 +81,7 @@ describe('Windows worker shared contracts', () => {
       kind: 'authoring', protocolVersion: 1, projectId: 'p', taskId: 't', runId: 'r', jobId: 'j', leaseId: 'pending',
       repository: 'owner/repo', sourceUrl: 'https://github.com/owner/repo.git', baseCommitSha: commitSha,
       workspaceRoot: 'runner-managed', artifactRoot: 'runner-managed', requiredCapabilities: ['windows', 'asset-authoring'],
+      step: { prompt: 'Update the generated map.', acceptanceCriteria: ['The map is updated.'] },
       managedRoots: ['Content/Generated'], operations: [{ id: 'op-1', kind: 'modify', path: 'Content/Generated/map.bin', rationale: 'Update map' }],
       checkpoints: [{ id: 'cp-1', label: 'Map saved', afterOperationIds: ['op-1'], artifactExpectationNames: ['map'] }],
       artifactExpectations: [{ name: 'map', relativePath: 'Content/Generated/map.bin', required: true, delivery: 'artifact-store', binary: true, maxBytes: 4096 }],
@@ -93,10 +94,11 @@ describe('Windows worker shared contracts', () => {
     expect(isWindowsAuthoringPacket({ ...authoring, authority: { ...authoring.authority, database: 'direct' } })).toBe(false);
     const result = { kind: 'authoring-result', protocolVersion: 1, projectId: 'p', taskId: 't', runId: 'r', jobId: 'j', leaseId: 'l',
       deviceId: 'd', sessionId: 's', nonce: 'n', inputHash: hash, baseCommitSha: commitSha, resultTreeSha: commitSha,
-      tree: [{ path: 'Content/Generated/map.bin', kind: 'file', sha256: hash, sizeBytes: 42, binary: true, mode: '100644' }],
-      completedOperationIds: ['op-1'], checkpointIds: ['cp-1'], artifacts: [], status: 'succeeded',
+      tree: [{ path: 'Content/Generated/map.bin', kind: 'file', sha256: hash, sizeBytes: 42, binary: true, mode: '100644' }], patch: 'diff --git',
+      completedOperationIds: ['op-1'], checkpointIds: ['cp-1'], artifacts: [], processes: [{ leaseId: 'l', sessionId: 's', checkId: 'provider', command: 'provider.implement', shell: 'system', exitCode: 0, stdout: 'done', stderr: '', startedAt: '2026-01-01T00:00:00Z', completedAt: '2026-01-01T00:00:30Z' }], status: 'succeeded',
       startedAt: '2026-01-01T00:00:00Z', completedAt: '2026-01-01T00:01:00Z', summary: 'authored' };
     expect(isWindowsAuthoringResult(result)).toBe(true);
+    expect(isWindowsAuthoringResult({ ...result, processes: [{ ...result.processes[0], leaseId: 'other' }] })).toBe(false);
     expect(isWindowsAuthoringResult({ ...result, resultTreeSha: 'working-tree' })).toBe(false);
     expect(isWindowsAuthoringResult({ ...result, tree: [{ ...result.tree[0], binary: undefined }] })).toBe(false);
   });

@@ -10,6 +10,7 @@ export interface ProviderActivity {
   message: string;
   elapsedMs: number;
   usage?: ProviderUsageMeasurement;
+  process?: { event: 'started' | 'completed'; id?: string; command: string; exitCode?: number; stdout?: string; stderr?: string };
 }
 
 export type ProviderActivityHandler = (activity: ProviderActivity) => void | Promise<void>;
@@ -215,6 +216,7 @@ export interface ImplementInput {
   attemptNumber?: number;
   previousValidationError?: string;
   previousReviewBlockers?: string[];
+  nativeToolChannel?: { command: string; args: string[] };
   onActivity?: ProviderActivityHandler;
   session?: ProviderSessionContext;
   signal?: AbortSignal;

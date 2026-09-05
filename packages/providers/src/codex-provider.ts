@@ -1004,10 +1004,13 @@ export class CodexProvider implements AIProvider {
   }
 
   private async implementWithCli(input: ImplementInput): Promise<ImplementResult> {
-    const providerPrompt = buildCodexImplementationPrompt(
+    const baseProviderPrompt = buildCodexImplementationPrompt(
       input,
       Boolean(resolveCompatibleSessionId(input.session, 'codex', this.model))
     );
+    const providerPrompt = input.nativeToolChannel
+      ? `Use only the discoverable forgemind_native filesystem and process tools for repository access and commands. The built-in shell is disabled so every process preserves separate stdout and stderr.\n\n${baseProviderPrompt}`
+      : baseProviderPrompt;
     const beforeSnapshot = await collectChangedFileSnapshot(input.repositoryPath);
     let content: string;
     let recoveredFromTimeout = false;
@@ -1018,6 +1021,7 @@ export class CodexProvider implements AIProvider {
         onActivity: input.onActivity,
         session: input.session,
         signal: input.signal,
+        nativeToolChannel: input.nativeToolChannel,
         schema: {
           type: 'object',
           additionalProperties: false,
@@ -1143,6 +1147,7 @@ export class CodexProvider implements AIProvider {
     session?: ProviderSessionContext;
     maxRuntimeMs?: number;
     signal?: AbortSignal;
+    nativeToolChannel?: { command: string; args: string[] };
   }): Promise<string> {
     await this.verifyOAuthSession();
 
@@ -1159,7 +1164,8 @@ export class CodexProvider implements AIProvider {
       schemaPath,
       outputPath,
       repositoryPath: executionDirectory,
-      sessionId: resolveCompatibleSessionId(input.session, 'codex', this.model)
+      sessionId: resolveCompatibleSessionId(input.session, 'codex', this.model),
+      nativeToolChannel: input.nativeToolChannel
     });
 
     try {
@@ -1352,10 +1358,11 @@ export function buildCodexExecArgs(input: {
   outputPath: string;
   repositoryPath?: string;
   sessionId?: string;
+  nativeToolChannel?: { command: string; args: string[] };
 }): string[] {
   const args = input.sessionId ? ['exec', 'resume'] : ['exec', '--color', 'never'];
 
-  if (input.sandbox === 'workspace-write' || input.bypassSandbox) {
+  if (input.bypassSandbox) {
     args.push('--dangerously-bypass-approvals-and-sandbox');
   } else if (input.sessionId) {
     args.push('-c', `sandbox_mode="${input.sandbox}"`);
@@ -1364,6 +1371,10 @@ export function buildCodexExecArgs(input: {
   }
 
   args.push('--model', input.model);
+  if (input.nativeToolChannel) {
+    args.push('--disable', 'shell_tool', '-c', `mcp_servers.forgemind_native.command=${JSON.stringify(input.nativeToolChannel.command)}`,
+      '-c', `mcp_servers.forgemind_native.args=${JSON.stringify(input.nativeToolChannel.args)}`);
+  }
   args.push('--output-schema', input.schemaPath);
   args.push('--output-last-message', input.outputPath, '--skip-git-repo-check', '--json');
 
@@ -1457,13 +1468,14 @@ export async function runCodexProcess(
       workspaceWatcher?.close();
       options.signal?.removeEventListener('abort', stopForAbort);
     };
-    const enqueueActivity = (kind: 'lifecycle' | 'stdout' | 'stderr' | 'workspace', message: string) => {
+    const enqueueActivity = (kind: 'lifecycle' | 'stdout' | 'stderr' | 'workspace', message: string, process?: import('./provider.js').ProviderActivity['process']) => {
       activityQueue = activityQueue
         .then(async () => {
           await emitProviderActivityMessage(options.onActivity, {
             kind,
             message: stripAnsi(message),
-            elapsedMs: Date.now() - startedAt
+            elapsedMs: Date.now() - startedAt,
+            process
           });
         })
         .catch(() => undefined);
@@ -1522,16 +1534,19 @@ export async function runCodexProcess(
       clearTimeout(inactivityTimer);
       inactivityTimer = setTimeout(() => stopForTimeout('inactivity'), inactivityTimeoutMs);
     };
-    const recordActivity = (kind: 'stdout' | 'stderr' | 'workspace', message: string) => {
+    const recordActivity = (kind: 'stdout' | 'stderr' | 'workspace', message: string, process?: import('./provider.js').ProviderActivity['process']) => {
       if (settled || timeoutReason) return;
       resetInactivityTimer();
-      emitActivity(kind, message);
+      if (process) {
+        flushBufferedActivity();
+        enqueueActivity(kind, message, process);
+      } else emitActivity(kind, message);
     };
-    const consumeJsonEvents = (chunk: string, flush = false): string[] => {
+    const consumeJsonEvents = (chunk: string, flush = false): Array<{ message: string; process?: import('./provider.js').ProviderActivity['process'] }> => {
       jsonLineBuffer += chunk;
       const lines = jsonLineBuffer.split(/\r?\n/);
       jsonLineBuffer = flush ? '' : (lines.pop() ?? '');
-      const messages: string[] = [];
+      const messages: Array<{ message: string; process?: import('./provider.js').ProviderActivity['process'] }> = [];
       for (const line of lines) {
         try {
           const event = JSON.parse(line) as CodexJsonEvent;
@@ -1544,9 +1559,9 @@ export async function runCodexProcess(
             jsonTotalTokens = usage.input_tokens + usage.output_tokens;
           }
           const message = formatCodexJsonEvent(event);
-          if (message) messages.push(message);
+          if (message) messages.push({ message, process: codexProcessActivity(event) });
         } catch {
-          if (line.trim()) messages.push(line);
+          if (line.trim()) messages.push({ message: line });
         }
       }
       return messages;
@@ -1578,7 +1593,7 @@ export async function runCodexProcess(
       const text = chunk.toString('utf8');
       stdout = appendCappedOutput(stdout, text);
       if (expectsJsonEvents) {
-        for (const message of consumeJsonEvents(text)) recordActivity('stdout', message);
+        for (const activity of consumeJsonEvents(text)) recordActivity('stdout', activity.message, activity.process);
       } else {
         recordActivity('stdout', text);
       }
@@ -1591,7 +1606,7 @@ export async function runCodexProcess(
     child.on('error', (error) => finish(error));
     child.on('close', (code) => {
       if (expectsJsonEvents) {
-        for (const message of consumeJsonEvents('', true)) recordActivity('stdout', message);
+        for (const activity of consumeJsonEvents('', true)) recordActivity('stdout', activity.message, activity.process);
       }
       if (timeoutReason) {
         finish(new CodexExecutionTimeoutError(timeoutReason, Date.now() - startedAt, stdout, stderr));
@@ -1620,10 +1635,13 @@ interface CodexJsonEvent {
   error?: { message?: string } | string;
   usage?: { input_tokens?: number; output_tokens?: number };
   item?: {
+    id?: string;
     type?: string;
     text?: string;
     command?: string;
     aggregated_output?: string;
+    stdout?: string;
+    stderr?: string;
     status?: string;
     exit_code?: number;
   };
@@ -1645,6 +1663,19 @@ export function formatCodexJsonEvent(event: CodexJsonEvent): string | undefined 
     return [event.item.command ? `Finished (${status}): ${event.item.command}` : `Command finished (${status}).`, output].filter(Boolean).join('\n');
   }
   return event.item.text?.trim() || undefined;
+}
+
+export function codexProcessActivity(event: CodexJsonEvent): import('./provider.js').ProviderActivity['process'] | undefined {
+  if (!event.type?.startsWith('item.') || event.item?.type !== 'command_execution' || !event.item.command) return undefined;
+  if (event.type === 'item.started') return { event: 'started', id: event.item.id, command: event.item.command };
+  if (event.type === 'item.completed') {
+    // Newer Codex event producers expose the streams independently. An older
+    // aggregated-only event cannot truthfully be represented as either stream;
+    // fail closed downstream instead of silently relabeling combined evidence.
+    return { event: 'completed', id: event.item.id, command: event.item.command,
+      exitCode: event.item.exit_code, stdout: event.item.stdout, stderr: event.item.stderr };
+  }
+  return undefined;
 }
 
 export function isNoisyWorkspaceActivityPath(path: string): boolean {
