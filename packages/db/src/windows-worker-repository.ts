@@ -169,6 +169,20 @@ export class WindowsWorkerRepository {
     return id;
   }
 
+  /** Waits for the lease result without imposing a workflow retry or duration
+   * limit. Cancellation remains controlled by the owning task run. */
+  async waitForAuthoringResult(jobId: string, signal?: AbortSignal): Promise<import('@forgemind/core').WindowsAuthoringResult> {
+    while (!signal?.aborted) {
+      const job = await this.prisma.windowsExecutionJob.findUnique({ where: { id: jobId }, select: { status: true, packet: true } });
+      if (!job) throw new Error('Windows authoring job was not found.');
+      const packet = job.packet as unknown as WindowsAuthoringPacket & { authoringResult?: import('@forgemind/core').WindowsAuthoringResult };
+      if (packet.authoringResult && isWindowsAuthoringResult(packet.authoringResult)) return packet.authoringResult;
+      if (['cancelled', 'expired'].includes(job.status)) throw new Error(`Windows authoring job ${job.status}.`);
+      await new Promise<void>((resolve) => { const timer = setTimeout(resolve, 1_000); signal?.addEventListener('abort', () => { clearTimeout(timer); resolve(); }, { once: true }); });
+    }
+    throw new Error('Windows authoring was cancelled.');
+  }
+
   async uploadEvidence(deviceId: string, upload: WindowsEvidenceUpload): Promise<'accepted' | 'duplicate' | 'conflict'> {
     return this.prisma.$transaction(async (tx) => {
       const locked = await tx.$queryRaw<Array<{ id: string }>>`

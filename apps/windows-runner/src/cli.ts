@@ -4,9 +4,11 @@ import { release as osRelease } from 'node:os';
 import { join } from 'node:path';
 import { stdin, stdout } from 'node:process';
 import { pathToFileURL } from 'node:url';
-import { classifyWindowsExecutionPacket, isWindowsExecutionPacket } from '@forgemind/core';
+import { classifyWindowsExecutionPacket, isWindowsAuthoringPacket, isWindowsExecutionPacket } from '@forgemind/core';
+import { createProvider } from '@forgemind/providers';
 import { WindowsCredentialStore } from './credential-store.js';
 import { cleanupWindowsValidationWorkspace, executeWindowsValidation } from './executor.js';
+import { executeWindowsAuthoring, LifecycleNativeImplementationProvider } from './authoring-executor.js';
 import { runCapabilityProbes, windowsRunnerCapabilityProbes } from './probes.js';
 import { runManualSession } from './session.js';
 import { WindowsRunnerTransport } from './transport.js';
@@ -67,6 +69,15 @@ export async function main(args = process.argv.slice(2)): Promise<void> {
     await runManualSession(transport, auth, { projectIds: parsed.projectIds, signal: controller.signal,
       onClaim: async (claim, context) => {
         if (!claim.job || !claim.lease) return;
+        if (isWindowsAuthoringPacket(claim.job.packet)) {
+          stdout.write(`Running native Windows implementation ${claim.job.packet.jobId}.\n`);
+          const executed = await executeWindowsAuthoring(claim.job.packet, { deviceId: auth.deviceId, sessionId: context.sessionId,
+            workspaceRoot: parsed.workspaceRoot, artifactRoot: parsed.artifactRoot, signal: context.signal,
+            provider: new LifecycleNativeImplementationProvider(createProvider('codex')) });
+          await transport.submitResult(auth, executed.result);
+          stdout.write(`${executed.result.summary}\n`);
+          return;
+        }
         const disposition = classifyWindowsExecutionPacket(claim.job.packet);
         if (!isWindowsExecutionPacket(claim.job.packet)) {
           stdout.write(`Deferred (${disposition.status === 'deferred' ? `${disposition.handling}/${disposition.reason}` : 'manual-local'}): This runner does not support the leased protocol. No process was started.\n`);

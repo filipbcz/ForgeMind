@@ -1,4 +1,4 @@
-import type { WindowsEvidenceUpload, WindowsExecutionJob, WindowsExecutionLease, WindowsExecutionResult, WorkerCapability, WorkerProbeEvidence } from '@forgemind/core';
+import type { WindowsEvidenceUpload, WindowsExecutionJob, WindowsExecutionLease, WindowsJobResult, WorkerCapability, WorkerProbeEvidence } from '@forgemind/core';
 import type { RunnerCredential } from './credential-store.js';
 
 export interface RunnerControlState { deviceStatus: string; sessionStatus: string; leaseStatus?: string; jobStatus?: string }
@@ -16,7 +16,7 @@ export class WindowsRunnerTransport {
     return this.call('/api/windows-runner/device', auth, input, 'PUT');
   }
   startSession(auth: RunnerCredential, projectIds: string[]) { return this.call<{ sessionId: string }>('/api/windows-runner/device/session', auth, { projectIds }); }
-  claim(auth: RunnerCredential, sessionId: string, requestId: string) { return this.call<LeaseClaim>('/api/windows-runner/device/lease', auth, { sessionId, requestId }); }
+  claim(auth: RunnerCredential, sessionId: string, requestId: string) { return this.call<LeaseClaim>('/api/windows-runner/device/lease', auth, { sessionId, requestId, authoringProtocolVersions: [1] }); }
   heartbeat(auth: RunnerCredential, sessionId: string, leaseId?: string) { return this.call('/api/windows-runner/device/heartbeat', auth, { sessionId, leaseId }); }
   control(auth: RunnerCredential, sessionId: string, leaseId?: string) {
     const query = new URLSearchParams({ sessionId }); if (leaseId) query.set('leaseId', leaseId);
@@ -25,7 +25,7 @@ export class WindowsRunnerTransport {
   drain(auth: RunnerCredential, sessionId: string) { return this.call('/api/windows-runner/device/session/drain', auth, { sessionId }); }
   stop(auth: RunnerCredential, sessionId: string) { return this.call('/api/windows-runner/device/session/stop', auth, { sessionId }); }
   uploadEvidence(auth: RunnerCredential, input: WindowsEvidenceUpload) { return this.call<{ accepted: boolean; duplicate: boolean }>('/api/windows-runner/device/evidence', auth, input); }
-  submitResult(auth: RunnerCredential, input: WindowsExecutionResult) { return this.call<{ accepted: boolean }>('/api/windows-runner/device/result', auth, input); }
+  submitResult(auth: RunnerCredential, input: WindowsJobResult) { return this.call<{ accepted: boolean }>('/api/windows-runner/device/result', auth, input); }
   close(auth: RunnerCredential, sessionId: string) { return this.call('/api/windows-runner/device/session/close', auth, { sessionId }); }
   private async call<T = unknown>(path: string, auth?: RunnerCredential, body?: unknown, method = 'POST'): Promise<T> {
     const response = await this.request(new URL(path, this.baseUrl), {

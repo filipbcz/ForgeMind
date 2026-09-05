@@ -1,9 +1,10 @@
 import { parseAgentConfigYaml, type AgentConfig } from '@forgemind/config';
 import { createHash, randomUUID } from 'node:crypto';
-import { activeProjectContractRequirements, createBlockedRunState, createFailedRunState, WINDOWS_EVIDENCE_MAX_ARTIFACT_BYTES, WINDOWS_EVIDENCE_MAX_LOG_BYTES } from '@forgemind/core';
+import { spawn } from 'node:child_process';
+import { activeProjectContractRequirements, createBlockedRunState, createFailedRunState, WINDOWS_EVIDENCE_MAX_ARTIFACT_BYTES, WINDOWS_EVIDENCE_MAX_LOG_BYTES, type WindowsAuthoringPacket } from '@forgemind/core';
 import { advanceRoadmapAfterTaskCompletion, createRepository, getPrismaClient, startNextRoadmapStep, WindowsWorkerRepository, type AIProviderConnectionSecret, type ForgeMindRepository } from '@forgemind/db';
 import { GitHubAppAdapter, createGitHubAdapterFromEnv } from '@forgemind/github';
-import { buildProjectExtensionProposalPrompt, createProvider, formatProjectExtensionProposal, normalizeProviderError, type AIProvider, type CapabilityAuditInput, type ProviderSessionContext, type ProviderUsageMeasurement, type ReleaseAuditInput, type ValidationCheck } from '@forgemind/providers';
+import { buildProjectExtensionProposalPrompt, createProvider, formatProjectExtensionProposal, normalizeProviderError, type AIProvider, type CapabilityAuditInput, type ImplementResult, type ProviderSessionContext, type ProviderUsageMeasurement, type ReleaseAuditInput, type ValidationCheck } from '@forgemind/providers';
 import type { NormalizedProviderErrorDetails, ProviderCircuitBreakerSnapshot, ProviderKind } from '@forgemind/core';
 import { toErrorMessage } from '@forgemind/shared';
 import { formatProjectArchitectureContext, runWorkerTask } from './workflow.js';
@@ -128,6 +129,65 @@ async function enqueueExternalWindowsValidations(
       payload: { jobId, checkId, command: check.command, requestedCapabilities, commitSha: input.commitSha }
     });
   }
+}
+
+async function implementThroughWindowsLease(windowsWorkers: WindowsWorkerRepository, input: {
+  project: import('@forgemind/core').Project; taskId: string; taskRunId: string; workspacePath: string;
+  prompt: string; acceptanceCriteria: string[]; previousValidationError?: string; previousReviewBlockers?: string[];
+  baseCommitSha: string; requiredCapabilities: string[]; signal?: AbortSignal;
+}): Promise<ImplementResult> {
+  if (!input.project.githubOwner || !input.project.githubRepo) throw new Error('Windows authoring requires a GitHub repository.');
+  const jobId = randomUUID();
+  const priorPatch = await readGitPatch(input.workspacePath, input.signal);
+  const packet: WindowsAuthoringPacket = {
+    kind: 'authoring', protocolVersion: 1, projectId: input.project.id, taskId: input.taskId, runId: input.taskRunId,
+    jobId, leaseId: 'pending', repository: `${input.project.githubOwner}/${input.project.githubRepo}`,
+    sourceUrl: `https://github.com/${input.project.githubOwner}/${input.project.githubRepo}.git`, baseCommitSha: input.baseCommitSha,
+    workspaceRoot: 'runner-managed', artifactRoot: 'runner-managed', step: { prompt: input.prompt, acceptanceCriteria: input.acceptanceCriteria,
+      previousValidationError: input.previousValidationError, previousReviewBlockers: input.previousReviewBlockers, priorPatch },
+    operations: [{ id: 'implementation', kind: 'tool', tool: 'ai-implementation', arguments: { acceptanceCriteria: input.acceptanceCriteria }, rationale: 'Implement the current task step in the exact native checkout.' }],
+    requiredCapabilities: input.requiredCapabilities, managedRoots: ['.'], checkpoints: [], artifactExpectations: [],
+    resourcePolicy: { timeoutSeconds: 36_000, maxLogBytes: WINDOWS_EVIDENCE_MAX_LOG_BYTES, maxArtifactBytes: WINDOWS_EVIDENCE_MAX_ARTIFACT_BYTES },
+    nonce: 'pending', inputHash: createHash('sha256').update(JSON.stringify({ taskId: input.taskId, runId: input.taskRunId, baseCommitSha: input.baseCommitSha,
+      prompt: input.prompt, acceptanceCriteria: input.acceptanceCriteria, previousValidationError: input.previousValidationError,
+      previousReviewBlockers: input.previousReviewBlockers, priorPatch })).digest('hex'),
+    authority: { database: 'none', productionHosts: 'none', globalGitHubCredentials: 'none' }
+  };
+  await windowsWorkers.enqueueAuthoring({ id: jobId, projectId: input.project.id, taskId: input.taskId, runId: input.taskRunId, requiredCapabilities: input.requiredCapabilities, packet });
+  const result = await windowsWorkers.waitForAuthoringResult(jobId, input.signal);
+  if (result.status !== 'succeeded') throw new Error(`Windows authoring ${result.status}: ${result.summary}`);
+  await replaceGitPatch(input.workspacePath, priorPatch, result.patch, input.signal);
+  return { outcome: result.patch.trim() ? 'changes_made' : 'already_satisfied', summary: result.summary,
+    changedFiles: result.tree.map(({ path }) => path), evidenceFiles: [], diffStat: { filesChanged: result.tree.length, insertions: 0, deletions: 0 },
+    validationChecks: [], architectureUpdate: undefined };
+}
+
+export async function replaceGitPatch(workspacePath: string, previousPatch: string, patch: string, signal?: AbortSignal): Promise<void> {
+  if (previousPatch.trim()) await runGitApply(workspacePath, previousPatch, true, signal);
+  try {
+    if (patch.trim()) await runGitApply(workspacePath, patch, false, signal);
+  } catch (error) {
+    if (previousPatch.trim()) await runGitApply(workspacePath, previousPatch, false, signal);
+    throw error;
+  }
+}
+
+async function runGitApply(workspacePath: string, patch: string, reverse: boolean, signal?: AbortSignal): Promise<void> {
+  await new Promise<void>((resolve, reject) => {
+    const child = spawn('git', ['apply', ...(reverse ? ['--reverse'] : []), '--binary', '--whitespace=nowarn', '-'], { cwd: workspacePath, stdio: ['pipe', 'pipe', 'pipe'] });
+    let stderr = ''; child.stderr.on('data', (chunk) => { stderr += String(chunk); });
+    const abort = () => child.kill('SIGTERM'); signal?.addEventListener('abort', abort, { once: true }); child.stdin.end(patch);
+    child.once('error', reject); child.once('close', (code) => { signal?.removeEventListener('abort', abort); code === 0 ? resolve() : reject(new Error(`Windows result reconciliation failed: ${stderr}`)); });
+  });
+}
+
+async function readGitPatch(workspacePath: string, signal?: AbortSignal): Promise<string> {
+  return await new Promise<string>((resolve, reject) => {
+    const child = spawn('git', ['diff', '--binary', '--no-ext-diff', 'HEAD'], { cwd: workspacePath, stdio: ['ignore', 'pipe', 'pipe'] });
+    let stdout = ''; let stderr = ''; child.stdout.on('data', (chunk) => { stdout += String(chunk); }); child.stderr.on('data', (chunk) => { stderr += String(chunk); });
+    const abort = () => child.kill('SIGTERM'); signal?.addEventListener('abort', abort, { once: true }); child.once('error', reject);
+    child.once('close', (code) => { signal?.removeEventListener('abort', abort); code === 0 ? resolve(stdout) : reject(new Error(`Could not read current Windows patch: ${stderr}`)); });
+  });
 }
 
 let preferChatQueue = true;
@@ -406,6 +466,16 @@ export async function runDatabaseWorkerOnce(options: { deferInterruptSignals?: b
       provider,
       reviewProvider,
       workspaceRoot,
+      implementationOwner: projectConfig?.workflow.implementation_owner ?? 'linux',
+      implementOnWindows: projectConfig?.workflow.implementation_owner === 'windows'
+        ? async (implementationInput) => implementThroughWindowsLease(windowsWorkers, {
+            project: claimed.project, taskId: claimed.task.id, taskRunId: claimed.taskRun.id,
+            workspacePath: `${workspaceRoot}/${claimed.task.id}`, prompt: implementationInput.prompt,
+            acceptanceCriteria: implementationInput.plan.acceptanceCriteria, baseCommitSha: implementationInput.baseCommitSha,
+            previousValidationError: implementationInput.previousValidationError, previousReviewBlockers: implementationInput.previousReviewBlockers,
+            requiredCapabilities: projectConfig.workflow.windows_authoring_capabilities, signal: implementationInput.signal
+          })
+        : undefined,
       resourcePolicy,
       usageSummary: costEstimateAvailable
         ? `Pre-run estimate: ${costEstimate.inputTokens} input tokens, ${costEstimate.outputTokens} output tokens, ${costEstimate.estimatedCostUsd.toFixed(4)} USD`

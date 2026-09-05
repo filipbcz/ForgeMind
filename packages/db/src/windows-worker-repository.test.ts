@@ -28,6 +28,7 @@ describe('WindowsWorkerRepository capability leases', () => {
   it('persists a versioned authoring packet with its exact base identity', async () => {
     const packet = { kind: 'authoring', protocolVersion: 1, projectId: 'project_1', taskId: 'task_1', runId: 'run_1', jobId: 'job_1', leaseId: 'pending',
       repository: 'owner/repo', sourceUrl: 'https://example.test/repo.git', baseCommitSha: 'b'.repeat(40), workspaceRoot: 'runner-managed', artifactRoot: 'runner-managed',
+      step: { prompt: 'Update map', acceptanceCriteria: ['Map is updated'] },
       operations: [{ id: 'op-1', kind: 'modify', path: 'Content/map.bin', rationale: 'Update map' }], requiredCapabilities: ['windows-authoring'],
       managedRoots: ['Content'], checkpoints: [{ id: 'cp-1', label: 'Saved', afterOperationIds: ['op-1'], artifactExpectationNames: ['map'] }],
       artifactExpectations: [{ name: 'map', relativePath: 'Content/map.bin', required: true, delivery: 'artifact-store', binary: true, maxBytes: 1024 }],
@@ -241,6 +242,7 @@ describe('WindowsWorkerRepository capability leases', () => {
   it('accepts only an authoring result matching every lease and base identity and persists its complete tree', async () => {
     const packet = { kind: 'authoring', protocolVersion: 1, projectId: 'project_1', taskId: 'task_1', runId: 'run_1', jobId: 'job_1', leaseId: 'lease_1',
       repository: 'owner/repo', sourceUrl: 'https://example.test/repo.git', baseCommitSha: 'b'.repeat(40), workspaceRoot: 'runner-managed', artifactRoot: 'runner-managed',
+      step: { prompt: 'Update map', acceptanceCriteria: ['Map is updated'] },
       operations: [{ id: 'op-1', kind: 'modify', path: 'Content/map.bin', rationale: 'Update' }], requiredCapabilities: ['windows-authoring'], managedRoots: ['Content'],
       checkpoints: [{ id: 'cp-1', label: 'Saved', afterOperationIds: ['op-1'], artifactExpectationNames: [] }], artifactExpectations: [],
       resourcePolicy: { timeoutSeconds: 60, maxLogBytes: 100, maxArtifactBytes: 100 }, nonce: 'nonce_1', inputHash: packetDigest,
@@ -251,8 +253,8 @@ describe('WindowsWorkerRepository capability leases', () => {
     const prisma: any = { $transaction: vi.fn(async (work: (client: unknown) => unknown) => work(tx)) };
     const result = { kind: 'authoring-result', protocolVersion: 1, projectId: 'project_1', taskId: 'task_1', runId: 'run_1', jobId: 'job_1', leaseId: 'lease_1',
       deviceId: 'device_1', sessionId: 'session_1', nonce: 'nonce_1', inputHash: packetDigest, baseCommitSha: packet.baseCommitSha,
-      resultTreeSha: 'c'.repeat(40), tree: [{ path: 'Content/map.bin', kind: 'file', sha256: 'd'.repeat(64), sizeBytes: 8, binary: true, mode: '100644' }],
-      completedOperationIds: ['op-1'], checkpointIds: ['cp-1'], artifacts: [], status: 'succeeded', startedAt: '2026-09-01T00:00:00Z', completedAt: '2026-09-01T00:01:00Z', summary: 'done' } as const;
+      resultTreeSha: 'c'.repeat(40), tree: [{ path: 'Content/map.bin', kind: 'file', sha256: 'd'.repeat(64), sizeBytes: 8, binary: true, mode: '100644' }], patch: 'diff --git',
+      completedOperationIds: ['op-1'], checkpointIds: ['cp-1'], artifacts: [], processes: [], status: 'succeeded', startedAt: '2026-09-01T00:00:00Z', completedAt: '2026-09-01T00:01:00Z', summary: 'done' } as const;
     const repository = new WindowsWorkerRepository(prisma);
     expect(await repository.submitResult('device_1', result as any)).toEqual({ accepted: true, packet });
     expect(updateMany).toHaveBeenCalledWith(expect.objectContaining({ data: { status: 'succeeded', packet: { ...packet, authoringResult: result } } }));

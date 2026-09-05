@@ -320,7 +320,7 @@ describe('Codex provider', () => {
     });
   });
 
-  it('uses bypass mode for Codex CLI workspace writes', () => {
+  it('confines Codex CLI workspace writes without interactive approvals', () => {
     const args = buildCodexExecArgs({
       sandbox: 'workspace-write',
       model: 'gpt-5.5',
@@ -329,8 +329,9 @@ describe('Codex provider', () => {
       repositoryPath: 'C:/tmp/repo'
     });
 
-    expect(args).toContain('--dangerously-bypass-approvals-and-sandbox');
-    expect(args).not.toContain('--sandbox');
+    expect(args).not.toContain('--dangerously-bypass-approvals-and-sandbox');
+    expect(args).toContain('--sandbox');
+    expect(args).toContain('workspace-write');
     expect(args).toContain('--cd');
     expect(args).toContain('C:/tmp/repo');
   });
@@ -346,6 +347,14 @@ describe('Codex provider', () => {
     expect(args).toContain('--sandbox');
     expect(args).toContain('read-only');
     expect(args).not.toContain('--dangerously-bypass-approvals-and-sandbox');
+  });
+
+  it('disables the lossy built-in shell when a native MCP tool channel is supplied', () => {
+    const args = buildCodexExecArgs({ sandbox: 'workspace-write', model: 'gpt-5.5', schemaPath: 'schema.json', outputPath: 'out.json',
+      repositoryPath: 'C:/checkout', nativeToolChannel: { command: 'node.exe', args: ['native-tool-server.js', 'C:/checkout', 'C:/evidence.jsonl'] } });
+    expect(args).toEqual(expect.arrayContaining(['--disable', 'shell_tool']));
+    expect(args).toContain('mcp_servers.forgemind_native.command="node.exe"');
+    expect(args).toContain('mcp_servers.forgemind_native.args=["native-tool-server.js","C:/checkout","C:/evidence.jsonl"]');
   });
 
   it('can bypass the read-only sandbox inside an isolated worker container', () => {

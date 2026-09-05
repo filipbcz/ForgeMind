@@ -5,10 +5,10 @@
   "type": "module",
   "bin": { "forgemind-windows-runner": "dist/cli.js" },
   "scripts": {
-    "build": "tsup src/cli.ts --format esm --target node22 --out-dir dist --clean --sourcemap",
+    "build": "tsup src/cli.ts src/native-tool-server.ts --format esm --target node22 --out-dir dist --clean --sourcemap",
     "pretest": "npm run build",
     "test": "vitest run"
   },
-  "dependencies": { "@forgemind/core": "0.1.0" },
+  "dependencies": { "@forgemind/core": "0.1.0", "@forgemind/providers": "0.1.0" },
   "devDependencies": { "tsup": "^8.5.0" }
 }

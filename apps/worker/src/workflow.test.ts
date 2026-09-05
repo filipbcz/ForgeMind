@@ -1,5 +1,5 @@
 import { randomUUID } from 'node:crypto';
-import { mkdtemp, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { simpleGit } from 'simple-git';
@@ -15,6 +15,7 @@ import type {
   ReviewResult
 } from '@forgemind/providers';
 import { buildTaskExecutionPrompt, collectValidationWorkspacePatch, createDirectTaskPlan, runWorkerTask, selectReusableValidationResults, validationCheckFingerprint } from './workflow.js';
+import { replaceGitPatch } from './db-worker.js';
 
 const projectConfig = `project:
   id: workflow-test
@@ -128,6 +129,16 @@ function createProvider(overrides: Partial<AIProvider> = {}): AIProvider {
 }
 
 describe('simple autonomous worker workflow', () => {
+  it('replaces a prior base-relative Windows patch instead of stacking correction patches', async () => {
+    const workspace = await mkdtemp(join(tmpdir(), 'forgemind-native-patch-')); const git = simpleGit(workspace);
+    await git.init(); await git.addConfig('user.name', 'ForgeMind Test'); await git.addConfig('user.email', 'test@forgemind.local');
+    const target = join(workspace, 'value.txt'); await writeFile(target, 'base\n'); await git.add('value.txt'); await git.commit('base');
+    await writeFile(target, 'first\n'); const first = await git.diff(['--binary', 'HEAD']); await git.raw(['checkout', '--', 'value.txt']);
+    await writeFile(target, 'corrected\n'); const corrected = await git.diff(['--binary', 'HEAD']); await git.raw(['checkout', '--', 'value.txt']);
+    await writeFile(join(workspace, 'first.patch'), first); await git.raw(['apply', '--binary', 'first.patch']);
+    await replaceGitPatch(workspace, first, corrected);
+    expect(await readFile(target, 'utf8')).toBe('corrected\n');
+  });
   it('includes untracked names and contents in the workspace inputs shown to impact AI', async () => {
     const workspace = await mkdtemp(join(tmpdir(), 'forgemind-validation-inputs-'));
     const git = simpleGit(workspace);
@@ -227,6 +238,27 @@ describe('simple autonomous worker workflow', () => {
     expect(implementInputs[1]?.previousValidationError).toContain(validationCommand);
     expect(implementInputs[1]?.previousValidationError).toContain('Exit code: 7');
     expect(implementInputs[1]?.previousValidationError).toContain('EXACT_VALIDATION_FAILURE');
+  }, workflowTestTimeoutMs);
+
+  it('arbitrates implementation ownership to Windows before Linux validation and independent review', async () => {
+    const project = createProject(); const task = createTask(project.id);
+    const linuxImplement = vi.fn(async () => { throw new Error('Linux must not implement a Windows-owned step.'); });
+    let reviewAttempt = 0;
+    const reviewer = createProvider({ review: vi.fn(async () => ++reviewAttempt === 1 ? review('not_satisfied', ['Fix native output.']) : review('satisfied')) });
+    const implementOnWindows = vi.fn(async (_input: ImplementInput & { baseCommitSha: string }) => implementation('pass\n'));
+    const workspaceRoot = join(tmpdir(), `forgemind-windows-owner-${randomUUID()}`); const checkout = join(workspaceRoot, task.id);
+    await mkdir(checkout, { recursive: true }); const git = simpleGit(checkout); await git.init();
+    await git.addConfig('user.name', 'ForgeMind Test'); await git.addConfig('user.email', 'test@forgemind.local');
+    await writeFile(join(checkout, 'README.md'), 'base\n'); await git.add('README.md'); await git.commit('base');
+    const result = await runWorkerTask({ project, task, provider: createProvider({ implement: linuxImplement }), reviewProvider: reviewer,
+      implementationOwner: 'windows', implementOnWindows, workspaceRoot });
+    expect(result.status).toBe('ready_for_user_review');
+    expect(implementOnWindows).toHaveBeenCalledWith(expect.objectContaining({ baseCommitSha: expect.stringMatching(/^[a-f0-9]{40}$/) }));
+    expect(implementOnWindows).toHaveBeenCalledTimes(2);
+    expect(implementOnWindows.mock.calls[1]?.[0]).toMatchObject({ previousReviewBlockers: ['Fix native output.'] });
+    expect(linuxImplement).not.toHaveBeenCalled();
+    expect(reviewer.review).toHaveBeenCalledWith(expect.objectContaining({ repositoryPath: result.workspacePath }));
+    expect(result.validation.passed).toBe(true);
   }, workflowTestTimeoutMs);
 
   it('returns concrete review blockers to implementation and validates the corrected state', async () => {

@@ -208,6 +208,10 @@ export interface WindowsAuthoringPacket {
   baseCommitSha: string;
   workspaceRoot: string;
   artifactRoot: string;
+  /** The complete, current implementation step. No roadmap or prior task context is
+   * available to the native implementation provider. */
+  step: { prompt: string; acceptanceCriteria: string[]; previousValidationError?: string; previousReviewBlockers?: string[]; priorPatch?: string;
+    previousFailures?: Array<{ checkId: string; command: string; shell: 'powershell' | 'cmd' | 'system'; exitCode?: number; stdout: string; stderr: string }> };
   operations: AuthoringOperationIntent[];
   requiredCapabilities: string[];
   managedRoots: string[];
@@ -247,13 +251,30 @@ export interface WindowsAuthoringResult {
   baseCommitSha: string;
   resultTreeSha: string;
   tree: AuthoringTreeEntry[];
+  /** Textual Git patch used by the server-side checkout and delivery lifecycle.
+   * Binary payload transport remains the responsibility of artifact delivery. */
+  patch: string;
   completedOperationIds: string[];
   checkpointIds: string[];
   artifacts: ExecutionArtifactResult[];
+  processes: WindowsAuthoringProcessResult[];
   status: 'succeeded' | 'failed' | 'cancelled';
   startedAt: IsoDateString;
   completedAt: IsoDateString;
   summary: string;
+}
+
+export interface WindowsAuthoringProcessResult {
+  leaseId: string;
+  sessionId: string;
+  checkId: string;
+  command: string;
+  shell: 'powershell' | 'cmd' | 'system';
+  exitCode?: number;
+  stdout: string;
+  stderr: string;
+  startedAt: IsoDateString;
+  completedAt: IsoDateString;
 }
 
 export type WindowsJobPacket = WindowsExecutionPacket | WindowsAuthoringPacket;
@@ -490,7 +511,12 @@ export function isWindowsAuthoringPacket(value: unknown): value is WindowsAuthor
   const identities = ['projectId', 'taskId', 'runId', 'jobId', 'leaseId', 'repository', 'sourceUrl', 'workspaceRoot', 'artifactRoot', 'nonce'];
   if (!identities.every((key) => isNonEmpty(value[key])) || !isGitCommitSha(value.baseCommitSha) || !isSha256(value.inputHash)
     || !areCapabilityKeys(value.requiredCapabilities) || !Array.isArray(value.managedRoots) || value.managedRoots.length === 0
-    || !value.managedRoots.every(isSafeRelativePath) || new Set(value.managedRoots).size !== value.managedRoots.length
+    || !value.managedRoots.every((root) => root === '.' || isSafeRelativePath(root)) || new Set(value.managedRoots).size !== value.managedRoots.length
+    || !isRecord(value.step) || !isNonEmpty(value.step.prompt) || !Array.isArray(value.step.acceptanceCriteria)
+    || !value.step.acceptanceCriteria.every(isNonEmpty)
+    || (value.step.previousValidationError !== undefined && typeof value.step.previousValidationError !== 'string')
+    || (value.step.previousReviewBlockers !== undefined && (!Array.isArray(value.step.previousReviewBlockers) || !value.step.previousReviewBlockers.every(isNonEmpty)))
+    || (value.step.priorPatch !== undefined && typeof value.step.priorPatch !== 'string')
     || !Array.isArray(value.operations) || value.operations.length === 0 || !value.operations.every(isAuthoringIntent)) return false;
   const operationIds = (value.operations as AuthoringOperationIntent[]).map(({ id }) => id);
   const managedRoots = value.managedRoots as string[];
@@ -523,7 +549,12 @@ export function isWindowsAuthoringResult(value: unknown): value is WindowsAuthor
     && isGitCommitSha(value.resultTreeSha) && ['succeeded', 'failed', 'cancelled'].includes(value.status as string)
     && isIsoDate(value.startedAt) && isIsoDate(value.completedAt) && areCapabilityKeys(value.completedOperationIds)
     && areCapabilityKeys(value.checkpointIds) && Array.isArray(value.artifacts) && value.artifacts.every(isArtifactResult)
-    && Array.isArray(value.tree) && value.tree.every((entry) => isRecord(entry) && isSafeRelativePath(entry.path)
+    && Array.isArray(value.processes) && value.processes.every((process) => isRecord(process) && isNonEmpty(process.checkId)
+      && process.leaseId === value.leaseId && process.sessionId === value.sessionId
+      && isNonEmpty(process.command) && ['powershell', 'cmd', 'system'].includes(process.shell as string)
+      && (process.exitCode === undefined || Number.isInteger(process.exitCode)) && typeof process.stdout === 'string'
+      && typeof process.stderr === 'string' && isIsoDate(process.startedAt) && isIsoDate(process.completedAt))
+    && typeof value.patch === 'string' && Array.isArray(value.tree) && value.tree.every((entry) => isRecord(entry) && isSafeRelativePath(entry.path)
       && ['file', 'symlink'].includes(entry.kind as string) && isSha256(entry.sha256) && Number.isSafeInteger(entry.sizeBytes)
       && (entry.sizeBytes as number) >= 0 && typeof entry.binary === 'boolean' && /^[0-7]{6}$/.test(String(entry.mode)))
     && new Set((value.tree as AuthoringTreeEntry[]).map(({ path }) => path)).size === value.tree.length;
