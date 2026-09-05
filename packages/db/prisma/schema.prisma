@@ -549,6 +549,8 @@ model WindowsExecutionJob {
   runId                String             @map("run_id")
   status               ExecutionJobStatus @default(queued)
   requiredCapabilities Json               @default("[]") @map("required_capabilities")
+  waitReason           String?            @map("wait_reason")
+  pendingPhase         String             @default("validate") @map("pending_phase")
   packet               Json
   createdAt            DateTime           @default(now()) @map("created_at")
   updatedAt            DateTime           @updatedAt @map("updated_at")

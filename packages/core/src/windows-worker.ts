@@ -20,6 +20,7 @@ export interface WorkerProbeEvidence {
   status: 'supported' | 'unsupported' | 'error';
   probedAt: IsoDateString;
   probeVersion: string;
+  provenance: 'local-probe' | 'fixture';
   summary: string;
   evidenceHash: string;
   metadata?: Record<string, JsonValue>;
@@ -31,6 +32,7 @@ export function canonicalizeWorkerProbeEvidence(evidence: Omit<WorkerProbeEviden
     status: evidence.status,
     probedAt: evidence.probedAt,
     probeVersion: evidence.probeVersion,
+    provenance: evidence.provenance,
     summary: evidence.summary
   });
 }
@@ -280,10 +282,14 @@ export interface WindowsEvidenceUpload {
   artifacts: Array<ExecutionArtifactResult & { contentBase64: string; criterion: string }>;
 }
 
+export type WindowsCapabilityWaitReason = 'unavailable_capability' | 'insufficient_capacity';
+export type WindowsPendingPhase = 'probe' | 'author' | 'validate' | 'package';
+
 export interface WindowsWorkerOperationsReadModel {
   schemaVersion: WindowsWorkerSchemaVersion;
   devices: Array<WorkerDevice & { sessions: WorkerManualSession[] }>;
-  waitingValidations: Array<{ jobId: string; taskId: string; criterion?: string; requiredCapabilities: string[]; compatibleDeviceIds: string[] }>;
+  waitingValidations: Array<{ jobId: string; taskId: string; criterion?: string; requiredCapabilities: string[]; compatibleDeviceIds: string[];
+    waitReason: WindowsCapabilityWaitReason; pendingPhase: WindowsPendingPhase }>;
   evidence: Array<{ jobId: string; taskId: string; checkId: string; criterion?: string; commitSha: string; log?: WindowsEvidenceUpload['log']; artifacts: Array<ExecutionArtifactResult & { criterion: string }> }>;
 }
 

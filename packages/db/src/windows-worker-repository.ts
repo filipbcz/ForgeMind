@@ -1,9 +1,9 @@
 import { createHash, randomUUID } from 'node:crypto';
 import type { Prisma, PrismaClient } from '@prisma/client';
-import { deferLegacyWindowsExecutionPacket, isWindowsAuthoringPacket, isWindowsAuthoringResult, isWindowsExecutionPacket, isWindowsExecutionResult, WINDOWS_DEVICE_OFFLINE_AFTER_MS } from '@forgemind/core';
+import { canonicalizeWorkerProbeEvidence, deferLegacyWindowsExecutionPacket, isWindowsAuthoringPacket, isWindowsAuthoringResult, isWindowsExecutionPacket, isWindowsExecutionResult, WINDOWS_DEVICE_OFFLINE_AFTER_MS } from '@forgemind/core';
 import type {
   WorkerCapability, WorkerProbeEvidence, WindowsExecutionJob, WindowsExecutionLease,
-  WindowsAuthoringPacket, WindowsExecutionPacket, WindowsExecutionResult, WindowsJobPacket, WindowsJobResult
+  WindowsAuthoringPacket, WindowsCapabilityWaitReason, WindowsExecutionPacket, WindowsExecutionResult, WindowsJobPacket, WindowsJobResult, WindowsPendingPhase
 } from '@forgemind/core';
 import type { WindowsEvidenceUpload, WindowsWorkerOperationsReadModel } from '@forgemind/core';
 
@@ -25,6 +25,7 @@ export interface EnqueueWindowsExecutionInput {
   runId: string;
   requiredCapabilities: string[];
   packet: WindowsExecutionPacket;
+  pendingPhase?: WindowsPendingPhase;
 }
 
 export interface EnqueueWindowsAuthoringInput extends Omit<EnqueueWindowsExecutionInput, 'packet'> {
@@ -52,21 +53,50 @@ const asJson = (value: unknown): Prisma.InputJsonValue => value as Prisma.InputJ
 const sameCapabilitySet = (left: string[], right: string[]): boolean => left.length === right.length
   && new Set(left).size === left.length && new Set(right).size === right.length
   && left.every((capability) => right.includes(capability));
+const PROBE_MAX_AGE_MS = 5 * 60_000;
+const LARGE_FLYING_FREE_BYTES = 100 * 1024 ** 3;
+
+function verifiedCapabilities(input: RegisterWorkerDeviceInput, now = new Date()): WorkerCapability[] {
+  return input.capabilities.filter((capability) => input.probeEvidence.some((evidence) => {
+    if (evidence.status !== 'supported' || evidence.provenance !== 'local-probe' || JSON.stringify(evidence.capability) !== JSON.stringify(capability)) return false;
+    const age = now.getTime() - Date.parse(evidence.probedAt);
+    if (!Number.isFinite(age) || age < -60_000 || age > PROBE_MAX_AGE_MS || !/^[a-f0-9]{64}$/i.test(evidence.evidenceHash)) return false;
+    const canonical = canonicalizeWorkerProbeEvidence(evidence);
+    return createHash('sha256').update(canonical).digest('hex') === evidence.evidenceHash;
+  }));
+}
+
+function capabilitySatisfies(device: { capabilities: WorkerCapability[]; probeEvidence: WorkerProbeEvidence[] }, key: string, now: Date): boolean {
+  if (key === 'disk-free-100gb') {
+    const disk = device.capabilities.find((item) => item.key === 'disk-capacity');
+    const evidence = device.probeEvidence.find((item) => item.status === 'supported' && item.provenance === 'local-probe' && JSON.stringify(item.capability) === JSON.stringify(disk));
+    const age = evidence ? now.getTime() - Date.parse(evidence.probedAt) : Number.NaN;
+    return Number.isFinite(age) && age >= 0 && age <= PROBE_MAX_AGE_MS
+      && typeof disk?.metadata?.freeBytes === 'number' && disk.metadata.freeBytes >= LARGE_FLYING_FREE_BYTES;
+  }
+  const advertised = device.capabilities.find((item) => item.key === key);
+  if (!advertised) return false;
+  const evidence = device.probeEvidence.find((item) => item.status === 'supported' && item.provenance === 'local-probe' && JSON.stringify(item.capability) === JSON.stringify(advertised));
+  const age = evidence ? now.getTime() - Date.parse(evidence.probedAt) : Number.NaN;
+  if (!Number.isFinite(age) || age < 0 || age > PROBE_MAX_AGE_MS) return false;
+  return true;
+}
 
 /** Persistence boundary for the manually activated Windows validation executor. */
 export class WindowsWorkerRepository {
   constructor(private readonly prisma: PrismaClient) {}
 
   async registerDevice(input: RegisterWorkerDeviceInput): Promise<void> {
+    const capabilities = verifiedCapabilities(input);
     await this.prisma.workerDevice.upsert({
       where: { id: input.id },
       create: {
         id: input.id, platform: 'windows', runnerVersion: input.runnerVersion, displayName: input.displayName,
-        status: 'offline', capabilities: asJson(input.capabilities), probeEvidence: asJson(input.probeEvidence),
+        status: 'offline', capabilities: asJson(capabilities), probeEvidence: asJson(input.probeEvidence),
         metadata: input.metadata ?? {}
       },
       update: {
-        runnerVersion: input.runnerVersion, displayName: input.displayName, capabilities: asJson(input.capabilities),
+        runnerVersion: input.runnerVersion, displayName: input.displayName, capabilities: asJson(capabilities),
         probeEvidence: asJson(input.probeEvidence), metadata: input.metadata ?? {}
       }
     });
@@ -123,7 +153,7 @@ export class WindowsWorkerRepository {
     await this.prisma.$transaction(async (tx) => {
       await tx.windowsExecutionJob.create({ data: {
         id, projectId: input.projectId, taskId: input.taskId, runId: input.runId,
-        requiredCapabilities: asJson(input.requiredCapabilities), packet: asJson(input.packet)
+        requiredCapabilities: asJson(input.requiredCapabilities), packet: asJson(input.packet), pendingPhase: input.pendingPhase ?? 'validate'
       } });
     });
     return id;
@@ -135,7 +165,7 @@ export class WindowsWorkerRepository {
       || input.packet.runId !== input.runId || !sameCapabilitySet(input.packet.requiredCapabilities, input.requiredCapabilities)
       || !isWindowsAuthoringPacket(input.packet)) throw new Error('Windows authoring enqueue identity is invalid.');
     await this.prisma.windowsExecutionJob.create({ data: { id, projectId: input.projectId, taskId: input.taskId, runId: input.runId,
-      requiredCapabilities: asJson(input.requiredCapabilities), packet: asJson(input.packet) } });
+      requiredCapabilities: asJson(input.requiredCapabilities), packet: asJson(input.packet), pendingPhase: input.pendingPhase ?? 'author' } });
     return id;
   }
 
@@ -175,10 +205,11 @@ export class WindowsWorkerRepository {
     return { schemaVersion: 1, devices: mappedDevices, waitingValidations: jobs.filter((job) => job.status === 'queued').map((job) => {
       const packet = job.packet as unknown as WindowsExecutionPacket; const required = job.requiredCapabilities as string[];
       return { jobId: job.id, taskId: job.taskId, criterion: packet.check?.criterion, requiredCapabilities: required,
+        waitReason: (job.waitReason === 'insufficient_capacity' ? 'insufficient_capacity' : 'unavailable_capability') as WindowsCapabilityWaitReason,
+        pendingPhase: job.pendingPhase as WindowsPendingPhase,
         compatibleDeviceIds: mappedDevices.filter((device) => device.status === 'idle'
           && device.sessions.some((session) => session.status === 'active' && Date.parse(session.expiresAt) > now.getTime() && Date.parse(session.lastHeartbeatAt) >= heartbeatCutoff)
-          && required.every((key) => device.capabilities.some((capability) => capability.key === key)
-          && device.probeEvidence.some((evidence) => evidence.capability.key === key && evidence.status === 'supported'))).map((device) => device.id) };
+          && required.every((key) => capabilitySatisfies(device, key, now))).map((device) => device.id) };
     }), evidence: jobs.flatMap((job) => { const packet = job.packet as unknown as WindowsExecutionPacket & { evidenceUpload?: WindowsEvidenceUpload };
       return packet.evidenceUpload ? [{ jobId: job.id, taskId: job.taskId, checkId: packet.checkId, criterion: packet.check.criterion,
         commitSha: packet.commitSha, log: packet.evidenceUpload.log, artifacts: packet.evidenceUpload.artifacts.map(({ contentBase64: _content, ...artifact }) => artifact) }] : []; }) };
@@ -225,14 +256,46 @@ export class WindowsWorkerRepository {
             OR candidate."packet"->>'protocolVersion' = ANY(${authoringProtocolVersions.map(String)}::text[]))
           AND NOT EXISTS (
             SELECT 1 FROM jsonb_array_elements_text(candidate."required_capabilities") required(key)
-            WHERE NOT (d."capabilities" @> jsonb_build_array(jsonb_build_object('key', required.key)))
-               OR NOT (d."probe_evidence" @> jsonb_build_array(jsonb_build_object('capability', jsonb_build_object('key', required.key), 'status', 'supported')))
+            WHERE required.key <> 'disk-free-100gb' AND (NOT (d."capabilities" @> jsonb_build_array(jsonb_build_object('key', required.key)))
+               OR NOT (d."probe_evidence" @> jsonb_build_array(jsonb_build_object('capability', jsonb_build_object('key', required.key), 'status', 'supported'))))
           )
+          AND NOT EXISTS (
+            SELECT 1 FROM jsonb_array_elements(d."capabilities") capability
+            WHERE capability->>'key' = ANY(ARRAY(SELECT jsonb_array_elements_text(candidate."required_capabilities")))
+              AND NOT EXISTS (SELECT 1 FROM jsonb_array_elements(d."probe_evidence") evidence
+                WHERE evidence->>'status' = 'supported' AND evidence->>'provenance' = 'local-probe' AND evidence->'capability' = capability
+                  AND (evidence->>'probedAt')::timestamptz >= CURRENT_TIMESTAMP - INTERVAL '5 minutes'
+                  AND evidence->>'evidenceHash' ~ '^[a-f0-9]{64}$')
+          )
+          AND (NOT (candidate."required_capabilities" @> '["disk-free-100gb"]'::jsonb)
+            OR EXISTS (SELECT 1 FROM jsonb_array_elements(d."capabilities") disk
+              JOIN LATERAL jsonb_array_elements(d."probe_evidence") evidence ON evidence->'capability' = disk
+              WHERE disk->>'key' = 'disk-capacity' AND (disk->'metadata'->>'freeBytes')::numeric >= ${LARGE_FLYING_FREE_BYTES}
+                AND evidence->>'status' = 'supported' AND evidence->>'provenance' = 'local-probe'
+                AND (evidence->>'probedAt')::timestamptz >= CURRENT_TIMESTAMP - INTERVAL '5 minutes'
+                AND evidence->>'evidenceHash' ~ '^[a-f0-9]{64}$'))
         ORDER BY candidate."created_at", candidate."id"
         FOR UPDATE OF candidate SKIP LOCKED LIMIT 1
       `;
       const selected = jobs[0];
-      if (!selected) return undefined;
+      if (!selected) {
+        await tx.$executeRaw`
+          UPDATE "windows_execution_jobs" candidate SET "wait_reason" =
+            CASE WHEN candidate."required_capabilities" @> '["disk-free-100gb"]'::jsonb
+              AND NOT EXISTS (SELECT 1 FROM "worker_devices" capacity_device,
+                LATERAL jsonb_array_elements(capacity_device."capabilities") disk,
+                LATERAL jsonb_array_elements(capacity_device."probe_evidence") evidence
+                WHERE capacity_device."id" = ${session.device_id} AND disk->>'key' = 'disk-capacity'
+                  AND evidence->'capability' = disk AND evidence->>'status' = 'supported'
+                  AND evidence->>'provenance' = 'local-probe'
+                  AND (evidence->>'probedAt')::timestamptz >= CURRENT_TIMESTAMP - INTERVAL '5 minutes'
+                  AND evidence->>'evidenceHash' ~ '^[a-f0-9]{64}$'
+                  AND (disk->'metadata'->>'freeBytes')::numeric >= ${LARGE_FLYING_FREE_BYTES})
+              THEN 'insufficient_capacity' ELSE 'unavailable_capability' END
+          WHERE candidate."status" = 'queued'
+            AND candidate."project_id" IN (SELECT jsonb_array_elements_text(${JSON.stringify(session.authorized_project_ids)}::jsonb))`;
+        return undefined;
+      }
 
       const selectedJob = await tx.windowsExecutionJob.findUniqueOrThrow({ where: { id: selected.job_id } });
       const selectedPacket = selectedJob.packet;
@@ -247,7 +310,7 @@ export class WindowsWorkerRepository {
       } });
       await tx.windowsExecutionJob.update({
         where: { id: selected.job_id },
-        data: { status: 'leased', packet: asJson({ ...leasedPacket, leaseId, nonce: requestId }) }
+        data: { status: 'leased', waitReason: null, packet: asJson({ ...leasedPacket, leaseId, nonce: requestId }) }
       });
       await tx.workerDevice.update({ where: { id: session.device_id }, data: { status: 'reserved' } });
       const created = await this.readClaimByNonce(tx, sessionId, requestId);

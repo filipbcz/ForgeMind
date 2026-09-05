@@ -56,7 +56,7 @@ describe('Windows runner real transport and persistence flow', () => {
 
     const workers = new WindowsWorkerRepository(prisma);
     await workers.registerDevice({ id: ids.device, runnerVersion: 'fake-1', displayName: 'Fake runner', capabilities: [{ key: 'windows' }], probeEvidence: [{
-      schemaVersion: 1, capability: { key: 'windows' }, status: 'supported', probedAt: new Date().toISOString(), probeVersion: 'fixture-1', summary: 'supported', evidenceHash: 'c'.repeat(64)
+      schemaVersion: 1, capability: { key: 'windows' }, status: 'supported', provenance: 'local-probe', probedAt: new Date().toISOString(), probeVersion: 'fixture-1', summary: 'supported', evidenceHash: 'c'.repeat(64)
     }] });
     await workers.enqueue({ id: ids.job, projectId: ids.project, taskId: ids.task, runId: ids.run, requiredCapabilities: ['windows'], packet: {
       schemaVersion: 2, projectId: ids.project, taskId: ids.task, runId: ids.run, checkId, jobId: ids.job, leaseId: 'pending', repository: 'owner/repo',

@@ -5,7 +5,7 @@ import { canonicalizeWorkerProbeEvidence } from '@forgemind/core';
 import { registerWindowsRunnerRoutes } from './windows-runner-routes.js';
 
 function probeEvidence(capability: { key: string; version?: string }, status: 'supported' | 'unsupported' | 'error' = 'supported', overrides: Record<string, unknown> = {}) {
-  const evidence = { capability, status, probedAt: '2026-09-01T00:00:00.000Z', probeVersion: '1', summary: status === 'supported' ? 'Local probe succeeded.' : 'Local probe failed.' };
+  const evidence = { capability, status, probedAt: '2026-09-01T00:00:00.000Z', probeVersion: '1', provenance: 'local-probe' as const, summary: status === 'supported' ? 'Local probe succeeded.' : 'Local probe failed.' };
   return { schemaVersion: 1, ...evidence, evidenceHash: createHash('sha256').update(canonicalizeWorkerProbeEvidence(evidence)).digest('hex'), ...overrides };
 }
 
@@ -83,8 +83,9 @@ describe('Windows runner enrollment API', () => {
     registerWindowsRunnerRoutes(app, repository, credentials, workers);
     const headers = { authorization: 'Bearer device-token' };
     const evidence = probeEvidence({ key: 'windows' });
-    expect((await app.inject({ method: 'PUT', url: '/api/windows-runner/device', headers, payload: { runnerVersion: '0.1.0', displayName: 'Runner', capabilities: [{ key: 'windows' }], probeEvidence: [evidence] } })).statusCode).toBe(200);
-    expect(workers.registerDevice).toHaveBeenCalledWith(expect.objectContaining({ id: deviceId, capabilities: [{ key: 'windows' }], probeEvidence: [evidence] }));
+    const failedEvidence = probeEvidence({ key: 'unreal' }, 'unsupported');
+    expect((await app.inject({ method: 'PUT', url: '/api/windows-runner/device', headers, payload: { runnerVersion: '0.1.0', displayName: 'Runner', capabilities: [{ key: 'windows' }], probeEvidence: [evidence, failedEvidence] } })).statusCode).toBe(200);
+    expect(workers.registerDevice).toHaveBeenCalledWith(expect.objectContaining({ id: deviceId, capabilities: [{ key: 'windows' }], probeEvidence: [evidence, failedEvidence] }));
     const sessionId = '22222222-2222-4222-8222-222222222222';
     expect((await app.inject({ method: 'POST', url: '/api/windows-runner/device/session/drain', headers, payload: { sessionId } })).statusCode).toBe(200);
     expect(workers.getControlState).toHaveBeenCalledWith(deviceId, sessionId);
