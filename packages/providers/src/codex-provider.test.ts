@@ -36,6 +36,31 @@ describe('Codex structured output schemas', () => {
       execute.mockRestore();
     }
   });
+
+  it('reviews a large repository through the native read-only checkout without embedding it in the prompt', async () => {
+    const provider = new CodexProvider({ authMode: 'codex_oauth' });
+    const intercepted = new Error('Stop before invoking Codex.');
+    const execute = vi.spyOn(provider as unknown as {
+      runCodexExec: (input: { repositoryPath?: string; prompt: string }) => Promise<string>;
+    }, 'runCodexExec').mockRejectedValue(intercepted);
+    try {
+      await expect(provider.reviewRoadmap({
+        taskId: 'review-test', objective: 'Review the candidate.', repositoryPath: '/tmp/read-only-repository',
+        projectContract: {
+          version: 1, summary: 'Test project', invariants: [], prohibitedSubstitutes: [], requirements: [], releaseCriteria: []
+        },
+        implementationSteps: [], requiredRequirementIds: [], completedStepTitles: [],
+        repositoryBaseline: { commitSha: 'a'.repeat(40), evidence: 'x'.repeat(2_750_000) }
+      })).rejects.toBe(intercepted);
+
+      expect(execute).toHaveBeenCalledTimes(1);
+      expect(execute.mock.calls[0]![0].repositoryPath).toBe('/tmp/read-only-repository');
+      expect(execute.mock.calls[0]![0].prompt).toContain('inspect the complete read-only checkout');
+      expect(execute.mock.calls[0]![0].prompt.length).toBeLessThan(10_000);
+    } finally {
+      execute.mockRestore();
+    }
+  });
 });
 
 interface JsonSchema {

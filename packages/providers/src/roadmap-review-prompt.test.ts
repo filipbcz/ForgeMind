@@ -63,4 +63,28 @@ describe('roadmap quality review prompt', () => {
       requiredRequirementIds: ['REQ-GENERATOR'], completedStepTitles: [], implementationSteps: []
     })).toThrow('Commit-bound repository baseline is required');
   });
+
+  it('uses a native read-only checkout without embedding repository contents', () => {
+    const completeRepositorySnapshot = `--- package-lock.json ---\n${'x'.repeat(1_100_000)}`;
+    const prompt = buildRoadmapQualityReviewPrompt({
+      taskId: 'project_1', objective: 'Build exercises.', projectContract: contract,
+      requiredRequirementIds: ['REQ-GENERATOR'], completedStepTitles: [], implementationSteps: [],
+      repositoryPath: '/tmp/read-only-repository', nativeRepositoryAccess: true,
+      repositoryBaseline: { commitSha: 'b'.repeat(40), evidence: completeRepositorySnapshot }
+    });
+
+    expect(prompt).toContain('inspect the complete read-only checkout');
+    expect(prompt).toContain('current working directory');
+    expect(prompt).not.toContain(completeRepositorySnapshot);
+    expect(prompt.length).toBeLessThan(10_000);
+  });
+
+  it('requires a repository path for native review', () => {
+    expect(() => buildRoadmapQualityReviewPrompt({
+      taskId: 'project_1', objective: 'Build exercises.', projectContract: contract,
+      requiredRequirementIds: ['REQ-GENERATOR'], completedStepTitles: [], implementationSteps: [],
+      nativeRepositoryAccess: true,
+      repositoryBaseline: { commitSha: 'b'.repeat(40), evidence: 'snapshot' }
+    })).toThrow('requires a read-only repository path');
+  });
 });

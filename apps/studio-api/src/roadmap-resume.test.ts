@@ -148,6 +148,9 @@ describe('roadmap draft resume context', () => {
       expect(resumed.statusCode).toBe(201);
       expect(provider.plan).toHaveBeenCalledTimes(1);
       expect(provider.reviewRoadmap).toHaveBeenCalledTimes(2);
+      expect(provider.reviewRoadmap).toHaveBeenCalledWith(expect.objectContaining({
+        repositoryPath: '/tmp/read-only-baseline'
+      }));
       expect(repository.createProjectRoadmapCycle).toHaveBeenCalledTimes(1);
       expect(repository.createProjectRoadmapCycle).toHaveBeenCalledWith(expect.objectContaining({ qualityReview: expect.objectContaining({ verdict: 'satisfied' }) }));
     } finally { await app.close(); }

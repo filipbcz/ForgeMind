@@ -94,6 +94,8 @@ export interface RoadmapQualityReviewInput {
   completedStepTitles: string[];
   repositoryPath?: string;
   repositoryBaseline?: RepositoryBaseline;
+  /** The provider can inspect repositoryPath directly and must not receive the repository contents in its prompt. */
+  nativeRepositoryAccess?: boolean;
   onActivity?: ProviderActivityHandler;
   signal?: AbortSignal;
 }

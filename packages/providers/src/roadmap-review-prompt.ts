@@ -33,7 +33,13 @@ export function compactRoadmapContract(
 }
 
 export function buildRoadmapQualityReviewPrompt(input: RoadmapQualityReviewInput): string {
-  if (!input.repositoryBaseline?.commitSha || !input.repositoryBaseline.evidence.trim()) {
+  if (!input.repositoryBaseline?.commitSha) {
+    throw new Error('Commit-bound repository baseline is required for roadmap quality review.');
+  }
+  if (input.nativeRepositoryAccess && !input.repositoryPath) {
+    throw new Error('Native roadmap quality review requires a read-only repository path.');
+  }
+  if (!input.nativeRepositoryAccess && !input.repositoryBaseline.evidence.trim()) {
     throw new Error('Commit-bound repository baseline is required for roadmap quality review.');
   }
   const relevantRequirementIds = Array.from(new Set([
@@ -44,7 +50,9 @@ export function buildRoadmapQualityReviewPrompt(input: RoadmapQualityReviewInput
 
   return [
     'Independently review the candidate implementation roadmap before it is persisted.',
-    'Do not design a different product or modify the repository. Use the supplied commit-bound repository baseline as evidence.',
+    input.nativeRepositoryAccess
+      ? 'Do not design a different product or modify the repository. Inspect the read-only repository in the current working directory and use it as evidence.'
+      : 'Do not design a different product or modify the repository. Use the supplied commit-bound repository baseline as evidence.',
     'Reject any step that lacks a concrete gap proven by the baseline. Existing capabilities must not be recreated merely because requirement IDs or completed-step titles differ.',
     'Return verdict "satisfied" only when every quality criterion below is met.',
     'Return verdict "not_satisfied" with concrete blockers when changes are required. Each blocker must name the affected step or missing step and state the exact correction needed.',
@@ -67,7 +75,9 @@ export function buildRoadmapQualityReviewPrompt(input: RoadmapQualityReviewInput
     `Completed step titles that must not be recreated:\n${input.completedStepTitles.map((title) => `- ${title}`).join('\n') || '- none'}`,
     '',
     `Repository baseline commit: ${input.repositoryBaseline.commitSha}`,
-    `Repository evidence:\n${input.repositoryBaseline.evidence}`,
+    input.nativeRepositoryAccess
+      ? 'Repository evidence: inspect the complete read-only checkout in the current working directory. Cite concrete files, symbols, tests, or documentation from that checkout.'
+      : `Repository evidence:\n${input.repositoryBaseline.evidence}`,
     '',
     `Candidate roadmap JSON:\n${JSON.stringify(input.implementationSteps)}`,
     '',

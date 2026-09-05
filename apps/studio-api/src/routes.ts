@@ -1204,11 +1204,11 @@ export function registerRoutes(
         : await readAIProviderConnectionSecret(repository);
       if (!connection) throw new Error('Connect an AI provider before reviewing audit gaps.');
       if (!project.githubOwner || !project.githubRepo) throw new Error('A connected repository is required for audit gap review.');
+      const provider = createProvider(connection.provider, { apiKey: connection.apiKey, authMode: connection.authMode, model: connection.model, codexHome: connection.codexHome });
+      if (!provider.reviewRoadmap) throw new Error(`AI provider "${provider.kind}" does not support independent roadmap quality review.`);
       const githubConnection = await readGitHubConnectionSecret(repository);
       if (!githubConnection) throw new Error('Connect GitHub before reviewing audit gaps.');
       checkout = await prepareReadOnlyRepositoryBaseline(new GitHubAppAdapter({ token: githubConnection.token, apiBaseUrl: githubConnection.apiBaseUrl }), project);
-      const provider = createProvider(connection.provider, { apiKey: connection.apiKey, authMode: connection.authMode, model: connection.model, codexHome: connection.codexHome });
-      if (!provider.reviewRoadmap) throw new Error(`AI provider "${provider.kind}" does not support independent roadmap quality review.`);
       const reviewContract = buildAuditGapReviewContract(project.projectContract, job.gapProposal.newRequirements);
       const review = await provider.reviewRoadmap({
         taskId: `audit-gap:${job.id}`,
@@ -1224,6 +1224,7 @@ export function registerRoutes(
         requiredRequirementIds: Array.from(new Set(job.gapProposal.steps.flatMap((step) => step.requirementIds))),
         completedStepTitles: roadmap.steps.filter((step) => step.status === 'completed').map((step) => step.title),
         implementationSteps: job.gapProposal.steps.map((step) => ({ ...step, inScope: [], outOfScope: [] })),
+        repositoryPath: checkout.repositoryPath,
         repositoryBaseline: { commitSha: checkout.commitSha, evidence: checkout.evidence }
       });
       await repository.saveProjectAuditGapReview({ projectId: id, auditJobId: job.id, review });
@@ -1287,6 +1288,7 @@ export function registerRoutes(
 
   app.post('/api/projects/:id/implementation-steps/generate', async (request, reply) => {
     let generation: ReturnType<typeof beginRoadmapRequest>;
+    let planning: Awaited<ReturnType<typeof generateRoadmapPlan>> | undefined;
     try {
       const { id } = idParamsSchema.parse(request.params);
       const input = roadmapGenerateSchema.parse(request.body ?? {});
@@ -1332,7 +1334,7 @@ export function registerRoutes(
         });
       }
       const previousContract = recoveryBaseVersion?.contract ?? latestContractVersion?.contract;
-      const planning = await generateRoadmapPlan(
+      planning = await generateRoadmapPlan(
         repository,
         project,
         objective,
@@ -1381,7 +1383,8 @@ export function registerRoutes(
           requiredRequirementIds,
           completedStepTitles: planning.completedSteps,
           migrationImpacts: contractDelta?.migrationImpacts ?? [],
-          compatibilityImpacts: contractDelta?.compatibilityImpacts ?? []
+          compatibilityImpacts: contractDelta?.compatibilityImpacts ?? [],
+          repositoryPath: planning.repositoryPath
         },
         reviewInput: {
           taskId: project.id,
@@ -1390,6 +1393,7 @@ export function registerRoutes(
           projectContract,
           requiredRequirementIds,
           completedStepTitles: planning.completedSteps,
+          repositoryPath: planning.repositoryPath,
           repositoryBaseline: planning.repositoryBaseline
         },
         validate: (candidate, effectiveContract = projectContract, effectiveRequiredIds = requiredRequirementIds) => toImplementationStepBlueprints(
@@ -1435,12 +1439,17 @@ export function registerRoutes(
       await recordRoadmapInterruption(repository, generation, error, request);
       return sendBadRequest(reply, error);
     } finally {
-      generation?.release();
+      try {
+        await planning?.cleanup();
+      } finally {
+        generation?.release();
+      }
     }
   });
 
   app.post('/api/projects/:id/extension/decision', async (request, reply) => {
     let generation: ReturnType<typeof beginRoadmapRequest>;
+    let planning: Awaited<ReturnType<typeof generateRoadmapPlan>> | undefined;
     try {
       const { id } = idParamsSchema.parse(request.params);
       const input = roadmapExtensionDecisionSchema.parse(request.body ?? {});
@@ -1489,7 +1498,7 @@ export function registerRoutes(
       if (!project.projectContract) {
         throw new Error('A current project contract is required before an extension can be accepted. Regenerate the roadmap first.');
       }
-      const planning = await generateRoadmapPlan(repository, project, objective, nextSpecification, project.projectContract,
+      planning = await generateRoadmapPlan(repository, project, objective, nextSpecification, project.projectContract,
         undefined, generation!.signal, { operation: 'extension', cycleId: cycle.id });
       let plan = planning.plan;
       const contractDelta = toProjectContractDelta(plan);
@@ -1518,7 +1527,8 @@ export function registerRoutes(
           requiredRequirementIds: appliedContract.touchedRequirementIds,
           completedStepTitles: planning.completedSteps,
           migrationImpacts: contractDelta.migrationImpacts,
-          compatibilityImpacts: contractDelta.compatibilityImpacts
+          compatibilityImpacts: contractDelta.compatibilityImpacts,
+          repositoryPath: planning.repositoryPath
         },
         reviewInput: {
           taskId: project.id,
@@ -1527,6 +1537,7 @@ export function registerRoutes(
           projectContract,
           requiredRequirementIds: appliedContract.touchedRequirementIds,
           completedStepTitles: planning.completedSteps,
+          repositoryPath: planning.repositoryPath,
           repositoryBaseline: planning.repositoryBaseline
         },
         validate: (candidate, effectiveContract = projectContract, effectiveRequiredIds = appliedContract.touchedRequirementIds) =>
@@ -1568,7 +1579,11 @@ export function registerRoutes(
       await recordRoadmapInterruption(repository, generation, error, request);
       return sendBadRequest(reply, error);
     } finally {
-      generation?.release();
+      try {
+        await planning?.cleanup();
+      } finally {
+        generation?.release();
+      }
     }
   });
 
@@ -1931,6 +1946,8 @@ export async function generateRoadmapPlan(
   completedSteps: string[];
   unfinishedSteps: Array<{ title: string; requirementIds: string[] }>;
   repositoryBaseline: { commitSha: string; evidence: string };
+  repositoryPath: string;
+  cleanup: () => Promise<void>;
   checkpoint: RoadmapGenerationCheckpoint;
   saveCheckpoint: (checkpoint: RoadmapGenerationCheckpoint) => Promise<void>;
   assertCurrentSource: () => Promise<void>;
@@ -1959,74 +1976,84 @@ export async function generateRoadmapPlan(
     );
   };
   const checkout = await discoverBaseline();
-  const repositoryBaseline = { commitSha: checkout.commitSha, evidence: checkout.evidence };
-  let session = createProjectPlanningSession(repository, project, connection);
-  const existingRoadmap = await repository.getProjectRoadmap(project.id);
-  const completedSteps = existingRoadmap?.steps.filter((step) => step.status === 'completed').map((step) => step.title) ?? [];
-  const unfinishedSteps = selectUnfinishedRoadmapSteps(existingRoadmap, sourceContractVersionId);
-  const sourceKey = await roadmapSourceKey(repository, project.id);
-  const contextKey = createHash('sha256').update(JSON.stringify({
-    sourceKey, objective, currentSpecification, currentContract, sourceContractVersionId, operation,
-    repositoryCommitSha: repositoryBaseline?.commitSha,
-    provider: connection.provider, model: connection.model, connectionId: connection.id
-  })).digest('hex');
-  const assertCurrentSource = async () => {
-    if (await roadmapSourceKey(repository, project.id) !== sourceKey) {
-      throw new Error('Project planning inputs changed during roadmap generation. Retry against the current specification and contract.');
-    }
-    {
-      const current = await discoverBaseline();
-      try {
-        if (current.commitSha !== repositoryBaseline.commitSha) {
-          throw new Error('Repository checkout changed during roadmap generation. Retry against the current commit.');
-        }
-      } finally { await current?.cleanup(); }
-    }
-  };
-  const saveCheckpoint = async (checkpoint: RoadmapGenerationCheckpoint) => {
-    await assertCurrentSource();
-    await repository.saveRoadmapGenerationCheckpoint(project.id, contextKey, checkpoint);
-  };
-  const checkpoint = await repository.getRoadmapGenerationCheckpoint(project.id, contextKey);
-  if (checkpoint) {
-    signal?.throwIfAborted();
-    await repository.writeAudit({
-      actorType: 'system', eventType: 'project_roadmap_generation_resumed', projectId: project.id,
-      payload: { contextKey, phase: checkpoint.phase, revision: checkpoint.revision }
-    });
-    await checkout?.cleanup();
-    return { plan: checkpoint.plan, provider, session, completedSteps, unfinishedSteps, repositoryBaseline, checkpoint, saveCheckpoint, assertCurrentSource };
-  }
-  const planInput = {
-    taskId: project.id,
-    title: `Project roadmap for ${project.name}`,
-    prompt: buildRoadmapPlanningPrompt({
-      project: currentSpecification ? { ...project, brief: currentSpecification } : project,
-      objective,
-      completedSteps,
-      unfinishedSteps,
-      continuation: Boolean(session.id),
-      currentContract
-    }),
-    maxRuntimeMs: roadmapPlanningMaxRuntimeMs(),
-    signal,
-    repositoryPath: checkout?.repositoryPath,
-    repositoryBaseline
-  };
-  let plan: PlanResult;
   try {
-    signal?.throwIfAborted();
-    plan = await provider.plan({ ...planInput, session });
+    const repositoryBaseline = { commitSha: checkout.commitSha, evidence: checkout.evidence };
+    let session = createProjectPlanningSession(repository, project, connection);
+    const existingRoadmap = await repository.getProjectRoadmap(project.id);
+    const completedSteps = existingRoadmap?.steps.filter((step) => step.status === 'completed').map((step) => step.title) ?? [];
+    const unfinishedSteps = selectUnfinishedRoadmapSteps(existingRoadmap, sourceContractVersionId);
+    const sourceKey = await roadmapSourceKey(repository, project.id);
+    const contextKey = createHash('sha256').update(JSON.stringify({
+      sourceKey, objective, currentSpecification, currentContract, sourceContractVersionId, operation,
+      repositoryCommitSha: repositoryBaseline?.commitSha,
+      provider: connection.provider, model: connection.model, connectionId: connection.id
+    })).digest('hex');
+    const assertCurrentSource = async () => {
+      if (await roadmapSourceKey(repository, project.id) !== sourceKey) {
+        throw new Error('Project planning inputs changed during roadmap generation. Retry against the current specification and contract.');
+      }
+      {
+        const current = await discoverBaseline();
+        try {
+          if (current.commitSha !== repositoryBaseline.commitSha) {
+            throw new Error('Repository checkout changed during roadmap generation. Retry against the current commit.');
+          }
+        } finally { await current?.cleanup(); }
+      }
+    };
+    const saveCheckpoint = async (checkpoint: RoadmapGenerationCheckpoint) => {
+      await assertCurrentSource();
+      await repository.saveRoadmapGenerationCheckpoint(project.id, contextKey, checkpoint);
+    };
+    const checkpoint = await repository.getRoadmapGenerationCheckpoint(project.id, contextKey);
+    if (checkpoint) {
+      signal?.throwIfAborted();
+      await repository.writeAudit({
+        actorType: 'system', eventType: 'project_roadmap_generation_resumed', projectId: project.id,
+        payload: { contextKey, phase: checkpoint.phase, revision: checkpoint.revision }
+      });
+      return {
+        plan: checkpoint.plan, provider, session, completedSteps, unfinishedSteps, repositoryBaseline,
+        repositoryPath: checkout.repositoryPath, cleanup: checkout.cleanup, checkpoint, saveCheckpoint, assertCurrentSource
+      };
+    }
+    const planInput = {
+      taskId: project.id,
+      title: `Project roadmap for ${project.name}`,
+      prompt: buildRoadmapPlanningPrompt({
+        project: currentSpecification ? { ...project, brief: currentSpecification } : project,
+        objective,
+        completedSteps,
+        unfinishedSteps,
+        continuation: Boolean(session.id),
+        currentContract
+      }),
+      maxRuntimeMs: roadmapPlanningMaxRuntimeMs(),
+      signal,
+      repositoryPath: checkout?.repositoryPath,
+      repositoryBaseline
+    };
+    let plan: PlanResult;
+    try {
+      signal?.throwIfAborted();
+      plan = await provider.plan({ ...planInput, session });
+    } catch (error) {
+      signal?.throwIfAborted();
+      if (!(error instanceof CodexExecutionTimeoutError) || !session.id) throw error;
+      session = createProjectPlanningSession(repository, project, connection, true);
+      plan = await provider.plan({ ...planInput, session });
+    }
+    const initial: RoadmapGenerationCheckpoint = { version: 1, phase: 'validate', revision: 0, plan };
+    await saveCheckpoint(initial);
+    return {
+      plan, provider, session, completedSteps, unfinishedSteps, repositoryBaseline,
+      repositoryPath: checkout.repositoryPath, cleanup: checkout.cleanup,
+      checkpoint: initial, saveCheckpoint, assertCurrentSource
+    };
   } catch (error) {
-    signal?.throwIfAborted();
-    if (!(error instanceof CodexExecutionTimeoutError) || !session.id) throw error;
-    session = createProjectPlanningSession(repository, project, connection, true);
-    plan = await provider.plan({ ...planInput, session });
+    await checkout.cleanup();
+    throw error;
   }
-  const initial: RoadmapGenerationCheckpoint = { version: 1, phase: 'validate', revision: 0, plan };
-  await saveCheckpoint(initial);
-  await checkout?.cleanup();
-  return { plan, provider, session, completedSteps, unfinishedSteps, repositoryBaseline, checkpoint: initial, saveCheckpoint, assertCurrentSource };
 }
 
 function roadmapPlanningMaxRuntimeMs(): number {

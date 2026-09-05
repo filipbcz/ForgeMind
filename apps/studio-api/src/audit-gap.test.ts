@@ -74,6 +74,7 @@ describe('audit gap activation', () => {
     expect(response.statusCode).toBe(200);
     expect(f.provider.reviewRoadmap).toHaveBeenCalledWith(expect.objectContaining({
       authoritativeSpecification: f.project.brief,
+      repositoryPath: '/read-only/current',
       repositoryBaseline: { commitSha: currentSha, evidence: expect.stringContaining('current code') },
       objective: expect.stringContaining(auditSha)
     }));

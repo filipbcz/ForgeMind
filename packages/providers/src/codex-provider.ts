@@ -664,7 +664,8 @@ export class CodexProvider implements AIProvider {
   }
 
   async reviewRoadmap(input: RoadmapQualityReviewInput): Promise<ReviewResult> {
-    const providerPrompt = buildRoadmapQualityReviewPrompt(input);
+    const nativeRepositoryAccess = this.authMode === 'oauth';
+    const providerPrompt = buildRoadmapQualityReviewPrompt({ ...input, nativeRepositoryAccess });
     let content: string;
     if (this.authMode === 'oauth') {
       content = await this.runCodexExec({
