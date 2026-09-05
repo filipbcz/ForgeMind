@@ -256,7 +256,9 @@ describe('WindowsWorkerRepository capability leases', () => {
       deviceId: 'device_1', sessionId: 'session_1', nonce: 'nonce_1', inputHash: packetDigest, baseCommitSha: packet.baseCommitSha,
       resultTreeSha: 'c'.repeat(40), tree: [{ path: 'Content/map.bin', kind: 'file', sha256: 'd'.repeat(64), sizeBytes: 8, binary: true, mode: '100644' }], patch: 'diff --git',
       resultBundle: { version: 1, format: 'git-binary-patch', sha256: createHash('sha256').update('diff --git').digest('hex'), sizeBytes: 10, lfsObjects: [], outputs: [] },
-      completedOperationIds: ['op-1'], checkpointIds: ['cp-1'], artifacts: [], processes: [], status: 'succeeded', startedAt: '2026-09-01T00:00:00Z', completedAt: '2026-09-01T00:01:00Z', summary: 'done' } as const;
+      completedOperationIds: ['op-1'], checkpointIds: ['cp-1'], artifacts: [], processes: [], status: 'succeeded',
+      contentAssessment: { technicalVerification: 'passed', productionReviewRequired: false, rationale: 'Technical verification passed.' },
+      startedAt: '2026-09-01T00:00:00Z', completedAt: '2026-09-01T00:01:00Z', summary: 'done' } as const;
     const repository = new WindowsWorkerRepository(prisma);
     expect(await repository.submitResult('device_1', result as any)).toEqual({ accepted: true, packet });
     expect(updateMany).toHaveBeenCalledWith(expect.objectContaining({ data: { status: 'succeeded', packet: { ...packet, authoringResult: result } } }));

@@ -1,7 +1,7 @@
 import { createHash, randomUUID } from 'node:crypto';
 import { spawn } from 'node:child_process';
 import { lstat, mkdir, readFile, readdir, realpath, rename, rm, writeFile } from 'node:fs/promises';
-import { basename, dirname, relative, resolve } from 'node:path';
+import { basename, dirname, posix, relative, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import type { AuthoringTreeEntry, WindowsAuthoringPacket, WindowsAuthoringProcessResult, WindowsAuthoringResult } from '@forgemind/core';
 import { redactSecrets } from '@forgemind/core';
@@ -142,8 +142,9 @@ export async function executeWindowsAuthoring(packet: WindowsAuthoringPacket, co
     summary = redactSecrets(error instanceof Error ? error.message : String(error));
   }
   await rm(resolve(workspacePath, '.forgemind-tmp'), { recursive: true, force: true });
+  const changedPaths = await stageChangedPaths(workspacePath, context.signal);
   await rejectProhibitedResultPaths(packet, workspacePath, context.signal);
-  await enforceRequiredUnrealAssets(packet, workspacePath, context.signal);
+  const productionReviewRequired = await enforceRequiredUnrealAssets(packet, workspacePath, evidenceDirectory, changedPaths, processes, packet.resourcePolicy.timeoutSeconds * 1_000, context.signal);
   const tree = await collectTree(workspacePath);
   const treeSha = await gitTree(workspacePath, context.signal);
   const patchResult = await spawnComplete('git.exe', ['diff', '--binary', '--no-ext-diff', '--cached', 'HEAD'], workspacePath, 30_000, context.signal);
@@ -162,7 +163,10 @@ export async function executeWindowsAuthoring(packet: WindowsAuthoringPacket, co
     nonce: packet.nonce, inputHash: packet.inputHash, baseCommitSha: packet.baseCommitSha, resultTreeSha: treeSha, resultBundle,
     tree, patch: patchResult.stdout, completedOperationIds, checkpointIds,
     artifacts: outputs.map((output) => ({ name: `managed-output:${output.path}`, relativePath: output.path, sizeBytes: output.sizeBytes, sha256: output.sha256 })),
-    processes, status,
+    processes, status, contentAssessment: { technicalVerification: packet.contentPolicy.requiresUnrealAssets ? 'passed' : 'not-required',
+      productionReviewRequired, rationale: productionReviewRequired
+        ? 'Technical loadability and provenance are verified; usable production quality requires downstream visual or domain review.'
+        : 'No separate production-quality review was requested by the acceptance criteria.' },
     startedAt: startedAt.toISOString(), completedAt: new Date().toISOString(), summary
   } };
 }
@@ -325,10 +329,104 @@ export function isProhibitedAuthoringPath(path: string, sizeBytes: number, polic
   return sizeBytes > policy.maxUnclassifiedFileBytes && !deliverableAsset;
 }
 
-async function enforceRequiredUnrealAssets(packet: WindowsAuthoringPacket, root: string, signal?: AbortSignal): Promise<void> {
-  if (!packet.contentPolicy.requiresUnrealAssets) return;
-  const changed = await spawnComplete('git.exe', ['status', '--porcelain=v1', '-z'], root, 30_000, signal);
-  if (!changed.stdout.split('\0').some((line) => /\.(?:uasset|umap)$/i.test(line.slice(3)))) throw new Error('Required Unreal authoring did not produce a .uasset or .umap payload.');
+async function stageChangedPaths(root: string, signal?: AbortSignal): Promise<string[]> {
+  const staged = await spawnComplete('git.exe', ['add', '-A'], root, 30_000, signal);
+  if (staged.exitCode !== 0) throw new Error(`Could not stage the complete authored result: ${staged.stderr}`);
+  const changed = await spawnComplete('git.exe', ['diff', '--cached', '--name-only', '-z', 'HEAD'], root, 30_000, signal);
+  if (changed.exitCode !== 0) throw new Error(`Could not inspect the staged authored result: ${changed.stderr}`);
+  return changed.stdout.split('\0').filter(Boolean).map((path) => path.replaceAll('\\', '/'));
+}
+
+async function enforceRequiredUnrealAssets(packet: WindowsAuthoringPacket, root: string, evidenceRoot: string, changedPaths: string[], processes: WindowsAuthoringProcessResult[], timeoutMs: number, signal?: AbortSignal): Promise<boolean> {
+  if (!packet.contentPolicy.requiresUnrealAssets) return false;
+  const assets = changedPaths.filter((path) => /\.(?:uasset|umap)$/i.test(path));
+  const authored = processes.find((process) => process.exitCode === 0 && process.authoring?.phase === 'author'
+    && ['unreal-editor', 'unreal-python'].includes(process.authoring.tool));
+  if (assets.length > 0 && authored?.authoring) {
+    const verification = await verifyUnrealPackages(root, evidenceRoot, assets, authored.authoring, timeoutMs, signal);
+    processes.push({ ...verification, leaseId: packet.leaseId, sessionId: processes[0]?.sessionId ?? 'authoring-session' });
+  }
+  return validateRequiredUnrealAssets(assets, processes, requiresProductionContent(packet.step.acceptanceCriteria));
+}
+
+export function requiresProductionContent(criteria: string[]): boolean {
+  return criteria.some((criterion) => /\b(?:usable|production(?:-ready)?|non-placeholder|finished)\b/i.test(criterion)
+    && /\b(?:scene|map|asset|content|environment|level)\b/i.test(criterion));
+}
+
+export function validateRequiredUnrealAssets(assets: string[], processes: WindowsAuthoringProcessResult[], requireProduction = false): boolean {
+  if (assets.length === 0) throw new Error('Required Unreal authoring did not produce a .uasset or .umap payload.');
+  const authored = processes.find((process) => process.exitCode === 0 && process.authoring?.phase === 'author'
+    && ['unreal-editor', 'unreal-python'].includes(process.authoring.tool));
+  if (!authored) throw new Error('Required Unreal content was not created or imported through a successful editor authoring API call.');
+  const verified = processes.find((process) => process.exitCode === 0 && process.authoring?.phase === 'verify'
+    && ['unreal-editor', 'unreal-python'].includes(process.authoring.tool)
+    && process.authoring.projectRelativePath === authored.authoring?.projectRelativePath
+    && assets.every((asset) => process.authoring?.loadedPackages?.includes(asset)));
+  if (!verified) throw new Error(`Required Unreal packages were not subsequently loaded by the selected project: ${assets.join(', ')}`);
+  return requireProduction;
+}
+
+async function verifyUnrealPackages(root: string, evidenceRoot: string, assets: string[], authoring: NonNullable<WindowsAuthoringProcessResult['authoring']>, timeoutMs: number, signal?: AbortSignal): Promise<Omit<WindowsAuthoringProcessResult, 'leaseId' | 'sessionId'>> {
+  const marker = 'FORGEMIND_PACKAGE_INSPECTION:';
+  const sourceNames = authoring.sourceRelativePaths.map((path) => posix.basename(path.replaceAll('\\', '/')).toLowerCase());
+  const packages = assets.map((path) => ({ path, objectPath: unrealObjectPath(path, authoring.projectRelativePath), sourceNames }));
+  const scriptPath = resolve(evidenceRoot, 'verify-saved-unreal-content.py');
+  const script = [
+    'import unreal',
+    `packages = ${JSON.stringify(packages)}`,
+    'failed = []',
+    'for package in packages:',
+    "    loaded = unreal.load_asset(package['objectPath'])",
+    "    if loaded is None:",
+    "        failed.append(package['path'])",
+    "        continue",
+    "    observations = []",
+    "    if not package['path'].lower().endswith('.umap'):",
+    "        try:",
+    "            import_data = loaded.get_editor_property('asset_import_data')",
+    "            imported_names = [__import__('os').path.basename(path).lower() for path in import_data.extract_filenames()] if import_data else []",
+    "            if any(name in package['sourceNames'] for name in imported_names): observations.append('asset-import-data-matches-recorded-source')",
+    "        except Exception:",
+    "            pass",
+    "    if package['path'].lower().endswith('.umap'):",
+    "        unreal.EditorLevelLibrary.load_level(package['objectPath'])",
+    "        for actor in unreal.EditorLevelLibrary.get_all_level_actors():",
+    "            class_name = actor.get_class().get_name()",
+    "            if class_name in ['WorldSettings', 'DefaultPhysicsVolume', 'Brush']: continue",
+    "            mesh_path = ''",
+    "            if class_name == 'StaticMeshActor':",
+    "                component = actor.get_component_by_class(unreal.StaticMeshComponent)",
+    "                if component and component.static_mesh: mesh_path = component.static_mesh.get_path_name()",
+    "            if class_name != 'StaticMeshActor' or (mesh_path and not mesh_path.startswith('/Engine/BasicShapes/')):",
+    "                observations.append('non-basic-level-actor-present')",
+    "                break",
+    "    inspection = {'path': package['path'], 'className': loaded.get_class().get_name(), 'technicalObservations': observations}",
+    `    print('${marker}' + __import__('json').dumps(inspection, separators=(',', ':')))`,
+    "if failed: raise RuntimeError('Could not load saved packages: ' + ', '.join(failed))"
+  ].join('\n');
+  await writeFile(scriptPath, script, 'utf8');
+  const projectPath = await realpath(resolve(root, authoring.projectRelativePath));
+  const relativeProject = relative(root, projectPath);
+  if (relativeProject === '..' || relativeProject.startsWith(`..${process.platform === 'win32' ? '\\' : '/'}`)) throw new Error('Selected Unreal project escapes the leased checkout.');
+  const args = [projectPath, '-unattended', '-nop4', '-nosplash', `-ExecutePythonScript=${scriptPath}`];
+  const startedAt = new Date();
+  const output = await spawnComplete(authoring.executablePath, args, root, timeoutMs, signal);
+  const inspections = output.stdout.split(/\r?\n/).filter((line) => line.includes(marker)).flatMap((line) => {
+    try { return [JSON.parse(line.slice(line.indexOf(marker) + marker.length).trim()) as { path: string; className: string; technicalObservations: string[] }]; } catch { return []; }
+  });
+  const loadedPackages = inspections.map(({ path }) => path);
+  return { checkId: 'unreal-saved-content-load', command: [authoring.executablePath, ...args].join(' '), shell: 'system', ...output,
+    startedAt: startedAt.toISOString(), completedAt: new Date().toISOString(), authoring: { tool: 'unreal-python', phase: 'verify',
+      projectRelativePath: authoring.projectRelativePath, executablePath: authoring.executablePath, args: args.slice(1), sourceRelativePaths: [], loadedPackages, inspections } };
+}
+
+export function unrealObjectPath(assetPath: string, projectRelativePath: string): string {
+  const normalizedAsset = assetPath.replaceAll('\\', '/');
+  const projectDirectory = posix.dirname(projectRelativePath.replaceAll('\\', '/'));
+  const contentPrefix = projectDirectory === '.' ? 'Content/' : `${projectDirectory}/Content/`;
+  if (!normalizedAsset.toLowerCase().startsWith(contentPrefix.toLowerCase())) throw new Error(`Changed Unreal package is outside the selected project's Content directory: ${assetPath}`);
+  return `/Game/${normalizedAsset.slice(contentPrefix.length).replace(/\.(?:uasset|umap)$/i, '')}`;
 }
 
 async function collectLfsObjects(root: string, signal?: AbortSignal): Promise<Array<{ oid: string; sha256: string; sizeBytes: number; contentBase64: string }>> {

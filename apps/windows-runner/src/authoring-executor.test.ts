@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from 'vitest';
-import { isProhibitedAuthoringPath, LifecycleNativeImplementationProvider, type NativeAuthoringTools } from './authoring-executor.js';
+import { isProhibitedAuthoringPath, LifecycleNativeImplementationProvider, requiresProductionContent, type NativeAuthoringTools, unrealObjectPath, validateRequiredUnrealAssets } from './authoring-executor.js';
 
 const implementation = {
   outcome: 'changes_made' as const, summary: 'implemented', changedFiles: ['src/a.ts'], evidenceFiles: [],
@@ -11,6 +11,35 @@ const implementation = {
 };
 
 describe('native implementation provider lifecycle', () => {
+  it('requires editor-authored packages to be loaded after saving and retains source and exact tool provenance', () => {
+    const base = { leaseId: 'lease', sessionId: 'session', shell: 'system' as const, exitCode: 0, stdout: '', stderr: '',
+      startedAt: '2026-09-05T00:00:00.000Z', completedAt: '2026-09-05T00:01:00.000Z' };
+    const authoring = { projectRelativePath: 'Game/Game.uproject', executablePath: 'C:/UE/UnrealEditor-Cmd.exe',
+      args: ['-ExecutePythonScript=Scripts/import.py', '-unattended'], sourceRelativePaths: ['SourceAssets/tree.fbx'] };
+    const authored = { ...base, checkId: 'author', command: 'editor author', authoring: { ...authoring, tool: 'unreal-python' as const, phase: 'author' as const } };
+    const verified = { ...base, checkId: 'verify', command: 'editor verify',
+      authoring: { ...authoring, args: ['-ExecutePythonScript=diagnostics/verify.py'], sourceRelativePaths: [], tool: 'unreal-python' as const,
+        phase: 'verify' as const, loadedPackages: ['Game/Content/Maps/World.umap', 'Game/Content/Props/Tree.uasset'], inspections: [
+          { path: 'Game/Content/Maps/World.umap', className: 'World', technicalObservations: ['non-basic-level-actor-present'] },
+          { path: 'Game/Content/Props/Tree.uasset', className: 'StaticMesh', technicalObservations: ['asset-import-data-matches-recorded-source'] }
+        ] } };
+    expect(validateRequiredUnrealAssets(['Game/Content/Maps/World.umap', 'Game/Content/Props/Tree.uasset'], [authored, verified])).toBe(false);
+    expect(() => validateRequiredUnrealAssets(['Game/Content/Maps/World.umap'], [authored])).toThrow('not subsequently loaded');
+    expect(() => validateRequiredUnrealAssets(['Game/Content/Maps/World.umap'], [authored, { ...verified,
+      authoring: { ...verified.authoring, projectRelativePath: 'Other/Other.uproject' } }])).toThrow('not subsequently loaded');
+    expect(() => validateRequiredUnrealAssets(['Game/Content/Maps/World.umap'], [authored, { ...verified, authoring: { ...verified.authoring, loadedPackages: [] } }]))
+      .toThrow('not subsequently loaded');
+    expect(validateRequiredUnrealAssets(['Game/Content/Maps/World.umap'], [authored, verified], true)).toBe(true);
+    expect(() => validateRequiredUnrealAssets(['Game/Content/Maps/World.umap'], [{ ...authored, authoring: { ...authored.authoring, tool: 'project-script' as const } }, verified]))
+      .toThrow('not created or imported through a successful editor');
+    expect(requiresProductionContent(['Create usable production scene content'])).toBe(true);
+    expect(requiresProductionContent(['The package can load'])).toBe(false);
+  });
+  it('maps packages relative to the selected project Content directory', () => {
+    expect(unrealObjectPath('Content/Props/Tree.uasset', 'Game.uproject')).toBe('/Game/Props/Tree');
+    expect(unrealObjectPath('Game/Content/Props/Tree.uasset', 'Game/Game.uproject')).toBe('/Game/Props/Tree');
+    expect(() => unrealObjectPath('Other/Content/Tree.uasset', 'Game/Game.uproject')).toThrow("outside the selected project's Content");
+  });
   it('rejects directory GIS datasets and oversized unclassified data while retaining Unreal payloads', () => {
     const policy = { requiresUnrealAssets: true, prohibitedDatasetExtensions: ['.gdb', '.gpkg'], maxUnclassifiedFileBytes: 1024 };
     expect(isProhibitedAuthoringPath('Source/region.gdb/a00000001.gdbtable', 12, policy)).toBe(true);

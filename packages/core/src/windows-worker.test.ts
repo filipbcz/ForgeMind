@@ -98,8 +98,10 @@ describe('Windows worker shared contracts', () => {
       tree: [{ path: 'Content/Generated/map.bin', kind: 'file', sha256: hash, sizeBytes: 42, binary: true, mode: '100644' }], patch: 'diff --git',
       resultBundle: { version: 1, format: 'git-binary-patch', sha256: '35ab12569421d1cd6fa0a9a3deb5b40126a1a8272702923dc722409bdaf5801d', sizeBytes: 10, lfsObjects: [], outputs: [] },
       completedOperationIds: ['op-1'], checkpointIds: ['cp-1'], artifacts: [], processes: [{ leaseId: 'l', sessionId: 's', checkId: 'provider', command: 'provider.implement', shell: 'system', exitCode: 0, stdout: 'done', stderr: '', startedAt: '2026-01-01T00:00:00Z', completedAt: '2026-01-01T00:00:30Z' }], status: 'succeeded',
+      contentAssessment: { technicalVerification: 'passed', productionReviewRequired: true, rationale: 'Requires visual review.' },
       startedAt: '2026-01-01T00:00:00Z', completedAt: '2026-01-01T00:01:00Z', summary: 'authored' };
     expect(isWindowsAuthoringResult(result)).toBe(true);
+    expect(isWindowsAuthoringResult({ ...result, contentAssessment: undefined })).toBe(false);
     expect(isWindowsAuthoringResult({ ...result, processes: [{ ...result.processes[0], leaseId: 'other' }] })).toBe(false);
     expect(isWindowsAuthoringResult({ ...result, resultTreeSha: 'working-tree' })).toBe(false);
     expect(isWindowsAuthoringResult({ ...result, tree: [{ ...result.tree[0], binary: undefined }] })).toBe(false);
