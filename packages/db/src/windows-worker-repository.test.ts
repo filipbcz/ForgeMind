@@ -74,18 +74,33 @@ describe('WindowsWorkerRepository capability leases', () => {
     const now = new Date('2026-09-01T12:00:00.000Z');
     const device = (id: string, status: 'idle' | 'revoked', heartbeat: string, sessionStatus: 'active' | 'closed') => ({
       id, platform: 'windows', runnerVersion: '1', displayName: id, status, capabilities: [{ key: 'windows' }],
-      probeEvidence: [{ capability: { key: 'windows' }, status: 'supported' }], lastHeartbeatAt: new Date(heartbeat),
+      probeEvidence: [{ capability: { key: 'windows' }, status: 'supported', provenance: 'local-probe', probedAt: '2026-09-01T11:59:55.000Z' }], lastHeartbeatAt: new Date(heartbeat),
       sessions: [{ id: `${id}-session`, deviceId: id, status: sessionStatus, startedAt: now, expiresAt: new Date(now.getTime() + 60_000), lastHeartbeatAt: new Date(heartbeat), endedAt: null }]
     });
-    const devices = [device('eligible', 'idle', '2026-09-01T11:59:50.000Z', 'active'), device('stale', 'idle', '2026-09-01T11:00:00.000Z', 'active'),
+    const fixture = device('fixture', 'idle', '2026-09-01T11:59:50.000Z', 'active'); fixture.probeEvidence[0]!.provenance = 'fixture';
+    const devices = [device('eligible', 'idle', '2026-09-01T11:59:50.000Z', 'active'), fixture, device('stale', 'idle', '2026-09-01T11:00:00.000Z', 'active'),
       device('closed', 'idle', '2026-09-01T11:59:50.000Z', 'closed'), device('revoked', 'revoked', '2026-09-01T11:59:50.000Z', 'active')];
     const prisma: any = { workerDevice: { findMany: vi.fn(async () => devices) }, windowsExecutionJob: { findMany: vi.fn(async () => [{
-      id: 'job_1', taskId: 'task_1', status: 'queued', requiredCapabilities: ['windows'], packet: queuedPacket
+      id: 'job_1', taskId: 'task_1', status: 'queued', waitReason: 'unavailable_capability', pendingPhase: 'validate', requiredCapabilities: ['windows'], packet: queuedPacket
     }]) } };
     const readModel = await new WindowsWorkerRepository(prisma).readOperations(undefined, now);
     expect(readModel.devices.find(({ id }) => id === 'stale')?.status).toBe('offline');
     expect(readModel.devices.find(({ id }) => id === 'revoked')?.status).toBe('revoked');
     expect(readModel.waitingValidations[0]?.compatibleDeviceIds).toEqual(['eligible']);
+    expect(readModel.waitingValidations[0]).toMatchObject({ waitReason: 'unavailable_capability', pendingPhase: 'validate' });
+  });
+
+  it('persists a recoverable capacity wait without leasing or changing the pending phase', async () => {
+    const execute = vi.fn(async () => 1);
+    const tx: any = {
+      $executeRaw: execute,
+      $queryRaw: vi.fn().mockResolvedValueOnce([{ device_id: 'device_1', authorized_project_ids: ['project_1'] }]).mockResolvedValueOnce([]),
+      windowsExecutionLease: { findUnique: vi.fn(async () => null) }
+    };
+    const prisma: any = { $transaction: vi.fn(async (work: (client: unknown) => unknown) => work(tx)) };
+    await expect(new WindowsWorkerRepository(prisma).claimCompatible('session_1', 60, 'capacity-request')).resolves.toBeUndefined();
+    expect(execute).toHaveBeenCalledTimes(2);
+    expect(String((execute.mock.calls as unknown[][])[1]?.[0])).toContain('wait_reason');
   });
 
   it('returns an existing active lease for an idempotent claim without reserving another job', async () => {
@@ -116,7 +131,7 @@ describe('WindowsWorkerRepository capability leases', () => {
     expect(claim?.job.id).toBe('job_1');
     expect(tx.windowsExecutionLease.create).toHaveBeenCalledTimes(1);
     expect(tx.windowsExecutionJob.update).toHaveBeenCalledWith({
-      where: { id: 'job_1' }, data: { status: 'leased', packet: { ...queuedPacket, dispatch: { kind: 'deferred', reason: 'legacy_unsafe_packet', handling: 'manual-local' }, leaseId: expect.any(String), nonce: 'request_1' } }
+      where: { id: 'job_1' }, data: { status: 'leased', waitReason: null, packet: { ...queuedPacket, dispatch: { kind: 'deferred', reason: 'legacy_unsafe_packet', handling: 'manual-local' }, leaseId: expect.any(String), nonce: 'request_1' } }
     });
   });
 

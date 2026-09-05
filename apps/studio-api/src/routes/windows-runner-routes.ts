@@ -17,8 +17,8 @@ const claim = z.object({ sessionId: z.string().uuid(), requestId: z.string().min
   authoringProtocolVersions: z.array(z.number().int().positive()).max(8).default([]) });
 const deviceRegistration = z.object({
   runnerVersion: z.string().min(1).max(128), displayName: z.string().min(1).max(200),
-  capabilities: z.array(z.object({ key: z.string().min(1), version: z.string().min(1).optional() })),
-  probeEvidence: z.array(z.object({ schemaVersion: z.literal(1), capability: z.object({ key: z.string().min(1), version: z.string().min(1).optional() }), status: z.enum(['supported', 'unsupported', 'error']), probedAt: z.string().datetime(), probeVersion: z.string().min(1), summary: z.string().min(1), evidenceHash: z.string().regex(/^[a-f0-9]{64}$/i) }))
+  capabilities: z.array(z.object({ key: z.string().min(1), version: z.string().min(1).optional(), metadata: z.record(z.string(), z.any()).optional() })),
+  probeEvidence: z.array(z.object({ schemaVersion: z.literal(1), capability: z.object({ key: z.string().min(1), version: z.string().min(1).optional(), metadata: z.record(z.string(), z.any()).optional() }), status: z.enum(['supported', 'unsupported', 'error']), probedAt: z.string().datetime(), probeVersion: z.string().min(1), provenance: z.enum(['local-probe', 'fixture']), summary: z.string().min(1), evidenceHash: z.string().regex(/^[a-f0-9]{64}$/i) }))
 }).superRefine((input, context) => {
   const identity = (capability: { key: string; version?: string }) => `${capability.key}\u0000${capability.version ?? ''}`;
   const capabilityIds = input.capabilities.map(identity);
@@ -27,9 +27,9 @@ const deviceRegistration = z.object({
   if (new Set(evidenceIds).size !== evidenceIds.length) context.addIssue({ code: z.ZodIssueCode.custom, path: ['probeEvidence'], message: 'Probe evidence must be unique.' });
   for (const capabilityId of capabilityIds) {
     const matching = input.probeEvidence.filter((evidence) => identity(evidence.capability) === capabilityId);
-    if (matching.length !== 1 || matching[0]?.status !== 'supported') context.addIssue({ code: z.ZodIssueCode.custom, path: ['probeEvidence'], message: 'Every advertised capability requires one successful matching probe.' });
+    if (matching.length !== 1 || matching[0]?.status !== 'supported' || matching[0]?.provenance !== 'local-probe') context.addIssue({ code: z.ZodIssueCode.custom, path: ['probeEvidence'], message: 'Every advertised capability requires one successful matching local probe.' });
   }
-  if (evidenceIds.some((evidenceId) => !capabilityIds.includes(evidenceId))) context.addIssue({ code: z.ZodIssueCode.custom, path: ['probeEvidence'], message: 'Probe evidence must match an advertised capability.' });
+  if (input.probeEvidence.some((evidence) => evidence.status === 'supported' && !capabilityIds.includes(identity(evidence.capability)))) context.addIssue({ code: z.ZodIssueCode.custom, path: ['probeEvidence'], message: 'Successful probe evidence must match an advertised capability.' });
   for (const [index, evidence] of input.probeEvidence.entries()) {
     const expectedHash = createHash('sha256').update(canonicalizeWorkerProbeEvidence(evidence)).digest('hex');
     if (evidence.evidenceHash.toLowerCase() !== expectedHash) context.addIssue({ code: z.ZodIssueCode.custom, path: ['probeEvidence', index, 'evidenceHash'], message: 'Probe evidence hash is invalid.' });
