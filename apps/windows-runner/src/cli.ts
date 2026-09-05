@@ -104,6 +104,7 @@ export async function main(args = process.argv.slice(2)): Promise<void> {
             pinnedFixtureTools: adapterPolicy.pinnedFixtureTools,
             pinnedUnrealTools: adapterPolicy.pinnedUnrealTools,
             approvedUnrealProfiles: adapterPolicy.approvedUnrealProfiles,
+            pinnedRuntimeApplications: adapterPolicy.pinnedRuntimeApplications,
             showLocally: (summary) => stdout.write(`${summary}\n`)
           });
           await transport.uploadEvidence(auth, executed.evidence);
@@ -124,17 +125,19 @@ interface LocalAdapterPolicy {
   pinnedFixtureTools: import('./executor.js').PinnedFixtureTool[];
   pinnedUnrealTools: import('./unreal-adapter.js').PinnedUnrealTool[];
   approvedUnrealProfiles: import('./unreal-adapter.js').ApprovedUnrealProfile[];
+  pinnedRuntimeApplications: import('./executor.js').PinnedRuntimeApplication[];
 }
 
 function readLocalAdapterPolicy(): LocalAdapterPolicy {
   const raw = process.env.FORGEMIND_WINDOWS_ADAPTER_POLICY;
-  if (!raw) return { allowedFixtureExecutablePaths: [], pinnedFixtureTools: [], pinnedUnrealTools: [], approvedUnrealProfiles: [] };
+  if (!raw) return { allowedFixtureExecutablePaths: [], pinnedFixtureTools: [], pinnedUnrealTools: [], approvedUnrealProfiles: [], pinnedRuntimeApplications: [] };
   const value = JSON.parse(raw) as Partial<LocalAdapterPolicy>;
   return {
     allowedFixtureExecutablePaths: Array.isArray(value.allowedFixtureExecutablePaths) ? value.allowedFixtureExecutablePaths : [],
     pinnedFixtureTools: Array.isArray(value.pinnedFixtureTools) ? value.pinnedFixtureTools : [],
     pinnedUnrealTools: Array.isArray(value.pinnedUnrealTools) ? value.pinnedUnrealTools : [],
-    approvedUnrealProfiles: Array.isArray(value.approvedUnrealProfiles) ? value.approvedUnrealProfiles : []
+    approvedUnrealProfiles: Array.isArray(value.approvedUnrealProfiles) ? value.approvedUnrealProfiles : [],
+    pinnedRuntimeApplications: Array.isArray(value.pinnedRuntimeApplications) ? value.pinnedRuntimeApplications : []
   };
 }
 

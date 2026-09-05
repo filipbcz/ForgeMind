@@ -428,6 +428,13 @@ export class WindowsWorkerRepository {
       if (updated.count !== 1) throw new Error('Execution job changed while its result was being reconciled.');
       await tx.windowsExecutionLease.update({ where: { id: result.leaseId }, data: { status: result.status === 'cancelled' ? 'cancelled' : 'released', releasedAt: new Date() } });
       await tx.workerDevice.update({ where: { id: deviceId }, data: { status: persisted.sessionStatus === 'active' ? 'idle' : 'offline' } });
+      if (status === 'succeeded' && validationPacket.realEngineEvidence?.classification === 'capture') {
+        await tx.task.updateMany({ where: { id: result.taskId, status: 'completed' }, data: { status: 'submitted', finishedAt: null } });
+        const activeRepair = await tx.taskQueueJob.count({ where: { taskId: result.taskId, status: { in: ['pending', 'claimed'] } } });
+        if (activeRepair === 0) await tx.taskQueueJob.create({ data: {
+          taskId: result.taskId, reason: 'runtime_capture_ready', status: 'pending', nextAttemptAt: new Date()
+        } });
+      }
       return { accepted: true, packet };
     });
   }
@@ -531,6 +538,25 @@ export class WindowsWorkerRepository {
       return capability && typeof capability === 'object' && !Array.isArray(capability) && typeof capability.key === 'string' ? [capability.key] : [];
     }));
     return required.length === requiredValue.length && required.every((key) => capabilities.has(key) && supported.has(key));
+  }
+
+  async listCaptureEvidence(taskId: string): Promise<Array<{ artifactHash: string; resultTreeSha: string; buildId: string; scene: string; settings: Record<string, import('@forgemind/shared').JsonValue>; contentBase64: string }>> {
+    const jobs = await this.prisma.windowsExecutionJob.findMany({ where: { taskId, status: 'succeeded' }, orderBy: { updatedAt: 'desc' }, take: 10 });
+    return jobs.flatMap((job) => {
+      const packet = job.packet as unknown as WindowsExecutionPacket & { evidenceUpload?: WindowsEvidenceUpload };
+      if (!isWindowsExecutionPacket(packet) || packet.realEngineEvidence?.classification !== 'capture' || packet.evidenceUpload?.realEngineEvidence?.state !== 'succeeded') return [];
+      return packet.evidenceUpload.artifacts.filter((artifact) => artifact.mimeType === 'image/png').map((artifact) => ({
+        artifactHash: artifact.sha256, resultTreeSha: packet.commitSha, buildId: packet.realEngineEvidence!.buildId,
+        scene: packet.realEngineEvidence!.scenario, settings: packet.realEngineEvidence!.settings, contentBase64: artifact.contentBase64
+      }));
+    });
+  }
+
+  async activatePendingCaptureRepair(taskId: string): Promise<boolean> {
+    const pending = await this.prisma.taskQueueJob.count({ where: { taskId, status: 'pending', reason: 'runtime_capture_ready' } });
+    if (!pending) return false;
+    const updated = await this.prisma.task.updateMany({ where: { id: taskId, status: 'completed' }, data: { status: 'submitted', finishedAt: null } });
+    return updated.count === 1;
   }
 }
 

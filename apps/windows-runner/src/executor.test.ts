@@ -5,7 +5,7 @@ import { join } from 'node:path';
 import { promisify } from 'node:util';
 import { afterEach, describe, expect, it } from 'vitest';
 import type { WindowsExecutionPacket } from '@forgemind/core';
-import { cleanupWindowsValidationWorkspace, executeWindowsValidation, findPinnedFixtureTool, mapFixtureArtifactPath } from './executor.js';
+import { cleanupWindowsValidationWorkspace, executeWindowsValidation, findPinnedFixtureTool, mapFixtureArtifactPath, validatePngArtifact } from './executor.js';
 
 const executeFile = promisify(execFile);
 const temporaryPaths: string[] = [];
@@ -15,6 +15,17 @@ describe('fixture adapter path mapping', () => {
     const mapped = mapFixtureArtifactPath('/runner/work/job-1', 'artifacts/result.json');
     expect(mapped).toEqual({ artifactRoot: '/runner/work/job-1/artifacts', artifactRelativePath: 'result.json' });
     expect(join(mapped.artifactRoot, mapped.artifactRelativePath)).toBe('/runner/work/job-1/artifacts/result.json');
+  });
+});
+
+describe('runtime capture decoding', () => {
+  const png = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=', 'base64');
+  it('accepts a complete decodable PNG and rejects signature-only or truncated evidence', () => {
+    expect(() => validatePngArtifact(png)).not.toThrow();
+    expect(() => validatePngArtifact(png.subarray(0, 32))).toThrow(/unreadable/);
+    expect(() => validatePngArtifact(Buffer.concat([png.subarray(0, 8), Buffer.alloc(40)]))).toThrow(/unreadable/);
+    const corruptCrc = Buffer.from(png); corruptCrc[29] = corruptCrc[29]! ^ 1;
+    expect(() => validatePngArtifact(corruptCrc)).toThrow(/unreadable/);
   });
 });
 

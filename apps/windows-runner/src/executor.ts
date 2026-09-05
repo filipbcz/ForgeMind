@@ -1,4 +1,5 @@
 import { createHash } from 'node:crypto';
+import { inflateSync } from 'node:zlib';
 import { spawn } from 'node:child_process';
 import { mkdir, readFile, realpath, rm, stat } from 'node:fs/promises';
 import { basename, dirname, isAbsolute, relative, resolve } from 'node:path';
@@ -33,11 +34,13 @@ export interface WindowsExecutionContext {
   pinnedFixtureTools?: readonly PinnedFixtureTool[];
   pinnedUnrealTools?: readonly PinnedUnrealTool[];
   approvedUnrealProfiles?: readonly ApprovedUnrealProfile[];
+  pinnedRuntimeApplications?: readonly PinnedRuntimeApplication[];
   confirmLargeUnrealJob?: (summary: string) => Promise<boolean>;
   showLocally?: (summary: string) => void;
 }
 
 export interface PinnedFixtureTool { canonicalPath: string; version: string }
+export interface PinnedRuntimeApplication { kind: 'editor' | 'built-application'; canonicalPath: string; version: string }
 
 export interface ExecutedWindowsValidation {
   evidence: WindowsEvidenceUpload;
@@ -191,6 +194,7 @@ async function runValidationAdapter(packet: WindowsExecutionPacket, cwd: string,
     }, context.signal);
     return { ...result, stdout: '', stderr: '', toolVersions: [{ tool: `fixture:${basename(fixtureTool.canonicalPath)}`, version: fixtureTool.version }] };
   }
+  if (dispatch.kind === 'runtime-capture') return runRuntimeCapture(packet, cwd, dispatch, context);
   const workingDirectory = resolve(cwd, dispatch.workingDirectoryRelativePath);
   const prepared = await new PinnedUnrealCommandAdapter({
     canonicalize: realpath,
@@ -207,6 +211,36 @@ async function runValidationAdapter(packet: WindowsExecutionPacket, cwd: string,
   if (prepared.status !== 'ready') return { status: 'failed', exitCode: 2, stdout: '', stderr: `${prepared.status}: ${prepared.reason}: ${prepared.message}` };
   const result = await runProcess(prepared.executablePath, [...prepared.args], processOptions(packet, prepared.workingDirectory, context.signal));
   return { ...result, toolVersions: [{ tool: dispatch.tool, version: prepared.toolVersion }] };
+}
+
+async function runRuntimeCapture(packet: WindowsExecutionPacket, cwd: string,
+  dispatch: Extract<WindowsExecutionPacket['dispatch'], { kind: 'runtime-capture' }>, context: WindowsExecutionContext): Promise<ProcessResult> {
+  if (packet.realEngineEvidence?.classification !== 'capture') return { status: 'failed', exitCode: 2, stdout: '',
+    stderr: 'Runtime capture requires capture-classified evidence and cannot satisfy benchmark, soak, Shipping, build, or user-approval evidence.' };
+  const capabilities = new Set(context.observedCapabilities.map(({ key }) => key));
+  const missing = ['interactive-desktop', 'gpu'].filter((key) => !capabilities.has(key));
+  if (missing.length) return { status: 'failed', exitCode: 2, stdout: '', stderr: `missing-capability: ${missing.join(', ')}` };
+  const pinned = await findPinnedRuntimeLauncher(dispatch.executablePath, dispatch.runtimeKind, context.pinnedRuntimeApplications ?? []);
+  const profile = (context.approvedUnrealProfiles ?? []).find((candidate) => candidate.id === dispatch.profileId
+    && candidate.tool === 'project-script' && JSON.stringify(candidate.allowedArguments) === JSON.stringify(dispatch.args));
+  if (!pinned || !profile) return { status: 'failed', exitCode: 2, stdout: '', stderr: 'Runtime capture launcher/profile is not locally pinned and approved.' };
+  assertSafeArtifactPath(dispatch.artifactRelativePath);
+  const target = resolveContained(cwd, dispatch.artifactRelativePath);
+  await mkdir(dirname(target), { recursive: true });
+  const script = '$ErrorActionPreference="Stop"; $session=(Get-Process -Id $PID).SessionId; if(Get-Process LogonUI -ErrorAction SilentlyContinue | Where-Object SessionId -eq $session){throw "locked-desktop"}; $launchArgs=if($args.Length -gt 4){$args[4..($args.Length-1)]}else{@()}; $p=Start-Process -FilePath $args[0] -WorkingDirectory $args[1] -ArgumentList $launchArgs -PassThru; try { Start-Sleep -Seconds ([int]$args[2]); if(Get-Process LogonUI -ErrorAction SilentlyContinue | Where-Object SessionId -eq $session){throw "locked-desktop"}; Add-Type -AssemblyName System.Windows.Forms; Add-Type -AssemblyName System.Drawing; $b=[System.Windows.Forms.Screen]::PrimaryScreen.Bounds; if($b.Width -lt 2 -or $b.Height -lt 2){throw "locked-or-unreadable-desktop"}; $i=New-Object System.Drawing.Bitmap $b.Width,$b.Height; $g=[System.Drawing.Graphics]::FromImage($i); $g.CopyFromScreen($b.Location,[System.Drawing.Point]::Empty,$b.Size); $i.Save($args[3],[System.Drawing.Imaging.ImageFormat]::Png); $g.Dispose(); $i.Dispose() } finally { if($p -and -not $p.HasExited){Stop-Process -Id $p.Id -Force} }';
+  const result = await runProcess('powershell.exe', ['-NoProfile', '-NonInteractive', '-STA', '-Command', script,
+    dispatch.executablePath, resolve(cwd, dispatch.workingDirectoryRelativePath), String(dispatch.settleSeconds), target, ...dispatch.args],
+  processOptions(packet, cwd, context.signal));
+  return { ...result, toolVersions: [{ tool: 'runtime-launcher', version: pinned.version }, { tool: 'desktop-capture', version: 'powershell-system-drawing-v1' }] };
+}
+
+async function findPinnedRuntimeLauncher(path: string, kind: PinnedRuntimeApplication['kind'], tools: readonly PinnedRuntimeApplication[]): Promise<PinnedRuntimeApplication | undefined> {
+  let canonical: string;
+  try { canonical = await realpath(path); } catch { return undefined; }
+  for (const tool of tools) try {
+    if (tool.kind === kind && equalCanonicalPath(await realpath(tool.canonicalPath), canonical)) return tool;
+  } catch { /* an unavailable pinned entry is not usable */ }
+  return undefined;
 }
 
 export function mapFixtureArtifactPath(workspacePath: string, workspaceRelativePath: string): { artifactRoot: string; artifactRelativePath: string } {
@@ -281,6 +315,7 @@ async function collectArtifacts(packet: WindowsExecutionPacket, workspacePath: s
       totalBytes += info.size;
       if (totalBytes > packet.resourcePolicy.maxArtifactBytes) throw new Error('Windows validation artifacts exceed the configured limit.');
       const content = await readFile(canonicalSource);
+      if (expected.mimeType === 'image/png' || expected.relativePath.toLowerCase().endsWith('.png')) validatePngArtifact(content, expected.relativePath);
       if (redactSecrets(content.toString('utf8')) !== content.toString('utf8')) throw new Error(`Expected artifact contains secret-like content: ${expected.relativePath}`);
       resolveContained(await realpath(artifactPath), expected.relativePath);
       results.push({
@@ -296,6 +331,51 @@ async function collectArtifacts(packet: WindowsExecutionPacket, workspacePath: s
     }
   }
   return results;
+}
+
+/** Parses the complete PNG container and inflates its image stream. Signature-only
+ * checks accept truncated captures, which must never count as visual evidence. */
+export function validatePngArtifact(content: Buffer, relativePath = 'capture.png'): void {
+  const fail = () => { throw new Error(`Runtime capture artifact is unreadable or is not a complete PNG: ${relativePath}`); };
+  if (content.length < 45 || !content.subarray(0, 8).equals(Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]))) fail();
+  let offset = 8; let width = 0; let height = 0; let channels = 0; let bitDepth = 0; let colorType = -1;
+  let sawHeader = false; let sawPalette = false; let sawImageData = false; let endedImageData = false; let sawEnd = false;
+  const compressed: Buffer[] = [];
+  while (offset + 12 <= content.length) {
+    const length = content.readUInt32BE(offset); const end = offset + 12 + length;
+    if (end > content.length) fail();
+    const type = content.toString('ascii', offset + 4, offset + 8); const data = content.subarray(offset + 8, offset + 8 + length);
+    if (pngCrc32(content.subarray(offset + 4, offset + 8 + length)) !== content.readUInt32BE(offset + 8 + length)) fail();
+    if (type === 'IHDR') {
+      if (sawHeader || offset !== 8 || length !== 13) fail(); sawHeader = true; width = data.readUInt32BE(0); height = data.readUInt32BE(4); bitDepth = data[8]!; colorType = data[9]!;
+      channels = ({ 0: 1, 2: 3, 3: 1, 4: 2, 6: 4 } as Record<number, number>)[colorType] ?? 0;
+      const legalDepths: Record<number, number[]> = { 0: [1, 2, 4, 8, 16], 2: [8, 16], 3: [1, 2, 4, 8], 4: [8, 16], 6: [8, 16] };
+      if (!width || !height || !channels || !legalDepths[colorType]?.includes(bitDepth) || data[10] !== 0 || data[11] !== 0 || data[12] !== 0) fail();
+    } else if (type === 'PLTE') {
+      if (!sawHeader || sawImageData || sawPalette || [0, 4].includes(colorType) || length === 0 || length % 3 || length > 768) fail(); sawPalette = true;
+    } else if (type === 'IDAT') {
+      if (!sawHeader || endedImageData || (colorType === 3 && !sawPalette)) fail(); sawImageData = true; compressed.push(data);
+    }
+    else if (type === 'IEND') { if (length !== 0) fail(); sawEnd = true; offset = end; break; }
+    else if (sawImageData) endedImageData = true;
+    offset = end;
+  }
+  if (!sawHeader || !sawEnd || offset !== content.length || compressed.length === 0) fail();
+  try {
+    const decoded = inflateSync(Buffer.concat(compressed));
+    const rowBytes = Math.ceil(width * channels * bitDepth / 8);
+    if (decoded.length !== height * (rowBytes + 1)) fail();
+    for (let row = 0; row < height; row += 1) if (decoded[row * (rowBytes + 1)]! > 4) fail();
+  } catch { fail(); }
+}
+
+function pngCrc32(value: Buffer): number {
+  let crc = 0xffffffff;
+  for (const byte of value) {
+    crc ^= byte;
+    for (let bit = 0; bit < 8; bit += 1) crc = (crc >>> 1) ^ (crc & 1 ? 0xedb88320 : 0);
+  }
+  return (crc ^ 0xffffffff) >>> 0;
 }
 
 function resolveManagedPath(root: string, child: string): string {

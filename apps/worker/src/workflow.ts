@@ -54,6 +54,7 @@ export interface WorkerTaskInput {
   resourcePolicy?: WorkerResourcePolicy;
   implementationOwner?: 'linux' | 'windows';
   implementOnWindows?: (input: Parameters<AIProvider['implement']>[0] & { baseCommitSha: string }) => Promise<ImplementResult>;
+  visualEvidence?: Parameters<AIProvider['implement']>[0]['visualEvidence'];
 }
 
 type GitHubOperation = 'create_issue' | 'create_branch' | 'commit_and_push' | 'create_draft_pr' | 'create_pull_request' | 'merge_pr' | 'comment_on_issue';
@@ -417,6 +418,7 @@ export async function runWorkerTask(input: WorkerTaskInput): Promise<WorkerTaskR
           ? formatValidationFailure(validation)
           : input.resume?.previousValidationError,
         previousReviewBlockers: review?.blockers.length ? review.blockers : undefined,
+        visualEvidence: input.visualEvidence,
         onActivity: (activity) => input.hooks?.onProviderActivity?.({ phase: 'implementation', attempt, ...activity })
       };
     if (input.implementationOwner === 'windows' && !input.implementOnWindows) throw new Error('Windows owns implementation but no native authoring channel is configured.');

@@ -56,9 +56,13 @@ export async function listOpenAIModels(apiKey: string, apiBaseUrl = process.env.
     .sort((left, right) => left.id.localeCompare(right.id));
 }
 
-function serializeMessages(messages: Array<{ role: 'system' | 'user' | 'assistant'; content: string }>): string {
-  return messages.map((message) => `[${message.role}]\n${message.content}`).join('\n\n');
+function serializeMessages(messages: OpenAIMessage[]): string {
+  return messages.map((message) => `[${message.role}]\n${typeof message.content === 'string' ? message.content : JSON.stringify(message.content)}`).join('\n\n');
 }
+
+type OpenAIMessage = { role: 'system' | 'user' | 'assistant'; content: string | Array<
+  { type: 'text'; text: string } | { type: 'image_url'; image_url: { url: string; detail: 'high' } }
+> };
 
 export class OpenAIProvider implements AIProvider {
   readonly kind: ProviderKind = 'openai';
@@ -99,7 +103,7 @@ export class OpenAIProvider implements AIProvider {
   }
 
   async plan(input: PlanInput): Promise<PlanResult> {
-    const messages: Array<{ role: 'system' | 'user' | 'assistant'; content: string }> = [
+    const messages: OpenAIMessage[] = [
       {
         role: 'system',
         content: 'You are an AI project planner. Provide a JSON object with summary, steps, acceptanceCriteria, implementationSteps, projectContract, contractDelta, and architectureUpdate. ' +
@@ -132,7 +136,7 @@ export class OpenAIProvider implements AIProvider {
   }
 
   async repairRoadmap(input: RoadmapRepairInput): Promise<RoadmapRepairResult> {
-    const messages: Array<{ role: 'system' | 'user' | 'assistant'; content: string }> = [
+    const messages: OpenAIMessage[] = [
       {
         role: 'system',
         content: 'Repair only the supplied invalid implementation roadmap, except when the blocker proves the derived contract contradicts the complete current specification. Return JSON containing implementationSteps and contractDelta (null unless a targeted contract correction is necessary). The CURRENT SPECIFICATION is authoritative; the existing contract is historical derived context, not a current normative instruction. Preserve valid steps and untouched requirement IDs and semantics. Never turn an obsolete obligation into roadmap work. A contract correction must be the smallest explicit delta against the supplied version and give a non-empty rationale for every update, supersession, or removal. Do not broadly regenerate the contract. Each step may contain at most 3 requirementIds, 3 deliverables, 5 acceptanceCriteria, and 5 inScope items; split oversized work while preserving complete requirement coverage.'
@@ -170,7 +174,7 @@ export class OpenAIProvider implements AIProvider {
 
   async reviewRoadmap(input: RoadmapQualityReviewInput): Promise<ReviewResult> {
     const providerPrompt = buildRoadmapQualityReviewPrompt(input);
-    const messages: Array<{ role: 'system' | 'user' | 'assistant'; content: string }> = [
+    const messages: OpenAIMessage[] = [
       {
         role: 'system',
         content: 'You are an independent roadmap quality reviewer. Assess only roadmap quality against the supplied objective and contract. Return verdict satisfied or not_satisfied with concrete blockers as JSON.'
@@ -191,7 +195,7 @@ export class OpenAIProvider implements AIProvider {
   }
 
   async implement(input: ImplementInput): Promise<ImplementResult> {
-    const messages: Array<{ role: 'system' | 'user' | 'assistant'; content: string }> = [
+    const messages: OpenAIMessage[] = [
       {
         role: 'system',
         content: 'You are an AI implementation assistant. Make only the repository changes required by the supplied task and correction context. Use any repository, shell, network, installation, build, or test command needed to implement the task correctly. Set outcome to changes_made when repository changes are required, already_satisfied when the repository already meets the task, or blocked only for a concrete external blocker that prevents further progress. After editing, propose the authoritative validationChecks. An empty array explicitly means no executable validation is applicable. For every command select shell (system, powershell, cmd, bash, or sh), target (local or windows), requiredCapabilities, continueOnFailure, and timeoutMinutes from 1 to 600. Use target windows only when the check genuinely requires Windows or Windows-only tooling. For a Windows check, set windowsAdapter to a complete fixture-validation or unreal-validation profile only when that typed adapter genuinely applies; otherwise set it to null for manual-local deferral. ForgeMind executes the command text exactly as returned for local checks; Windows checks execute only through the typed adapter. Provide a JSON object with outcome, summary, changedFiles, evidenceFiles, diffStat, validationChecks, architectureUpdate, and optional fileUpdates [{ path, content }]. architectureUpdate must be a compact delta containing only architectural facts introduced or changed by this attempt, including databaseSchemas; use empty arrays when nothing changed. Respond only with JSON.'
@@ -206,10 +210,17 @@ export class OpenAIProvider implements AIProvider {
           input.attemptNumber && input.attemptNumber > 1 ? 'Preserve completed work and apply only the supplied correction.' : '',
           input.previousValidationError ? `Previous validation error: ${input.previousValidationError}` : '',
           input.previousReviewBlockers?.length ? `Previous review blockers: ${input.previousReviewBlockers.join(' | ')}` : '',
+          input.visualEvidence?.length ? `Runtime capture files (with verified hashes and provenance): ${input.visualEvidence.map((item) => `${item.localPath} sha256=${item.artifactHash} tree=${item.resultTreeSha} build=${item.buildId} scene=${item.scene}`).join(' | ')}` : '',
+          input.visualEvidence?.length ? `Runtime capture files available for visual inspection: ${input.visualEvidence.map((item) => `${item.localPath} sha256=${item.artifactHash} tree=${item.resultTreeSha}`).join(' | ')}` : '',
         ]
           .filter(Boolean)
           .join('\n')
       }
+    ];
+    if (input.visualEvidence?.length) messages[1]!.content = [
+      { type: 'text', text: messages[1]!.content as string },
+      ...input.visualEvidence.map((item) => ({ type: 'image_url' as const,
+        image_url: { url: `data:image/png;base64,${item.contentBase64}`, detail: 'high' as const } }))
     ];
     const response = await this.requestChat(messages, input.signal);
     const content = response.content;
@@ -383,7 +394,7 @@ export class OpenAIProvider implements AIProvider {
   }
 
   protected async requestChat(
-    messages: Array<{ role: 'system' | 'user' | 'assistant'; content: string }>,
+    messages: OpenAIMessage[],
     signal?: AbortSignal
   ): Promise<{ content: string; usage?: import('./provider.js').ProviderUsageMeasurement }> {
     try {

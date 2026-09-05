@@ -98,6 +98,16 @@ export type WindowsExecutionDispatch =
       minimumLargeJobFreeSpaceBytes: number;
     }
   | {
+      kind: 'runtime-capture';
+      runtimeKind: 'editor' | 'built-application';
+      profileId: string;
+      executablePath: string;
+      workingDirectoryRelativePath: string;
+      args: string[];
+      artifactRelativePath: string;
+      settleSeconds: number;
+    }
+  | {
       kind: 'deferred';
       reason: 'unsupported_validation_intent' | 'legacy_unsafe_packet';
       handling: 'manual-local';
@@ -566,6 +576,12 @@ function isExecutionDispatch(value: unknown): value is WindowsExecutionDispatch 
     && Array.isArray(value.args) && value.args.every((arg) => isNonEmpty(arg) && !/[\r\n\0]/.test(arg as string))
     && ['standard', 'large'].includes(value.size as string)
     && Number.isSafeInteger(value.minimumLargeJobFreeSpaceBytes) && (value.minimumLargeJobFreeSpaceBytes as number) >= 0;
+  if (value.kind === 'runtime-capture') return isNonEmpty(value.profileId) && isNonEmpty(value.executablePath)
+    && ['editor', 'built-application'].includes(value.runtimeKind as string)
+    && isSafeRelativePath(value.workingDirectoryRelativePath) && Array.isArray(value.args)
+    && value.args.every((arg) => isNonEmpty(arg) && !/[\r\n\0]/.test(arg as string))
+    && isSafeRelativePath(value.artifactRelativePath) && Number.isInteger(value.settleSeconds)
+    && (value.settleSeconds as number) >= 1 && (value.settleSeconds as number) <= 300;
   return false;
 }
 

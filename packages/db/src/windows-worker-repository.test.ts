@@ -298,6 +298,26 @@ describe('WindowsWorkerRepository capability leases', () => {
     });
   });
 
+  it('reopens and queues the task when a successful capture becomes available for visual repair', async () => {
+    const digest = 'c'.repeat(64); const intent = { classification: 'capture' as const, buildId: 'build-1', scenario: 'Main', settings: { quality: 'Epic' } };
+    const engine = { ...intent, projectId: 'project_1', taskId: 'task_1', runId: 'run_1', inputHash: digest, resultTreeSha: digest,
+      toolVersions: [{ tool: 'runtime-launcher', version: '1' }], startedAt: '2026-09-01T00:00:00.000Z', completedAt: '2026-09-01T00:01:00.000Z', durationMs: 60_000, state: 'succeeded' as const, exitCode: 0, artifacts: [] };
+    const packet = { ...queuedPacket, commitSha: digest, inputHash: digest, leaseId: 'lease_1', nonce: 'nonce_1', realEngineEvidence: intent,
+      evidenceUpload: { schemaVersion: 1 as const, jobId: 'job_1', leaseId: 'lease_1', inputHash: digest, commitSha: digest,
+        log: { text: 'captured', sizeBytes: 8, sha256: digest }, artifacts: [], realEngineEvidence: engine } };
+    const create = vi.fn(async () => undefined); const tx: any = {
+      $queryRaw: vi.fn(async () => [{ jobId: 'job_1', projectId: 'project_1', taskId: 'task_1', runId: 'run_1', packet }]),
+      windowsExecutionJob: { updateMany: vi.fn(async () => ({ count: 1 })) }, windowsExecutionLease: { update: vi.fn() }, workerDevice: { update: vi.fn() },
+      task: { updateMany: vi.fn(async () => ({ count: 1 })) }, taskQueueJob: { count: vi.fn(async () => 0), create }
+    };
+    const result = { schemaVersion: 1 as const, projectId: 'project_1', taskId: 'task_1', runId: 'run_1', checkId: 'check_1', jobId: 'job_1', leaseId: 'lease_1',
+      deviceId: 'device_1', sessionId: 'session_1', nonce: 'nonce_1', inputHash: digest, commitSha: digest, observedCapabilities: [], toolVersions: engine.toolVersions,
+      status: 'succeeded' as const, startedAt: engine.startedAt, completedAt: engine.completedAt, exitCode: 0, summary: 'captured', logHash: digest, artifacts: [], realEngineEvidence: engine };
+    expect(await new WindowsWorkerRepository({ $transaction: vi.fn(async (work: any) => work(tx)) } as any).submitResult('device_1', result)).toEqual({ accepted: true, packet });
+    expect(tx.task.updateMany).toHaveBeenCalledWith({ where: { id: 'task_1', status: 'completed' }, data: { status: 'submitted', finishedAt: null } });
+    expect(create).toHaveBeenCalledWith({ data: expect.objectContaining({ taskId: 'task_1', reason: 'runtime_capture_ready', status: 'pending' }) });
+  });
+
   it('keeps an active lease reconcilable when cancellation is requested', async () => {
     const tx: any = {
       workerSession: { update: vi.fn(async () => ({ deviceId: 'device_1' })) },

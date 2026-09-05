@@ -67,6 +67,16 @@ async function enqueueExternalWindowsValidations(
       .update(JSON.stringify({ commitSha: input.commitSha, command: check.command, shell: check.shell ?? 'system', requestedCapabilities,
         windowsAdapter: check.windowsAdapter ?? null, realEngineEvidence: check.realEngineEvidence ?? null }))
       .digest('hex');
+    if (check.windowsAdapter?.kind === 'runtime-capture' && check.realEngineEvidence?.classification === 'capture') {
+      const prior = await windowsWorkers.listCaptureEvidence(input.taskId);
+      if (prior.some((capture) => capture.resultTreeSha.toLowerCase() === input.commitSha!.toLowerCase()
+        && capture.buildId === check.realEngineEvidence!.buildId && capture.scene === check.realEngineEvidence!.scenario
+        && JSON.stringify(capture.settings) === JSON.stringify(check.realEngineEvidence!.settings))) {
+        await repository.writeAudit({ actorType: 'system', eventType: 'windows_capture_reused', projectId: project.id, taskId: input.taskId,
+          payload: { inputHash, commitSha: input.commitSha, reason: 'Result tree and capture settings are unchanged.' } });
+        continue;
+      }
+    }
     await windowsWorkers.enqueue({
       id: jobId,
       projectId: project.id,
@@ -104,7 +114,8 @@ async function enqueueExternalWindowsValidations(
           maxLogBytes: WINDOWS_EVIDENCE_MAX_LOG_BYTES,
           maxArtifactBytes: WINDOWS_EVIDENCE_MAX_ARTIFACT_BYTES
         },
-        expectedArtifacts: [],
+        expectedArtifacts: check.windowsAdapter?.kind === 'runtime-capture' ? [{ name: 'runtime-capture',
+          relativePath: check.windowsAdapter.artifactRelativePath, mimeType: 'image/png', required: true }] : [],
         nonce: 'pending',
         inputHash,
         ...(check.realEngineEvidence ? { realEngineEvidence: check.realEngineEvidence } : {}),
@@ -549,6 +560,18 @@ export async function runDatabaseWorkerOnce(options: { deferInterruptSignals?: b
         : null
   });
 
+  const storedCaptures = typeof windowsWorkers.listCaptureEvidence === 'function' ? await windowsWorkers.listCaptureEvidence(claimed.task.id) : [];
+  const visualEvidence = await Promise.all(storedCaptures.map(async (capture) => {
+    const directory = resolve(workspaceRoot, '.visual-evidence', claimed.task.id);
+    await mkdir(directory, { recursive: true });
+    const localPath = resolve(directory, `${capture.artifactHash}.png`);
+    const bytes = Buffer.from(capture.contentBase64, 'base64');
+    if (createHash('sha256').update(bytes).digest('hex') !== capture.artifactHash.toLowerCase()) throw new Error('Persisted visual evidence hash mismatch.');
+    await writeFile(localPath, bytes);
+    return { artifactHash: capture.artifactHash, resultTreeSha: capture.resultTreeSha, buildId: capture.buildId,
+      scene: capture.scene, settings: capture.settings, localPath, contentBase64: capture.contentBase64 };
+  }));
+
   try {
     const result = await runWorkerTask({
       project: claimed.project,
@@ -557,6 +580,7 @@ export async function runDatabaseWorkerOnce(options: { deferInterruptSignals?: b
       provider,
       reviewProvider,
       workspaceRoot,
+      visualEvidence,
       implementationOwner: projectConfig?.workflow.implementation_owner ?? 'linux',
       implementOnWindows: projectConfig?.workflow.implementation_owner === 'windows'
         ? async (implementationInput) => implementThroughWindowsLease(windowsWorkers, {
@@ -785,6 +809,7 @@ export async function runDatabaseWorkerOnce(options: { deferInterruptSignals?: b
       }
     }
 
+    let captureRepairActivated = false;
     if (result.status === 'validation_failed') {
       await repository.transitionTask(claimed.task.id, 'validation_failed', {
         validation: {
@@ -826,13 +851,15 @@ export async function runDatabaseWorkerOnce(options: { deferInterruptSignals?: b
       });
       if (result.status === 'completed') {
         await repository.transitionTask(claimed.task.id, 'completed');
-        await repository.recordCompletedTaskProjectMemory({
+        captureRepairActivated = typeof windowsWorkers.activatePendingCaptureRepair === 'function'
+          ? await windowsWorkers.activatePendingCaptureRepair(claimed.task.id) : false;
+        if (!captureRepairActivated) await repository.recordCompletedTaskProjectMemory({
           taskId: claimed.task.id,
           summary: result.summary,
           commitSha: result.commitSha,
           architectureUpdate: result.architectureUpdate
         });
-        await advanceRoadmapAfterTaskCompletion(repository, claimed.task.id);
+        if (!captureRepairActivated) await advanceRoadmapAfterTaskCompletion(repository, claimed.task.id);
       }
       await repository.finishTaskRun({
         taskRunId: claimed.taskRun.id,
@@ -842,7 +869,7 @@ export async function runDatabaseWorkerOnce(options: { deferInterruptSignals?: b
         ...getRunUsageFields()
       });
       await finalizeQueueJob('succeeded');
-      if (result.status === 'completed') {
+      if (result.status === 'completed' && !captureRepairActivated) {
         await cleanupCompletedTaskWorkspace(workspaceRoot, claimed.task.id);
       }
     }

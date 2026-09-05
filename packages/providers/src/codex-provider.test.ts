@@ -24,13 +24,17 @@ describe('Codex structured output schemas', () => {
       const schema = JSON.parse(JSON.stringify(execute.mock.calls[0]![0].schema)) as JsonSchema;
       expectStrictResponseSchema(schema);
       const adapters = schema.properties!.validationChecks!.items!.properties!.windowsAdapter!.anyOf!;
-      expect(adapters).toHaveLength(3);
+      expect(adapters).toHaveLength(4);
       expect(adapters[0]).toEqual({ type: 'null' });
       expect(adapters[1]!.properties!.kind).toEqual({ type: 'string', const: 'fixture-validation' });
       expect(adapters[2]!.properties).toMatchObject({
         kind: { type: 'string', const: 'unreal-validation' },
         tool: { type: 'string', enum: ['unreal-editor-cmd', 'build-bat', 'automation-tool', 'project-script'] },
         size: { type: 'string', enum: ['standard', 'large'] }
+      });
+      expect(adapters[3]!.properties).toMatchObject({
+        kind: { type: 'string', const: 'runtime-capture' },
+        settleSeconds: { type: 'integer', minimum: 1, maximum: 300 }
       });
     } finally {
       execute.mockRestore();
