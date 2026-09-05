@@ -29,10 +29,10 @@ describe('pinned Unreal command adapter', () => {
     await expect(adapter.prepare({ ...profile, args }, policy)).resolves.toMatchObject({ reason });
   });
 
-  it('requires free space and separate local confirmation for a large job', async () => {
+  it('requires free space but no repeated confirmation for an authorized large job', async () => {
     const largePolicy = { ...policy, approvedProfiles: [{ ...policy.approvedProfiles[0]!, size: 'large' as const }] };
     await expect(harness(true, 499).adapter.prepare({ ...profile, size: 'large' }, largePolicy)).resolves.toMatchObject({ status: 'approval_required', reason: 'insufficient_free_space' });
-    await expect(harness(false).adapter.prepare({ ...profile, size: 'large' }, largePolicy)).resolves.toMatchObject({ status: 'approval_required', reason: 'large_job_confirmation' });
+    await expect(harness(false).adapter.prepare({ ...profile, size: 'large' }, largePolicy)).resolves.toMatchObject({ status: 'ready' });
     await expect(harness(true).adapter.prepare({ ...profile, size: 'large' }, largePolicy)).resolves.toMatchObject({ status: 'ready' });
     await expect(harness(true).adapter.prepare(profile, largePolicy)).resolves.toMatchObject({ status: 'manual_required', reason: 'unknown_profile' });
   });
@@ -79,13 +79,10 @@ describe('pinned Unreal command adapter', () => {
     await expect(new PinnedUnrealCommandAdapter(dependencies).prepare(junctionProfile, junctionPolicy)).resolves.toMatchObject({ status: 'manual_required', reason: 'unknown_profile' });
   });
 
-  it('returns structured approval statuses when large-job safeguards are unavailable', async () => {
+  it('returns a structured status when the large-job resource check is unavailable', async () => {
     const largePolicy = { ...policy, approvedProfiles: [{ ...policy.approvedProfiles[0]!, size: 'large' as const }] };
     const freeSpaceFailure = harness();
     freeSpaceFailure.dependencies.freeSpaceBytes = async () => { throw new Error('unavailable'); };
     await expect(freeSpaceFailure.adapter.prepare({ ...profile, size: 'large' }, largePolicy)).resolves.toMatchObject({ status: 'approval_required', reason: 'resource_check_failed' });
-    const confirmationFailure = harness();
-    confirmationFailure.dependencies.confirmLargeJob = async () => { throw new Error('unavailable'); };
-    await expect(confirmationFailure.adapter.prepare({ ...profile, size: 'large' }, largePolicy)).resolves.toMatchObject({ status: 'approval_required', reason: 'local_confirmation_unavailable' });
   });
 });

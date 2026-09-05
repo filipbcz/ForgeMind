@@ -1331,7 +1331,7 @@ Aktualni stav tohoto repozitare:
 
 Windows runner je pouze validacni executor pro presny commit SHA a verzovane schema z `packages/core`. Neni obecny remote shell: nesmi planovat ani implementovat, pouzivat Git push, merge, PR nebo deploy, pristupovat primo do databaze, provozovat Docker, bezet bezobsluzne jako sluzba ani menit UAC, restart nebo security konfiguraci.
 
-Lokalni adapter policy se runneru predava v `FORGEMIND_WINDOWS_ADAPTER_POLICY` jako JSON s poli `allowedFixtureExecutablePaths`, `pinnedUnrealTools` a `approvedUnrealProfiles`. Prazdna nebo chybejici policy nic nespusti. Velky Unreal profil navic vyzaduje interaktivni TTY potvrzeni a diskovy preflight; server nema approval frontu.
+Lokalni adapter policy se runneru predava v `FORGEMIND_WINDOWS_ADAPTER_POLICY` jako JSON s poli `allowedFixtureExecutablePaths`, `pinnedUnrealTools` a `approvedUnrealProfiles`. Prazdna nebo chybejici policy nic nespusti. Operator aktivuje obnovovanou foreground relaci prikazem `session start --project <uuid>`; muze povolit vice projektu opakovanim `--project`. `session drain` zastavi nove claimy a necha aktualni ulohu dobehnout, zatimco `session stop` okamzite zrusi relaci i vlastneny process tree. Velke schvalene profily po aktivaci nevyzaduji dalsi potvrzeni, ale zachovavaji diskovy preflight; instalace, UAC, restart a licencni/globalni zmeny zustavaji zakazane.
 
 Root/CI test foundation pro release a migracni matrix zustava dostupny:
 

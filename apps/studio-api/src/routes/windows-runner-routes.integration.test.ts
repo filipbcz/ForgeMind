@@ -74,7 +74,7 @@ describe('Windows runner real transport and persistence flow', () => {
     const absentSession = '77777777-7777-4777-8777-777777777777';
     expect((await app.inject({ method: 'POST', url: '/api/windows-runner/device/lease', headers, payload: { sessionId: absentSession, requestId: 'before-session' } })).json()).toEqual({ job: null, lease: null });
 
-    const sessionId = (await app.inject({ method: 'POST', url: '/api/windows-runner/device/session', headers, payload: { expiresInMinutes: 30 } })).json().sessionId as string;
+    const sessionId = (await app.inject({ method: 'POST', url: '/api/windows-runner/device/session', headers, payload: { projectIds: [ids.project] } })).json().sessionId as string;
     const claim = (await app.inject({ method: 'POST', url: '/api/windows-runner/device/lease', headers, payload: { sessionId, requestId: 'fake-runner-request' } })).json();
     expect(claim.job.id).toBe(ids.job);
     expect((await app.inject({ method: 'POST', url: '/api/windows-runner/device/heartbeat', headers, payload: { sessionId, leaseId: claim.lease.id } })).statusCode).toBe(200);

@@ -15,7 +15,7 @@ export class WindowsRunnerTransport {
   publishDevice(auth: RunnerCredential, input: { runnerVersion: string; displayName: string; capabilities: WorkerCapability[]; probeEvidence: WorkerProbeEvidence[] }) {
     return this.call('/api/windows-runner/device', auth, input, 'PUT');
   }
-  startSession(auth: RunnerCredential, expiresInMinutes: number) { return this.call<{ sessionId: string }>('/api/windows-runner/device/session', auth, { expiresInMinutes }); }
+  startSession(auth: RunnerCredential, projectIds: string[]) { return this.call<{ sessionId: string }>('/api/windows-runner/device/session', auth, { projectIds }); }
   claim(auth: RunnerCredential, sessionId: string, requestId: string) { return this.call<LeaseClaim>('/api/windows-runner/device/lease', auth, { sessionId, requestId }); }
   heartbeat(auth: RunnerCredential, sessionId: string, leaseId?: string) { return this.call('/api/windows-runner/device/heartbeat', auth, { sessionId, leaseId }); }
   control(auth: RunnerCredential, sessionId: string, leaseId?: string) {
@@ -23,6 +23,7 @@ export class WindowsRunnerTransport {
     return this.call<RunnerControlState>(`/api/windows-runner/device/control?${query}`, auth, undefined, 'GET');
   }
   drain(auth: RunnerCredential, sessionId: string) { return this.call('/api/windows-runner/device/session/drain', auth, { sessionId }); }
+  stop(auth: RunnerCredential, sessionId: string) { return this.call('/api/windows-runner/device/session/stop', auth, { sessionId }); }
   uploadEvidence(auth: RunnerCredential, input: WindowsEvidenceUpload) { return this.call<{ accepted: boolean; duplicate: boolean }>('/api/windows-runner/device/evidence', auth, input); }
   submitResult(auth: RunnerCredential, input: WindowsExecutionResult) { return this.call<{ accepted: boolean }>('/api/windows-runner/device/result', auth, input); }
   close(auth: RunnerCredential, sessionId: string) { return this.call('/api/windows-runner/device/session/close', auth, { sessionId }); }

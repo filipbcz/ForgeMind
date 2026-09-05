@@ -15,8 +15,8 @@ const RUNNER_VERSION = '0.1.0';
 
 export type CliCommand =
   | { command: 'enroll' | 'probe'; apiUrl: string }
-  | { command: 'session-start'; apiUrl: string; minutes: number; workspaceRoot: string; artifactRoot: string }
-  | { command: 'session-drain'; apiUrl: string; sessionId: string };
+  | { command: 'session-start'; apiUrl: string; projectIds: string[]; workspaceRoot: string; artifactRoot: string }
+  | { command: 'session-drain' | 'session-stop'; apiUrl: string; sessionId: string };
 
 export function parseCliArgs(args: string[]): CliCommand {
   const command = args[0];
@@ -26,21 +26,22 @@ export function parseCliArgs(args: string[]): CliCommand {
   if (!apiUrl) throw new Error('--api-url is required.');
   if (command === 'enroll' || command === 'probe') return { command, apiUrl };
   if (command === 'session' && action === 'start') {
-    const minutes = Number(option(options, '--minutes') ?? '60');
-    if (!Number.isInteger(minutes) || minutes < 1 || minutes > 720) throw new Error('--minutes must be an integer from 1 to 720.');
+    const projectIds = optionsFor(options, '--project');
+    if (projectIds.length === 0) throw new Error('At least one --project UUID is required for local activation.');
+    if (projectIds.some((id) => !/^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(id))) throw new Error('--project values must be UUIDs.');
     const localRoot = process.env.LOCALAPPDATA ?? process.cwd();
     return {
-      command: 'session-start', apiUrl, minutes,
+      command: 'session-start', apiUrl, projectIds: [...new Set(projectIds)],
       workspaceRoot: option(options, '--workspace-root') ?? join(localRoot, 'ForgeMind', 'windows-runner', 'workspaces'),
       artifactRoot: option(options, '--artifact-root') ?? join(localRoot, 'ForgeMind', 'windows-runner', 'artifacts')
     };
   }
-  if (command === 'session' && action === 'drain') {
+  if (command === 'session' && (action === 'drain' || action === 'stop')) {
     const sessionId = option(options, '--session-id');
     if (!sessionId) throw new Error('--session-id is required.');
-    return { command: 'session-drain', apiUrl, sessionId };
+    return { command: action === 'drain' ? 'session-drain' : 'session-stop', apiUrl, sessionId };
   }
-  throw new Error('Usage: forgemind-windows-runner enroll|probe|session start|session drain --api-url https://...');
+  throw new Error('Usage: forgemind-windows-runner enroll|probe|session start --project <uuid>|session drain|session stop --api-url https://...');
 }
 
 export async function main(args = process.argv.slice(2)): Promise<void> {
@@ -63,7 +64,7 @@ export async function main(args = process.argv.slice(2)): Promise<void> {
     const adapterPolicy = readLocalAdapterPolicy();
     await transport.publishDevice(auth, { runnerVersion: RUNNER_VERSION, displayName: process.env.COMPUTERNAME ?? 'Windows runner', capabilities: probes.capabilities, probeEvidence: probes.evidence });
     const controller = new AbortController(); process.once('SIGINT', () => controller.abort());
-    await runManualSession(transport, auth, { durationMinutes: parsed.minutes, signal: controller.signal,
+    await runManualSession(transport, auth, { projectIds: parsed.projectIds, signal: controller.signal,
       onClaim: async (claim, context) => {
         if (!claim.job || !claim.lease) return;
         const disposition = classifyWindowsExecutionPacket(claim.job.packet);
@@ -88,13 +89,7 @@ export async function main(args = process.argv.slice(2)): Promise<void> {
             pinnedFixtureTools: adapterPolicy.pinnedFixtureTools,
             pinnedUnrealTools: adapterPolicy.pinnedUnrealTools,
             approvedUnrealProfiles: adapterPolicy.approvedUnrealProfiles,
-            showLocally: (summary) => stdout.write(`${summary}\n`),
-            confirmLargeUnrealJob: async (summary) => {
-              if (!process.stdin.isTTY || !process.stdout.isTTY) return false;
-              const terminal = createInterface({ input: stdin, output: stdout });
-              try { return (await terminal.question(`${summary}\nConfirm this large local Unreal job [y/N]: `)).trim().toLowerCase() === 'y'; }
-              finally { terminal.close(); }
-            }
+            showLocally: (summary) => stdout.write(`${summary}\n`)
           });
           await transport.uploadEvidence(auth, executed.evidence);
           await transport.submitResult(auth, executed.result);
@@ -106,6 +101,7 @@ export async function main(args = process.argv.slice(2)): Promise<void> {
     return;
   }
   if (parsed.command === 'session-drain') { await transport.drain(auth, parsed.sessionId); return; }
+  if (parsed.command === 'session-stop') { await transport.stop(auth, parsed.sessionId); return; }
 }
 
 interface LocalAdapterPolicy {
@@ -128,5 +124,6 @@ function readLocalAdapterPolicy(): LocalAdapterPolicy {
 }
 
 function option(args: string[], name: string): string | undefined { const index = args.indexOf(name); return index >= 0 ? args[index + 1] : undefined; }
+function optionsFor(args: string[], name: string): string[] { return args.flatMap((value, index) => value === name && args[index + 1] ? [args[index + 1]!] : []); }
 
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) main().catch((error) => { process.stderr.write(`${error instanceof Error ? error.message : error}\n`); process.exitCode = 1; });

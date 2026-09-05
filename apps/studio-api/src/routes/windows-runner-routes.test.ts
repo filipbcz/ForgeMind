@@ -52,9 +52,9 @@ describe('Windows runner enrollment API', () => {
     const credentials: any = { authenticate: vi.fn(async () => ({ credentialId: 'credential_1', deviceId: '11111111-1111-4111-8111-111111111111', scope: 'windows_runner:device_operations' })) };
     const workers: any = { startManualSession: vi.fn(async () => 'session_1') };
     registerWindowsRunnerRoutes(app, repository, credentials, workers);
-    const response = await app.inject({ method: 'POST', url: '/api/windows-runner/device/session', headers: { authorization: 'Bearer device-token' }, payload: { expiresInMinutes: 30 } });
+    const response = await app.inject({ method: 'POST', url: '/api/windows-runner/device/session', headers: { authorization: 'Bearer device-token' }, payload: { projectIds: ['22222222-2222-4222-8222-222222222222'] } });
     expect(response.statusCode).toBe(200);
-    expect(workers.startManualSession).toHaveBeenCalledWith('11111111-1111-4111-8111-111111111111', expect.any(Date));
+    expect(workers.startManualSession).toHaveBeenCalledWith('11111111-1111-4111-8111-111111111111', expect.any(Date), ['22222222-2222-4222-8222-222222222222']);
     expect(repository.writeAudit).toHaveBeenCalledWith(expect.objectContaining({ eventType: 'windows_runner_session_started', actorId: '11111111-1111-4111-8111-111111111111' }));
   });
 
@@ -76,9 +76,11 @@ describe('Windows runner enrollment API', () => {
     const workers: any = {
       registerDevice: vi.fn(async () => undefined),
       getControlState: vi.fn(async () => ({ deviceStatus: 'idle', sessionStatus: 'active' })),
-      drainSession: vi.fn(async () => undefined)
+      drainSession: vi.fn(async () => undefined),
+      cancelSession: vi.fn(async () => undefined)
     };
-    registerWindowsRunnerRoutes(app, {} as any, credentials, workers);
+    const repository: any = { writeAudit: vi.fn(async () => undefined) };
+    registerWindowsRunnerRoutes(app, repository, credentials, workers);
     const headers = { authorization: 'Bearer device-token' };
     const evidence = probeEvidence({ key: 'windows' });
     expect((await app.inject({ method: 'PUT', url: '/api/windows-runner/device', headers, payload: { runnerVersion: '0.1.0', displayName: 'Runner', capabilities: [{ key: 'windows' }], probeEvidence: [evidence] } })).statusCode).toBe(200);
@@ -87,6 +89,8 @@ describe('Windows runner enrollment API', () => {
     expect((await app.inject({ method: 'POST', url: '/api/windows-runner/device/session/drain', headers, payload: { sessionId } })).statusCode).toBe(200);
     expect(workers.getControlState).toHaveBeenCalledWith(deviceId, sessionId);
     expect(workers.drainSession).toHaveBeenCalledWith(sessionId);
+    expect((await app.inject({ method: 'POST', url: '/api/windows-runner/device/session/stop', headers, payload: { sessionId } })).statusCode).toBe(200);
+    expect(workers.cancelSession).toHaveBeenCalledWith(sessionId);
   });
 
   it.each([
