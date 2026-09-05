@@ -2,7 +2,7 @@ import type { FastifyInstance, FastifyReply, FastifyRequest } from 'fastify';
 import { createHash } from 'node:crypto';
 import { z } from 'zod';
 import type { ForgeMindRepository, WindowsRunnerCredentialAdapter, WindowsRunnerPrincipal, WindowsWorkerRepository } from '@forgemind/db';
-import { canonicalizeWorkerProbeEvidence, isWindowsExecutionResult, redactSecrets, WINDOWS_EVIDENCE_MAX_ARTIFACT_BYTES, WINDOWS_EVIDENCE_MAX_ARTIFACTS, WINDOWS_EVIDENCE_MAX_LOG_BYTES } from '@forgemind/core';
+import { canonicalizeWorkerProbeEvidence, isWindowsAuthoringPacket, isWindowsAuthoringResult, isWindowsExecutionResult, redactSecrets, WINDOWS_EVIDENCE_MAX_ARTIFACT_BYTES, WINDOWS_EVIDENCE_MAX_ARTIFACTS, WINDOWS_EVIDENCE_MAX_LOG_BYTES } from '@forgemind/core';
 
 const deviceParams = z.object({ deviceId: z.string().uuid() });
 const enrollment = z.object({
@@ -13,7 +13,8 @@ const enrollment = z.object({
 const redeem = z.object({ code: z.string().min(32).max(128) });
 const session = z.object({ expiresInMinutes: z.number().int().min(1).max(720) });
 const heartbeat = z.object({ sessionId: z.string().uuid(), leaseId: z.string().uuid().optional(), leaseSeconds: z.number().int().min(15).max(300).default(60) });
-const claim = z.object({ sessionId: z.string().uuid(), requestId: z.string().min(8).max(128), leaseSeconds: z.number().int().min(15).max(300).default(60) });
+const claim = z.object({ sessionId: z.string().uuid(), requestId: z.string().min(8).max(128), leaseSeconds: z.number().int().min(15).max(300).default(60),
+  authoringProtocolVersions: z.array(z.number().int().positive()).max(8).default([]) });
 const deviceRegistration = z.object({
   runnerVersion: z.string().min(1).max(128), displayName: z.string().min(1).max(200),
   capabilities: z.array(z.object({ key: z.string().min(1), version: z.string().min(1).optional() })),
@@ -100,13 +101,22 @@ export function registerWindowsRunnerRoutes(app: FastifyInstance, repository: Fo
   });
   app.post('/api/windows-runner/device/lease', { preHandler: runnerAuth(credentials) }, async (request) => {
     const principal = runnerPrincipal(request); const input = claim.parse(request.body);
-    return (await workers.claimCompatible(input.sessionId, input.leaseSeconds, input.requestId, principal.deviceId)) ?? { job: null, lease: null };
+    return (await workers.claimCompatible(input.sessionId, input.leaseSeconds, input.requestId, principal.deviceId, input.authoringProtocolVersions)) ?? { job: null, lease: null };
   });
   app.post('/api/windows-runner/device/result', { preHandler: runnerAuth(credentials) }, async (request, reply) => {
     const principal = runnerPrincipal(request);
-    if (!isWindowsExecutionResult(request.body) || request.body.deviceId !== principal.deviceId) return reply.code(400).send({ error: 'Invalid execution result.' });
+    if ((!isWindowsExecutionResult(request.body) && !isWindowsAuthoringResult(request.body)) || request.body.deviceId !== principal.deviceId) return reply.code(400).send({ error: 'Invalid execution result.' });
     const outcome = await workers.submitResult(principal.deviceId, request.body);
     if (!outcome.accepted || !outcome.packet) return reply.code(409).send({ error: 'Execution lease is not active for this device.' });
+    if (isWindowsAuthoringPacket(outcome.packet)) {
+      if (!isWindowsAuthoringResult(request.body)) return reply.code(409).send({ error: 'Result protocol does not match the leased job.' });
+      await repository.writeAudit({ actorType: 'system', actorId: principal.deviceId, eventType: 'windows_runner_authoring_result_submitted',
+        taskId: request.body.taskId, projectId: request.body.projectId, payload: { deviceId: principal.deviceId, jobId: request.body.jobId,
+          leaseId: request.body.leaseId, status: request.body.status, baseCommitSha: request.body.baseCommitSha,
+          resultTreeSha: request.body.resultTreeSha, binaryEntries: request.body.tree.filter((entry) => entry.binary).length } });
+      return { accepted: true, evidenceRecorded: false };
+    }
+    if (!isWindowsExecutionResult(request.body)) return reply.code(409).send({ error: 'Result protocol does not match the leased job.' });
     let evidenceRecorded = false;
     const context = outcome.packet.evidenceContext;
     if (context) {

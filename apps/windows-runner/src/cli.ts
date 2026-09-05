@@ -4,7 +4,7 @@ import { release as osRelease } from 'node:os';
 import { join } from 'node:path';
 import { stdin, stdout } from 'node:process';
 import { pathToFileURL } from 'node:url';
-import { classifyWindowsExecutionPacket } from '@forgemind/core';
+import { classifyWindowsExecutionPacket, isWindowsExecutionPacket } from '@forgemind/core';
 import { WindowsCredentialStore } from './credential-store.js';
 import { cleanupWindowsValidationWorkspace, executeWindowsValidation } from './executor.js';
 import { runCapabilityProbes, windowsRunnerCapabilityProbes } from './probes.js';
@@ -67,7 +67,11 @@ export async function main(args = process.argv.slice(2)): Promise<void> {
       onClaim: async (claim, context) => {
         if (!claim.job || !claim.lease) return;
         const disposition = classifyWindowsExecutionPacket(claim.job.packet);
-        if (disposition.status === 'deferred' && claim.job.packet.dispatch?.kind !== 'deferred') {
+        if (!isWindowsExecutionPacket(claim.job.packet)) {
+          stdout.write(`Deferred (${disposition.status === 'deferred' ? `${disposition.handling}/${disposition.reason}` : 'manual-local'}): This runner does not support the leased protocol. No process was started.\n`);
+          return;
+        }
+        if (disposition.status === 'deferred' && claim.job.packet.dispatch.kind !== 'deferred') {
           stdout.write(`Deferred (${disposition.handling}/${disposition.reason}): ${disposition.message} No process was started.\n`);
           return;
         }

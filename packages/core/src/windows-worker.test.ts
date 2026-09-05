@@ -1,8 +1,8 @@
 import { describe, expect, it } from 'vitest';
 import {
   WINDOWS_WORKER_SCHEMA_VERSION, canTransitionExecutionJob, canTransitionWorkerDevice, classifyWindowsExecutionPacket,
-  canTransitionWorkerSession, isWindowsExecutionPacket, isWindowsExecutionResult,
-  type WindowsExecutionPacket, type WindowsExecutionResult
+  canTransitionWorkerSession, isWindowsAuthoringPacket, isWindowsAuthoringResult, isWindowsExecutionPacket, isWindowsExecutionResult,
+  type WindowsAuthoringPacket, type WindowsExecutionPacket, type WindowsExecutionResult
 } from './windows-worker.js';
 
 const hash = 'a'.repeat(64);
@@ -74,5 +74,30 @@ describe('Windows worker shared contracts', () => {
     expect(isWindowsExecutionPacket({ ...packet, check: { ...packet.check, shell: 'unknown' } })).toBe(false);
     expect(isWindowsExecutionPacket({ ...packet, dispatch: { kind: 'raw-shell', command: 'whoami' } })).toBe(false);
     expect(isWindowsExecutionPacket({ ...packet, evidenceContext: { cycleId: 'cycle', stepId: 'step', requirementIds: [], contractVersion: 0 } })).toBe(false);
+  });
+
+  it('validates declarative authoring packets and complete binary-aware result trees', () => {
+    const authoring: WindowsAuthoringPacket = {
+      kind: 'authoring', protocolVersion: 1, projectId: 'p', taskId: 't', runId: 'r', jobId: 'j', leaseId: 'pending',
+      repository: 'owner/repo', sourceUrl: 'https://github.com/owner/repo.git', baseCommitSha: commitSha,
+      workspaceRoot: 'runner-managed', artifactRoot: 'runner-managed', requiredCapabilities: ['windows', 'asset-authoring'],
+      managedRoots: ['Content/Generated'], operations: [{ id: 'op-1', kind: 'modify', path: 'Content/Generated/map.bin', rationale: 'Update map' }],
+      checkpoints: [{ id: 'cp-1', label: 'Map saved', afterOperationIds: ['op-1'], artifactExpectationNames: ['map'] }],
+      artifactExpectations: [{ name: 'map', relativePath: 'Content/Generated/map.bin', required: true, delivery: 'artifact-store', binary: true, maxBytes: 4096 }],
+      resourcePolicy: { timeoutSeconds: 60, maxLogBytes: 1024, maxArtifactBytes: 4096 }, nonce: 'pending', inputHash: hash,
+      authority: { database: 'none', productionHosts: 'none', globalGitHubCredentials: 'none' }
+    };
+    expect(isWindowsAuthoringPacket(authoring)).toBe(true);
+    expect(isWindowsAuthoringPacket({ ...authoring, protocolVersion: 2 })).toBe(false);
+    expect(isWindowsAuthoringPacket({ ...authoring, baseCommitSha: 'main' })).toBe(false);
+    expect(isWindowsAuthoringPacket({ ...authoring, authority: { ...authoring.authority, database: 'direct' } })).toBe(false);
+    const result = { kind: 'authoring-result', protocolVersion: 1, projectId: 'p', taskId: 't', runId: 'r', jobId: 'j', leaseId: 'l',
+      deviceId: 'd', sessionId: 's', nonce: 'n', inputHash: hash, baseCommitSha: commitSha, resultTreeSha: commitSha,
+      tree: [{ path: 'Content/Generated/map.bin', kind: 'file', sha256: hash, sizeBytes: 42, binary: true, mode: '100644' }],
+      completedOperationIds: ['op-1'], checkpointIds: ['cp-1'], artifacts: [], status: 'succeeded',
+      startedAt: '2026-01-01T00:00:00Z', completedAt: '2026-01-01T00:01:00Z', summary: 'authored' };
+    expect(isWindowsAuthoringResult(result)).toBe(true);
+    expect(isWindowsAuthoringResult({ ...result, resultTreeSha: 'working-tree' })).toBe(false);
+    expect(isWindowsAuthoringResult({ ...result, tree: [{ ...result.tree[0], binary: undefined }] })).toBe(false);
   });
 });

@@ -25,6 +25,22 @@ const leaseRow = {
 };
 
 describe('WindowsWorkerRepository capability leases', () => {
+  it('persists a versioned authoring packet with its exact base identity', async () => {
+    const packet = { kind: 'authoring', protocolVersion: 1, projectId: 'project_1', taskId: 'task_1', runId: 'run_1', jobId: 'job_1', leaseId: 'pending',
+      repository: 'owner/repo', sourceUrl: 'https://example.test/repo.git', baseCommitSha: 'b'.repeat(40), workspaceRoot: 'runner-managed', artifactRoot: 'runner-managed',
+      operations: [{ id: 'op-1', kind: 'modify', path: 'Content/map.bin', rationale: 'Update map' }], requiredCapabilities: ['windows-authoring'],
+      managedRoots: ['Content'], checkpoints: [{ id: 'cp-1', label: 'Saved', afterOperationIds: ['op-1'], artifactExpectationNames: ['map'] }],
+      artifactExpectations: [{ name: 'map', relativePath: 'Content/map.bin', required: true, delivery: 'artifact-store', binary: true, maxBytes: 1024 }],
+      resourcePolicy: { timeoutSeconds: 60, maxLogBytes: 1024, maxArtifactBytes: 1024 }, nonce: 'pending', inputHash: packetDigest,
+      authority: { database: 'none', productionHosts: 'none', globalGitHubCredentials: 'none' } } as const;
+    const create = vi.fn(async () => undefined); const prisma: any = { windowsExecutionJob: { create } };
+    await expect(new WindowsWorkerRepository(prisma).enqueueAuthoring({ id: 'job_1', projectId: 'project_1', taskId: 'task_1', runId: 'run_1',
+      requiredCapabilities: ['windows-authoring'], packet: packet as any })).resolves.toBe('job_1');
+    expect(create).toHaveBeenCalledWith({ data: expect.objectContaining({ packet, requiredCapabilities: ['windows-authoring'] }) });
+    await expect(new WindowsWorkerRepository(prisma).enqueueAuthoring({ id: 'other', projectId: 'project_1', taskId: 'task_1', runId: 'run_1',
+      requiredCapabilities: ['windows-authoring'], packet: packet as any })).rejects.toThrow('identity');
+  });
+
   it('enqueues an AI-proposed command without a runtime approval', async () => {
     const windowsPacket = { ...queuedPacket, requiredCapabilities: ['windows', 'unreal-engine-5.8'],
       check: { ...queuedPacket.check, requiredCapabilities: ['windows', 'unreal-engine-5.8'] } };
@@ -205,6 +221,28 @@ describe('WindowsWorkerRepository capability leases', () => {
     expect(accepted).toEqual({ accepted: false });
     expect(tx.windowsExecutionJob.updateMany).not.toHaveBeenCalled();
     expect(tx.windowsExecutionLease.update).not.toHaveBeenCalled();
+  });
+
+  it('accepts only an authoring result matching every lease and base identity and persists its complete tree', async () => {
+    const packet = { kind: 'authoring', protocolVersion: 1, projectId: 'project_1', taskId: 'task_1', runId: 'run_1', jobId: 'job_1', leaseId: 'lease_1',
+      repository: 'owner/repo', sourceUrl: 'https://example.test/repo.git', baseCommitSha: 'b'.repeat(40), workspaceRoot: 'runner-managed', artifactRoot: 'runner-managed',
+      operations: [{ id: 'op-1', kind: 'modify', path: 'Content/map.bin', rationale: 'Update' }], requiredCapabilities: ['windows-authoring'], managedRoots: ['Content'],
+      checkpoints: [{ id: 'cp-1', label: 'Saved', afterOperationIds: ['op-1'], artifactExpectationNames: [] }], artifactExpectations: [],
+      resourcePolicy: { timeoutSeconds: 60, maxLogBytes: 100, maxArtifactBytes: 100 }, nonce: 'nonce_1', inputHash: packetDigest,
+      authority: { database: 'none', productionHosts: 'none', globalGitHubCredentials: 'none' } } as const;
+    const updateMany = vi.fn(async () => ({ count: 1 }));
+    const tx: any = { $queryRaw: vi.fn(async () => [{ jobId: 'job_1', projectId: 'project_1', taskId: 'task_1', runId: 'run_1', packet }]),
+      windowsExecutionJob: { updateMany }, windowsExecutionLease: { update: vi.fn(async () => undefined) }, workerDevice: { update: vi.fn(async () => undefined) } };
+    const prisma: any = { $transaction: vi.fn(async (work: (client: unknown) => unknown) => work(tx)) };
+    const result = { kind: 'authoring-result', protocolVersion: 1, projectId: 'project_1', taskId: 'task_1', runId: 'run_1', jobId: 'job_1', leaseId: 'lease_1',
+      deviceId: 'device_1', sessionId: 'session_1', nonce: 'nonce_1', inputHash: packetDigest, baseCommitSha: packet.baseCommitSha,
+      resultTreeSha: 'c'.repeat(40), tree: [{ path: 'Content/map.bin', kind: 'file', sha256: 'd'.repeat(64), sizeBytes: 8, binary: true, mode: '100644' }],
+      completedOperationIds: ['op-1'], checkpointIds: ['cp-1'], artifacts: [], status: 'succeeded', startedAt: '2026-09-01T00:00:00Z', completedAt: '2026-09-01T00:01:00Z', summary: 'done' } as const;
+    const repository = new WindowsWorkerRepository(prisma);
+    expect(await repository.submitResult('device_1', result as any)).toEqual({ accepted: true, packet });
+    expect(updateMany).toHaveBeenCalledWith(expect.objectContaining({ data: { status: 'succeeded', packet: { ...packet, authoringResult: result } } }));
+    expect(await repository.submitResult('device_1', { ...result, protocolVersion: 2 } as any)).toEqual({ accepted: false });
+    expect(await repository.submitResult('device_1', { ...result, baseCommitSha: 'e'.repeat(40) } as any)).toEqual({ accepted: false });
   });
 
   it('accepts the exact deferred check result without restarting the completed task', async () => {
