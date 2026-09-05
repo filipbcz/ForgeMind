@@ -125,7 +125,8 @@ export interface ValidationCheck {
 
 export type WindowsValidationAdapter =
   | { kind: 'fixture-validation'; executablePath: string; inputRelativePath: string; artifactRelativePath: string; minimumFreeSpaceBytes: number; maxConcurrentProcesses: number }
-  | { kind: 'unreal-validation'; profileId: string; tool: 'unreal-editor-cmd' | 'build-bat' | 'automation-tool' | 'project-script'; executablePath: string; workingDirectoryRelativePath: string; args: string[]; size: 'standard' | 'large'; minimumLargeJobFreeSpaceBytes: number };
+  | { kind: 'unreal-validation'; profileId: string; tool: 'unreal-editor-cmd' | 'build-bat' | 'automation-tool' | 'project-script'; executablePath: string; workingDirectoryRelativePath: string; args: string[]; size: 'standard' | 'large'; minimumLargeJobFreeSpaceBytes: number }
+  | { kind: 'runtime-capture'; runtimeKind: 'editor' | 'built-application'; profileId: string; executablePath: string; workingDirectoryRelativePath: string; args: string[]; artifactRelativePath: string; settleSeconds: number };
 
 export interface ValidationProvenance {
   version: 1;
@@ -209,6 +210,11 @@ function normalizeWindowsValidationAdapter(value: unknown): WindowsValidationAda
     && ['standard', 'large'].includes(item.size as string) && Number.isSafeInteger(item.minimumLargeJobFreeSpaceBytes)) {
     return item as unknown as WindowsValidationAdapter;
   }
+  if (item.kind === 'runtime-capture' && typeof item.profileId === 'string' && typeof item.executablePath === 'string'
+    && ['editor', 'built-application'].includes(String(item.runtimeKind))
+    && typeof item.workingDirectoryRelativePath === 'string' && Array.isArray(item.args) && item.args.every((arg) => typeof arg === 'string')
+    && typeof item.artifactRelativePath === 'string' && Number.isSafeInteger(item.settleSeconds)
+    && Number(item.settleSeconds) >= 1 && Number(item.settleSeconds) <= 300) return item as unknown as WindowsValidationAdapter;
   return undefined;
 }
 
@@ -228,6 +234,7 @@ export interface ImplementInput {
   attemptNumber?: number;
   previousValidationError?: string;
   previousReviewBlockers?: string[];
+  visualEvidence?: Array<{ artifactHash: string; resultTreeSha: string; buildId: string; scene: string; settings: Record<string, import('@forgemind/shared').JsonValue>; localPath: string; contentBase64: string }>;
   nativeToolChannel?: { command: string; args: string[] };
   onActivity?: ProviderActivityHandler;
   session?: ProviderSessionContext;
