@@ -102,7 +102,7 @@ Doporucene doplneni pred produkci:
 ## 9) Windows runner security boundary
 
 1. Credential identifikuje konkretni enrolled device a neni univerzalni sdileny produkcni secret. Runner pouziva pouze odchozi Studio API volani; nema inbound port ani prime databazove spojeni.
-2. Aktivace je rucni a session je casove omezena. Capability lease vyzaduje cerstvy heartbeat, aktivni manualni session a odpovidajici uspesny lokalni probe.
+2. Aktivace je rucni, foreground a omezena explicitne zvolenymi projekty. Session nema povinny casovy rozpocet: heartbeat obnovuje jeji kratkou platnost i aktivni lease; stop, ztrata heartbeat, sleep nebo restart starou ownership zneplatni. Drain zastavi nove claimy a necha vlastnenou ulohu dokoncit.
 3. Execution packet je vazan na exact commit SHA a verzovane shared schema. Executor neni obecny remote shell a smi volat pouze typovane adaptery s kanonickou kontrolou executable, working directory a argument paths.
 4. Runner nesmi planovat, implementovat, pushovat, mergovat, vytvaret PR, deployovat, pouzivat Docker runtime, automatizovat UAC/restart ani menit security konfiguraci. Logy a artefakty jsou omezene, redigovane a hashovane pred pripojenim k acceptance evidence.
 5. Realna BOREK-FILIP validace a finalni audit jsou `deferred` a human-triggered. Produkcni status se nesmi odvodit z fixture testu ani textove capability konfigurace bez lokalni probe evidence.

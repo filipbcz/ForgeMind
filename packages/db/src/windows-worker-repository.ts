@@ -89,12 +89,25 @@ export class WindowsWorkerRepository {
     };
   }
 
-  async startManualSession(deviceId: string, expiresAt: Date): Promise<string> {
+  async startManualSession(deviceId: string, expiresAt: Date, authorizedProjectIds: string[]): Promise<string> {
     if (expiresAt.getTime() <= Date.now()) throw new Error('Worker session expiry must be in the future.');
+    if (authorizedProjectIds.length === 0 || new Set(authorizedProjectIds).size !== authorizedProjectIds.length) throw new Error('At least one unique authorized project is required.');
     return this.prisma.$transaction(async (tx) => {
       const devices = await tx.$queryRaw<Array<{ id: string }>>`SELECT "id" FROM "worker_devices" WHERE "id" = ${deviceId} AND "status" <> 'revoked' FOR UPDATE`;
       if (devices.length !== 1) throw new Error('Worker device is missing or revoked.');
-      const session = await tx.workerSession.create({ data: { deviceId, expiresAt } });
+      const projects = await tx.project.count({ where: { id: { in: authorizedProjectIds } } });
+      if (projects !== authorizedProjectIds.length) throw new Error('One or more authorized projects do not exist.');
+      const previousSessions = await tx.workerSession.findMany({ where: { deviceId, status: { in: ['active', 'draining'] } }, select: { id: true } });
+      const previousSessionIds = previousSessions.map(({ id }) => id);
+      const previousLeases = await tx.windowsExecutionLease.findMany({ where: { sessionId: { in: previousSessionIds }, status: 'active' }, select: { jobId: true } });
+      if (previousLeases.length > 0) throw new Error('The device still owns an active process; stop it and wait for cancellation reconciliation before starting another session.');
+      const previousJobIds = previousLeases.map(({ jobId }) => jobId);
+      const now = new Date();
+      await tx.workerSession.updateMany({ where: { id: { in: previousSessionIds } }, data: { status: 'expired', endedAt: now } });
+      await tx.windowsExecutionLease.updateMany({ where: { sessionId: { in: previousSessionIds }, status: 'active' }, data: { status: 'expired', releasedAt: now } });
+      await tx.windowsExecutionJob.updateMany({ where: { id: { in: previousJobIds }, status: 'leased' }, data: { status: 'queued' } });
+      await tx.windowsExecutionJob.updateMany({ where: { id: { in: previousJobIds }, status: 'running' }, data: { status: 'expired' } });
+      const session = await tx.workerSession.create({ data: { deviceId, expiresAt, authorizedProjectIds: asJson(authorizedProjectIds) } });
       await tx.workerDevice.update({ where: { id: deviceId }, data: { status: 'idle', lastHeartbeatAt: new Date() } });
       return session.id;
     });
@@ -191,8 +204,8 @@ export class WindowsWorkerRepository {
 
       // Lock the session/device before looking at jobs so competing claims cannot lock
       // different jobs and then deadlock or serialize-fail on the same device.
-      const sessions = await tx.$queryRaw<Array<{ device_id: string }>>`
-        SELECT s."device_id"
+      const sessions = await tx.$queryRaw<Array<{ device_id: string; authorized_project_ids: string[] }>>`
+        SELECT s."device_id", s."authorized_project_ids"
         FROM "worker_sessions" s
         JOIN "worker_devices" d ON d."id" = s."device_id"
         WHERE s."id" = ${sessionId} AND s."status" = 'active' AND s."expires_at" > CURRENT_TIMESTAMP
@@ -207,6 +220,7 @@ export class WindowsWorkerRepository {
         JOIN "task_runs" run ON run."id" = candidate."run_id" AND run."task_id" = task."id"
         JOIN "worker_devices" d ON d."id" = ${session.device_id}
         WHERE candidate."status" = 'queued'
+          AND candidate."project_id" IN (SELECT jsonb_array_elements_text(${JSON.stringify(session.authorized_project_ids)}::jsonb))
           AND (candidate."packet"->>'kind' IS DISTINCT FROM 'authoring'
             OR candidate."packet"->>'protocolVersion' = ANY(${authoringProtocolVersions.map(String)}::text[]))
           AND NOT EXISTS (
@@ -254,7 +268,7 @@ export class WindowsWorkerRepository {
       `;
       const session = sessions[0];
       if (!session) return false;
-      await tx.workerSession.update({ where: { id: sessionId }, data: { lastHeartbeatAt: now } });
+      await tx.workerSession.update({ where: { id: sessionId }, data: { lastHeartbeatAt: now, expiresAt: new Date(now.getTime() + leaseSeconds * 1_000) } });
       if (leaseId) {
         await tx.$queryRaw`SELECT "id" FROM "windows_execution_leases" WHERE "id" = ${leaseId} FOR UPDATE`;
         const renewed = await tx.windowsExecutionLease.updateMany({
@@ -276,9 +290,10 @@ export class WindowsWorkerRepository {
   async submitResult(deviceId: string, result: WindowsJobResult): Promise<SubmittedWindowsResult> {
     if ((!isWindowsExecutionResult(result) && !isWindowsAuthoringResult(result)) || result.deviceId !== deviceId) return { accepted: false };
     return this.prisma.$transaction(async (tx) => {
-      const leases = await tx.$queryRaw<Array<{ jobId: string; projectId: string; taskId: string; runId: string; packet: Prisma.JsonValue }>>`
-        SELECT l."job_id" AS "jobId", j."project_id" AS "projectId", j."task_id" AS "taskId", j."run_id" AS "runId", j."packet"
+      const leases = await tx.$queryRaw<Array<{ jobId: string; projectId: string; taskId: string; runId: string; packet: Prisma.JsonValue; sessionStatus: string }>>`
+        SELECT l."job_id" AS "jobId", j."project_id" AS "projectId", j."task_id" AS "taskId", j."run_id" AS "runId", j."packet", s."status"::text AS "sessionStatus"
         FROM "windows_execution_leases" l JOIN "windows_execution_jobs" j ON j."id" = l."job_id"
+        JOIN "worker_sessions" s ON s."id" = l."session_id"
         WHERE l."id" = ${result.leaseId} AND l."job_id" = ${result.jobId} AND l."device_id" = ${deviceId}
           AND l."session_id" = ${result.sessionId} AND l."nonce" = ${result.nonce} AND l."status" = 'active'
         FOR UPDATE OF l, j`;
@@ -302,7 +317,7 @@ export class WindowsWorkerRepository {
           packet: asJson({ ...packet, authoringResult: result }) } });
         if (updated.count !== 1) throw new Error('Execution job changed while its result was being reconciled.');
         await tx.windowsExecutionLease.update({ where: { id: result.leaseId }, data: { status: result.status === 'cancelled' ? 'cancelled' : 'released', releasedAt: new Date() } });
-        await tx.workerDevice.update({ where: { id: deviceId }, data: { status: 'idle' } });
+        await tx.workerDevice.update({ where: { id: deviceId }, data: { status: persisted.sessionStatus === 'active' ? 'idle' : 'offline' } });
         return { accepted: true, packet };
       }
       const validationResult = result as WindowsExecutionResult;
@@ -316,7 +331,7 @@ export class WindowsWorkerRepository {
       const updated = await tx.windowsExecutionJob.updateMany({ where: { id: result.jobId, status: { in: ['leased', 'running'] } }, data: { status } });
       if (updated.count !== 1) throw new Error('Execution job changed while its result was being reconciled.');
       await tx.windowsExecutionLease.update({ where: { id: result.leaseId }, data: { status: result.status === 'cancelled' ? 'cancelled' : 'released', releasedAt: new Date() } });
-      await tx.workerDevice.update({ where: { id: deviceId }, data: { status: 'idle' } });
+      await tx.workerDevice.update({ where: { id: deviceId }, data: { status: persisted.sessionStatus === 'active' ? 'idle' : 'offline' } });
       return { accepted: true, packet };
     });
   }
@@ -324,12 +339,18 @@ export class WindowsWorkerRepository {
   async drainSession(sessionId: string): Promise<void> {
     await this.prisma.$transaction(async (tx) => {
       const session = await tx.workerSession.update({ where: { id: sessionId }, data: { status: 'draining' } });
-      await tx.workerDevice.update({ where: { id: session.deviceId }, data: { status: 'draining' } });
+      const activeLease = await tx.windowsExecutionLease.count({ where: { sessionId, status: 'active' } });
+      await tx.workerDevice.update({ where: { id: session.deviceId }, data: { status: activeLease ? 'draining' : 'offline' } });
     });
   }
 
   async cancelSession(sessionId: string): Promise<void> {
-    await this.finishSession(sessionId, 'cancelled', 'cancelled');
+    await this.prisma.$transaction(async (tx) => {
+      const now = new Date();
+      const session = await tx.workerSession.update({ where: { id: sessionId }, data: { status: 'cancelled', endedAt: now } });
+      const activeLease = await tx.windowsExecutionLease.count({ where: { sessionId, status: 'active' } });
+      await tx.workerDevice.update({ where: { id: session.deviceId }, data: { status: activeLease ? 'draining' : 'offline' } });
+    });
   }
 
   async closeSession(sessionId: string): Promise<void> {
@@ -351,7 +372,7 @@ export class WindowsWorkerRepository {
       const stale = await tx.$queryRaw<Array<{ id: string; jobId: string; deviceId: string }>>`
         SELECT l."id", l."job_id" AS "jobId", l."device_id" AS "deviceId"
         FROM "windows_execution_leases" l JOIN "worker_sessions" s ON s."id" = l."session_id"
-        WHERE l."status" = 'active' AND (l."expires_at" <= ${now} OR s."status" IN ('expired', 'cancelled', 'closed'))
+        WHERE l."status" = 'active' AND (l."expires_at" <= ${now} OR s."status" IN ('expired', 'closed'))
         FOR UPDATE OF l
       `;
       const leaseIds = stale.map(({ id }) => id);

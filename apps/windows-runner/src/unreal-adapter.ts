@@ -24,7 +24,7 @@ export interface UnrealExecutorPolicy {
 }
 
 export type UnrealManualReason = 'unknown_profile' | 'gui_job';
-export type UnrealApprovalReason = 'installation' | 'uac' | 'restart' | 'license_risk' | 'large_job_confirmation' | 'insufficient_free_space' | 'resource_check_failed' | 'local_confirmation_unavailable';
+export type UnrealApprovalReason = 'installation' | 'uac' | 'restart' | 'license_risk' | 'insufficient_free_space' | 'resource_check_failed';
 
 export type UnrealPreparationResult =
   | { status: 'ready'; executablePath: string; workingDirectory: string; args: readonly string[]; toolVersion: string }
@@ -84,9 +84,6 @@ export class PinnedUnrealCommandAdapter {
       let freeSpace: number;
       try { freeSpace = await this.dependencies.freeSpaceBytes(workspace); } catch { return approval('resource_check_failed', 'Large Unreal validation is blocked because free space could not be verified.'); }
       if (freeSpace < policy.minimumLargeJobFreeSpaceBytes) return approval('insufficient_free_space', 'Large Unreal validation is blocked by the free-space policy.');
-      let confirmed: boolean;
-      try { confirmed = await this.dependencies.confirmLargeJob(summary); } catch { return approval('local_confirmation_unavailable', 'Large Unreal validation is blocked because local confirmation is unavailable.'); }
-      if (!confirmed) return approval('large_job_confirmation', 'Large Unreal validation requires separate local confirmation.');
     }
     return { status: 'ready', executablePath, workingDirectory, args: [...profile.args], toolVersion: pin.version };
   }

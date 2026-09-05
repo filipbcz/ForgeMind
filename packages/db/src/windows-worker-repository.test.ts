@@ -275,10 +275,19 @@ describe('WindowsWorkerRepository capability leases', () => {
     });
   });
 
-  it.each([
-    ['cancelSession', 'cancelled', 'cancelled'],
-    ['closeSession', 'closed', 'released']
-  ] as const)('reconciles leased and running jobs when %s terminates a session', async (method, sessionStatus, leaseStatus) => {
+  it('keeps an active lease reconcilable when cancellation is requested', async () => {
+    const tx: any = {
+      workerSession: { update: vi.fn(async () => ({ deviceId: 'device_1' })) },
+      windowsExecutionLease: { count: vi.fn(async () => 1) },
+      workerDevice: { update: vi.fn(async () => undefined) }
+    };
+    const prisma: any = { $transaction: vi.fn(async (work: (client: unknown) => unknown) => work(tx)) };
+    await new WindowsWorkerRepository(prisma).cancelSession('session_1');
+    expect(tx.workerSession.update).toHaveBeenCalledWith(expect.objectContaining({ data: expect.objectContaining({ status: 'cancelled' }) }));
+    expect(tx.workerDevice.update).toHaveBeenCalledWith(expect.objectContaining({ data: { status: 'draining' } }));
+  });
+
+  it('reconciles leased and running jobs when closeSession terminates a session', async () => {
     const updateJobs = vi.fn(async () => ({ count: 1 }));
     const tx: any = {
       workerSession: { update: vi.fn(async () => ({ deviceId: 'device_1' })) },
@@ -288,9 +297,9 @@ describe('WindowsWorkerRepository capability leases', () => {
       windowsExecutionJob: { updateMany: updateJobs }, workerDevice: { update: vi.fn(async () => undefined) }
     };
     const prisma: any = { $transaction: vi.fn(async (work: (client: unknown) => unknown) => work(tx)) };
-    await new WindowsWorkerRepository(prisma)[method]('session_1');
-    expect(tx.workerSession.update).toHaveBeenCalledWith(expect.objectContaining({ data: expect.objectContaining({ status: sessionStatus }) }));
-    expect(tx.windowsExecutionLease.updateMany).toHaveBeenCalledWith(expect.objectContaining({ data: expect.objectContaining({ status: leaseStatus }) }));
+    await new WindowsWorkerRepository(prisma).closeSession('session_1');
+    expect(tx.workerSession.update).toHaveBeenCalledWith(expect.objectContaining({ data: expect.objectContaining({ status: 'closed' }) }));
+    expect(tx.windowsExecutionLease.updateMany).toHaveBeenCalledWith(expect.objectContaining({ data: expect.objectContaining({ status: 'released' }) }));
     expect(updateJobs).toHaveBeenNthCalledWith(1, expect.objectContaining({ where: expect.objectContaining({ status: 'leased' }), data: { status: 'queued' } }));
     expect(updateJobs).toHaveBeenNthCalledWith(2, expect.objectContaining({ where: expect.objectContaining({ status: 'running' }), data: { status: 'expired' } }));
   });

@@ -11,7 +11,7 @@ const enrollment = z.object({
   expiresInMinutes: z.number().int().min(1).max(60).default(10)
 });
 const redeem = z.object({ code: z.string().min(32).max(128) });
-const session = z.object({ expiresInMinutes: z.number().int().min(1).max(720) });
+const session = z.object({ projectIds: z.array(z.string().uuid()).min(1).max(100).refine((ids) => new Set(ids).size === ids.length) });
 const heartbeat = z.object({ sessionId: z.string().uuid(), leaseId: z.string().uuid().optional(), leaseSeconds: z.number().int().min(15).max(300).default(60) });
 const claim = z.object({ sessionId: z.string().uuid(), requestId: z.string().min(8).max(128), leaseSeconds: z.number().int().min(15).max(300).default(60),
   authoringProtocolVersions: z.array(z.number().int().positive()).max(8).default([]) });
@@ -66,8 +66,8 @@ export function registerWindowsRunnerRoutes(app: FastifyInstance, repository: Fo
   });
   app.post('/api/windows-runner/device/session', { preHandler: runnerAuth(credentials) }, async (request) => {
     const principal = runnerPrincipal(request); const input = session.parse(request.body);
-    const sessionId = await workers.startManualSession(principal.deviceId, new Date(Date.now() + input.expiresInMinutes * 60_000));
-    await repository.writeAudit({ actorType: 'system', actorId: principal.deviceId, eventType: 'windows_runner_session_started', payload: { deviceId: principal.deviceId, sessionId } });
+    const sessionId = await workers.startManualSession(principal.deviceId, new Date(Date.now() + 60_000), input.projectIds);
+    await repository.writeAudit({ actorType: 'system', actorId: principal.deviceId, eventType: 'windows_runner_session_started', payload: { deviceId: principal.deviceId, sessionId, projectIds: input.projectIds } });
     return { sessionId };
   });
   app.put('/api/windows-runner/device', { preHandler: runnerAuth(credentials) }, async (request, reply) => {
@@ -93,6 +93,14 @@ export function registerWindowsRunnerRoutes(app: FastifyInstance, repository: Fo
     const state = await workers.getControlState(principal.deviceId, input.sessionId);
     if (!state) return { accepted: false };
     await workers.closeSession(input.sessionId); return { accepted: true };
+  });
+  app.post('/api/windows-runner/device/session/stop', { preHandler: runnerAuth(credentials) }, async (request) => {
+    const principal = runnerPrincipal(request); const input = sessionControl.parse(request.body);
+    const state = await workers.getControlState(principal.deviceId, input.sessionId);
+    if (!state) return { accepted: false };
+    await workers.cancelSession(input.sessionId);
+    await repository.writeAudit({ actorType: 'system', actorId: principal.deviceId, eventType: 'windows_runner_session_stopped', payload: { deviceId: principal.deviceId, sessionId: input.sessionId } });
+    return { accepted: true };
   });
   app.post('/api/windows-runner/device/heartbeat', { preHandler: runnerAuth(credentials) }, async (request, reply) => {
     const principal = runnerPrincipal(request); const input = heartbeat.parse(request.body);
