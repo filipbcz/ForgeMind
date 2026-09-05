@@ -187,8 +187,10 @@ async function implementThroughWindowsLease(windowsWorkers: WindowsWorkerReposit
   await replaceGitPatch(input.workspacePath, priorPatch, result.patch, input.signal);
   await verifyWindowsResultTree(input.workspacePath, result, input.signal);
   const outputEvidence = await materializeWindowsOutputs(input.workspacePath, result.resultBundle.outputs);
+  const reviewNotice = result.contentAssessment.productionReviewRequired
+    ? '\n\nProduction-content review required: technical loadability and provenance passed, but these signals do not approve visual or domain quality.' : '';
   return { outcome: result.patch.trim() ? 'changes_made' : 'already_satisfied',
-    summary: outputEvidence.length > 0 ? `${result.summary}\n\nManaged output evidence: ${outputEvidence.join(', ')}` : result.summary,
+    summary: `${outputEvidence.length > 0 ? `${result.summary}\n\nManaged output evidence: ${outputEvidence.join(', ')}` : result.summary}${reviewNotice}`,
     changedFiles: result.tree.map(({ path }) => path), evidenceFiles: outputEvidence, diffStat: { filesChanged: result.tree.length, insertions: 0, deletions: 0 },
     validationChecks: [], architectureUpdate: undefined };
 }

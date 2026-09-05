@@ -262,6 +262,7 @@ export interface WindowsAuthoringResult {
   checkpointIds: string[];
   artifacts: ExecutionArtifactResult[];
   processes: WindowsAuthoringProcessResult[];
+  contentAssessment: { technicalVerification: 'passed' | 'not-required'; productionReviewRequired: boolean; rationale: string };
   status: 'succeeded' | 'failed' | 'cancelled';
   startedAt: IsoDateString;
   completedAt: IsoDateString;
@@ -279,6 +280,11 @@ export interface WindowsAuthoringProcessResult {
   stderr: string;
   startedAt: IsoDateString;
   completedAt: IsoDateString;
+  /** Present for structured Unreal authoring calls. Unlike legacy validation,
+   * these calls deliberately carry the AI-selected argument vector. */
+  authoring?: { tool: 'unreal-editor' | 'unreal-python' | 'project-script' | 'cpp-tool'; phase: 'author' | 'verify' | 'build' | 'cook' | 'package';
+    projectRelativePath: string; executablePath: string; args: string[]; sourceRelativePaths: string[]; loadedPackages?: string[];
+    inspections?: Array<{ path: string; className: string; technicalObservations: string[] }> };
 }
 
 export type WindowsJobPacket = WindowsExecutionPacket | WindowsAuthoringPacket;
@@ -556,12 +562,25 @@ export function isWindowsAuthoringResult(value: unknown): value is WindowsAuthor
   return identities.every((key) => isNonEmpty(value[key])) && isSha256(value.inputHash) && isGitCommitSha(value.baseCommitSha)
     && isGitCommitSha(value.resultTreeSha) && ['succeeded', 'failed', 'cancelled'].includes(value.status as string)
     && isIsoDate(value.startedAt) && isIsoDate(value.completedAt) && areCapabilityKeys(value.completedOperationIds)
+    && isRecord(value.contentAssessment) && ['passed', 'not-required'].includes(value.contentAssessment.technicalVerification as string)
+    && typeof value.contentAssessment.productionReviewRequired === 'boolean' && isNonEmpty(value.contentAssessment.rationale)
     && areCapabilityKeys(value.checkpointIds) && Array.isArray(value.artifacts) && value.artifacts.every(isArtifactResult)
     && Array.isArray(value.processes) && value.processes.every((process) => isRecord(process) && isNonEmpty(process.checkId)
       && process.leaseId === value.leaseId && process.sessionId === value.sessionId
       && isNonEmpty(process.command) && ['powershell', 'cmd', 'system'].includes(process.shell as string)
       && (process.exitCode === undefined || Number.isInteger(process.exitCode)) && typeof process.stdout === 'string'
-      && typeof process.stderr === 'string' && isIsoDate(process.startedAt) && isIsoDate(process.completedAt))
+      && typeof process.stderr === 'string' && isIsoDate(process.startedAt) && isIsoDate(process.completedAt)
+      && (process.authoring === undefined || (isRecord(process.authoring)
+        && ['unreal-editor', 'unreal-python', 'project-script', 'cpp-tool'].includes(process.authoring.tool as string)
+        && ['author', 'verify', 'build', 'cook', 'package'].includes(process.authoring.phase as string)
+        && isSafeRelativePath(process.authoring.projectRelativePath) && isNonEmpty(process.authoring.executablePath)
+        && Array.isArray(process.authoring.args) && process.authoring.args.every((arg) => typeof arg === 'string')
+        && Array.isArray(process.authoring.sourceRelativePaths) && process.authoring.sourceRelativePaths.every(isSafeRelativePath)
+        && (process.authoring.loadedPackages === undefined || (Array.isArray(process.authoring.loadedPackages)
+          && process.authoring.loadedPackages.every(isSafeRelativePath)))
+        && (process.authoring.inspections === undefined || (Array.isArray(process.authoring.inspections)
+          && process.authoring.inspections.every((inspection) => isRecord(inspection) && isSafeRelativePath(inspection.path)
+            && isNonEmpty(inspection.className) && areCapabilityKeys(inspection.technicalObservations)))))))
     && isRecord(value.resultBundle) && value.resultBundle.version === 1 && value.resultBundle.format === 'git-binary-patch'
     && isSha256(value.resultBundle.sha256) && Number.isSafeInteger(value.resultBundle.sizeBytes) && (value.resultBundle.sizeBytes as number) >= 0
     && Array.isArray(value.resultBundle.lfsObjects) && value.resultBundle.lfsObjects.every((object) => isRecord(object)
