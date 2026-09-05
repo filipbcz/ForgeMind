@@ -152,6 +152,38 @@ export interface WindowsExecutionEvidenceContext {
   contractVersion: number;
 }
 
+/** Mutually exclusive real-engine evidence purposes. A consumer must request the
+ * exact purpose it needs; successful evidence is never interchangeable. */
+export type RealEngineEvidenceClassification =
+  | 'automated-scenario' | 'benchmark' | 'soak' | 'build-validation' | 'capture' | 'shipping';
+export type RealEngineEvidenceState =
+  | 'succeeded' | 'failed' | 'timed-out' | 'cancelled' | 'missing-capability' | 'incomplete-output';
+
+export interface RealEngineEvidenceIntent {
+  classification: RealEngineEvidenceClassification;
+  buildId: string;
+  scenario: string;
+  settings: Record<string, JsonValue>;
+  /** Shipping is current only when this immutable executable identity is set by
+   * the producer which selected the real Win64 Shipping build. */
+  shippingExecutable?: { relativePath: string; sha256: string; platform: 'Win64'; configuration: 'Shipping'; current: boolean };
+}
+
+export interface RealEngineEvidence extends RealEngineEvidenceIntent {
+  projectId: string;
+  taskId: string;
+  runId: string;
+  inputHash: string;
+  resultTreeSha: string;
+  toolVersions: ExecutionToolVersionEvidence[];
+  startedAt: IsoDateString;
+  completedAt: IsoDateString;
+  durationMs: number;
+  state: RealEngineEvidenceState;
+  exitCode?: number;
+  artifacts: ExecutionArtifactResult[];
+}
+
 export interface WindowsExecutionPacket {
   schemaVersion: WindowsExecutionPacketVersion;
   projectId: string;
@@ -173,6 +205,7 @@ export interface WindowsExecutionPacket {
   nonce: string;
   inputHash: string;
   evidenceContext?: WindowsExecutionEvidenceContext;
+  realEngineEvidence?: RealEngineEvidenceIntent;
 }
 
 export type AuthoringOperationIntent =
@@ -221,6 +254,7 @@ export interface WindowsAuthoringPacket {
   resourcePolicy: ExecutionResourcePolicy;
   nonce: string;
   inputHash: string;
+  realEngineEvidence?: RealEngineEvidenceIntent;
   authority: {
     database: 'none';
     productionHosts: 'none';
@@ -267,6 +301,7 @@ export interface WindowsAuthoringResult {
   startedAt: IsoDateString;
   completedAt: IsoDateString;
   summary: string;
+  realEngineEvidence?: RealEngineEvidence;
 }
 
 export interface WindowsAuthoringProcessResult {
@@ -280,6 +315,7 @@ export interface WindowsAuthoringProcessResult {
   stderr: string;
   startedAt: IsoDateString;
   completedAt: IsoDateString;
+  terminationReason?: 'timed-out' | 'cancelled' | 'missing-capability';
   /** Present for structured Unreal authoring calls. Unlike legacy validation,
    * these calls deliberately carry the AI-selected argument vector. */
   authoring?: { tool: 'unreal-editor' | 'unreal-python' | 'project-script' | 'cpp-tool'; phase: 'author' | 'verify' | 'build' | 'cook' | 'package';
@@ -311,6 +347,7 @@ export interface WindowsEvidenceUpload {
   commitSha: string;
   log: { text: string; sizeBytes: number; sha256: string };
   artifacts: Array<ExecutionArtifactResult & { contentBase64: string; criterion: string }>;
+  realEngineEvidence?: RealEngineEvidence;
 }
 
 export type WindowsCapabilityWaitReason = 'unavailable_capability' | 'insufficient_capacity';
@@ -353,6 +390,7 @@ export interface WindowsExecutionResult {
   summary: string;
   logHash: string;
   artifacts: ExecutionArtifactResult[];
+  realEngineEvidence?: RealEngineEvidence;
 }
 
 const deviceTransitions: Record<WorkerDeviceStatus, readonly WorkerDeviceStatus[]> = {
@@ -414,6 +452,42 @@ const isArtifactResult = (value: unknown): value is ExecutionArtifactResult => i
   && Number.isInteger(value.sizeBytes) && (value.sizeBytes as number) >= 0 && isSha256(value.sha256);
 const isToolVersion = (value: unknown): value is ExecutionToolVersionEvidence => isRecord(value) && isNonEmpty(value.tool)
   && isNonEmpty(value.version) && (value.driverVersion === undefined || isNonEmpty(value.driverVersion));
+const evidenceClassifications: RealEngineEvidenceClassification[] = ['automated-scenario', 'benchmark', 'soak', 'build-validation', 'capture', 'shipping'];
+const evidenceStates: RealEngineEvidenceState[] = ['succeeded', 'failed', 'timed-out', 'cancelled', 'missing-capability', 'incomplete-output'];
+const isEvidenceIntent = (value: unknown): value is RealEngineEvidenceIntent => isRecord(value)
+  && evidenceClassifications.includes(value.classification as RealEngineEvidenceClassification)
+  && isNonEmpty(value.buildId) && isNonEmpty(value.scenario) && isRecord(value.settings) && isJsonValue(value.settings)
+  && (value.shippingExecutable === undefined || (isRecord(value.shippingExecutable)
+    && isSafeRelativePath(value.shippingExecutable.relativePath) && /\.exe$/i.test(value.shippingExecutable.relativePath as string)
+    && isSha256(value.shippingExecutable.sha256) && value.shippingExecutable.platform === 'Win64'
+    && value.shippingExecutable.configuration === 'Shipping' && typeof value.shippingExecutable.current === 'boolean'))
+  && (value.classification === 'shipping' ? value.shippingExecutable !== undefined : value.shippingExecutable === undefined);
+export const isRealEngineEvidence = (value: unknown): value is RealEngineEvidence => isEvidenceIntent(value) && isRecord(value)
+  && ['projectId', 'taskId', 'runId'].every((key) => isNonEmpty(value[key])) && isSha256(value.inputHash)
+  && isGitCommitSha(value.resultTreeSha) && Array.isArray(value.toolVersions) && value.toolVersions.every(isToolVersion)
+  && isIsoDate(value.startedAt) && isIsoDate(value.completedAt) && Number.isSafeInteger(value.durationMs) && (value.durationMs as number) >= 0
+  && evidenceStates.includes(value.state as RealEngineEvidenceState) && (value.exitCode === undefined || Number.isInteger(value.exitCode))
+  && Array.isArray(value.artifacts) && value.artifacts.every(isArtifactResult);
+
+/** Exact reconciliation shared by native authoring and validation artifact paths. */
+export function reconcileRealEngineEvidence(intent: RealEngineEvidenceIntent | undefined, evidence: RealEngineEvidence | undefined,
+  identity: { projectId: string; taskId: string; runId: string; inputHash: string; resultTreeSha: string }): boolean {
+  if (!intent && !evidence) return true; // legacy evidence compatibility
+  if (!intent || !evidence || !isEvidenceIntent(intent) || !isRealEngineEvidence(evidence)) return false;
+  if (intent.classification !== evidence.classification || intent.buildId !== evidence.buildId || intent.scenario !== evidence.scenario
+    || JSON.stringify(intent.settings) !== JSON.stringify(evidence.settings)
+    || evidence.projectId !== identity.projectId || evidence.taskId !== identity.taskId || evidence.runId !== identity.runId
+    || evidence.inputHash.toLowerCase() !== identity.inputHash.toLowerCase()
+    || evidence.resultTreeSha.toLowerCase() !== identity.resultTreeSha.toLowerCase()) return false;
+  if (intent.classification === 'shipping') {
+    const executable = evidence.shippingExecutable;
+    return executable?.current === true && intent.shippingExecutable?.current === true
+      && JSON.stringify(executable) === JSON.stringify(intent.shippingExecutable)
+      && evidence.artifacts.some((artifact) => artifact.relativePath === executable.relativePath
+        && artifact.sha256.toLowerCase() === executable.sha256.toLowerCase());
+  }
+  return true;
+}
 export function isWindowsExecutionPacket(value: unknown): value is WindowsExecutionPacket {
   if (!isRecord(value) || value.schemaVersion !== WINDOWS_EXECUTION_PACKET_VERSION) return false;
   const required = ['projectId', 'taskId', 'runId', 'checkId', 'jobId', 'leaseId', 'repository', 'sourceUrl', 'workspaceRoot', 'artifactRoot', 'nonce'];
@@ -432,6 +506,7 @@ export function isWindowsExecutionPacket(value: unknown): value is WindowsExecut
     || !areCapabilityKeys(value.evidenceContext.requirementIds)
     || !Number.isInteger(value.evidenceContext.contractVersion)
     || (value.evidenceContext.contractVersion as number) <= 0)) return false;
+  if (value.realEngineEvidence !== undefined && !isEvidenceIntent(value.realEngineEvidence)) return false;
   if (!isRecord(value.resourcePolicy) || !Number.isInteger(value.resourcePolicy.timeoutSeconds) || (value.resourcePolicy.timeoutSeconds as number) <= 0) return false;
   return Number.isInteger(value.resourcePolicy.maxLogBytes) && (value.resourcePolicy.maxLogBytes as number) >= 0
     && Number.isInteger(value.resourcePolicy.maxArtifactBytes) && (value.resourcePolicy.maxArtifactBytes as number) >= 0
@@ -505,7 +580,8 @@ export function isWindowsExecutionResult(value: unknown): value is WindowsExecut
     && (value.exitCode === undefined || Number.isInteger(value.exitCode))
     && areCapabilities(value.observedCapabilities)
     && Array.isArray(value.toolVersions) && value.toolVersions.every(isToolVersion)
-    && Array.isArray(value.artifacts) && value.artifacts.every(isArtifactResult);
+    && Array.isArray(value.artifacts) && value.artifacts.every(isArtifactResult)
+    && (value.realEngineEvidence === undefined || isRealEngineEvidence(value.realEngineEvidence));
 }
 
 const isAuthoringIntent = (value: unknown): value is AuthoringOperationIntent => {
@@ -531,7 +607,8 @@ export function isWindowsAuthoringPacket(value: unknown): value is WindowsAuthor
     || (value.step.previousValidationError !== undefined && typeof value.step.previousValidationError !== 'string')
     || (value.step.previousReviewBlockers !== undefined && (!Array.isArray(value.step.previousReviewBlockers) || !value.step.previousReviewBlockers.every(isNonEmpty)))
     || (value.step.priorPatch !== undefined && typeof value.step.priorPatch !== 'string')
-    || !Array.isArray(value.operations) || value.operations.length === 0 || !value.operations.every(isAuthoringIntent)) return false;
+    || !Array.isArray(value.operations) || value.operations.length === 0 || !value.operations.every(isAuthoringIntent)
+    || (value.realEngineEvidence !== undefined && !isEvidenceIntent(value.realEngineEvidence))) return false;
   const operationIds = (value.operations as AuthoringOperationIntent[]).map(({ id }) => id);
   const managedRoots = value.managedRoots as string[];
   if (new Set(operationIds).size !== operationIds.length || !Array.isArray(value.checkpoints) || !value.checkpoints.every((checkpoint) => isRecord(checkpoint)
@@ -570,6 +647,7 @@ export function isWindowsAuthoringResult(value: unknown): value is WindowsAuthor
       && isNonEmpty(process.command) && ['powershell', 'cmd', 'system'].includes(process.shell as string)
       && (process.exitCode === undefined || Number.isInteger(process.exitCode)) && typeof process.stdout === 'string'
       && typeof process.stderr === 'string' && isIsoDate(process.startedAt) && isIsoDate(process.completedAt)
+      && (process.terminationReason === undefined || ['timed-out', 'cancelled', 'missing-capability'].includes(process.terminationReason as string))
       && (process.authoring === undefined || (isRecord(process.authoring)
         && ['unreal-editor', 'unreal-python', 'project-script', 'cpp-tool'].includes(process.authoring.tool as string)
         && ['author', 'verify', 'build', 'cook', 'package'].includes(process.authoring.phase as string)
@@ -593,5 +671,6 @@ export function isWindowsAuthoringResult(value: unknown): value is WindowsAuthor
     && Array.isArray(value.tree) && value.tree.every((entry) => isRecord(entry) && isSafeRelativePath(entry.path)
       && ['file', 'symlink'].includes(entry.kind as string) && isSha256(entry.sha256) && Number.isSafeInteger(entry.sizeBytes)
       && (entry.sizeBytes as number) >= 0 && typeof entry.binary === 'boolean' && /^[0-7]{6}$/.test(String(entry.mode)))
-    && new Set((value.tree as AuthoringTreeEntry[]).map(({ path }) => path)).size === value.tree.length;
+    && new Set((value.tree as AuthoringTreeEntry[]).map(({ path }) => path)).size === value.tree.length
+    && (value.realEngineEvidence === undefined || isRealEngineEvidence(value.realEngineEvidence));
 }

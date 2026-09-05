@@ -1,7 +1,7 @@
 import { redactError } from '@forgemind/core';
 import type { ImplementationStepPlan, RoadmapCandidate, RoadmapQualityReview } from '@forgemind/core';
 export type { ImplementationStepPlan } from '@forgemind/core';
-import type { AcceptanceEvidenceSource, AcceptanceEvidenceStatus, NormalizedProviderErrorDetails, NormalizedProviderErrorKind, ProjectArchitectureUpdate, ProjectContract, ProjectContractDelta, ProjectContractRequirement, ProviderKind, ProviderPreflightResult, TaskMode, ValidationCheckCategory } from '@forgemind/core';
+import type { AcceptanceEvidenceSource, AcceptanceEvidenceStatus, NormalizedProviderErrorDetails, NormalizedProviderErrorKind, ProjectArchitectureUpdate, ProjectContract, ProjectContractDelta, ProjectContractRequirement, ProviderKind, ProviderPreflightResult, RealEngineEvidenceIntent, TaskMode, ValidationCheckCategory } from '@forgemind/core';
 
 export type { NormalizedProviderErrorDetails, NormalizedProviderErrorKind, ProviderPreflightResult } from '@forgemind/core';
 
@@ -119,6 +119,8 @@ export interface ValidationCheck {
   criterion?: string;
   rationale?: string;
   windowsAdapter?: WindowsValidationAdapter;
+  /** AI-selected evidence purpose and immutable build/scenario identity. */
+  realEngineEvidence?: RealEngineEvidenceIntent;
 }
 
 export type WindowsValidationAdapter =
@@ -174,14 +176,24 @@ export function normalizeValidationChecks(value: unknown): ValidationCheck[] {
       : [];
     if (check.kind === 'command' && typeof check.command === 'string' && check.command.trim()) {
       const windowsAdapter = target === 'windows' ? normalizeWindowsValidationAdapter(check.windowsAdapter) : undefined;
+      const realEngineEvidence = target === 'windows' ? normalizeRealEngineEvidenceIntent(check.realEngineEvidence) : undefined;
       return [{
         kind: 'command', command: check.command.trim(), shell, target, continueOnFailure, category, criterion, rationale, timeoutMinutes,
         requiredCapabilities: target === 'windows' ? Array.from(new Set(['windows', ...requiredCapabilities])) : [],
-        ...(windowsAdapter ? { windowsAdapter } : {})
+        ...(windowsAdapter ? { windowsAdapter } : {}), ...(realEngineEvidence ? { realEngineEvidence } : {})
       }];
     }
     return [];
   });
+}
+
+function normalizeRealEngineEvidenceIntent(value: unknown): RealEngineEvidenceIntent | undefined {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return undefined;
+  const item = value as Record<string, unknown>;
+  if (!['automated-scenario', 'benchmark', 'soak', 'build-validation', 'capture', 'shipping'].includes(String(item.classification))
+    || typeof item.buildId !== 'string' || !item.buildId.trim() || typeof item.scenario !== 'string' || !item.scenario.trim()
+    || !item.settings || typeof item.settings !== 'object' || Array.isArray(item.settings)) return undefined;
+  return item as unknown as RealEngineEvidenceIntent;
 }
 
 function normalizeWindowsValidationAdapter(value: unknown): WindowsValidationAdapter | undefined {

@@ -39,9 +39,18 @@ const sessionControl = z.object({ sessionId: z.string().uuid() });
 const controlQuery = z.object({ sessionId: z.string().uuid(), leaseId: z.string().uuid().optional() });
 const sha = z.string().regex(/^[a-f0-9]{64}$/i);
 const gitCommitSha = z.string().regex(/^(?:[a-f0-9]{40}|[a-f0-9]{64})$/i);
+const artifactResult = z.object({ name: z.string().min(1), relativePath: z.string().min(1), mimeType: z.string().optional(),
+  sizeBytes: z.number().int().nonnegative(), sha256: sha });
+const realEngineEvidence = z.object({ classification: z.enum(['automated-scenario', 'benchmark', 'soak', 'build-validation', 'capture', 'shipping']),
+  buildId: z.string().min(1), scenario: z.string().min(1), settings: z.record(z.string(), z.any()), projectId: z.string().min(1), taskId: z.string().min(1),
+  runId: z.string().min(1), inputHash: sha, resultTreeSha: gitCommitSha, toolVersions: z.array(z.object({ tool: z.string().min(1), version: z.string().min(1), driverVersion: z.string().min(1).optional() })),
+  startedAt: z.string().datetime(), completedAt: z.string().datetime(), durationMs: z.number().int().nonnegative(),
+  state: z.enum(['succeeded', 'failed', 'timed-out', 'cancelled', 'missing-capability', 'incomplete-output']), exitCode: z.number().int().optional(), artifacts: z.array(artifactResult),
+  shippingExecutable: z.object({ relativePath: z.string().regex(/\.exe$/i), sha256: sha, platform: z.literal('Win64'), configuration: z.literal('Shipping'), current: z.boolean() }).optional() });
 const evidenceUpload = z.object({ schemaVersion: z.literal(1), jobId: z.string().uuid(), leaseId: z.string().uuid(), inputHash: sha, commitSha: gitCommitSha,
   log: z.object({ text: z.string(), sizeBytes: z.number().int().nonnegative(), sha256: sha }), artifacts: z.array(z.object({ name: z.string().min(1).max(200),
-    relativePath: z.string().min(1).max(500), mimeType: z.string().min(1).max(200).optional(), sizeBytes: z.number().int().nonnegative(), sha256: sha, contentBase64: z.string(), criterion: z.string().min(1).max(2000) })).max(WINDOWS_EVIDENCE_MAX_ARTIFACTS) });
+    relativePath: z.string().min(1).max(500), mimeType: z.string().min(1).max(200).optional(), sizeBytes: z.number().int().nonnegative(), sha256: sha, contentBase64: z.string(), criterion: z.string().min(1).max(2000) })).max(WINDOWS_EVIDENCE_MAX_ARTIFACTS),
+  realEngineEvidence: realEngineEvidence.optional() });
 
 export function registerWindowsRunnerRoutes(app: FastifyInstance, repository: ForgeMindRepository, credentials: WindowsRunnerCredentialAdapter, workers: WindowsWorkerRepository) {
   app.post('/api/windows-runner/enrollments', async (request) => {
@@ -149,6 +158,7 @@ export function registerWindowsRunnerRoutes(app: FastifyInstance, repository: Fo
             deviceId: principal.deviceId,
             summary: request.body.summary,
             logHash: request.body.logHash,
+            realEngineEvidence: request.body.realEngineEvidence ? JSON.parse(JSON.stringify(request.body.realEngineEvidence)) : null,
             artifacts: request.body.artifacts.map((artifact) => ({ ...artifact }))
           }
         });

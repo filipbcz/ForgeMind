@@ -103,6 +103,19 @@ export async function executeWindowsValidation(
     execution.stderr ? `[stderr]\n${execution.stderr}` : ''
   ].filter(Boolean).join('\n\n')), packet.resourcePolicy.maxLogBytes);
   const logHash = sha256(Buffer.from(logText));
+  const completedAt = new Date();
+  const plainArtifacts = artifacts.map(({ contentBase64: _content, ...artifact }) => artifact);
+  const missingRequiredOutput = packet.expectedArtifacts.some((expected) => expected.required
+    && !plainArtifacts.some((artifact) => artifact.name === expected.name && artifact.relativePath === expected.relativePath));
+  const classified = packet.realEngineEvidence ? {
+    ...packet.realEngineEvidence, projectId: packet.projectId, taskId: packet.taskId, runId: packet.runId,
+    inputHash: packet.inputHash, resultTreeSha: packet.commitSha, toolVersions: execution.toolVersions ?? [],
+    startedAt: startedAt.toISOString(), completedAt: completedAt.toISOString(), durationMs: completedAt.getTime() - startedAt.getTime(),
+    state: (missingRequiredOutput ? 'incomplete-output' : execution.status === 'timed_out' ? 'timed-out'
+      : execution.status === 'cancelled' ? 'cancelled' : execution.exitCode === 2 ? 'missing-capability'
+      : execution.status === 'succeeded' ? 'succeeded' : 'failed') as import('@forgemind/core').RealEngineEvidenceState,
+    exitCode: execution.exitCode, artifacts: plainArtifacts
+  } : undefined;
   const evidence: WindowsEvidenceUpload = {
     schemaVersion: 1,
     jobId: packet.jobId,
@@ -110,9 +123,9 @@ export async function executeWindowsValidation(
     inputHash: packet.inputHash,
     commitSha: packet.commitSha,
     log: { text: logText, sizeBytes: Buffer.byteLength(logText), sha256: logHash },
-    artifacts: artifacts.map((artifact) => ({ ...artifact, criterion: packet.check.criterion ?? packet.check.command }))
+    artifacts: artifacts.map((artifact) => ({ ...artifact, criterion: packet.check.criterion ?? packet.check.command })),
+    ...(classified ? { realEngineEvidence: classified } : {})
   };
-  const completedAt = new Date();
   const result: WindowsExecutionResult = {
     schemaVersion: 1,
     projectId: packet.projectId,
@@ -139,7 +152,8 @@ export async function executeWindowsValidation(
       ? `Windows validation passed: ${packet.check.command}`
       : `Windows validation ${execution.status}: ${packet.check.command}`,
     logHash,
-    artifacts: artifacts.map(({ contentBase64: _content, ...artifact }) => artifact)
+    artifacts: plainArtifacts,
+    ...(classified ? { realEngineEvidence: classified } : {})
   };
   return { evidence, result, workspacePath };
 }

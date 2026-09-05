@@ -1,6 +1,6 @@
 import { createHash, randomUUID } from 'node:crypto';
 import type { Prisma, PrismaClient } from '@prisma/client';
-import { canonicalizeWorkerProbeEvidence, deferLegacyWindowsExecutionPacket, isWindowsAuthoringPacket, isWindowsAuthoringResult, isWindowsExecutionPacket, isWindowsExecutionResult, WINDOWS_DEVICE_OFFLINE_AFTER_MS } from '@forgemind/core';
+import { canonicalizeWorkerProbeEvidence, deferLegacyWindowsExecutionPacket, isWindowsAuthoringPacket, isWindowsAuthoringResult, isWindowsExecutionPacket, isWindowsExecutionResult, reconcileRealEngineEvidence, WINDOWS_DEVICE_OFFLINE_AFTER_MS } from '@forgemind/core';
 import type {
   WorkerCapability, WorkerProbeEvidence, WindowsExecutionJob, WindowsExecutionLease,
   WindowsAuthoringPacket, WindowsCapabilityWaitReason, WindowsExecutionPacket, WindowsExecutionResult, WindowsJobPacket, WindowsJobResult, WindowsPendingPhase
@@ -195,6 +195,9 @@ export class WindowsWorkerRepository {
       if (!lease || !isWindowsExecutionPacket(lease.job.packet)) return 'conflict';
       const packet = lease.job.packet;
       if (packet.inputHash !== upload.inputHash || packet.commitSha !== upload.commitSha) return 'conflict';
+      if (!reconcileRealEngineEvidence(packet.realEngineEvidence, upload.realEngineEvidence, {
+        projectId: packet.projectId, taskId: packet.taskId, runId: packet.runId, inputHash: packet.inputHash, resultTreeSha: packet.commitSha
+      })) return 'conflict';
       const existing = (packet as unknown as { evidenceUpload?: WindowsEvidenceUpload }).evidenceUpload;
       if (existing) return JSON.stringify(existing) === JSON.stringify(upload) ? 'duplicate' : 'conflict';
       const packetWithEvidence = Object.assign({}, packet as WindowsExecutionPacket, { evidenceUpload: upload });
@@ -394,7 +397,9 @@ export class WindowsWorkerRepository {
         if (!isWindowsAuthoringResult(result) || result.protocolVersion !== packet.protocolVersion
           || result.baseCommitSha !== packet.baseCommitSha
           || result.completedOperationIds.some((id) => !packet.operations.some((operation) => operation.id === id))
-          || result.checkpointIds.some((id) => !packet.checkpoints.some((checkpoint) => checkpoint.id === id))) return { accepted: false };
+          || result.checkpointIds.some((id) => !packet.checkpoints.some((checkpoint) => checkpoint.id === id))
+          || !reconcileRealEngineEvidence(packet.realEngineEvidence, result.realEngineEvidence, { projectId: packet.projectId,
+            taskId: packet.taskId, runId: packet.runId, inputHash: packet.inputHash, resultTreeSha: result.resultTreeSha })) return { accepted: false };
       } else {
         if (!isWindowsExecutionResult(result) || packet.checkId !== result.checkId || packet.commitSha !== result.commitSha) return { accepted: false };
       }
@@ -408,8 +413,12 @@ export class WindowsWorkerRepository {
         return { accepted: true, packet };
       }
       const validationResult = result as WindowsExecutionResult;
-      const evidence = (packet as WindowsExecutionPacket & { evidenceUpload?: WindowsEvidenceUpload }).evidenceUpload;
+      const validationPacket = packet as WindowsExecutionPacket & { evidenceUpload?: WindowsEvidenceUpload };
+      const evidence = validationPacket.evidenceUpload;
       if (!evidence || evidence.log.sha256.toLowerCase() !== validationResult.logHash.toLowerCase()
+        || !reconcileRealEngineEvidence(validationPacket.realEngineEvidence, validationResult.realEngineEvidence, { projectId: validationPacket.projectId,
+          taskId: validationPacket.taskId, runId: validationPacket.runId, inputHash: validationPacket.inputHash, resultTreeSha: validationPacket.commitSha })
+        || JSON.stringify(evidence.realEngineEvidence) !== JSON.stringify(validationResult.realEngineEvidence)
         || evidence.artifacts.length !== validationResult.artifacts.length
         || validationResult.artifacts.some((artifact) => !evidence.artifacts.some((uploaded) => uploaded.name === artifact.name
           && uploaded.relativePath === artifact.relativePath && uploaded.sizeBytes === artifact.sizeBytes

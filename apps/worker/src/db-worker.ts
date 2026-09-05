@@ -3,7 +3,7 @@ import { createHash, randomUUID } from 'node:crypto';
 import { spawn } from 'node:child_process';
 import { mkdir, readFile, writeFile } from 'node:fs/promises';
 import { resolve } from 'node:path';
-import { activeProjectContractRequirements, createBlockedRunState, createFailedRunState, WINDOWS_EVIDENCE_MAX_ARTIFACT_BYTES, WINDOWS_EVIDENCE_MAX_LOG_BYTES, type WindowsAuthoringPacket, type WindowsAuthoringResult } from '@forgemind/core';
+import { activeProjectContractRequirements, createBlockedRunState, createFailedRunState, WINDOWS_EVIDENCE_MAX_ARTIFACT_BYTES, WINDOWS_EVIDENCE_MAX_LOG_BYTES, type RealEngineEvidenceIntent, type WindowsAuthoringPacket, type WindowsAuthoringResult } from '@forgemind/core';
 import { advanceRoadmapAfterTaskCompletion, createRepository, getPrismaClient, startNextRoadmapStep, WindowsWorkerRepository, type AIProviderConnectionSecret, type ForgeMindRepository } from '@forgemind/db';
 import { GitHubAppAdapter, createGitHubAdapterFromEnv } from '@forgemind/github';
 import { buildProjectExtensionProposalPrompt, createProvider, formatProjectExtensionProposal, normalizeProviderError, type AIProvider, type CapabilityAuditInput, type ImplementResult, type ProviderSessionContext, type ProviderUsageMeasurement, type ReleaseAuditInput, type ValidationCheck } from '@forgemind/providers';
@@ -64,7 +64,8 @@ async function enqueueExternalWindowsValidations(
     const requestedCapabilities = Array.from(new Set((check.requiredCapabilities ?? []).map((capability) => capability.trim()).filter(Boolean)));
     const requiredCapabilities = Array.from(new Set(['windows', ...requestedCapabilities]));
     const inputHash = createHash('sha256')
-      .update(JSON.stringify({ commitSha: input.commitSha, command: check.command, shell: check.shell ?? 'system', requestedCapabilities, windowsAdapter: check.windowsAdapter ?? null }))
+      .update(JSON.stringify({ commitSha: input.commitSha, command: check.command, shell: check.shell ?? 'system', requestedCapabilities,
+        windowsAdapter: check.windowsAdapter ?? null, realEngineEvidence: check.realEngineEvidence ?? null }))
       .digest('hex');
     await windowsWorkers.enqueue({
       id: jobId,
@@ -106,6 +107,7 @@ async function enqueueExternalWindowsValidations(
         expectedArtifacts: [],
         nonce: 'pending',
         inputHash,
+        ...(check.realEngineEvidence ? { realEngineEvidence: check.realEngineEvidence } : {}),
         ...(evidenceContext ? { evidenceContext } : {})
       }
     });
@@ -141,6 +143,8 @@ async function implementThroughWindowsLease(windowsWorkers: WindowsWorkerReposit
   if (!input.project.githubOwner || !input.project.githubRepo) throw new Error('Windows authoring requires a GitHub repository.');
   const jobId = randomUUID();
   const priorPatch = await readGitPatch(input.workspacePath, input.signal);
+  const realEngineEvidence = classifyAuthoringEvidence(input.prompt, input.acceptanceCriteria, input.baseCommitSha,
+    input.requiredCapabilities, input.requiresUnrealAssets);
   const packet: WindowsAuthoringPacket = {
     kind: 'authoring', protocolVersion: 1, projectId: input.project.id, taskId: input.taskId, runId: input.taskRunId,
     jobId, leaseId: 'pending', repository: `${input.project.githubOwner}/${input.project.githubRepo}`,
@@ -159,6 +163,7 @@ async function implementThroughWindowsLease(windowsWorkers: WindowsWorkerReposit
     nonce: 'pending', inputHash: createHash('sha256').update(JSON.stringify({ taskId: input.taskId, runId: input.taskRunId, baseCommitSha: input.baseCommitSha,
       prompt: input.prompt, acceptanceCriteria: input.acceptanceCriteria, previousValidationError: input.previousValidationError,
       previousReviewBlockers: input.previousReviewBlockers, priorPatch, requiresUnrealAssets: input.requiresUnrealAssets })).digest('hex'),
+    ...(realEngineEvidence ? { realEngineEvidence } : {}),
     authority: { database: 'none', productionHosts: 'none', globalGitHubCredentials: 'none' }
   };
   await windowsWorkers.enqueueAuthoring({ id: jobId, projectId: input.project.id, taskId: input.taskId, runId: input.taskRunId, requiredCapabilities: input.requiredCapabilities, packet });
@@ -193,6 +198,19 @@ async function implementThroughWindowsLease(windowsWorkers: WindowsWorkerReposit
     summary: `${outputEvidence.length > 0 ? `${result.summary}\n\nManaged output evidence: ${outputEvidence.join(', ')}` : result.summary}${reviewNotice}`,
     changedFiles: result.tree.map(({ path }) => path), evidenceFiles: outputEvidence, diffStat: { filesChanged: result.tree.length, insertions: 0, deletions: 0 },
     validationChecks: [], architectureUpdate: undefined };
+}
+
+export function classifyAuthoringEvidence(prompt: string, acceptanceCriteria: string[], buildId: string,
+  requiredCapabilities: string[], requiresUnrealAssets: boolean): RealEngineEvidenceIntent | undefined {
+  const text = `${prompt}\n${acceptanceCriteria.join('\n')}`;
+  const classification = /\bbenchmark(?:ing)?\b/i.test(text) ? 'benchmark'
+    : /\bsoak(?:ing)?\b|\bendurance\b/i.test(text) ? 'soak'
+    : /\bbuild[- ]validation\b/i.test(text) ? 'build-validation'
+    : /\bcapture\b|\bscreenshot\b|\bvideo\b/i.test(text) ? 'capture'
+    : /\bscenario\b|\bfunctional test\b|\bautomation test\b/i.test(text) || requiresUnrealAssets ? 'automated-scenario'
+    : undefined;
+  return classification ? { classification, buildId, scenario: acceptanceCriteria[0] ?? prompt,
+    settings: { requiredCapabilities, requiresUnrealAssets } } : undefined;
 }
 
 async function materializeWindowsOutputs(workspacePath: string, outputs: WindowsAuthoringResult['resultBundle']['outputs']): Promise<string[]> {
