@@ -197,6 +197,14 @@ describe('project operational overview layout', () => {
     expect(projectAuditMatchesStatusFilter(job, 'active')).toBe(true);
   });
 
+  it('offers targeted repair for a rejected proposal and explains automatic re-review', () => {
+    const job = { ...auditWithProposal, gapProposalReview: { verdict: 'not_satisfied' as const, summary: 'Name broken paths.', blockers: ['Give precise references.'] } };
+    const markup = renderProjectsPanel({ ...roadmap, auditJobs: [job] });
+    expect(markup).toContain('Opravit a znovu zkontrolovat návrh');
+    expect(markup).toContain('AI zapracuje připomínky');
+    expect(markup).toContain('Předchozí verze zůstanou v historii');
+  });
+
   it('renders current state and primary action before project metrics and roadmap history', () => {
     const markup = renderProjectsPanel();
 

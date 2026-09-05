@@ -546,6 +546,7 @@ export interface AuditGapProposal {
 }
 export interface AuditGapProposalHistoryEntry {
   proposal: AuditGapProposal;
+  reason?: 'repair';
   status: 'proposed' | 'activated' | 'dismissed';
   review?: { verdict: 'satisfied' | 'not_satisfied'; summary: string; blockers: string[] };
   decidedAt?: IsoDateString;

@@ -1,10 +1,10 @@
 import Fastify from 'fastify';
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import type { AuditGapProposal, Project } from '@forgemind/core';
+import type { AuditGapProposal, AuditGapProposalHistoryEntry, Project } from '@forgemind/core';
 import type { ForgeMindRepository } from '@forgemind/db';
 import { prepareReadOnlyRepositoryBaseline } from '@forgemind/github';
 import { createProvider } from '@forgemind/providers';
-import type { AIProvider } from '@forgemind/providers';
+import type { AIProvider, ReviewResult } from '@forgemind/providers';
 import { createAuthService } from './auth.js';
 import { registerRoutes } from './routes.js';
 
@@ -35,11 +35,18 @@ function fixture() {
       changeRationale: 'References are invalid.', dependsOnStepTitles: [], validationFocus: ['regression']
     }]
   };
-  const job = { id: 'audit', cycleId: 'cycle', status: 'succeeded', gapProposalStatus: 'proposed', gapProposal };
+  const job = { id: 'audit', cycleId: 'cycle', status: 'succeeded', gapProposalStatus: 'proposed', gapProposal,
+    gapProposalReview: undefined as ReviewResult | undefined, gapProposalHistory: [] as AuditGapProposalHistoryEntry[] };
   const roadmap = { projectId: project.id, cycles: [{ id: 'cycle', status: 'partial' }], steps: [], auditJobs: [job] };
   const owner = { id: 'owner', name: 'Owner', email: 'owner@example.com', role: 'owner' as const };
   const review = { verdict: 'satisfied' as const, summary: 'Still needed in the current repository.', blockers: [] };
-  const provider = { kind: 'codex', reviewRoadmap: vi.fn(async (_input: Parameters<NonNullable<AIProvider['reviewRoadmap']>>[0]) => review) };
+  const provider = { kind: 'codex',
+    supportsNativeRepositoryReview: () => true,
+    reviewRoadmap: vi.fn(async (_input: Parameters<NonNullable<AIProvider['reviewRoadmap']>>[0]): Promise<ReviewResult> => review),
+    repairRoadmap: vi.fn(async (_input: Parameters<NonNullable<AIProvider['repairRoadmap']>>[0]) => ({
+      implementationSteps: [{ ...gapProposal.steps[0]!, description: 'Correct docs/readme-parity.md:22, using apps/studio-api/src/routes.ts.', inScope: [], outOfScope: [] }]
+    }))
+  };
   const cleanup = vi.fn(async () => undefined);
   vi.mocked(createProvider).mockReturnValue(provider as unknown as AIProvider);
   vi.mocked(prepareReadOnlyRepositoryBaseline).mockResolvedValue({
@@ -52,7 +59,12 @@ function fixture() {
     getProjectSpecifications: vi.fn(async () => ({ current: { fullSpecification: project.brief } })),
     getAIProviderConnectionSecretById: vi.fn(async () => ({ provider: 'codex', authMode: 'codex_oauth', model: 'test-model' })),
     getGitHubConnectionSecret: vi.fn(async () => ({ token: 'test-token', apiBaseUrl: 'https://api.github.test' })),
-    saveProjectAuditGapReview: vi.fn(), decideProjectAuditGapProposal: vi.fn(), writeAudit: vi.fn(),
+    saveProjectAuditGapReview: vi.fn(async (input: { review: ReviewResult }) => { job.gapProposalReview = input.review; }),
+    reviseProjectAuditGapProposal: vi.fn(async (input: { proposal: AuditGapProposal }) => {
+      job.gapProposalHistory.push({ proposal: job.gapProposal, status: 'proposed', reason: 'repair', review: job.gapProposalReview, archivedAt: '' });
+      job.gapProposal = input.proposal; job.gapProposalReview = undefined;
+    }),
+    decideProjectAuditGapProposal: vi.fn(), writeAudit: vi.fn(),
     createTask: vi.fn(), enqueueTask: vi.fn()
   };
   const auth = createAuthService();
@@ -79,27 +91,114 @@ describe('audit gap activation', () => {
       objective: expect.stringContaining(auditSha)
     }));
     expect(f.provider.reviewRoadmap.mock.calls[0]![0].objective).toContain('already implemented');
-    expect(f.repository.saveProjectAuditGapReview).toHaveBeenCalledWith({ projectId: 'project', auditJobId: 'audit', review: f.review });
+    expect(f.repository.saveProjectAuditGapReview).toHaveBeenCalledWith({ projectId: 'project', auditJobId: 'audit', review: f.review, expectedProposal: f.job.gapProposal });
     expect(f.repository.writeAudit).toHaveBeenCalledWith(expect.objectContaining({
       eventType: 'project_audit_gap_review_baseline',
       payload: { auditJobId: 'audit', proposalCommitSha: auditSha, reviewCommitSha: currentSha, verdict: 'satisfied' }
     }));
-    expect(f.repository.decideProjectAuditGapProposal).toHaveBeenCalledWith({ projectId: 'project', auditJobId: 'audit', accepted: true, review: f.review });
+    expect(f.repository.decideProjectAuditGapProposal).toHaveBeenCalledWith({ projectId: 'project', auditJobId: 'audit', accepted: true, review: f.review, expectedProposal: f.job.gapProposal });
     expect(f.repository.createTask).not.toHaveBeenCalled();
     expect(f.repository.enqueueTask).not.toHaveBeenCalled();
     expect(f.job.gapProposal.commitSha).toBe(auditSha);
-    expect(f.cleanup).toHaveBeenCalledOnce();
+    expect(f.cleanup).toHaveBeenCalledTimes(2);
   });
 
   it('does not activate a stale or already implemented proposal rejected by fresh review', async () => {
     const f = fixture();
     f.provider.reviewRoadmap.mockResolvedValue({ verdict: 'not_satisfied', summary: 'Already implemented.', blockers: ['Documentation was already repaired.'] } as never);
+    f.provider.repairRoadmap.mockRejectedValue(new Error('Repair provider unavailable.'));
     const response = await f.request();
-    expect(response.statusCode).toBe(409);
-    expect(response.json().blockers).toEqual(['Documentation was already repaired.']);
+    expect(response.statusCode).toBe(400);
+    expect(response.json().error).toContain('Repair provider unavailable.');
     expect(f.repository.saveProjectAuditGapReview).toHaveBeenCalledOnce();
     expect(f.repository.decideProjectAuditGapProposal).not.toHaveBeenCalled();
     expect(f.cleanup).toHaveBeenCalledOnce();
+  });
+
+  it('repairs concrete review feedback, preserves history and activates only after independent approval', async () => {
+    const f = fixture();
+    f.provider.reviewRoadmap.mockResolvedValueOnce({ verdict: 'not_satisfied', summary: 'Missing exact references.', blockers: ['Name the broken paths.'] });
+    const original = f.job.gapProposal;
+    expect((await f.request()).statusCode).toBe(200);
+    expect(f.provider.repairRoadmap).toHaveBeenCalledWith(expect.objectContaining({
+      validationError: expect.stringContaining('Name the broken paths.'),
+      authoritativeSpecification: f.project.brief, repositoryPath: '/read-only/current', signal: expect.any(AbortSignal)
+    }));
+    expect(f.provider.reviewRoadmap).toHaveBeenCalledTimes(2);
+    expect(f.provider.reviewRoadmap.mock.calls[1]![0].implementationSteps[0]!.description).toContain('docs/readme-parity.md:22');
+    expect(f.repository.reviseProjectAuditGapProposal).toHaveBeenCalledWith(expect.objectContaining({ expectedProposal: original }));
+    expect(f.job.gapProposalHistory).toMatchObject([{ proposal: original, reason: 'repair' }]);
+    expect(f.repository.decideProjectAuditGapProposal).toHaveBeenCalledWith(expect.objectContaining({ expectedProposal: f.job.gapProposal, review: f.review }));
+    expect(f.repository.createTask).not.toHaveBeenCalled();
+    expect(f.repository.enqueueTask).not.toHaveBeenCalled();
+  });
+
+  it('resumes at repair after a technical failure without repeating the saved rejected review', async () => {
+    const f = fixture();
+    f.job.gapProposalReview = { verdict: 'not_satisfied', summary: 'Unclear references.', blockers: ['Name the broken paths.'] };
+    f.provider.repairRoadmap.mockRejectedValueOnce(new Error('Temporary outage.'));
+    expect((await f.request()).statusCode).toBe(400);
+    expect(f.provider.reviewRoadmap).not.toHaveBeenCalled();
+    expect((await f.request()).statusCode).toBe(200);
+    expect(f.provider.repairRoadmap).toHaveBeenCalledTimes(2);
+    expect(f.provider.reviewRoadmap).toHaveBeenCalledTimes(1);
+  });
+
+  it('resumes a saved revision at review when its previous review call failed', async () => {
+    const f = fixture();
+    f.job.gapProposalReview = { verdict: 'not_satisfied', summary: 'Needs correction.', blockers: ['Name paths.'] };
+    f.provider.reviewRoadmap.mockRejectedValueOnce(new Error('Review outage.'));
+    expect((await f.request()).statusCode).toBe(400);
+    expect(f.job.gapProposalReview).toBeUndefined();
+    expect((await f.request()).statusCode).toBe(200);
+    expect(f.provider.repairRoadmap).toHaveBeenCalledTimes(1);
+    expect(f.job.gapProposalHistory).toHaveLength(1);
+  });
+
+  it('retains the original gaps in review context after an empty repair and interrupted review', async () => {
+    const f = fixture();
+    const originalTitle = f.job.gapProposal.steps[0]!.title;
+    f.job.gapProposalReview = { verdict: 'not_satisfied', summary: 'Reassess stale gaps.', blockers: ['Verify whether references are still wrong.'] };
+    f.provider.repairRoadmap.mockResolvedValueOnce({ implementationSteps: [] });
+    f.provider.reviewRoadmap.mockRejectedValueOnce(new Error('Review outage.'));
+    expect((await f.request()).statusCode).toBe(400);
+    expect(f.job.gapProposal.steps).toEqual([]);
+    expect((await f.request()).statusCode).toBe(200);
+    expect(f.provider.reviewRoadmap.mock.calls[1]![0].objective).toContain(originalTitle);
+    expect(f.provider.reviewRoadmap.mock.calls[1]![0].implementationSteps).toEqual([]);
+  });
+
+  it('does not activate when project scope changes during review', async () => {
+    const f = fixture();
+    f.provider.reviewRoadmap.mockImplementationOnce(async () => { f.project.brief = 'Changed specification.'; return f.review; });
+    expect((await f.request()).json().error).toContain('Project scope or roadmap changed');
+    expect(f.repository.decideProjectAuditGapProposal).not.toHaveBeenCalled();
+  });
+
+  it('does not activate when main changes during review', async () => {
+    const f = fixture();
+    f.provider.reviewRoadmap.mockImplementationOnce(async () => {
+      vi.mocked(prepareReadOnlyRepositoryBaseline).mockResolvedValueOnce({ repositoryPath: '/other', commitSha: 'c'.repeat(40), evidence: 'changed', cleanup: f.cleanup });
+      return f.review;
+    });
+    expect((await f.request()).json().error).toContain('Repository changed');
+    expect(f.repository.decideProjectAuditGapProposal).not.toHaveBeenCalled();
+  });
+
+  it('prevents concurrent activation or dismissal while an AI operation is running', async () => {
+    const f = fixture();
+    let started!: () => void;
+    let finish!: (review: ReviewResult) => void;
+    const ready = new Promise<void>(resolve => { started = resolve; });
+    f.provider.reviewRoadmap.mockImplementationOnce(() => { started(); return new Promise(resolve => { finish = resolve; }); });
+    const first = f.request();
+    await ready;
+    try {
+      expect((await f.request()).statusCode).toBe(409);
+      expect((await f.request(false)).statusCode).toBe(409);
+    } finally { finish(f.review); }
+    expect((await first).statusCode).toBe(200);
+    expect(f.provider.reviewRoadmap).toHaveBeenCalledOnce();
   });
 
   it('keeps the proposal available when review fails', async () => {

@@ -22,6 +22,7 @@ import { completeCodexOAuthBrowserLogin, readCodexOAuthBrowserLoginStatus, readC
 import { createTaskDispatchService } from './dispatch.js';
 import { sendBadRequest, sendNotFound } from './http.js';
 import { buildReviewedImplementationStepBlueprints } from './roadmap-generation.js';
+import { reviewAndRepairAuditGapProposal } from './audit-gap-review.js';
 import { advanceRoadmapAfterTaskCompletion, buildRoadmapStepTaskPrompt, composeApprovedExtensionSpecification, startNextRoadmapStep } from '@forgemind/db';
 import type { AIProviderConnectionKind, AIProviderConnectionSecret, ForgeMindRepository, WindowsRunnerCredentialAdapter, WindowsWorkerRepository } from '@forgemind/db';
 import { parseGitHubWebhookPayload, projectGitHubWebhookEvent, verifyGitHubWebhookSignature } from './webhook.js';
@@ -1183,9 +1184,12 @@ export function registerRoutes(
 
   app.post('/api/projects/:id/audit/gaps/decision', async (request, reply) => {
     let checkout: Awaited<ReturnType<typeof prepareReadOnlyRepositoryBaseline>> | undefined;
+    let operation: ReturnType<typeof beginRoadmapRequest>;
     try {
       const { id } = idParamsSchema.parse(request.params);
       const input = auditGapDecisionSchema.parse(request.body ?? {});
+      operation = beginRoadmapRequest(roadmapRequests, id, request, reply);
+      if (!operation) return reply.code(409).send({ error: 'A roadmap or audit proposal operation is already running for this project.' });
       const [project, roadmap] = await Promise.all([repository.getProject(id), repository.getProjectRoadmap(id)]);
       if (!project || !roadmap) return sendNotFound(reply, `Project "${id}" not found`);
       const job = roadmap.auditJobs.find((item) => item.id === input.auditJobId);
@@ -1208,36 +1212,73 @@ export function registerRoutes(
       if (!provider.reviewRoadmap) throw new Error(`AI provider "${provider.kind}" does not support independent roadmap quality review.`);
       const githubConnection = await readGitHubConnectionSecret(repository);
       if (!githubConnection) throw new Error('Connect GitHub before reviewing audit gaps.');
-      checkout = await prepareReadOnlyRepositoryBaseline(new GitHubAppAdapter({ token: githubConnection.token, apiBaseUrl: githubConnection.apiBaseUrl }), project);
+      const github = new GitHubAppAdapter({ token: githubConnection.token, apiBaseUrl: githubConnection.apiBaseUrl });
+      checkout = await prepareReadOnlyRepositoryBaseline(github, project, operation.signal);
       const reviewContract = buildAuditGapReviewContract(project.projectContract, job.gapProposal.newRequirements);
-      const review = await provider.reviewRoadmap({
-        taskId: `audit-gap:${job.id}`,
-        objective: [
-          `Review ${job.gapProposal.kind} audit gaps against the current project scope and repository.`,
-          `The proposal was recorded at commit ${job.gapProposal.commitSha}; this review uses current commit ${checkout.commitSha}.`,
-          'A different commit ID alone is not a blocker: squash merges may preserve identical content.',
-          'Reassess every proposed step against the current repository baseline. Reject work that is already implemented, no longer needed, or outside the current specification and contract.',
-          'Approve only concrete remaining gaps; historical audit findings are context, not proof that the gap still exists.'
-        ].join('\n'),
-        authoritativeSpecification: (await repository.getProjectSpecifications(id))?.current.fullSpecification ?? project.brief ?? project.name,
-        projectContract: reviewContract,
-        requiredRequirementIds: Array.from(new Set(job.gapProposal.steps.flatMap((step) => step.requirementIds))),
-        completedStepTitles: roadmap.steps.filter((step) => step.status === 'completed').map((step) => step.title),
-        implementationSteps: job.gapProposal.steps.map((step) => ({ ...step, inScope: [], outOfScope: [] })),
-        repositoryPath: checkout.repositoryPath,
-        repositoryBaseline: { commitSha: checkout.commitSha, evidence: checkout.evidence }
+      const specification = (await repository.getProjectSpecifications(id))?.current.fullSpecification ?? project.brief ?? project.name;
+      const scopeKey = (p: Project | undefined, spec: string, steps: typeof roadmap.steps) => JSON.stringify({
+        contract: p?.projectContract, specification: spec, owner: p?.githubOwner, repo: p?.githubRepo,
+        branch: p?.defaultBranch, steps: steps.map(s => [s.id, s.cycleId, s.status])
       });
-      await repository.saveProjectAuditGapReview({ projectId: id, auditJobId: job.id, review });
-      await repository.writeAudit({
-        actorType: 'system', eventType: 'project_audit_gap_review_baseline', projectId: id,
-        payload: { auditJobId: job.id, proposalCommitSha: job.gapProposal.commitSha, reviewCommitSha: checkout.commitSha, verdict: review.verdict }
+      const initialScopeKey = scopeKey(project, specification, roadmap.steps);
+      let originalProposal = job.gapProposal;
+      // Only walk this repair chain, not proposals archived by a different audit run.
+      for (const entry of [...(job.gapProposalHistory ?? [])].reverse()) {
+        if (entry.reason !== 'repair') break;
+        originalProposal = entry.proposal;
+      }
+      const assertCurrentSource = async () => {
+        operation!.signal.throwIfAborted();
+        const [current, specifications, currentRoadmap] = await Promise.all([
+          repository.getProject(id), repository.getProjectSpecifications(id), repository.getProjectRoadmap(id)
+        ]);
+        const spec = specifications?.current.fullSpecification ?? current?.brief ?? current?.name ?? '';
+        if (!currentRoadmap || scopeKey(current, spec, currentRoadmap.steps) !== initialScopeKey) {
+          throw new Error('Project scope or roadmap changed during audit proposal review. Retry against the current project.');
+        }
+      };
+      const { proposal, review } = await reviewAndRepairAuditGapProposal({
+        provider, proposal: job.gapProposal, originalProposal, previousReview: job.gapProposalReview,
+        assertCurrentSource,
+        saveProposal: async (proposal, previous) => {
+          await repository.reviseProjectAuditGapProposal({ projectId: id, auditJobId: job.id, proposal, expectedProposal: previous });
+        },
+        saveReview: async (review, proposal) => {
+          await repository.saveProjectAuditGapReview({ projectId: id, auditJobId: job.id, review, expectedProposal: proposal });
+          await repository.writeAudit({
+            actorType: 'system', eventType: 'project_audit_gap_review_baseline', projectId: id,
+            payload: { auditJobId: job.id, proposalCommitSha: proposal.commitSha, reviewCommitSha: checkout!.commitSha, verdict: review.verdict }
+          });
+        },
+        reviewInput: {
+          taskId: `audit-gap:${job.id}`,
+          objective: [
+            `Review ${job.gapProposal.kind} audit gaps against the current project scope and repository.`,
+            `The proposal was recorded at commit ${job.gapProposal.commitSha}; this review uses current commit ${checkout.commitSha}.`,
+            'A different commit ID alone is not a blocker: squash merges may preserve identical content.',
+            'Reassess every proposed step against the current repository baseline. Reject work that is already implemented, no longer needed, or outside the current specification and contract.',
+            'Approve only concrete remaining gaps; historical audit findings are context, not proof that the gap still exists.'
+          ].join('\n'),
+          authoritativeSpecification: specification,
+          projectContract: reviewContract,
+          completedStepTitles: roadmap.steps.filter((step) => step.status === 'completed').map((step) => step.title),
+          repositoryPath: checkout.repositoryPath,
+          repositoryBaseline: { commitSha: checkout.commitSha, evidence: checkout.evidence },
+          signal: operation.signal
+        }
       });
-      if (review.verdict !== 'satisfied') return reply.code(409).send({ error: review.summary, blockers: review.blockers });
-      await repository.decideProjectAuditGapProposal({ projectId: id, auditJobId: job.id, accepted: true, review });
+      const currentCheckout = await prepareReadOnlyRepositoryBaseline(github, project, operation.signal);
+      try {
+        if (currentCheckout.commitSha !== checkout.commitSha) throw new Error('Repository changed during audit proposal review. Retry against the current commit.');
+      } finally { await currentCheckout.cleanup(); }
+      await assertCurrentSource();
+      await repository.decideProjectAuditGapProposal({ projectId: id, auditJobId: job.id, accepted: true, review, expectedProposal: proposal });
       return (await repository.getProjectRoadmap(id))!;
     } catch (error) {
       return sendBadRequest(reply, error);
-    } finally { await checkout?.cleanup(); }
+    } finally {
+      try { await checkout?.cleanup(); } finally { operation?.release(); }
+    }
   });
 
   app.post('/api/projects/:id/implementation-steps/start-next', async (request, reply) => {

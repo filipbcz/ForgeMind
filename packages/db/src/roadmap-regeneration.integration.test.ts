@@ -1,6 +1,6 @@
 import { PrismaClient } from '@prisma/client';
 import { applyProjectContractDelta } from '@forgemind/core';
-import type { ProjectContract, ProjectContractDelta, RoadmapGenerationCheckpoint } from '@forgemind/core';
+import type { AuditGapProposal, ProjectContract, ProjectContractDelta, RoadmapGenerationCheckpoint } from '@forgemind/core';
 import { readFileSync, readdirSync } from 'node:fs';
 import { createRequire } from 'node:module';
 import path from 'node:path';
@@ -179,6 +179,43 @@ describe('roadmap regeneration lifecycle', () => {
     expect(await prisma.task.count({ where: { projectId: project.id } })).toBe(2);
     expect(await prisma.taskQueueJob.count({ where: { taskId: first.nextTask!.id } })).toBe(1);
     expect(await prisma.taskCheckpoint.findUnique({ where: { id: checkpoint.id } })).toEqual(checkpoint);
+  }, 30_000);
+
+  it('preserves audit repair history, rejects stale writes and activates only the reviewed revision once', async () => {
+    const repository = new ForgeMindRepository(prisma);
+    const project = await prisma.project.create({ data: { name: 'Audit repair', slug: 'audit-repair' } });
+    const step = { title: 'Ledger', description: 'Persist entries.', acceptanceCriteria: ['Entries persist.'],
+      requirementIds: ['REQ-LEDGER'], deliverables: ['Ledger'], changeRationale: 'Ledger is missing.',
+      dependsOnStepTitles: [], validationFocus: ['implementation' as const] };
+    const roadmap = await repository.createProjectRoadmapCycle({
+      projectId: project.id, objective: 'Ledger', projectContract: initialContract, steps: [step]
+    });
+    const cycleId = roadmap.cycles.at(-1)!.id;
+    const job = await prisma.projectAuditJob.create({ data: { projectId: project.id, cycleId, status: 'claimed' } });
+    const original: AuditGapProposal = { kind: 'capability', summary: 'Missing durability.', commitSha: 'a'.repeat(40), newRequirements: [], steps: [{ ...step, title: 'Fix durability' }] };
+    await repository.saveProjectAuditGapProposal(job.id, original);
+    await prisma.projectAuditJob.update({ where: { id: job.id }, data: { status: 'succeeded' } });
+    const rejected = { verdict: 'not_satisfied' as const, summary: 'Name exact path.', blockers: ['Name the durability module.'] };
+    await repository.saveProjectAuditGapReview({ projectId: project.id, auditJobId: job.id, review: rejected, expectedProposal: original });
+    const revision = { ...original, steps: [{ ...original.steps[0]!, description: 'Repair the transaction in src/ledger.ts.' }] };
+    const saved = await repository.reviseProjectAuditGapProposal({ projectId: project.id, auditJobId: job.id, proposal: revision, expectedProposal: original });
+    expect(saved.gapProposalReview).toBeUndefined();
+    expect(saved.gapProposalHistory).toMatchObject([{ proposal: original, review: rejected }]);
+    expect(saved.gapProposal).toEqual(revision);
+    const satisfied = { verdict: 'satisfied' as const, summary: 'Concrete gap.', blockers: [] };
+    await expect(repository.reviseProjectAuditGapProposal({ projectId: project.id, auditJobId: job.id, proposal: original, expectedProposal: original })).rejects.toThrow('changed during repair');
+    await expect(repository.saveProjectAuditGapReview({ projectId: project.id, auditJobId: job.id, review: satisfied, expectedProposal: original })).rejects.toThrow('changed during review');
+    await expect(repository.decideProjectAuditGapProposal({ projectId: project.id, auditJobId: job.id, accepted: true, review: satisfied, expectedProposal: original })).rejects.toThrow('changed before activation');
+    await repository.saveProjectAuditGapReview({ projectId: project.id, auditJobId: job.id, review: satisfied, expectedProposal: revision });
+    const accepted = { projectId: project.id, auditJobId: job.id, accepted: true, review: satisfied, expectedProposal: revision };
+    await repository.decideProjectAuditGapProposal(accepted);
+    await repository.decideProjectAuditGapProposal(accepted);
+    const current = (await repository.getProjectRoadmap(project.id))!;
+    expect(current.auditJobs[0]?.gapProposalStatus).toBe('activated');
+    expect(current.steps.filter(s => s.title === 'Fix durability')).toHaveLength(1);
+    expect(current.steps.find(s => s.title === 'Fix durability')?.description).toContain('src/ledger.ts');
+    expect(await prisma.task.count({ where: { projectId: project.id } })).toBe(0);
+    await expect(repository.reviseProjectAuditGapProposal({ projectId: project.id, auditJobId: job.id, proposal: original, expectedProposal: revision })).rejects.toThrow('Active audit gap proposal');
   }, 30_000);
 
   it('does not reopen superseded cycles or explicitly cancelled tasks during automatic retry', async () => {

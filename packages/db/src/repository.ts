@@ -2942,10 +2942,41 @@ export class ForgeMindRepository {
     return toProjectAuditJob(updated);
   }
 
+  async reviseProjectAuditGapProposal(input: {
+    projectId: string; auditJobId: string; proposal: AuditGapProposal; expectedProposal: AuditGapProposal;
+  }): Promise<ProjectAuditJob> {
+    return this.prisma.$transaction(async (tx) => {
+      const job = await tx.projectAuditJob.findUnique({ where: { id: input.auditJobId } });
+      if (!job || job.projectId !== input.projectId || job.status !== 'succeeded' || job.gapProposalStatus !== 'proposed') {
+        throw new Error('Active audit gap proposal was not found.');
+      }
+      const history = Array.isArray(job.gapProposalHistory) ? [...job.gapProposalHistory] : [];
+      history.push({ proposal: job.gapProposal, status: 'proposed', reason: 'repair', review: job.gapProposalReview, archivedAt: new Date().toISOString() });
+      const result = await tx.projectAuditJob.updateMany({
+        where: {
+          id: job.id, projectId: input.projectId, status: 'succeeded', gapProposalStatus: 'proposed',
+          updatedAt: job.updatedAt,
+          gapProposal: { equals: toPrismaJson(input.expectedProposal as unknown as JsonValue) }
+        },
+        data: {
+          gapProposal: toPrismaJson(input.proposal as unknown as JsonValue), gapProposalReview: Prisma.DbNull,
+          gapProposalHistory: toPrismaJson(history as unknown as JsonValue)
+        }
+      });
+      if (result.count !== 1) throw new Error('Audit gap proposal changed during repair. Retry against the current proposal.');
+      await this.writeAuditTx(tx, {
+        actorType: 'agent', eventType: 'project_audit_gap_repaired', projectId: input.projectId,
+        payload: { auditJobId: job.id, cycleId: job.cycleId, stepCount: input.proposal.steps.length }
+      });
+      return toProjectAuditJob((await tx.projectAuditJob.findUniqueOrThrow({ where: { id: job.id } })));
+    });
+  }
+
   async decideProjectAuditGapProposal(input: {
     projectId: string;
     auditJobId: string;
     accepted: boolean;
+    expectedProposal?: AuditGapProposal;
     review?: { verdict: 'satisfied' | 'not_satisfied'; summary: string; blockers: string[] };
   }): Promise<ProjectAuditJob> {
     const job = await this.prisma.projectAuditJob.findUnique({ where: { id: input.auditJobId } });
@@ -2953,7 +2984,11 @@ export class ForgeMindRepository {
     if (job.gapProposalStatus !== 'proposed') return toProjectAuditJob(job);
     if (input.accepted && input.review?.verdict !== 'satisfied') throw new Error('Audit gap proposal requires a satisfied independent roadmap quality review.');
     const reserved = await this.prisma.projectAuditJob.updateMany({
-      where: { id: job.id, projectId: input.projectId, gapProposalStatus: 'proposed' },
+      where: {
+        id: job.id, projectId: input.projectId, gapProposalStatus: 'proposed',
+        ...(input.accepted ? { status: 'succeeded' } : {}),
+        ...(input.expectedProposal ? { gapProposal: { equals: toPrismaJson(input.expectedProposal as unknown as JsonValue) } } : {})
+      },
       data: {
         gapProposalStatus: input.accepted ? 'activating' : 'dismissed',
         gapProposalReview: input.review ? toPrismaJson(input.review as unknown as JsonValue) : Prisma.DbNull,
@@ -2961,12 +2996,13 @@ export class ForgeMindRepository {
       }
     });
     if (reserved.count === 0) {
+      if (input.expectedProposal) throw new Error('Audit gap proposal changed before activation. Retry against the current proposal.');
       const current = await this.prisma.projectAuditJob.findUnique({ where: { id: job.id } });
       if (!current) throw new Error('Audit gap proposal was not found.');
       return toProjectAuditJob(current);
     }
     if (input.accepted) {
-      const proposal = job.gapProposal as unknown as AuditGapProposal;
+      const proposal = input.expectedProposal ?? job.gapProposal as unknown as AuditGapProposal;
       try {
         await this.appendProjectImplementationSteps({
           projectId: input.projectId, cycleId: job.cycleId,
@@ -2996,10 +3032,16 @@ export class ForgeMindRepository {
     return toProjectAuditJob(updated);
   }
 
-  async saveProjectAuditGapReview(input: { projectId: string; auditJobId: string; review: { verdict: 'satisfied' | 'not_satisfied'; summary: string; blockers: string[] } }): Promise<ProjectAuditJob> {
+  async saveProjectAuditGapReview(input: { projectId: string; auditJobId: string; expectedProposal?: AuditGapProposal; review: { verdict: 'satisfied' | 'not_satisfied'; summary: string; blockers: string[] } }): Promise<ProjectAuditJob> {
     const job = await this.prisma.projectAuditJob.findUnique({ where: { id: input.auditJobId } });
     if (!job || job.projectId !== input.projectId || job.gapProposalStatus !== 'proposed') throw new Error('Active audit gap proposal was not found.');
-    const updated = await this.prisma.projectAuditJob.update({ where: { id: job.id }, data: { gapProposalReview: toPrismaJson(input.review as unknown as JsonValue) } });
+    const saved = await this.prisma.projectAuditJob.updateMany({
+      where: { id: job.id, status: 'succeeded', gapProposalStatus: 'proposed',
+        ...(input.expectedProposal ? { gapProposal: { equals: toPrismaJson(input.expectedProposal as unknown as JsonValue) } } : {}) },
+      data: { gapProposalReview: toPrismaJson(input.review as unknown as JsonValue) }
+    });
+    if (saved.count !== 1) throw new Error('Audit gap proposal changed during review. Retry against the current proposal.');
+    const updated = await this.prisma.projectAuditJob.findUniqueOrThrow({ where: { id: job.id } });
     await this.writeAudit({ actorType: 'system', eventType: 'project_audit_gap_reviewed', projectId: input.projectId, payload: { auditJobId: job.id, cycleId: job.cycleId, ...input.review } });
     return toProjectAuditJob(updated);
   }
