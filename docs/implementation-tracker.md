@@ -1,30 +1,58 @@
 # ForgeMind - Implementacni tracker
 
-## Aktivni plan kvality roadmapy
+## Aktualni statusy
 
-Aktualni navazujici prace se ridi dokumentem `docs/roadmap-quality-implementation-plan.md`.
-Plan oddeluje dokonceni tasku, work itemu, kontraktni capability a celeho projektu. Tento tracker pouziva pouze statusy `implemented`, `tested`, `production-verified` a `deferred`. Etapy 1-6 a migracni kod etapy 7 jsou `implemented`; cilene testy u uvedenych kroku jsou `tested`; migracni matice a rizene produkcni overeni zustavaji `deferred`.
+Tracker pouziva ctyri odlisne statusy:
 
-Posledni aktualizace: 2026-08-19
-Zdroj pozadavku: README.md
+- `implemented`: chovani nebo konfigurace existuje v aktualnim repozitari.
+- `tested`: tvrzeni kryje existujici executable test nebo validacni prikaz.
+- `production-verified`: existuje explicitni dukaz z produkcniho prostredi.
+- `deferred`: overeni nebo scope je vedome odlozeny; fixture, historicky zaznam ani lokalni test tento status nepovysuji.
 
-## Kde jsme ted
+Posledni aktualizace: 2026-09-05
+Aktualni zdroj pravdy a evidence: `docs/readme-parity.md`
 
-- Zaklad persistence a fronty je `implemented` a `tested`: PostgreSQL queue, claim/finalize, recovery zaseklych claimed jobu (`packages/db/src/repository.ts`, `packages/db/src/repository.task-run.test.ts`).
-- Mobilni operativni stav je `implemented`: runs, queue, worker status/events (`apps/mobile-pwa/src/App.tsx`, `apps/mobile-pwa/src/api.ts`).
-- Kroky 1-22 (README MVP a parity vlna) jsou `implemented`; jednotlive radky nize uvadeji executable test evidence tam, kde existuje.
-- Verzovany project contract, acceptance evidence, capability/release audit a completion gate jsou `implemented` a `tested` v `packages/core/src`, `packages/db/src`, `apps/studio-api/src/routes.ts`, `apps/worker/src/db-worker.ts`, `apps/studio-api/src/routes.test.ts` a `apps/worker/src/db-worker.test.ts`.
-- ARM64 Raspberry Pi platform deploy workflow je `implemented` v `.github/workflows/deploy-raspberry.yml`, `infra/docker-compose.raspberry.yml` a `docs/deploy-raspberry.md`; produkcni overeni je `deferred`. OCI zustava rucni rollback cesta.
-- Otevrena prace je `deferred`: potvrzeni stavu migraci a rizene produkcni overeni etapy 7 vcetne jednoho celeho requirementu.
+## Aktivni plan
 
-## Pravidla postupu (abychom se neztraceli)
+Aktivnim planem je udrzovat konsolidovanou AI-first specifikaci a runtime v souladu s `README.md` a `docs/readme-parity.md`. Task probiha tokem `implementation -> validation -> read-only review -> delivery`. Implementacni AI vraci autoritativni validacni prikazy; runtime je nefiltruje Linux command allowlistem. Selhani validace nebo blocker z review vraci uplnou zpetnou vazbu implementaci. Phase-aware checkpointy zachovavaji uspesne faze a technicke retry nema budget, iteration ani finite retry stop. Runtime approval vetve byly odstraneny; historicke approval zaznamy zustavaji pouze pro audit.
+
+## Aktivni krok
+
+Aktivne se udrzuje dokumentacni shoda s konsolidovanou AI-first specifikaci. Neni otevreny krok, ktery by znovu zavadel runtime approvals, budget/iteration stop, konecny retry limit nebo Linux validation command allowlist. Produkcni E2E a rizene produkcni overeni zustavaji `deferred`.
+
+## Aktualni stav
+
+- AI-first worker flow je `implemented` a `tested`; validation a read-only review vraceji neuspech zpet implementaci a delivery umi navazat z checkpointu.
+- Autoritativni validation checks pochazeji z implementacni AI a nejsou filtrovany command allowlistem; toto chovani je `implemented` a `tested`.
+- Queue repository a phase-aware checkpointy podporuji technicky retry bez budget, iteration nebo retry capu; chovani je `implemented` a `tested`.
+- Runtime approval vetve jsou odstraneny migraci a aktualnim workflow; odstraneni je `implemented` a `tested`. Historicka data jsou pouze auditni evidence.
+- Repository-grounded planning, idempotentni GitHub delivery, mobilni read model, Windows validation worker a dalsi aktualni oblasti jsou rozepsany v `docs/readme-parity.md`.
+- Produkcni E2E realneho providera, GitHubu a nasazene PWA je `deferred`; zadne tvrzeni v tomto trackeru jej neoznacuje jako `production-verified`.
+
+## Aktualni evidence
+
+| Tvrzeni | Implementace | Executable evidence | Stav produkce |
+| --- | --- | --- | --- |
+| Worker workflow a navrat validation/review feedbacku | `apps/worker/src/workflow.ts` | `apps/worker/src/workflow.test.ts`; `apps/worker/src/db-worker.test.ts` | `deferred` |
+| AI validation bez command filtru | `packages/providers/src/provider.ts`; `apps/worker/src/validation.ts` | `apps/worker/src/validation.test.ts` | `deferred` |
+| Phase-aware checkpointy | `apps/worker/src/db-worker/checkpoints.ts` | `apps/worker/src/db-worker.test.ts` | `deferred` |
+| Queue persistence a neomezene technicke retry | `packages/db/src/repository.ts` | `packages/db/src/repository.task-run.test.ts`; `apps/worker/src/db-worker.test.ts` | `deferred` |
+| Odstraneni runtime approvals | `apps/worker/src/workflow.ts`; `apps/studio-api/src/routes.ts`; `packages/db/prisma/migrations/20260831160000_remove_runtime_approvals/migration.sql` | `apps/worker/src/workflow.test.ts`; `apps/studio-api/src/routes.test.ts` | `deferred` |
+
+Uplna aktualni evidence matice vcetne repository planningu, GitHub adapteru, Windows workeru a mobilniho runtime je v `docs/readme-parity.md`. Root prikazy `npm run build`, `npm run typecheck`, `npm test` a `npm run test:migrations` jsou executable release/CI evidence, nikoli povinna allowlist sada pro kazdy task.
+
+## Historicky plan a completion log (neaktualni runtime guidance)
+
+Nasledujici cislovany plan a datovany log zachovavaji dobovy stav implementace. Jsou pouze historickym zaznamem: zejmena kroky 6-9 a 14-15 popisuji drivejsi finite retry, budget/iteration stop, runtime approval a command sandbox chovani, ktere bylo pozdeji nahrazeno aktualnim AI-first tokem popsaným vyse. Jejich statusy a evidence se nesmeji pouzit jako tvrzeni o aktualnim runtime.
+
+### Historicka pravidla postupu
 
 1. Delame jen aktivni krok; nic navic mimo poradi.
 2. Kazdy krok ma tri casti: Cil, Zmena, Ověreni.
 3. Dokud neni krok 1-4 `implemented` a podle potreby `tested`, neotvirame novy UI scope.
 4. Po kazdem kroku zapiseme 1 vetu do tohoto trackeru: co je `implemented`, co je `tested`, co je `production-verified` a co zustava `deferred`.
 
-## 12 jasnych kroku, podle kterych pojedeme
+### Historicky cislovany plan, kroky 1-12
 
 1. [`implemented`, `tested` 2026-07-03] Webhook podpisy v API
 	Cil: Bezpecne overit, ze webhook prisel opravdu z GitHubu.
@@ -86,11 +114,11 @@ Zdroj pozadavku: README.md
 	 Zmena: Dopsat E2E test scenar a spustit root validaci.
 	 Overeni: `npm run build` a `npm test` v root musi projit bez chyb.
 
-## Aktivni krok
+### Historicky aktivni krok
 
-Aktivne resime: Etapu 7 planu kvality roadmapy - potvrzeni migraci a rizene produkcni overeni. Implementacni kroky 1-22 jsou `implemented`; test evidence je uvedena nize; produkcni overeni zustava `deferred`.
+Dobovy zaznam: Etapa 7 planu kvality roadmapy - potvrzeni migraci a rizene produkcni overeni. Implementacni kroky 1-22 byly v tomto snapshotu oznaceny `implemented`; tehdejsi test evidence je uvedena nize; produkcni overeni zustavalo `deferred`.
 
-## Navazujici kroky (README delta) - dalsi vlna
+### Historicky cislovany plan, kroky 13-22
 
 13. [`implemented`, `tested` 2026-07-03] Realny Codex provider + fallback provider policy
 	Cil: Splnit README pozadavek na primarni Codex provider a kontrolovany fallback.
@@ -142,7 +170,7 @@ Aktivne resime: Etapu 7 planu kvality roadmapy - potvrzeni migraci a rizene prod
 	Zmena: Aktualizovat tracker, README cross-reference a docs tak, aby kazdy README pozadavek mel implementacni odkaz nebo vedome odlozeni.
 	Overeni: `npm run build`, `npm test` a rucni parity review bez otevreneho kritickeho gapu.
 
-## Evidence pro completion claims
+### Historicka evidence pro completion claims
 
 | Kroky | Status | Evidence |
 | --- | --- | --- |
@@ -158,7 +186,7 @@ Aktivne resime: Etapu 7 planu kvality roadmapy - potvrzeni migraci a rizene prod
 | 19 | `implemented`, `tested` | `apps/mobile-pwa/src/pwa.ts`; `apps/mobile-pwa/public/sw.js`; `apps/studio-api/src/notifications.ts`; `apps/studio-api/src/server.ts`; `apps/studio-api/src/notifications.test.ts`; `apps/studio-api/src/routes.test.ts` |
 | Etapa 7 migracni matice a rizene produkcni overeni | `deferred` | `docs/roadmap-quality-implementation-plan.md` |
 
-## Prubezny log
+### Historicky datovany completion log
 
 - 2026-09-02: Selektivne prenesen Windows validation control plane bez stare approval, capability-waiting a task-resume logiky. Implementacni AI muze zvolit `target: windows`; hlavni task po Linux validaci a review pokracuje do dokonceni, zatimco autentizovany manualni Windows runner pozdeji spusti stejny neomezeny AI prikaz nad presnym commitem a ulozi hashovane evidence. API a Nastaveni zobrazuji zarizeni, relace a cekajici kontroly. Evidence: `packages/core/src/windows-worker.ts`, `packages/db/src/windows-worker-repository.ts`, `apps/studio-api/src/routes/windows-runner-routes.ts`, `apps/windows-runner/src/executor.ts`, `apps/mobile-pwa/src/App.tsx`.
 - 2026-09-01: Orchestrace tasku byla zjednodusena na `implementation -> validation -> review -> delivery`. Autoritativni validacni prikazy vraci pouze implementacni AI; worker je obsahove nefiltruje a pri chybe vraci kompletni command, exit code, stdout a stderr. Review je read-only a posuzuje pouze soulad implementace se zadanim; blocker vraci implementaci. Runtime approval API, provider approval vetve, command sandbox policy, projektove validation profiles a architektonicke validation commands byly odstraneny. Phase-aware checkpointy zachovavaji uspesne operace a migrace uzavre rozpracovane historicke approvals. Evidence: `apps/worker/src/workflow.ts`, `apps/worker/src/validation.ts`, `apps/worker/src/db-worker/checkpoints.ts`, `packages/providers/src/provider.ts`, `packages/db/prisma/migrations/20260831150000_remove_runtime_approvals/migration.sql`.
@@ -189,7 +217,7 @@ Aktivne resime: Etapu 7 planu kvality roadmapy - potvrzeni migraci a rizene prod
 - 2026-07-03: Krok 21 `implemented` a `tested`. Pridan representative integration test v `apps/studio-api/src/routes.test.ts` pokryvajici tok API create/start -> worker `runWorkerTask` -> GitHub issue/PR fields -> mobilni read-model projekce z `/api/tasks`; overeno: `npx vitest run apps/studio-api/src/routes.test.ts`.
 - 2026-07-03: Krok 22 `implemented` a `tested`. Pridan parity checklist (`docs/readme-parity.md`) + README cross-reference sekce a acceptance validacni prikazy; overeno: `npm run build`, `npm test`.
 
-## Definice `implemented` + `tested` pro nejblizsi milnik (kroky 17-20)
+### Historicka definice milniku (kroky 17-20)
 
 1. API expose metriky task lifecycle/fronta/approvals/provider failures + dokumentace metrik.
 2. Mobilni task formulare/detail dorovnaji README field richness a validacni tok.
