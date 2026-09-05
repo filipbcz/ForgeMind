@@ -366,6 +366,16 @@ export class WindowsWorkerRepository {
 
   async submitResult(deviceId: string, result: WindowsJobResult): Promise<SubmittedWindowsResult> {
     if ((!isWindowsExecutionResult(result) && !isWindowsAuthoringResult(result)) || result.deviceId !== deviceId) return { accepted: false };
+    if (isWindowsAuthoringResult(result)
+      && createHash('sha256').update(Buffer.from(result.patch, 'utf8')).digest('hex') !== result.resultBundle.sha256.toLowerCase()) return { accepted: false };
+    if (isWindowsAuthoringResult(result) && result.resultBundle.lfsObjects.some((object) => {
+      const content = Buffer.from(object.contentBase64, 'base64');
+      return content.length !== object.sizeBytes || createHash('sha256').update(content).digest('hex') !== object.oid.toLowerCase();
+    })) return { accepted: false };
+    if (isWindowsAuthoringResult(result) && result.resultBundle.outputs.some((output) => {
+      const content = Buffer.from(output.contentBase64, 'base64');
+      return content.length !== output.sizeBytes || createHash('sha256').update(content).digest('hex') !== output.sha256.toLowerCase();
+    })) return { accepted: false };
     return this.prisma.$transaction(async (tx) => {
       const leases = await tx.$queryRaw<Array<{ jobId: string; projectId: string; taskId: string; runId: string; packet: Prisma.JsonValue; sessionStatus: string }>>`
         SELECT l."job_id" AS "jobId", j."project_id" AS "projectId", j."task_id" AS "taskId", j."run_id" AS "runId", j."packet", s."status"::text AS "sessionStatus"

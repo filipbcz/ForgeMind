@@ -19,7 +19,8 @@ export const agentConfigSchema = z.object({
     auto_merge: z.boolean().default(false),
     allow_ai_auto_improvements: z.boolean().default(true),
     implementation_owner: z.enum(['linux', 'windows']).default('linux'),
-    windows_authoring_capabilities: z.array(z.string().min(1)).default(['windows', 'windows-authoring'])
+    windows_authoring_capabilities: z.array(z.string().min(1)).default(['windows', 'windows-authoring']),
+    windows_authoring_requires_unreal_assets: z.boolean().default(true)
   }),
   ai: z.object({
     primary_provider: z.enum(['codex', 'github_copilot', 'openai']).default('codex'),

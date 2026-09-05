@@ -11,6 +11,7 @@ import { cleanupWindowsValidationWorkspace, executeWindowsValidation } from './e
 import { executeWindowsAuthoring, LifecycleNativeImplementationProvider } from './authoring-executor.js';
 import { runCapabilityProbes, windowsRunnerCapabilityProbes } from './probes.js';
 import { runManualSession } from './session.js';
+import { cleanupAcceptedWindowsAuthoring, prepareWindowsManagedRoots } from './managed-roots.js';
 import { WindowsRunnerTransport } from './transport.js';
 
 const RUNNER_VERSION = '0.1.0';
@@ -63,6 +64,7 @@ export async function main(args = process.argv.slice(2)): Promise<void> {
     stdout.write(`${JSON.stringify(probes.evidence, null, 2)}\n`); return;
   }
   if (parsed.command === 'session-start') {
+    const managedRoots = await prepareWindowsManagedRoots(join(parsed.workspaceRoot, '..'));
     const adapterPolicy = readLocalAdapterPolicy();
     await transport.publishDevice(auth, { runnerVersion: RUNNER_VERSION, displayName: process.env.COMPUTERNAME ?? 'Windows runner', capabilities: probes.capabilities, probeEvidence: probes.evidence });
     const controller = new AbortController(); process.once('SIGINT', () => controller.abort());
@@ -72,9 +74,11 @@ export async function main(args = process.argv.slice(2)): Promise<void> {
         if (isWindowsAuthoringPacket(claim.job.packet)) {
           stdout.write(`Running native Windows implementation ${claim.job.packet.jobId}.\n`);
           const executed = await executeWindowsAuthoring(claim.job.packet, { deviceId: auth.deviceId, sessionId: context.sessionId,
-            workspaceRoot: parsed.workspaceRoot, artifactRoot: parsed.artifactRoot, signal: context.signal,
+            workspaceRoot: managedRoots.work, artifactRoot: managedRoots.diagnostics, signal: context.signal,
+            managedRoots,
             provider: new LifecycleNativeImplementationProvider(createProvider('codex')) });
-          await transport.submitResult(auth, executed.result);
+          const submitted = await transport.submitResult(auth, executed.result);
+          if (submitted.accepted && executed.result.status === 'succeeded') await cleanupAcceptedWindowsAuthoring(managedRoots, executed.result.taskId);
           stdout.write(`${executed.result.summary}\n`);
           return;
         }

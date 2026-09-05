@@ -85,6 +85,7 @@ describe('Windows worker shared contracts', () => {
       managedRoots: ['Content/Generated'], operations: [{ id: 'op-1', kind: 'modify', path: 'Content/Generated/map.bin', rationale: 'Update map' }],
       checkpoints: [{ id: 'cp-1', label: 'Map saved', afterOperationIds: ['op-1'], artifactExpectationNames: ['map'] }],
       artifactExpectations: [{ name: 'map', relativePath: 'Content/Generated/map.bin', required: true, delivery: 'artifact-store', binary: true, maxBytes: 4096 }],
+      contentPolicy: { requiresUnrealAssets: true, prohibitedDatasetExtensions: ['.gpkg'], maxUnclassifiedFileBytes: 1024 },
       resourcePolicy: { timeoutSeconds: 60, maxLogBytes: 1024, maxArtifactBytes: 4096 }, nonce: 'pending', inputHash: hash,
       authority: { database: 'none', productionHosts: 'none', globalGitHubCredentials: 'none' }
     };
@@ -95,11 +96,14 @@ describe('Windows worker shared contracts', () => {
     const result = { kind: 'authoring-result', protocolVersion: 1, projectId: 'p', taskId: 't', runId: 'r', jobId: 'j', leaseId: 'l',
       deviceId: 'd', sessionId: 's', nonce: 'n', inputHash: hash, baseCommitSha: commitSha, resultTreeSha: commitSha,
       tree: [{ path: 'Content/Generated/map.bin', kind: 'file', sha256: hash, sizeBytes: 42, binary: true, mode: '100644' }], patch: 'diff --git',
+      resultBundle: { version: 1, format: 'git-binary-patch', sha256: '35ab12569421d1cd6fa0a9a3deb5b40126a1a8272702923dc722409bdaf5801d', sizeBytes: 10, lfsObjects: [], outputs: [] },
       completedOperationIds: ['op-1'], checkpointIds: ['cp-1'], artifacts: [], processes: [{ leaseId: 'l', sessionId: 's', checkId: 'provider', command: 'provider.implement', shell: 'system', exitCode: 0, stdout: 'done', stderr: '', startedAt: '2026-01-01T00:00:00Z', completedAt: '2026-01-01T00:00:30Z' }], status: 'succeeded',
       startedAt: '2026-01-01T00:00:00Z', completedAt: '2026-01-01T00:01:00Z', summary: 'authored' };
     expect(isWindowsAuthoringResult(result)).toBe(true);
     expect(isWindowsAuthoringResult({ ...result, processes: [{ ...result.processes[0], leaseId: 'other' }] })).toBe(false);
     expect(isWindowsAuthoringResult({ ...result, resultTreeSha: 'working-tree' })).toBe(false);
     expect(isWindowsAuthoringResult({ ...result, tree: [{ ...result.tree[0], binary: undefined }] })).toBe(false);
+    expect(isWindowsAuthoringResult({ ...result, resultBundle: { ...result.resultBundle,
+      outputs: [{ path: '../escape.bin', sha256: hash, sizeBytes: 1, contentBase64: 'YQ==' }] } })).toBe(false);
   });
 });

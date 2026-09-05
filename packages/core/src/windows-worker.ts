@@ -217,6 +217,7 @@ export interface WindowsAuthoringPacket {
   managedRoots: string[];
   checkpoints: AuthoringCheckpoint[];
   artifactExpectations: AuthoringArtifactExpectation[];
+  contentPolicy: { requiresUnrealAssets: boolean; prohibitedDatasetExtensions: string[]; maxUnclassifiedFileBytes: number };
   resourcePolicy: ExecutionResourcePolicy;
   nonce: string;
   inputHash: string;
@@ -250,9 +251,12 @@ export interface WindowsAuthoringResult {
   inputHash: string;
   baseCommitSha: string;
   resultTreeSha: string;
+  /** Authenticates the complete binary Git patch transported to the server. */
+  resultBundle: { version: 1; format: 'git-binary-patch'; sha256: string; sizeBytes: number;
+    lfsObjects: Array<{ oid: string; sha256: string; sizeBytes: number; contentBase64: string }>;
+    outputs: Array<{ path: string; sha256: string; sizeBytes: number; contentBase64: string }> };
   tree: AuthoringTreeEntry[];
-  /** Textual Git patch used by the server-side checkout and delivery lifecycle.
-   * Binary payload transport remains the responsibility of artifact delivery. */
+  /** Binary-safe Git patch used by the server-side review and delivery lifecycle. */
   patch: string;
   completedOperationIds: string[];
   checkpointIds: string[];
@@ -512,6 +516,10 @@ export function isWindowsAuthoringPacket(value: unknown): value is WindowsAuthor
   if (!identities.every((key) => isNonEmpty(value[key])) || !isGitCommitSha(value.baseCommitSha) || !isSha256(value.inputHash)
     || !areCapabilityKeys(value.requiredCapabilities) || !Array.isArray(value.managedRoots) || value.managedRoots.length === 0
     || !value.managedRoots.every((root) => root === '.' || isSafeRelativePath(root)) || new Set(value.managedRoots).size !== value.managedRoots.length
+    || !isRecord(value.contentPolicy) || typeof value.contentPolicy.requiresUnrealAssets !== 'boolean'
+    || !areCapabilityKeys(value.contentPolicy.prohibitedDatasetExtensions)
+    || !value.contentPolicy.prohibitedDatasetExtensions.every((extension) => /^\.[a-z0-9]+$/i.test(extension))
+    || !Number.isSafeInteger(value.contentPolicy.maxUnclassifiedFileBytes) || (value.contentPolicy.maxUnclassifiedFileBytes as number) <= 0
     || !isRecord(value.step) || !isNonEmpty(value.step.prompt) || !Array.isArray(value.step.acceptanceCriteria)
     || !value.step.acceptanceCriteria.every(isNonEmpty)
     || (value.step.previousValidationError !== undefined && typeof value.step.previousValidationError !== 'string')
@@ -554,7 +562,16 @@ export function isWindowsAuthoringResult(value: unknown): value is WindowsAuthor
       && isNonEmpty(process.command) && ['powershell', 'cmd', 'system'].includes(process.shell as string)
       && (process.exitCode === undefined || Number.isInteger(process.exitCode)) && typeof process.stdout === 'string'
       && typeof process.stderr === 'string' && isIsoDate(process.startedAt) && isIsoDate(process.completedAt))
-    && typeof value.patch === 'string' && Array.isArray(value.tree) && value.tree.every((entry) => isRecord(entry) && isSafeRelativePath(entry.path)
+    && isRecord(value.resultBundle) && value.resultBundle.version === 1 && value.resultBundle.format === 'git-binary-patch'
+    && isSha256(value.resultBundle.sha256) && Number.isSafeInteger(value.resultBundle.sizeBytes) && (value.resultBundle.sizeBytes as number) >= 0
+    && Array.isArray(value.resultBundle.lfsObjects) && value.resultBundle.lfsObjects.every((object) => isRecord(object)
+      && isSha256(object.oid) && object.oid === object.sha256 && Number.isSafeInteger(object.sizeBytes) && (object.sizeBytes as number) >= 0
+      && typeof object.contentBase64 === 'string' && /^[A-Za-z0-9+/]*={0,2}$/.test(object.contentBase64))
+    && Array.isArray(value.resultBundle.outputs) && value.resultBundle.outputs.every((output) => isRecord(output)
+      && isSafeRelativePath(output.path) && isSha256(output.sha256) && Number.isSafeInteger(output.sizeBytes) && (output.sizeBytes as number) >= 0
+      && typeof output.contentBase64 === 'string' && /^[A-Za-z0-9+/]*={0,2}$/.test(output.contentBase64))
+    && typeof value.patch === 'string' && new TextEncoder().encode(value.patch).byteLength === value.resultBundle.sizeBytes
+    && Array.isArray(value.tree) && value.tree.every((entry) => isRecord(entry) && isSafeRelativePath(entry.path)
       && ['file', 'symlink'].includes(entry.kind as string) && isSha256(entry.sha256) && Number.isSafeInteger(entry.sizeBytes)
       && (entry.sizeBytes as number) >= 0 && typeof entry.binary === 'boolean' && /^[0-7]{6}$/.test(String(entry.mode)))
     && new Set((value.tree as AuthoringTreeEntry[]).map(({ path }) => path)).size === value.tree.length;

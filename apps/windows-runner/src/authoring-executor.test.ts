@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from 'vitest';
-import { LifecycleNativeImplementationProvider, type NativeAuthoringTools } from './authoring-executor.js';
+import { isProhibitedAuthoringPath, LifecycleNativeImplementationProvider, type NativeAuthoringTools } from './authoring-executor.js';
 
 const implementation = {
   outcome: 'changes_made' as const, summary: 'implemented', changedFiles: ['src/a.ts'], evidenceFiles: [],
@@ -11,6 +11,12 @@ const implementation = {
 };
 
 describe('native implementation provider lifecycle', () => {
+  it('rejects directory GIS datasets and oversized unclassified data while retaining Unreal payloads', () => {
+    const policy = { requiresUnrealAssets: true, prohibitedDatasetExtensions: ['.gdb', '.gpkg'], maxUnclassifiedFileBytes: 1024 };
+    expect(isProhibitedAuthoringPath('Source/region.gdb/a00000001.gdbtable', 12, policy)).toBe(true);
+    expect(isProhibitedAuthoringPath('Source/survey.custom-grid', 1025, policy)).toBe(true);
+    expect(isProhibitedAuthoringPath('Content/World.umap', 1025, policy)).toBe(false);
+  });
   it('runs unrestricted AI-selected shells and captures the implementation process', async () => {
     const provider: any = { implement: vi.fn(async (input: any) => {
       await input.onActivity?.({ kind: 'stdout', message: 'Running build', elapsedMs: 1, process: { event: 'started', id: 'tool-1', command: 'cmd /c npm test' } });
@@ -18,7 +24,7 @@ describe('native implementation provider lifecycle', () => {
       return implementation;
     }), review: vi.fn(async () => ({ verdict: 'satisfied', summary: 'ok', blockers: [] })) };
     const seen: Array<{ command: string; shell: string; checkId?: string }> = [];
-    const tools = { root: 'C:/exact/job', nativeToolChannel: { command: 'node', args: ['server'] }, drainNativeProcesses: vi.fn(), read: vi.fn(), write: vi.fn(), remove: vi.fn(), record: vi.fn(), run: vi.fn(async (input) => {
+    const tools = { root: 'C:/exact/job', managedRoots: { inputs: 'C:/inputs', sourceAssets: 'C:/source-assets', cache: 'C:/cache', outputs: 'C:/outputs', diagnostics: 'C:/diagnostics' }, nativeToolChannel: { command: 'node', args: ['server'] }, drainNativeProcesses: vi.fn(), read: vi.fn(), write: vi.fn(), remove: vi.fn(), record: vi.fn(), run: vi.fn(async (input) => {
       seen.push(input); return { leaseId: 'lease', sessionId: 'session', ...input, checkId: input.checkId!, exitCode: 0, stdout: 'complete output', stderr: '', startedAt: new Date().toISOString(), completedAt: new Date().toISOString() };
     }) } as NativeAuthoringTools;
     await new LifecycleNativeImplementationProvider(provider).implement({ prompt: 'current step', acceptanceCriteria: ['works'], operations: [{ id: 'op', kind: 'tool', tool: 'project', arguments: {}, rationale: 'build' }], tools });
@@ -32,7 +38,7 @@ describe('native implementation provider lifecycle', () => {
 
   it('returns a failed check to repair without discarding an earlier valid result', async () => {
     const provider: any = { implement: vi.fn(async () => implementation), review: vi.fn() }; const completed: string[] = [];
-    const tools = { root: 'C:/exact/job', nativeToolChannel: { command: 'node', args: ['server'] }, drainNativeProcesses: vi.fn(), read: vi.fn(), write: vi.fn(), remove: vi.fn(), record: vi.fn(), run: vi.fn(async ({ checkId, command, shell }) => {
+    const tools = { root: 'C:/exact/job', managedRoots: { inputs: 'C:/inputs', sourceAssets: 'C:/source-assets', cache: 'C:/cache', outputs: 'C:/outputs', diagnostics: 'C:/diagnostics' }, nativeToolChannel: { command: 'node', args: ['server'] }, drainNativeProcesses: vi.fn(), read: vi.fn(), write: vi.fn(), remove: vi.fn(), record: vi.fn(), run: vi.fn(async ({ checkId, command, shell }) => {
       completed.push(checkId); return { leaseId: 'lease', sessionId: 'session', checkId, command, shell, exitCode: checkId.endsWith('1') ? 0 : 1, stdout: checkId.endsWith('1') ? 'passed' : '', stderr: checkId.endsWith('1') ? '' : 'failed', startedAt: new Date().toISOString(), completedAt: new Date().toISOString() };
     }) } as NativeAuthoringTools;
     provider.implement.mockResolvedValueOnce(implementation).mockResolvedValueOnce({ ...implementation, validationChecks: [implementation.validationChecks[0]] });

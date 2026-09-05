@@ -741,7 +741,7 @@ export async function runWorkerTask(input: WorkerTaskInput): Promise<WorkerTaskR
             input.project.defaultBranch,
             !nativeRepositoryReview
           );
-          const reviewChangedFiles = reviewPacket.changedFiles;
+          const reviewChangedFiles = uniqueStrings([...reviewPacket.changedFiles, ...(implementation.evidenceFiles ?? [])]);
           const repositoryEvidence = nativeRepositoryReview
             ? undefined
             : await collectCompleteRepositorySnapshot(git, workspacePath);
