@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from 'vitest';
-import { isProhibitedAuthoringPath, LifecycleNativeImplementationProvider, requiresProductionContent, type NativeAuthoringTools, unrealObjectPath, validateRequiredUnrealAssets } from './authoring-executor.js';
+import { classifyAuthoringFailure, collectAuthoringToolVersions, isProhibitedAuthoringPath, LifecycleNativeImplementationProvider, requiresProductionContent, type NativeAuthoringTools, unrealObjectPath, validateRequiredUnrealAssets } from './authoring-executor.js';
 
 const implementation = {
   outcome: 'changes_made' as const, summary: 'implemented', changedFiles: ['src/a.ts'], evidenceFiles: [],
@@ -11,6 +11,18 @@ const implementation = {
 };
 
 describe('native implementation provider lifecycle', () => {
+  it('records selected Unreal tool versions from native process provenance', () => {
+    expect(collectAuthoringToolVersions([{ leaseId: 'l', sessionId: 's', checkId: 'c', command: 'editor', shell: 'system', exitCode: 0,
+      stdout: '', stderr: '', startedAt: '2026-01-01T00:00:00Z', completedAt: '2026-01-01T00:01:00Z',
+      authoring: { tool: 'unreal-editor', phase: 'verify', projectRelativePath: 'Game.uproject',
+        executablePath: 'C:/Epic/UE_5.8/Engine/Binaries/Win64/UnrealEditor.exe', args: [], sourceRelativePaths: [] } }]))
+      .toEqual([{ tool: 'unreal-editor', version: '5.8', driverVersion: 'C:/Epic/UE_5.8/Engine/Binaries/Win64/UnrealEditor.exe' }]);
+  });
+  it('classifies native timeout, cancellation, and missing-capability failures explicitly', () => {
+    expect(classifyAuthoringFailure('provider timeout', false, [])).toBe('timed-out');
+    expect(classifyAuthoringFailure('stopped', true, [])).toBe('cancelled');
+    expect(classifyAuthoringFailure('executable not found', false, [])).toBe('missing-capability');
+  });
   it('requires editor-authored packages to be loaded after saving and retains source and exact tool provenance', () => {
     const base = { leaseId: 'lease', sessionId: 'session', shell: 'system' as const, exitCode: 0, stdout: '', stderr: '',
       startedAt: '2026-09-05T00:00:00.000Z', completedAt: '2026-09-05T00:01:00.000Z' };

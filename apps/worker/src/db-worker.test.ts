@@ -2912,6 +2912,7 @@ github:
       externalValidationChecks: [{
         kind: 'command', command: 'cmake --build --preset windows-release', shell: 'powershell', target: 'windows',
         requiredCapabilities: ['windows', 'cmake', 'msvc'], timeoutMinutes: 45, category: 'build', criterion: 'Windows build passes.',
+        realEngineEvidence: { classification: 'benchmark', buildId: 'build-42', scenario: 'City flythrough', settings: { scalability: 'Epic' } },
         windowsAdapter: { kind: 'fixture-validation', executablePath: 'C:\\tools\\fixture.exe', inputRelativePath: 'fixtures/input.json', artifactRelativePath: 'artifacts/result.json', minimumFreeSpaceBytes: 1024, maxConcurrentProcesses: 1 }
       }],
       summary: 'Merged successfully.',
@@ -2934,6 +2935,7 @@ github:
         check: expect.objectContaining({ command: 'cmake --build --preset windows-release', shell: 'powershell', requiredCapabilities: ['windows', 'cmake', 'msvc'] }),
         dispatch: { kind: 'fixture-validation', executablePath: 'C:\\tools\\fixture.exe', inputRelativePath: 'fixtures/input.json', artifactRelativePath: 'artifacts/result.json', minimumFreeSpaceBytes: 1024, maxConcurrentProcesses: 1 },
         resourcePolicy: expect.objectContaining({ timeoutSeconds: 2700 }),
+        realEngineEvidence: { classification: 'benchmark', buildId: 'build-42', scenario: 'City flythrough', settings: { scalability: 'Epic' } },
         evidenceContext: { cycleId: 'cycle_1', stepId: 'step_1', requirementIds: ['REQ-WIN'], contractVersion: 3 }
       })
     }));
@@ -3159,5 +3161,15 @@ github:
     }));
     expect(repositoryMock.appendProjectImplementationSteps).not.toHaveBeenCalled();
     expect(startNextRoadmapStepMock).not.toHaveBeenCalled();
+  });
+});
+
+describe('real-engine authoring packet classification', () => {
+  it('derives distinct benchmark and soak intent for native authoring orchestration', async () => {
+    const { classifyAuthoringEvidence } = await import('./db-worker.js');
+    expect(classifyAuthoringEvidence('Run the city benchmark', ['Record frame timings'], 'build-1', ['unreal'], true))
+      .toMatchObject({ classification: 'benchmark', buildId: 'build-1', scenario: 'Record frame timings' });
+    expect(classifyAuthoringEvidence('Execute an endurance soak', ['Survive four hours'], 'build-2', ['unreal'], true))
+      .toMatchObject({ classification: 'soak', buildId: 'build-2', scenario: 'Survive four hours' });
   });
 });

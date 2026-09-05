@@ -174,7 +174,7 @@ function validationChecksJsonSchema(): Record<string, unknown> {
     items: {
       type: 'object',
       additionalProperties: false,
-      required: ['kind', 'command', 'shell', 'target', 'requiredCapabilities', 'continueOnFailure', 'category', 'criterion', 'rationale', 'timeoutMinutes', 'windowsAdapter'],
+      required: ['kind', 'command', 'shell', 'target', 'requiredCapabilities', 'continueOnFailure', 'category', 'criterion', 'rationale', 'timeoutMinutes', 'windowsAdapter', 'realEngineEvidence'],
       properties: {
         kind: { type: 'string', enum: ['command'] },
         command: { type: 'string' },
@@ -196,7 +196,14 @@ function validationChecksJsonSchema(): Record<string, unknown> {
               required: ['kind', 'profileId', 'tool', 'executablePath', 'workingDirectoryRelativePath', 'args', 'size', 'minimumLargeJobFreeSpaceBytes'],
               properties: { kind: { type: 'string', const: 'unreal-validation' }, profileId: { type: 'string' }, tool: { type: 'string', enum: ['unreal-editor-cmd', 'build-bat', 'automation-tool', 'project-script'] }, executablePath: { type: 'string' }, workingDirectoryRelativePath: { type: 'string' }, args: { type: 'array', items: { type: 'string' } }, size: { type: 'string', enum: ['standard', 'large'] }, minimumLargeJobFreeSpaceBytes: { type: 'integer', minimum: 0 } } }
           ]
-        }
+        },
+        realEngineEvidence: { anyOf: [{ type: 'null' }, { type: 'object', additionalProperties: false,
+          required: ['classification', 'buildId', 'scenario', 'settings', 'shippingExecutable'], properties: {
+            classification: { type: 'string', enum: ['automated-scenario', 'benchmark', 'soak', 'build-validation', 'capture', 'shipping'] },
+            buildId: { type: 'string' }, scenario: { type: 'string' }, settings: { type: 'object', additionalProperties: false, properties: {}, required: [] },
+            shippingExecutable: { anyOf: [{ type: 'null' }, { type: 'object', additionalProperties: false, required: ['relativePath', 'sha256', 'platform', 'configuration', 'current'],
+              properties: { relativePath: { type: 'string' }, sha256: { type: 'string' }, platform: { type: 'string', const: 'Win64' }, configuration: { type: 'string', const: 'Shipping' }, current: { type: 'boolean' } } }] }
+          } }] }
       }
     }
   };
@@ -712,6 +719,7 @@ export class CodexProvider implements AIProvider {
           'Use any repository, shell, network, installation, build, test, or formatting command needed to implement the task correctly. ForgeMind still runs the returned authoritative validation checks afterward. ' +
           'Set outcome to changes_made when repository changes are required, already_satisfied when the repository already meets the task, or blocked only for a concrete external blocker that prevents further progress. ' +
           'After editing, propose authoritative validationChecks. An empty array explicitly means no executable validation is applicable. For every command select shell, target (local or windows), requiredCapabilities, continueOnFailure, and timeoutMinutes. Use target windows only when the check genuinely requires Windows or Windows-only tooling. For Windows checks provide windowsAdapter only for a complete fixture or Unreal profile; otherwise use null for manual-local deferral. ForgeMind executes local commands exactly as returned; Windows checks execute only through the typed adapter. ' +
+          'For a Windows check that produces real-engine scenario, benchmark, soak, build-validation, capture, or Shipping evidence, include realEngineEvidence with its distinct classification, buildId, scenario, and settings; Shipping must also identify the current Win64 Shipping executable and hash. ' +
           'Return JSON with outcome, summary, changedFiles, evidenceFiles, diffStat, validationChecks, architectureUpdate, and optional fileUpdates [{ path, content }]. architectureUpdate must contain only architectural facts introduced or changed by this attempt, including databaseSchemas; use empty arrays when nothing changed. Reply with JSON only.'
       },
       {
@@ -1858,6 +1866,7 @@ export function buildCodexImplementationPrompt(input: ImplementInput, continueSe
     'Use any repository, shell, network, installation, build, or test command needed to implement the task correctly. ForgeMind still runs the returned authoritative validation checks afterward.',
     'Set outcome to changes_made when repository changes are required, already_satisfied when the repository already meets the task, or blocked only for a concrete external blocker that prevents further progress.',
     'After editing, return authoritative validationChecks. An empty array explicitly means no executable validation is applicable. For every command select shell (system, powershell, cmd, bash, or sh), target (local or windows), requiredCapabilities, continueOnFailure, and a realistic timeoutMinutes from 1 to 600. Use target windows only when the check genuinely requires Windows or Windows-only tooling. For each Windows check set windowsAdapter to a complete fixture-validation or unreal-validation profile only when applicable; otherwise set it to null for manual-local deferral. ForgeMind executes local commands exactly as returned; Windows checks execute only through the typed adapter. Do not use environment-only smoke checks such as node --version unless the task explicitly requires them.',
+    'For Windows real-engine scenario, benchmark, soak, build-validation, capture, or Shipping results, attach realEngineEvidence to the validation check with its exact classification, buildId, scenario, and settings. Shipping also requires the current Win64 Shipping executable path and SHA-256.',
     'Return architectureUpdate as a compact delta containing only modules, databaseSchemas, interfaces, dependencies, decisions, conventions, or debt introduced or changed by this attempt. Use empty arrays when architecture did not change.',
     'Validation checks must be executable commands that prove a criterion through their exit code. Omit criteria that cannot be verified automatically.',
     input.attemptNumber && input.attemptNumber > 1

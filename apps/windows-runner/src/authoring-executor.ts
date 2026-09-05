@@ -129,6 +129,7 @@ export async function executeWindowsAuthoring(packet: WindowsAuthoringPacket, co
   await persistCheckpoint(checkpointPath, packet, workspacePath, 'started', context.signal, outputDirectory);
   const startedAt = new Date();
   let status: WindowsAuthoringResult['status'] = 'succeeded';
+  let authoringFailureState: import('@forgemind/core').RealEngineEvidenceState | undefined;
   let summary = 'Native implementation completed.';
   let completedOperationIds: string[] = [];
   let checkpointIds: string[] = [];
@@ -140,6 +141,7 @@ export async function executeWindowsAuthoring(packet: WindowsAuthoringPacket, co
   } catch (error) {
     status = context.signal?.aborted ? 'cancelled' : 'failed';
     summary = redactSecrets(error instanceof Error ? error.message : String(error));
+    authoringFailureState = classifyAuthoringFailure(summary, context.signal?.aborted === true, processes);
   }
   await rm(resolve(workspacePath, '.forgemind-tmp'), { recursive: true, force: true });
   const changedPaths = await stageChangedPaths(workspacePath, context.signal);
@@ -154,6 +156,21 @@ export async function executeWindowsAuthoring(packet: WindowsAuthoringPacket, co
   const outputs = await collectManagedOutputs(outputDirectory, packet.resourcePolicy.maxArtifactBytes);
   const resultBundle = { version: 1 as const, format: 'git-binary-patch' as const,
     sha256: createHash('sha256').update(patchBytes).digest('hex'), sizeBytes: patchBytes.length, lfsObjects, outputs };
+  const completedAt = new Date();
+  const artifacts = outputs.map((output) => ({ name: `managed-output:${output.path}`, relativePath: output.path, sizeBytes: output.sizeBytes, sha256: output.sha256 }));
+  const evidenceArtifacts = [...artifacts, ...tree.filter((entry) => changedPaths.includes(entry.path)).map((entry) => ({
+    name: `result-tree:${entry.path}`, relativePath: entry.path, sizeBytes: entry.sizeBytes, sha256: entry.sha256
+  }))];
+  const incomplete = packet.artifactExpectations.some((expectation) => expectation.required
+    && !artifacts.some((artifact) => artifact.relativePath === expectation.relativePath || artifact.name === expectation.name)
+    && !tree.some((entry) => entry.path === expectation.relativePath || entry.path.startsWith(`${expectation.relativePath.replace(/[\\/]$/, '')}/`)));
+  const classified = packet.realEngineEvidence ? {
+    ...packet.realEngineEvidence, projectId: packet.projectId, taskId: packet.taskId, runId: packet.runId,
+    inputHash: packet.inputHash, resultTreeSha: treeSha, toolVersions: collectAuthoringToolVersions(processes), startedAt: startedAt.toISOString(), completedAt: completedAt.toISOString(),
+    durationMs: completedAt.getTime() - startedAt.getTime(), state: (incomplete ? 'incomplete-output'
+      : authoringFailureState ?? (status === 'cancelled' ? 'cancelled' : status === 'succeeded' ? 'succeeded' : 'failed')) as import('@forgemind/core').RealEngineEvidenceState,
+    artifacts: evidenceArtifacts
+  } : undefined;
   await writeFile(resolve(evidenceDirectory, 'result-checkpoint.json'), JSON.stringify({ version: 1, taskId: packet.taskId,
     jobId: packet.jobId, inputHash: packet.inputHash, baseCommitSha: packet.baseCommitSha, resultTreeSha: treeSha,
     resultBundle, tree, patchBase64: patchBytes.toString('base64'), status }), 'utf8');
@@ -162,13 +179,36 @@ export async function executeWindowsAuthoring(packet: WindowsAuthoringPacket, co
     runId: packet.runId, jobId: packet.jobId, leaseId: packet.leaseId, deviceId: context.deviceId, sessionId: context.sessionId,
     nonce: packet.nonce, inputHash: packet.inputHash, baseCommitSha: packet.baseCommitSha, resultTreeSha: treeSha, resultBundle,
     tree, patch: patchResult.stdout, completedOperationIds, checkpointIds,
-    artifacts: outputs.map((output) => ({ name: `managed-output:${output.path}`, relativePath: output.path, sizeBytes: output.sizeBytes, sha256: output.sha256 })),
+    artifacts, ...(classified ? { realEngineEvidence: classified } : {}),
     processes, status, contentAssessment: { technicalVerification: packet.contentPolicy.requiresUnrealAssets ? 'passed' : 'not-required',
       productionReviewRequired, rationale: productionReviewRequired
         ? 'Technical loadability and provenance are verified; usable production quality requires downstream visual or domain review.'
         : 'No separate production-quality review was requested by the acceptance criteria.' },
-    startedAt: startedAt.toISOString(), completedAt: new Date().toISOString(), summary
+    startedAt: startedAt.toISOString(), completedAt: completedAt.toISOString(), summary
   } };
+}
+
+export function collectAuthoringToolVersions(processes: WindowsAuthoringProcessResult[]): import('@forgemind/core').ExecutionToolVersionEvidence[] {
+  const versions = new Map<string, import('@forgemind/core').ExecutionToolVersionEvidence>();
+  for (const process of processes) {
+    if (!process.authoring) continue;
+    const pathVersion = process.authoring.executablePath.match(/(?:UE[_-]?|Unreal(?:Engine)?[_ -]?)(\d+(?:\.\d+){1,2})/i)?.[1]
+      ?? process.stdout.match(/Unreal Engine\s*(\d+(?:\.\d+){1,2})/i)?.[1]
+      ?? process.stderr.match(/Unreal Engine\s*(\d+(?:\.\d+){1,2})/i)?.[1]
+      ?? `selected-executable:${process.authoring.executablePath}`;
+    versions.set(`${process.authoring.tool}:${process.authoring.executablePath}`, {
+      tool: process.authoring.tool, version: pathVersion, driverVersion: process.authoring.executablePath
+    });
+  }
+  return [...versions.values()];
+}
+
+export function classifyAuthoringFailure(summary: string, cancelled: boolean,
+  processes: WindowsAuthoringProcessResult[]): import('@forgemind/core').RealEngineEvidenceState {
+  return cancelled ? 'cancelled'
+    : processes.some((process) => process.terminationReason === 'timed-out') || /timed?\s*out|timeout/i.test(summary) ? 'timed-out'
+    : processes.some((process) => process.terminationReason === 'missing-capability') || /missing capability|not found|enoent/i.test(summary) ? 'missing-capability'
+    : 'failed';
 }
 
 function managedChild(root: string, name: string): string {
@@ -460,11 +500,14 @@ async function collectManagedOutputs(root: string, maxBytes: number): Promise<Ar
 
 async function spawnComplete(executable: string, args: string[], cwd: string, timeoutMs: number, signal?: AbortSignal) {
   const child = spawn(executable, args, { cwd, shell: false, windowsHide: true }); let stdout = ''; let stderr = ''; let timedOut = false;
+  let missingCapability = false;
   child.stdout?.on('data', (v) => { stdout += String(v); }); child.stderr?.on('data', (v) => { stderr += String(v); });
   const kill = () => { if (child.pid) spawn('taskkill.exe', ['/PID', String(child.pid), '/T', '/F'], { windowsHide: true }); };
   const timer = setTimeout(() => { timedOut = true; kill(); }, timeoutMs); signal?.addEventListener('abort', kill, { once: true });
-  const exitCode = await new Promise<number | undefined>((done) => { child.once('error', (e) => { stderr += e.message; done(undefined); }); child.once('close', (code) => done(code ?? undefined)); });
-  clearTimeout(timer); signal?.removeEventListener('abort', kill); return { exitCode: timedOut ? undefined : exitCode, stdout, stderr };
+  const exitCode = await new Promise<number | undefined>((done) => { child.once('error', (e: NodeJS.ErrnoException) => { stderr += e.message; missingCapability = e.code === 'ENOENT'; done(undefined); }); child.once('close', (code) => done(code ?? undefined)); });
+  clearTimeout(timer); signal?.removeEventListener('abort', kill); return { exitCode: timedOut ? undefined : exitCode, stdout, stderr,
+    ...(timedOut ? { terminationReason: 'timed-out' as const } : signal?.aborted ? { terminationReason: 'cancelled' as const }
+      : missingCapability ? { terminationReason: 'missing-capability' as const } : {}) };
 }
 
 async function spawnWithInput(executable: string, args: string[], cwd: string, input: string, signal?: AbortSignal) {

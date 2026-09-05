@@ -2,11 +2,44 @@ import { describe, expect, it } from 'vitest';
 import {
   WINDOWS_WORKER_SCHEMA_VERSION, canTransitionExecutionJob, canTransitionWorkerDevice, classifyWindowsExecutionPacket,
   canTransitionWorkerSession, isWindowsAuthoringPacket, isWindowsAuthoringResult, isWindowsExecutionPacket, isWindowsExecutionResult,
+  reconcileRealEngineEvidence,
   type WindowsAuthoringPacket, type WindowsExecutionPacket, type WindowsExecutionResult
 } from './windows-worker.js';
 
 const hash = 'a'.repeat(64);
 const commitSha = 'b'.repeat(40);
+
+describe('real-engine evidence classification', () => {
+  const identity = { projectId: 'p', taskId: 't', runId: 'r', inputHash: hash, resultTreeSha: commitSha };
+  const intent = { classification: 'benchmark' as const, buildId: 'build-42', scenario: 'City/Flythrough', settings: { scalability: 'Epic' } };
+  const evidence = { ...intent, ...identity, toolVersions: [{ tool: 'UnrealEditor-Cmd', version: '5.8' }],
+    startedAt: '2026-01-01T00:00:00Z', completedAt: '2026-01-01T00:10:00Z', durationMs: 600000,
+    state: 'succeeded' as const, exitCode: 0, artifacts: [{ name: 'report', relativePath: 'reports/benchmark.json', sizeBytes: 4, sha256: hash }] };
+
+  it('keeps benchmark, soak, build, capture, scenario, and Shipping purposes non-interchangeable', () => {
+    expect(reconcileRealEngineEvidence(intent, evidence, identity)).toBe(true);
+    for (const classification of ['automated-scenario', 'soak', 'build-validation', 'capture', 'shipping'] as const) {
+      expect(reconcileRealEngineEvidence({ ...intent, classification } as any, evidence, identity)).toBe(false);
+    }
+  });
+
+  it('retains explicit non-success evidence and accepts legacy unclassified evidence', () => {
+    for (const state of ['failed', 'timed-out', 'cancelled', 'missing-capability', 'incomplete-output'] as const) {
+      expect(reconcileRealEngineEvidence(intent, { ...evidence, state }, identity)).toBe(true);
+    }
+    expect(reconcileRealEngineEvidence(undefined, undefined, identity)).toBe(true);
+    expect(reconcileRealEngineEvidence(intent, undefined, identity)).toBe(false);
+  });
+
+  it('accepts Shipping only for the current matching Win64 Shipping executable artifact', () => {
+    const executable = { relativePath: 'Binaries/Win64/Game.exe', sha256: hash, platform: 'Win64' as const, configuration: 'Shipping' as const, current: true };
+    const shippingIntent = { ...intent, classification: 'shipping' as const, shippingExecutable: executable };
+    const shipping = { ...evidence, ...shippingIntent, artifacts: [{ name: 'shipping-exe', relativePath: executable.relativePath, sizeBytes: 4, sha256: hash }] };
+    expect(reconcileRealEngineEvidence(shippingIntent, shipping, identity)).toBe(true);
+    expect(reconcileRealEngineEvidence(shippingIntent, { ...shipping, shippingExecutable: { ...executable, current: false } }, identity)).toBe(false);
+    expect(reconcileRealEngineEvidence(shippingIntent, { ...shipping, artifacts: [] }, identity)).toBe(false);
+  });
+});
 const packet: WindowsExecutionPacket = {
   schemaVersion: 2, projectId: 'p', taskId: 't', runId: 'r', checkId: 'c', jobId: 'j', leaseId: 'l',
   repository: 'owner/repo', sourceUrl: 'https://github.com/owner/repo.git', commitSha,
