@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto';
 import { describe, expect, it, vi } from 'vitest';
 import { WindowsWorkerRepository } from './windows-worker-repository.js';
 
@@ -31,7 +32,7 @@ describe('WindowsWorkerRepository capability leases', () => {
       step: { prompt: 'Update map', acceptanceCriteria: ['Map is updated'] },
       operations: [{ id: 'op-1', kind: 'modify', path: 'Content/map.bin', rationale: 'Update map' }], requiredCapabilities: ['windows-authoring'],
       managedRoots: ['Content'], checkpoints: [{ id: 'cp-1', label: 'Saved', afterOperationIds: ['op-1'], artifactExpectationNames: ['map'] }],
-      artifactExpectations: [{ name: 'map', relativePath: 'Content/map.bin', required: true, delivery: 'artifact-store', binary: true, maxBytes: 1024 }],
+      artifactExpectations: [{ name: 'map', relativePath: 'Content/map.bin', required: true, delivery: 'artifact-store', binary: true, maxBytes: 1024 }], contentPolicy: { requiresUnrealAssets: true, prohibitedDatasetExtensions: ['.gpkg'], maxUnclassifiedFileBytes: 1024 },
       resourcePolicy: { timeoutSeconds: 60, maxLogBytes: 1024, maxArtifactBytes: 1024 }, nonce: 'pending', inputHash: packetDigest,
       authority: { database: 'none', productionHosts: 'none', globalGitHubCredentials: 'none' } } as const;
     const create = vi.fn(async () => undefined); const prisma: any = { windowsExecutionJob: { create } };
@@ -244,7 +245,7 @@ describe('WindowsWorkerRepository capability leases', () => {
       repository: 'owner/repo', sourceUrl: 'https://example.test/repo.git', baseCommitSha: 'b'.repeat(40), workspaceRoot: 'runner-managed', artifactRoot: 'runner-managed',
       step: { prompt: 'Update map', acceptanceCriteria: ['Map is updated'] },
       operations: [{ id: 'op-1', kind: 'modify', path: 'Content/map.bin', rationale: 'Update' }], requiredCapabilities: ['windows-authoring'], managedRoots: ['Content'],
-      checkpoints: [{ id: 'cp-1', label: 'Saved', afterOperationIds: ['op-1'], artifactExpectationNames: [] }], artifactExpectations: [],
+      checkpoints: [{ id: 'cp-1', label: 'Saved', afterOperationIds: ['op-1'], artifactExpectationNames: [] }], artifactExpectations: [], contentPolicy: { requiresUnrealAssets: true, prohibitedDatasetExtensions: ['.gpkg'], maxUnclassifiedFileBytes: 1024 },
       resourcePolicy: { timeoutSeconds: 60, maxLogBytes: 100, maxArtifactBytes: 100 }, nonce: 'nonce_1', inputHash: packetDigest,
       authority: { database: 'none', productionHosts: 'none', globalGitHubCredentials: 'none' } } as const;
     const updateMany = vi.fn(async () => ({ count: 1 }));
@@ -254,12 +255,15 @@ describe('WindowsWorkerRepository capability leases', () => {
     const result = { kind: 'authoring-result', protocolVersion: 1, projectId: 'project_1', taskId: 'task_1', runId: 'run_1', jobId: 'job_1', leaseId: 'lease_1',
       deviceId: 'device_1', sessionId: 'session_1', nonce: 'nonce_1', inputHash: packetDigest, baseCommitSha: packet.baseCommitSha,
       resultTreeSha: 'c'.repeat(40), tree: [{ path: 'Content/map.bin', kind: 'file', sha256: 'd'.repeat(64), sizeBytes: 8, binary: true, mode: '100644' }], patch: 'diff --git',
+      resultBundle: { version: 1, format: 'git-binary-patch', sha256: createHash('sha256').update('diff --git').digest('hex'), sizeBytes: 10, lfsObjects: [], outputs: [] },
       completedOperationIds: ['op-1'], checkpointIds: ['cp-1'], artifacts: [], processes: [], status: 'succeeded', startedAt: '2026-09-01T00:00:00Z', completedAt: '2026-09-01T00:01:00Z', summary: 'done' } as const;
     const repository = new WindowsWorkerRepository(prisma);
     expect(await repository.submitResult('device_1', result as any)).toEqual({ accepted: true, packet });
     expect(updateMany).toHaveBeenCalledWith(expect.objectContaining({ data: { status: 'succeeded', packet: { ...packet, authoringResult: result } } }));
     expect(await repository.submitResult('device_1', { ...result, protocolVersion: 2 } as any)).toEqual({ accepted: false });
     expect(await repository.submitResult('device_1', { ...result, baseCommitSha: 'e'.repeat(40) } as any)).toEqual({ accepted: false });
+    expect(await repository.submitResult('device_1', { ...result, resultBundle: { ...result.resultBundle,
+      outputs: [{ path: 'reports/result.bin', sha256: '0'.repeat(64), sizeBytes: 1, contentBase64: 'YQ==' }] } } as any)).toEqual({ accepted: false });
   });
 
   it('accepts the exact deferred check result without restarting the completed task', async () => {

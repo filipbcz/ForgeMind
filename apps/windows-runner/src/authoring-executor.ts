@@ -1,7 +1,7 @@
 import { createHash, randomUUID } from 'node:crypto';
 import { spawn } from 'node:child_process';
-import { lstat, mkdir, readFile, readdir, realpath, rm } from 'node:fs/promises';
-import { relative, resolve } from 'node:path';
+import { lstat, mkdir, readFile, readdir, realpath, rename, rm, writeFile } from 'node:fs/promises';
+import { basename, dirname, relative, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import type { AuthoringTreeEntry, WindowsAuthoringPacket, WindowsAuthoringProcessResult, WindowsAuthoringResult } from '@forgemind/core';
 import { redactSecrets } from '@forgemind/core';
@@ -10,6 +10,7 @@ import { buildSandboxedProcessInvocation } from './native-sandbox.js';
 
 export interface NativeAuthoringTools {
   root: string;
+  managedRoots: { inputs: string; sourceAssets: string; cache: string; outputs: string; diagnostics: string };
   read(path: string): Promise<Buffer>;
   write(path: string, content: Buffer | string): Promise<void>;
   remove(path: string): Promise<void>;
@@ -97,20 +98,35 @@ function inferWindowsShell(command: string): 'powershell' | 'cmd' | 'system' {
 }
 
 export async function executeWindowsAuthoring(packet: WindowsAuthoringPacket, context: {
-  deviceId: string; sessionId: string; workspaceRoot: string; artifactRoot: string; signal?: AbortSignal; provider: NativeImplementationProvider;
+  deviceId: string; sessionId: string; workspaceRoot: string; artifactRoot: string;
+  managedRoots?: NativeAuthoringTools['managedRoots']; signal?: AbortSignal; provider: NativeImplementationProvider;
 }): Promise<{ result: WindowsAuthoringResult; workspacePath: string }> {
   if (process.platform !== 'win32') throw new Error('Windows authoring can run only on Windows.');
-  const workspacePath = await prepareCheckout(packet, context.workspaceRoot, context.signal);
-  if (packet.step.priorPatch?.trim()) {
+  const evidenceDirectory = managedChild(context.artifactRoot, packet.taskId);
+  await mkdir(evidenceDirectory, { recursive: true });
+  const suppliedRoots = context.managedRoots ?? { inputs: resolve(context.artifactRoot, 'inputs'), sourceAssets: resolve(context.artifactRoot, 'source-assets'),
+    cache: resolve(context.artifactRoot, 'cache'), outputs: resolve(context.artifactRoot, 'outputs'), diagnostics: context.artifactRoot };
+  await Promise.all(Object.values(suppliedRoots).map((path) => mkdir(path, { recursive: true })));
+  const cacheDirectory = managedChild(suppliedRoots.cache, packet.taskId); const outputDirectory = managedChild(suppliedRoots.outputs, packet.taskId);
+  const cacheIdentityPath = resolve(cacheDirectory, 'forgemind-cache-identity.json');
+  try {
+    const identity = JSON.parse(await readFile(cacheIdentityPath, 'utf8')) as { inputHash?: string; baseCommitSha?: string };
+    if (identity.inputHash !== packet.inputHash || identity.baseCommitSha?.toLowerCase() !== packet.baseCommitSha.toLowerCase()) await rm(cacheDirectory, { recursive: true, force: true });
+  } catch { await rm(cacheDirectory, { recursive: true, force: true }); }
+  await Promise.all([mkdir(cacheDirectory, { recursive: true }), mkdir(outputDirectory, { recursive: true })]);
+  await writeFile(cacheIdentityPath, JSON.stringify({ version: 1, inputHash: packet.inputHash, baseCommitSha: packet.baseCommitSha }), 'utf8');
+  const checkpointPath = resolve(evidenceDirectory, 'authoring-checkpoint.json');
+  const checkout = await prepareCheckout(packet, context.workspaceRoot, checkpointPath, outputDirectory, context.signal);
+  const workspacePath = checkout.path;
+  if (!checkout.resumed && packet.step.priorPatch?.trim()) {
     const prior = await spawnWithInput('git.exe', ['apply', '--binary', '--whitespace=nowarn', '-'], workspacePath, packet.step.priorPatch, context.signal);
     if (prior.exitCode !== 0) throw new Error(`Could not materialize the previous Windows attempt: ${prior.stderr}`);
   }
   const processes: WindowsAuthoringProcessResult[] = [];
-  const evidenceDirectory = managedChild(context.artifactRoot, packet.jobId);
-  await rm(evidenceDirectory, { recursive: true, force: true });
-  await mkdir(evidenceDirectory, { recursive: true });
   const tools = createTools(workspacePath, resolve(evidenceDirectory, 'native-processes.jsonl'), packet.resourcePolicy.timeoutSeconds * 1_000,
-    context.signal, processes, packet.leaseId, context.sessionId);
+    context.signal, processes, packet.leaseId, context.sessionId, { ...suppliedRoots, cache: cacheDirectory, outputs: outputDirectory,
+      diagnostics: evidenceDirectory }, async () => persistCheckpoint(checkpointPath, packet, workspacePath, 'in-progress', context.signal, outputDirectory));
+  await persistCheckpoint(checkpointPath, packet, workspacePath, 'started', context.signal, outputDirectory);
   const startedAt = new Date();
   let status: WindowsAuthoringResult['status'] = 'succeeded';
   let summary = 'Native implementation completed.';
@@ -126,15 +142,27 @@ export async function executeWindowsAuthoring(packet: WindowsAuthoringPacket, co
     summary = redactSecrets(error instanceof Error ? error.message : String(error));
   }
   await rm(resolve(workspacePath, '.forgemind-tmp'), { recursive: true, force: true });
+  await rejectProhibitedResultPaths(packet, workspacePath, context.signal);
+  await enforceRequiredUnrealAssets(packet, workspacePath, context.signal);
   const tree = await collectTree(workspacePath);
   const treeSha = await gitTree(workspacePath, context.signal);
   const patchResult = await spawnComplete('git.exe', ['diff', '--binary', '--no-ext-diff', '--cached', 'HEAD'], workspacePath, 30_000, context.signal);
   if (patchResult.exitCode !== 0) throw new Error(`Could not package result tree: ${patchResult.stderr}`);
+  const patchBytes = Buffer.from(patchResult.stdout, 'utf8');
+  const lfsObjects = await collectLfsObjects(workspacePath, context.signal);
+  const outputs = await collectManagedOutputs(outputDirectory, packet.resourcePolicy.maxArtifactBytes);
+  const resultBundle = { version: 1 as const, format: 'git-binary-patch' as const,
+    sha256: createHash('sha256').update(patchBytes).digest('hex'), sizeBytes: patchBytes.length, lfsObjects, outputs };
+  await writeFile(resolve(evidenceDirectory, 'result-checkpoint.json'), JSON.stringify({ version: 1, taskId: packet.taskId,
+    jobId: packet.jobId, inputHash: packet.inputHash, baseCommitSha: packet.baseCommitSha, resultTreeSha: treeSha,
+    resultBundle, tree, patchBase64: patchBytes.toString('base64'), status }), 'utf8');
   return { workspacePath, result: {
     kind: 'authoring-result', protocolVersion: packet.protocolVersion, projectId: packet.projectId, taskId: packet.taskId,
     runId: packet.runId, jobId: packet.jobId, leaseId: packet.leaseId, deviceId: context.deviceId, sessionId: context.sessionId,
-    nonce: packet.nonce, inputHash: packet.inputHash, baseCommitSha: packet.baseCommitSha, resultTreeSha: treeSha,
-    tree, patch: patchResult.stdout, completedOperationIds, checkpointIds, artifacts: [], processes, status,
+    nonce: packet.nonce, inputHash: packet.inputHash, baseCommitSha: packet.baseCommitSha, resultTreeSha: treeSha, resultBundle,
+    tree, patch: patchResult.stdout, completedOperationIds, checkpointIds,
+    artifacts: outputs.map((output) => ({ name: `managed-output:${output.path}`, relativePath: output.path, sizeBytes: output.sizeBytes, sha256: output.sha256 })),
+    processes, status,
     startedAt: startedAt.toISOString(), completedAt: new Date().toISOString(), summary
   } };
 }
@@ -145,12 +173,14 @@ function managedChild(root: string, name: string): string {
   return target;
 }
 
-function createTools(root: string, evidencePath: string, timeoutMs: number, signal: AbortSignal | undefined, results: WindowsAuthoringProcessResult[], leaseId: string, sessionId: string): NativeAuthoringTools {
+function createTools(root: string, evidencePath: string, timeoutMs: number, signal: AbortSignal | undefined, results: WindowsAuthoringProcessResult[], leaseId: string, sessionId: string,
+  managedRoots: NativeAuthoringTools['managedRoots'], checkpoint: () => Promise<void>): NativeAuthoringTools {
   let evidenceOffset = 0;
   const sandboxExecutable = process.env.FORGEMIND_CODEX_CLI_PATH?.trim() || 'codex';
   const contained = (path: string) => { const target = resolve(root, path); const rel = relative(root, target); if (rel.startsWith('..') || rel === '..') throw new Error('Tool path escapes the leased checkout.'); return target; };
   return {
     root,
+    managedRoots,
     nativeToolChannel: { command: process.execPath, args: [fileURLToPath(new URL('./native-tool-server.js', import.meta.url)), root, evidencePath,
       sandboxExecutable] },
     async drainNativeProcesses() {
@@ -163,29 +193,171 @@ function createTools(root: string, evidencePath: string, timeoutMs: number, sign
       }
     },
     read: (path) => readFile(contained(path)),
-    async write(path, content) { const target = contained(path); await mkdir(resolve(target, '..'), { recursive: true }); const { writeFile } = await import('node:fs/promises'); await writeFile(target, content); },
-    remove: (path) => rm(contained(path), { recursive: true, force: true }),
-    async record(result) { results.push({ ...result, leaseId, sessionId, stdout: redactSecrets(result.stdout), stderr: redactSecrets(result.stderr) }); },
+    async write(path, content) { const target = contained(path); await mkdir(resolve(target, '..'), { recursive: true }); await writeFile(target, content); await checkpoint(); },
+    async remove(path) { await rm(contained(path), { recursive: true, force: true }); await checkpoint(); },
+    async record(result) { results.push({ ...result, leaseId, sessionId, stdout: redactSecrets(result.stdout), stderr: redactSecrets(result.stderr) }); await checkpoint(); },
     async run(input) {
       const startedAt = new Date();
       const sandboxed = buildSandboxedProcessInvocation({ sandboxExecutable, checkoutRoot: root, command: input.command, shell: input.shell });
       const output = await spawnComplete(sandboxed.executable, sandboxed.args, root, timeoutMs, signal);
       const result = { leaseId, sessionId, checkId: input.checkId ?? randomUUID(), command: input.command, shell: input.shell, ...output,
         stdout: redactSecrets(output.stdout), stderr: redactSecrets(output.stderr), startedAt: startedAt.toISOString(), completedAt: new Date().toISOString() };
-      results.push(result); return result;
+      results.push(result); await checkpoint(); return result;
     }
   };
 }
 
-async function prepareCheckout(packet: WindowsAuthoringPacket, root: string, signal?: AbortSignal): Promise<string> {
-  await mkdir(root, { recursive: true }); const path = resolve(root, packet.jobId); await rm(path, { recursive: true, force: true });
+async function prepareCheckout(packet: WindowsAuthoringPacket, root: string, checkpointPath: string, outputRoot: string, signal?: AbortSignal): Promise<{ path: string; resumed: boolean }> {
+  await mkdir(root, { recursive: true }); const path = resolve(root, packet.taskId);
+  let checkpoint: AuthoringDiskCheckpoint | undefined;
+  let generations: string[] = [];
+  try { generations = (await readdir(dirname(checkpointPath))).filter((name) => name.startsWith(`${basename(checkpointPath)}.generation-`) && name.endsWith('.json')).sort().reverse().map((name) => resolve(dirname(checkpointPath), name)); } catch { /* no generations */ }
+  for (const candidate of [...generations, checkpointPath, `${checkpointPath}.previous`]) {
+    try { checkpoint = JSON.parse(await readFile(candidate, 'utf8')) as AuthoringDiskCheckpoint; if (checkpoint.version === 2) break; } catch { /* try last complete generation */ }
+  }
+  const checkpointMatches = checkpoint?.version === 2 && checkpoint.inputHash === packet.inputHash
+    && checkpoint.baseCommitSha.toLowerCase() === packet.baseCommitSha.toLowerCase();
+  try {
+    const actual = await spawnComplete('git.exe', ['rev-parse', 'HEAD'], path, 30_000, signal);
+    if (checkpointMatches
+      && actual.exitCode === 0 && actual.stdout.trim().toLowerCase() === packet.baseCommitSha.toLowerCase()) {
+      const status = await spawnComplete('git.exe', ['status', '--porcelain=v1'], path, 30_000, signal);
+      if (status.exitCode === 0 && status.stdout.trim().length > 0) return { path: await realpath(path), resumed: true };
+    }
+  } catch { /* missing or invalid retained checkout */ }
+  try { await rename(path, resolve(root, `${packet.taskId}.preserved-${Date.now()}`)); } catch (error) {
+    try { await lstat(path); } catch { /* checkout did not exist */ return cloneCheckout(packet, root, path, outputRoot, signal, checkpointMatches ? checkpoint : undefined); }
+    throw error;
+  }
+  return cloneCheckout(packet, root, path, outputRoot, signal, checkpointMatches ? checkpoint : undefined);
+}
+
+async function cloneCheckout(packet: WindowsAuthoringPacket, root: string, path: string, outputRoot: string, signal?: AbortSignal, checkpoint?: AuthoringDiskCheckpoint): Promise<{ path: string; resumed: boolean }> {
   const clone = await spawnComplete('git.exe', ['clone', '--no-checkout', packet.sourceUrl, path], root, packet.resourcePolicy.timeoutSeconds * 1000, signal);
   if (clone.exitCode !== 0) throw new Error(`Checkout clone failed: ${clone.stderr}`);
   const checkout = await spawnComplete('git.exe', ['checkout', '--detach', packet.baseCommitSha], path, packet.resourcePolicy.timeoutSeconds * 1000, signal);
   if (checkout.exitCode !== 0) throw new Error(`Checkout materialization failed: ${checkout.stderr}`);
   const actual = await spawnComplete('git.exe', ['rev-parse', 'HEAD'], path, 30_000, signal);
   if (actual.stdout.trim().toLowerCase() !== packet.baseCommitSha.toLowerCase()) throw new Error('Materialized checkout does not match the authoring base commit.');
-  return await realpath(path);
+  const canonical = await realpath(path);
+  if (checkpoint) {
+    await materializeLfsObjects(canonical, checkpoint.resultBundle.lfsObjects);
+    await materializeOutputs(outputRoot, checkpoint.resultBundle.outputs);
+    const restored = await spawnWithInput('git.exe', ['apply', '--binary', '--index', '--whitespace=nowarn', '-'], canonical, checkpoint.patch, signal);
+    if (restored.exitCode !== 0) throw new Error(`Could not restore durable Windows checkpoint: ${restored.stderr}`);
+    if (checkpoint.resultBundle.lfsObjects.length > 0) {
+      const checkoutLfs = await spawnComplete('git.exe', ['lfs', 'checkout'], canonical, 30_000, signal);
+      if (checkoutLfs.exitCode !== 0) throw new Error(`Could not restore Git LFS working files: ${checkoutLfs.stderr}`);
+    }
+    const restoredTree = await gitTree(canonical, signal);
+    if (restoredTree.toLowerCase() !== checkpoint.resultTreeSha.toLowerCase()) throw new Error('Restored Windows checkpoint tree does not match its recorded tree.');
+    return { path: canonical, resumed: true };
+  }
+  return { path: canonical, resumed: false };
+}
+
+async function materializeOutputs(root: string, outputs: AuthoringDiskCheckpoint['resultBundle']['outputs']): Promise<void> {
+  await rm(root, { recursive: true, force: true }); await mkdir(root, { recursive: true });
+  for (const output of outputs) {
+    const content = Buffer.from(output.contentBase64, 'base64');
+    if (content.length !== output.sizeBytes || createHash('sha256').update(content).digest('hex') !== output.sha256) throw new Error(`Durable checkpoint output is corrupt: ${output.path}`);
+    const target = resolve(root, output.path); const rel = relative(root, target);
+    if (!rel || rel === '..' || rel.startsWith(`..${process.platform === 'win32' ? '\\' : '/'}`)) throw new Error('Durable checkpoint output escapes its root.');
+    await mkdir(resolve(target, '..'), { recursive: true }); await writeFile(target, content);
+  }
+}
+
+interface AuthoringDiskCheckpoint {
+  version: 2; status: string; taskId: string; inputHash: string; baseCommitSha: string; resultTreeSha: string;
+  tree: AuthoringTreeEntry[]; patch: string;
+  resultBundle: { version: 1; format: 'git-binary-patch'; sha256: string; sizeBytes: number;
+    lfsObjects: Array<{ oid: string; sha256: string; sizeBytes: number; contentBase64: string }>;
+    outputs: Array<{ path: string; sha256: string; sizeBytes: number; contentBase64: string }> };
+  updatedAt: string;
+}
+
+async function persistCheckpoint(path: string, packet: WindowsAuthoringPacket, workspacePath: string, status: string, signal?: AbortSignal, outputRoot?: string): Promise<void> {
+  const resultTreeSha = await gitTree(workspacePath, signal);
+  const patchResult = await spawnComplete('git.exe', ['diff', '--binary', '--no-ext-diff', '--cached', 'HEAD'], workspacePath, 30_000, signal);
+  if (patchResult.exitCode !== 0) throw new Error(`Could not persist Windows checkpoint: ${patchResult.stderr}`);
+  const patchBytes = Buffer.from(patchResult.stdout, 'utf8'); const lfsObjects = await collectLfsObjects(workspacePath, signal);
+  const outputs = outputRoot ? await collectManagedOutputs(outputRoot, packet.resourcePolicy.maxArtifactBytes) : [];
+  const tree = await collectTree(workspacePath);
+  const checkpoint: AuthoringDiskCheckpoint = { version: 2, status, taskId: packet.taskId, inputHash: packet.inputHash,
+    baseCommitSha: packet.baseCommitSha, resultTreeSha, tree, patch: patchResult.stdout,
+    resultBundle: { version: 1, format: 'git-binary-patch', sha256: createHash('sha256').update(patchBytes).digest('hex'),
+      sizeBytes: patchBytes.length, lfsObjects, outputs }, updatedAt: new Date().toISOString() };
+  await writeCheckpointAtomically(path, JSON.stringify(checkpoint));
+}
+
+async function writeCheckpointAtomically(path: string, content: string): Promise<void> {
+  const generation = `${path}.generation-${Date.now().toString().padStart(16, '0')}-${randomUUID()}.json`; const temporary = `${generation}.tmp`;
+  await writeFile(temporary, content, 'utf8');
+  await rename(temporary, generation);
+}
+
+async function materializeLfsObjects(root: string, objects: AuthoringDiskCheckpoint['resultBundle']['lfsObjects']): Promise<void> {
+  for (const object of objects) {
+    const content = Buffer.from(object.contentBase64, 'base64');
+    if (content.length !== object.sizeBytes || createHash('sha256').update(content).digest('hex') !== object.oid) throw new Error(`Durable checkpoint LFS object is corrupt: ${object.oid}`);
+    const target = resolve(root, '.git', 'lfs', 'objects', object.oid.slice(0, 2), object.oid.slice(2, 4), object.oid);
+    await mkdir(resolve(target, '..'), { recursive: true }); await writeFile(target, content);
+  }
+}
+
+async function rejectProhibitedResultPaths(packet: WindowsAuthoringPacket, root: string, signal?: AbortSignal): Promise<void> {
+  const status = await spawnComplete('git.exe', ['status', '--porcelain=v1', '-z'], root, 30_000, signal);
+  const paths = status.stdout.split('\0').filter(Boolean).map((line) => line.slice(3).replaceAll('\\', '/'));
+  let prohibited: string | undefined;
+  for (const path of paths) {
+    let sizeBytes = 0; try { const info = await lstat(resolve(root, path)); if (info.isFile()) sizeBytes = info.size; } catch { /* deleted path */ }
+    if (isProhibitedAuthoringPath(path, sizeBytes, packet.contentPolicy)) { prohibited = path; break; }
+  }
+  if (prohibited) throw new Error(`Generated cache or raw geospatial data cannot enter an authoring result: ${prohibited}`);
+}
+
+export function isProhibitedAuthoringPath(path: string, sizeBytes: number, policy: WindowsAuthoringPacket['contentPolicy']): boolean {
+  const normalized = path.replaceAll('\\', '/'); const segments = normalized.toLowerCase().split('/');
+  const prohibitedExtensions = policy.prohibitedDatasetExtensions.map((extension) => extension.toLowerCase());
+  if (segments.some((segment) => ['deriveddatacache', 'intermediate', 'saved'].includes(segment)
+    || prohibitedExtensions.some((extension) => segment.endsWith(extension)))) return true;
+  const deliverableAsset = /\.(?:uasset|umap)$/i.test(normalized);
+  return sizeBytes > policy.maxUnclassifiedFileBytes && !deliverableAsset;
+}
+
+async function enforceRequiredUnrealAssets(packet: WindowsAuthoringPacket, root: string, signal?: AbortSignal): Promise<void> {
+  if (!packet.contentPolicy.requiresUnrealAssets) return;
+  const changed = await spawnComplete('git.exe', ['status', '--porcelain=v1', '-z'], root, 30_000, signal);
+  if (!changed.stdout.split('\0').some((line) => /\.(?:uasset|umap)$/i.test(line.slice(3)))) throw new Error('Required Unreal authoring did not produce a .uasset or .umap payload.');
+}
+
+async function collectLfsObjects(root: string, signal?: AbortSignal): Promise<Array<{ oid: string; sha256: string; sizeBytes: number; contentBase64: string }>> {
+  const objects: Array<{ oid: string; sha256: string; sizeBytes: number; contentBase64: string }> = [];
+  for (const entry of await collectTree(root)) {
+    const indexed = await spawnComplete('git.exe', ['show', `:${entry.path}`], root, 30_000, signal);
+    const pointer = indexed.stdout.match(/^version https:\/\/git-lfs\.github\.com\/spec\/v1\r?\noid sha256:([a-f0-9]{64})\r?\nsize (\d+)\r?\n?$/);
+    if (!pointer) continue;
+    const oid = pointer[1]!; const object = await readFile(resolve(root, '.git', 'lfs', 'objects', oid.slice(0, 2), oid.slice(2, 4), oid));
+    if (createHash('sha256').update(object).digest('hex') !== oid || object.length !== Number(pointer[2])) throw new Error(`Git LFS object does not match pointer: ${entry.path}`);
+    objects.push({ oid, sha256: oid, sizeBytes: object.length, contentBase64: object.toString('base64') });
+  }
+  return objects;
+}
+
+async function collectManagedOutputs(root: string, maxBytes: number): Promise<Array<{ path: string; sha256: string; sizeBytes: number; contentBase64: string }>> {
+  const outputs: Array<{ path: string; sha256: string; sizeBytes: number; contentBase64: string }> = []; let total = 0;
+  async function visit(directory: string): Promise<void> {
+    for (const name of await readdir(directory)) {
+      const path = resolve(directory, name); const info = await lstat(path);
+      if (info.isDirectory()) await visit(path); else if (info.isFile()) {
+        const content = await readFile(path); total += content.length;
+        if (total > maxBytes) throw new Error('Managed authoring outputs exceed the configured artifact limit.');
+        outputs.push({ path: relative(root, path).replaceAll('\\', '/'), sha256: createHash('sha256').update(content).digest('hex'),
+          sizeBytes: content.length, contentBase64: content.toString('base64') });
+      }
+    }
+  }
+  await visit(root); return outputs.sort((a, b) => a.path.localeCompare(b.path));
 }
 
 async function spawnComplete(executable: string, args: string[], cwd: string, timeoutMs: number, signal?: AbortSignal) {

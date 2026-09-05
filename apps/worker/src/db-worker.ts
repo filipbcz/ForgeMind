@@ -1,7 +1,9 @@
 import { parseAgentConfigYaml, type AgentConfig } from '@forgemind/config';
 import { createHash, randomUUID } from 'node:crypto';
 import { spawn } from 'node:child_process';
-import { activeProjectContractRequirements, createBlockedRunState, createFailedRunState, WINDOWS_EVIDENCE_MAX_ARTIFACT_BYTES, WINDOWS_EVIDENCE_MAX_LOG_BYTES, type WindowsAuthoringPacket } from '@forgemind/core';
+import { mkdir, readFile, writeFile } from 'node:fs/promises';
+import { resolve } from 'node:path';
+import { activeProjectContractRequirements, createBlockedRunState, createFailedRunState, WINDOWS_EVIDENCE_MAX_ARTIFACT_BYTES, WINDOWS_EVIDENCE_MAX_LOG_BYTES, type WindowsAuthoringPacket, type WindowsAuthoringResult } from '@forgemind/core';
 import { advanceRoadmapAfterTaskCompletion, createRepository, getPrismaClient, startNextRoadmapStep, WindowsWorkerRepository, type AIProviderConnectionSecret, type ForgeMindRepository } from '@forgemind/db';
 import { GitHubAppAdapter, createGitHubAdapterFromEnv } from '@forgemind/github';
 import { buildProjectExtensionProposalPrompt, createProvider, formatProjectExtensionProposal, normalizeProviderError, type AIProvider, type CapabilityAuditInput, type ImplementResult, type ProviderSessionContext, type ProviderUsageMeasurement, type ReleaseAuditInput, type ValidationCheck } from '@forgemind/providers';
@@ -134,7 +136,7 @@ async function enqueueExternalWindowsValidations(
 async function implementThroughWindowsLease(windowsWorkers: WindowsWorkerRepository, input: {
   project: import('@forgemind/core').Project; taskId: string; taskRunId: string; workspacePath: string;
   prompt: string; acceptanceCriteria: string[]; previousValidationError?: string; previousReviewBlockers?: string[];
-  baseCommitSha: string; requiredCapabilities: string[]; signal?: AbortSignal;
+  baseCommitSha: string; requiredCapabilities: string[]; requiresUnrealAssets: boolean; signal?: AbortSignal;
 }): Promise<ImplementResult> {
   if (!input.project.githubOwner || !input.project.githubRepo) throw new Error('Windows authoring requires a GitHub repository.');
   const jobId = randomUUID();
@@ -146,20 +148,89 @@ async function implementThroughWindowsLease(windowsWorkers: WindowsWorkerReposit
     workspaceRoot: 'runner-managed', artifactRoot: 'runner-managed', step: { prompt: input.prompt, acceptanceCriteria: input.acceptanceCriteria,
       previousValidationError: input.previousValidationError, previousReviewBlockers: input.previousReviewBlockers, priorPatch },
     operations: [{ id: 'implementation', kind: 'tool', tool: 'ai-implementation', arguments: { acceptanceCriteria: input.acceptanceCriteria }, rationale: 'Implement the current task step in the exact native checkout.' }],
-    requiredCapabilities: input.requiredCapabilities, managedRoots: ['.'], checkpoints: [], artifactExpectations: [],
+    requiredCapabilities: input.requiredCapabilities, managedRoots: ['.'], checkpoints: [], artifactExpectations: input.requiresUnrealAssets
+      ? [{ name: 'authored-unreal-assets', relativePath: 'Content', required: true, delivery: 'artifact-store', binary: true,
+        maxBytes: WINDOWS_EVIDENCE_MAX_ARTIFACT_BYTES }]
+      : [],
+    contentPolicy: { requiresUnrealAssets: input.requiresUnrealAssets,
+      prohibitedDatasetExtensions: ['.tif', '.tiff', '.geotiff', '.shp', '.dbf', '.shx', '.prj', '.gpkg', '.geojson', '.kml', '.kmz', '.gdb', '.fgb', '.las', '.laz', '.copc', '.dem', '.dt0', '.dt1', '.dt2', '.asc', '.img', '.jp2', '.ecw', '.mrf', '.mbtiles', '.pmtiles', '.osm', '.pbf', '.grib', '.nc', '.hdf'],
+      maxUnclassifiedFileBytes: 50 * 1024 * 1024 },
     resourcePolicy: { timeoutSeconds: 36_000, maxLogBytes: WINDOWS_EVIDENCE_MAX_LOG_BYTES, maxArtifactBytes: WINDOWS_EVIDENCE_MAX_ARTIFACT_BYTES },
     nonce: 'pending', inputHash: createHash('sha256').update(JSON.stringify({ taskId: input.taskId, runId: input.taskRunId, baseCommitSha: input.baseCommitSha,
       prompt: input.prompt, acceptanceCriteria: input.acceptanceCriteria, previousValidationError: input.previousValidationError,
-      previousReviewBlockers: input.previousReviewBlockers, priorPatch })).digest('hex'),
+      previousReviewBlockers: input.previousReviewBlockers, priorPatch, requiresUnrealAssets: input.requiresUnrealAssets })).digest('hex'),
     authority: { database: 'none', productionHosts: 'none', globalGitHubCredentials: 'none' }
   };
   await windowsWorkers.enqueueAuthoring({ id: jobId, projectId: input.project.id, taskId: input.taskId, runId: input.taskRunId, requiredCapabilities: input.requiredCapabilities, packet });
   const result = await windowsWorkers.waitForAuthoringResult(jobId, input.signal);
   if (result.status !== 'succeeded') throw new Error(`Windows authoring ${result.status}: ${result.summary}`);
+  const patchBytes = Buffer.from(result.patch, 'utf8');
+  const patchHash = createHash('sha256').update(patchBytes).digest('hex');
+  if (result.resultBundle.version !== 1 || result.resultBundle.format !== 'git-binary-patch'
+    || result.resultBundle.sizeBytes !== patchBytes.length || result.resultBundle.sha256.toLowerCase() !== patchHash) {
+    throw new Error('Windows result reconciliation failed: result bundle hash or size does not match its binary patch.');
+  }
+  for (const object of result.resultBundle.lfsObjects) {
+    const content = Buffer.from(object.contentBase64, 'base64');
+    if (content.length !== object.sizeBytes || createHash('sha256').update(content).digest('hex') !== object.oid.toLowerCase()) {
+      throw new Error(`Windows result reconciliation failed: Git LFS object ${object.oid} is corrupt.`);
+    }
+    const objectPath = resolve(input.workspacePath, '.git', 'lfs', 'objects', object.oid.slice(0, 2), object.oid.slice(2, 4), object.oid);
+    await mkdir(resolve(objectPath, '..'), { recursive: true }); await writeFile(objectPath, content);
+  }
+  for (const output of result.resultBundle.outputs) {
+    const content = Buffer.from(output.contentBase64, 'base64');
+    if (content.length !== output.sizeBytes || createHash('sha256').update(content).digest('hex') !== output.sha256.toLowerCase()) {
+      throw new Error(`Windows result reconciliation failed: managed output ${output.path} is corrupt.`);
+    }
+  }
   await replaceGitPatch(input.workspacePath, priorPatch, result.patch, input.signal);
-  return { outcome: result.patch.trim() ? 'changes_made' : 'already_satisfied', summary: result.summary,
-    changedFiles: result.tree.map(({ path }) => path), evidenceFiles: [], diffStat: { filesChanged: result.tree.length, insertions: 0, deletions: 0 },
+  await verifyWindowsResultTree(input.workspacePath, result, input.signal);
+  const outputEvidence = await materializeWindowsOutputs(input.workspacePath, result.resultBundle.outputs);
+  return { outcome: result.patch.trim() ? 'changes_made' : 'already_satisfied',
+    summary: outputEvidence.length > 0 ? `${result.summary}\n\nManaged output evidence: ${outputEvidence.join(', ')}` : result.summary,
+    changedFiles: result.tree.map(({ path }) => path), evidenceFiles: outputEvidence, diffStat: { filesChanged: result.tree.length, insertions: 0, deletions: 0 },
     validationChecks: [], architectureUpdate: undefined };
+}
+
+async function materializeWindowsOutputs(workspacePath: string, outputs: WindowsAuthoringResult['resultBundle']['outputs']): Promise<string[]> {
+  if (outputs.length === 0) return [];
+  const root = resolve(workspacePath, '.forgemind-outputs'); await mkdir(root, { recursive: true });
+  const excludePath = resolve(workspacePath, '.git', 'info', 'exclude');
+  let exclude = ''; try { exclude = await readFile(excludePath, 'utf8'); } catch { /* new checkout */ }
+  if (!exclude.split(/\r?\n/).includes('.forgemind-outputs/')) await writeFile(excludePath, `${exclude}${exclude.endsWith('\n') || !exclude ? '' : '\n'}.forgemind-outputs/\n`, 'utf8');
+  const evidence: string[] = [];
+  for (const output of outputs) {
+    const target = resolve(root, output.path); const content = Buffer.from(output.contentBase64, 'base64');
+    await mkdir(resolve(target, '..'), { recursive: true }); await writeFile(target, content); evidence.push(`.forgemind-outputs/${output.path}`);
+  }
+  return evidence;
+}
+
+async function verifyWindowsResultTree(workspacePath: string, result: WindowsAuthoringResult, signal?: AbortSignal): Promise<void> {
+  const tree = await new Promise<string>((resolve, reject) => {
+    const child = spawn('git', ['write-tree'], { cwd: workspacePath, stdio: ['ignore', 'pipe', 'pipe'] });
+    let stdout = ''; let stderr = ''; child.stdout.on('data', (chunk) => { stdout += String(chunk); }); child.stderr.on('data', (chunk) => { stderr += String(chunk); });
+    const abort = () => child.kill('SIGTERM'); signal?.addEventListener('abort', abort, { once: true }); child.once('error', reject);
+    child.once('close', (code) => { signal?.removeEventListener('abort', abort); code === 0 ? resolve(stdout.trim()) : reject(new Error(`Windows tree verification failed: ${stderr}`)); });
+  });
+  if (tree.toLowerCase() !== result.resultTreeSha.toLowerCase()) throw new Error('Windows result reconciliation failed: reconstructed Git tree does not match the runner result tree.');
+  const files = await runGitCapture(workspacePath, ['ls-files', '-z'], signal);
+  const supplied = new Set(result.resultBundle.lfsObjects.map(({ oid }) => oid.toLowerCase()));
+  for (const path of files.split('\0').filter(Boolean)) {
+    const indexed = await runGitCapture(workspacePath, ['show', `:${path}`], signal);
+    const pointer = indexed.match(/^version https:\/\/git-lfs\.github\.com\/spec\/v1\r?\noid sha256:([a-f0-9]{64})\r?\nsize \d+\r?\n?$/);
+    if (pointer && !supplied.has(pointer[1]!.toLowerCase())) throw new Error(`Windows result reconciliation failed: missing Git LFS object ${pointer[1]} for ${path}.`);
+  }
+}
+
+async function runGitCapture(workspacePath: string, args: string[], signal?: AbortSignal): Promise<string> {
+  return new Promise<string>((resolveOutput, reject) => {
+    const child = spawn('git', args, { cwd: workspacePath, stdio: ['ignore', 'pipe', 'pipe'] }); let stdout = ''; let stderr = '';
+    child.stdout.on('data', (chunk) => { stdout += String(chunk); }); child.stderr.on('data', (chunk) => { stderr += String(chunk); });
+    const abort = () => child.kill('SIGTERM'); signal?.addEventListener('abort', abort, { once: true }); child.once('error', reject);
+    child.once('close', (code) => { signal?.removeEventListener('abort', abort); code === 0 ? resolveOutput(stdout) : reject(new Error(`Git reconciliation failed: ${stderr}`)); });
+  });
 }
 
 export async function replaceGitPatch(workspacePath: string, previousPatch: string, patch: string, signal?: AbortSignal): Promise<void> {
@@ -473,7 +544,8 @@ export async function runDatabaseWorkerOnce(options: { deferInterruptSignals?: b
             workspacePath: `${workspaceRoot}/${claimed.task.id}`, prompt: implementationInput.prompt,
             acceptanceCriteria: implementationInput.plan.acceptanceCriteria, baseCommitSha: implementationInput.baseCommitSha,
             previousValidationError: implementationInput.previousValidationError, previousReviewBlockers: implementationInput.previousReviewBlockers,
-            requiredCapabilities: projectConfig.workflow.windows_authoring_capabilities, signal: implementationInput.signal
+            requiredCapabilities: projectConfig.workflow.windows_authoring_capabilities,
+            requiresUnrealAssets: projectConfig.workflow.windows_authoring_requires_unreal_assets, signal: implementationInput.signal
           })
         : undefined,
       resourcePolicy,
