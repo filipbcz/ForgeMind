@@ -5,6 +5,7 @@ import { readFileSync, readdirSync } from 'node:fs';
 import path from 'node:path';
 import { createHash } from 'node:crypto';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
+import { canonicalizeWorkerProbeEvidence } from '@forgemind/core';
 import { ForgeMindRepository, WindowsRunnerCredentialAdapter, WindowsWorkerRepository } from '@forgemind/db';
 import { registerWindowsRunnerRoutes } from './windows-runner-routes.js';
 
@@ -55,9 +56,12 @@ describe('Windows runner real transport and persistence flow', () => {
       outputJson: { evidenceVersion: 1, deferred: true, command: 'fixture.exe --validate', commitSha } } });
 
     const workers = new WindowsWorkerRepository(prisma);
-    await workers.registerDevice({ id: ids.device, runnerVersion: 'fake-1', displayName: 'Fake runner', capabilities: [{ key: 'windows' }], probeEvidence: [{
-      schemaVersion: 1, capability: { key: 'windows' }, status: 'supported', provenance: 'local-probe', probedAt: new Date().toISOString(), probeVersion: 'fixture-1', summary: 'supported', evidenceHash: 'c'.repeat(64)
-    }] });
+    const probe = { capability: { key: 'windows' }, status: 'supported' as const, provenance: 'local-probe' as const,
+      probedAt: new Date().toISOString(), probeVersion: 'fixture-1', summary: 'supported' };
+    const probeEvidence = { schemaVersion: 1 as const, ...probe,
+      evidenceHash: createHash('sha256').update(canonicalizeWorkerProbeEvidence(probe)).digest('hex') };
+    await workers.registerDevice({ id: ids.device, runnerVersion: 'fake-1', displayName: 'Fake runner',
+      capabilities: [{ key: 'windows' }], probeEvidence: [probeEvidence] });
     await workers.enqueue({ id: ids.job, projectId: ids.project, taskId: ids.task, runId: ids.run, requiredCapabilities: ['windows'], packet: {
       schemaVersion: 2, projectId: ids.project, taskId: ids.task, runId: ids.run, checkId, jobId: ids.job, leaseId: 'pending', repository: 'owner/repo',
       sourceUrl: 'https://example.test/owner/repo.git', commitSha, workspaceRoot: 'C:\\fixture', artifactRoot: 'C:\\fixture\\artifacts',

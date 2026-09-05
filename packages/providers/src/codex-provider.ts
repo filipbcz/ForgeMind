@@ -1159,7 +1159,7 @@ export class CodexProvider implements AIProvider {
 
     const args = buildCodexExecArgs({
       sandbox: input.sandbox,
-      bypassSandbox: input.sandbox === 'read-only' && process.env.FORGEMIND_CODEX_BYPASS_READ_ONLY_SANDBOX === 'true',
+      bypassSandbox: resolveCodexSandboxBypass(input.sandbox, Boolean(input.nativeToolChannel), process.env),
       model: this.model,
       schemaPath,
       outputPath,
@@ -1387,6 +1387,17 @@ export function buildCodexExecArgs(input: {
   }
   args.push('-');
   return args;
+}
+
+export function resolveCodexSandboxBypass(
+  sandbox: 'read-only' | 'workspace-write',
+  nativeToolChannel: boolean,
+  env: NodeJS.ProcessEnv = process.env
+): boolean {
+  if (nativeToolChannel) return false;
+  return sandbox === 'read-only'
+    ? env.FORGEMIND_CODEX_BYPASS_READ_ONLY_SANDBOX === 'true'
+    : env.FORGEMIND_CODEX_BYPASS_WORKSPACE_SANDBOX === 'true';
 }
 
 export interface CodexProcessOptions {

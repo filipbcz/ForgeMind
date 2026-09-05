@@ -1,8 +1,10 @@
 import { PrismaClient } from '@prisma/client';
+import { createHash } from 'node:crypto';
 import { readFileSync, readdirSync } from 'node:fs';
 import { createRequire } from 'node:module';
 import path from 'node:path';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
+import { canonicalizeWorkerProbeEvidence } from '@forgemind/core';
 import { WindowsWorkerRepository } from './windows-worker-repository.js';
 
 const databaseUrl = process.env.MIGRATION_DATABASE_URL ?? process.env.DATABASE_URL
@@ -59,13 +61,17 @@ describeDatabase('WindowsWorkerRepository PostgreSQL concurrency', () => {
       ON CONFLICT ("id") DO NOTHING`;
     await first.$executeRaw`INSERT INTO "task_runs" ("id", "task_id", "provider", "model", "status")
       VALUES (${ids.run}, ${ids.task}, 'codex', 'test', 'queued') ON CONFLICT ("id") DO NOTHING`;
+    const probe = { capability: { key: 'windows' }, status: 'supported' as const, provenance: 'local-probe' as const,
+      probedAt: new Date().toISOString(), probeVersion: 'test', summary: 'test' };
+    const probeEvidence = [{ schemaVersion: 1, ...probe,
+      evidenceHash: createHash('sha256').update(canonicalizeWorkerProbeEvidence(probe)).digest('hex') }];
     await first.$executeRaw`INSERT INTO "worker_devices" ("id", "platform", "runner_version", "display_name", "status", "capabilities", "probe_evidence")
-      VALUES (${ids.device}, 'windows', 'test', 'Test', 'idle', '[{"key":"windows"}]',
-        '[{"schemaVersion":1,"capability":{"key":"windows"},"status":"supported","probedAt":"2026-08-31T00:00:00.000Z","probeVersion":"test","summary":"test","evidenceHash":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}]')
+      VALUES (${ids.device}, 'windows', 'test', 'Test', 'idle', ${JSON.stringify([{ key: 'windows' }])}::jsonb, ${JSON.stringify(probeEvidence)}::jsonb)
       ON CONFLICT ("id") DO UPDATE SET "status" = 'idle'`;
-    await first.$executeRaw`INSERT INTO "worker_sessions" ("id", "device_id", "status", "expires_at")
-      VALUES (${ids.session}, ${ids.device}, 'active', CURRENT_TIMESTAMP + INTERVAL '10 minutes')
-      ON CONFLICT ("id") DO UPDATE SET "status" = 'active', "expires_at" = CURRENT_TIMESTAMP + INTERVAL '10 minutes'`;
+    await first.$executeRaw`INSERT INTO "worker_sessions" ("id", "device_id", "status", "expires_at", "authorized_project_ids")
+      VALUES (${ids.session}, ${ids.device}, 'active', CURRENT_TIMESTAMP + INTERVAL '10 minutes', ${JSON.stringify([ids.project])}::jsonb)
+      ON CONFLICT ("id") DO UPDATE SET "status" = 'active', "expires_at" = CURRENT_TIMESTAMP + INTERVAL '10 minutes',
+        "authorized_project_ids" = ${JSON.stringify([ids.project])}::jsonb`;
     await first.$executeRaw`INSERT INTO "windows_execution_jobs" ("id", "project_id", "task_id", "run_id", "status", "required_capabilities", "packet")
       VALUES (${ids.job}, ${ids.project}, ${ids.task}, ${ids.run}, 'queued', '["windows"]', '{}')
       ON CONFLICT ("id") DO UPDATE SET "status" = 'queued'`;

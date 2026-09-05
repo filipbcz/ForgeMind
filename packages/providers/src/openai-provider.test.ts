@@ -3,7 +3,7 @@ import { mkdirSync, mkdtempSync, rmSync, utimesSync, writeFileSync } from 'node:
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { listOpenAIModels, OpenAIProvider } from './openai-provider.js';
-import { CodexProvider, buildCodexExecArgs, normalizeCodexModels, resolveCodexBinary } from './codex-provider.js';
+import { CodexProvider, buildCodexExecArgs, normalizeCodexModels, resolveCodexBinary, resolveCodexSandboxBypass } from './codex-provider.js';
 import { ProviderContractError, normalizeProviderError } from './provider.js';
 
 function successfulResponse(body: unknown): Response {
@@ -366,6 +366,27 @@ describe('Codex provider', () => {
       outputPath: 'last-message.json'
     });
 
+    expect(args).toContain('--dangerously-bypass-approvals-and-sandbox');
+    expect(args).not.toContain('--sandbox');
+  });
+
+  it('bypasses workspace sandbox only when the isolated worker explicitly enables it', () => {
+    expect(resolveCodexSandboxBypass('workspace-write', false, {
+      FORGEMIND_CODEX_BYPASS_WORKSPACE_SANDBOX: 'true'
+    })).toBe(true);
+    expect(resolveCodexSandboxBypass('workspace-write', false, {})).toBe(false);
+    expect(resolveCodexSandboxBypass('workspace-write', true, {
+      FORGEMIND_CODEX_BYPASS_WORKSPACE_SANDBOX: 'true'
+    })).toBe(false);
+
+    const args = buildCodexExecArgs({
+      sandbox: 'workspace-write',
+      bypassSandbox: true,
+      model: 'gpt-5.5',
+      schemaPath: 'schema.json',
+      outputPath: 'last-message.json',
+      repositoryPath: '/data/workspaces/task-1'
+    });
     expect(args).toContain('--dangerously-bypass-approvals-and-sandbox');
     expect(args).not.toContain('--sandbox');
   });
