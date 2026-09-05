@@ -1,9 +1,9 @@
 import { createHash, randomUUID } from 'node:crypto';
 import type { Prisma, PrismaClient } from '@prisma/client';
-import { deferLegacyWindowsExecutionPacket, isWindowsExecutionPacket, WINDOWS_DEVICE_OFFLINE_AFTER_MS } from '@forgemind/core';
+import { deferLegacyWindowsExecutionPacket, isWindowsAuthoringPacket, isWindowsAuthoringResult, isWindowsExecutionPacket, isWindowsExecutionResult, WINDOWS_DEVICE_OFFLINE_AFTER_MS } from '@forgemind/core';
 import type {
   WorkerCapability, WorkerProbeEvidence, WindowsExecutionJob, WindowsExecutionLease,
-  WindowsExecutionPacket, WindowsExecutionResult
+  WindowsAuthoringPacket, WindowsExecutionPacket, WindowsExecutionResult, WindowsJobPacket, WindowsJobResult
 } from '@forgemind/core';
 import type { WindowsEvidenceUpload, WindowsWorkerOperationsReadModel } from '@forgemind/core';
 
@@ -27,6 +27,10 @@ export interface EnqueueWindowsExecutionInput {
   packet: WindowsExecutionPacket;
 }
 
+export interface EnqueueWindowsAuthoringInput extends Omit<EnqueueWindowsExecutionInput, 'packet'> {
+  packet: WindowsAuthoringPacket;
+}
+
 export interface ClaimedWindowsExecution {
   job: WindowsExecutionJob;
   lease: WindowsExecutionLease;
@@ -41,7 +45,7 @@ export interface WindowsRunnerControlState {
 
 export interface SubmittedWindowsResult {
   accepted: boolean;
-  packet?: WindowsExecutionPacket;
+  packet?: WindowsJobPacket;
 }
 
 const asJson = (value: unknown): Prisma.InputJsonValue => value as Prisma.InputJsonValue;
@@ -112,6 +116,16 @@ export class WindowsWorkerRepository {
     return id;
   }
 
+  async enqueueAuthoring(input: EnqueueWindowsAuthoringInput): Promise<string> {
+    const id = input.id ?? randomUUID();
+    if (input.packet.jobId !== id || input.packet.taskId !== input.taskId || input.packet.projectId !== input.projectId
+      || input.packet.runId !== input.runId || !sameCapabilitySet(input.packet.requiredCapabilities, input.requiredCapabilities)
+      || !isWindowsAuthoringPacket(input.packet)) throw new Error('Windows authoring enqueue identity is invalid.');
+    await this.prisma.windowsExecutionJob.create({ data: { id, projectId: input.projectId, taskId: input.taskId, runId: input.runId,
+      requiredCapabilities: asJson(input.requiredCapabilities), packet: asJson(input.packet) } });
+    return id;
+  }
+
   async uploadEvidence(deviceId: string, upload: WindowsEvidenceUpload): Promise<'accepted' | 'duplicate' | 'conflict'> {
     return this.prisma.$transaction(async (tx) => {
       const locked = await tx.$queryRaw<Array<{ id: string }>>`
@@ -167,7 +181,7 @@ export class WindowsWorkerRepository {
     });
   }
 
-  async claimCompatible(sessionId: string, leaseSeconds: number, requestId: string, deviceId?: string): Promise<ClaimedWindowsExecution | undefined> {
+  async claimCompatible(sessionId: string, leaseSeconds: number, requestId: string, deviceId?: string, authoringProtocolVersions: number[] = []): Promise<ClaimedWindowsExecution | undefined> {
     if (!Number.isInteger(leaseSeconds) || leaseSeconds <= 0) throw new Error('Lease duration must be a positive integer.');
     return this.prisma.$transaction(async (tx) => {
       // Serialize only retries from this session; request ids are not global credentials.
@@ -193,6 +207,8 @@ export class WindowsWorkerRepository {
         JOIN "task_runs" run ON run."id" = candidate."run_id" AND run."task_id" = task."id"
         JOIN "worker_devices" d ON d."id" = ${session.device_id}
         WHERE candidate."status" = 'queued'
+          AND (candidate."packet"->>'kind' IS DISTINCT FROM 'authoring'
+            OR candidate."packet"->>'protocolVersion' = ANY(${authoringProtocolVersions.map(String)}::text[]))
           AND NOT EXISTS (
             SELECT 1 FROM jsonb_array_elements_text(candidate."required_capabilities") required(key)
             WHERE NOT (d."capabilities" @> jsonb_build_array(jsonb_build_object('key', required.key)))
@@ -206,7 +222,7 @@ export class WindowsWorkerRepository {
 
       const selectedJob = await tx.windowsExecutionJob.findUniqueOrThrow({ where: { id: selected.job_id } });
       const selectedPacket = selectedJob.packet;
-      const leasedPacket = isWindowsExecutionPacket(selectedPacket)
+      const leasedPacket: WindowsJobPacket = isWindowsExecutionPacket(selectedPacket) || isWindowsAuthoringPacket(selectedPacket)
         ? selectedPacket
         : deferLegacyWindowsExecutionPacket(selectedPacket) ?? quarantineInvalidPacket(selectedJob, selectedPacket);
       const leaseId = randomUUID();
@@ -257,7 +273,8 @@ export class WindowsWorkerRepository {
     });
   }
 
-  async submitResult(deviceId: string, result: WindowsExecutionResult): Promise<SubmittedWindowsResult> {
+  async submitResult(deviceId: string, result: WindowsJobResult): Promise<SubmittedWindowsResult> {
+    if ((!isWindowsExecutionResult(result) && !isWindowsAuthoringResult(result)) || result.deviceId !== deviceId) return { accepted: false };
     return this.prisma.$transaction(async (tx) => {
       const leases = await tx.$queryRaw<Array<{ jobId: string; projectId: string; taskId: string; runId: string; packet: Prisma.JsonValue }>>`
         SELECT l."job_id" AS "jobId", j."project_id" AS "projectId", j."task_id" AS "taskId", j."run_id" AS "runId", j."packet"
@@ -266,16 +283,33 @@ export class WindowsWorkerRepository {
           AND l."session_id" = ${result.sessionId} AND l."nonce" = ${result.nonce} AND l."status" = 'active'
         FOR UPDATE OF l, j`;
       const persisted = leases[0];
-      if (!persisted || !isWindowsExecutionPacket(persisted.packet)) return { accepted: false };
-      const packet = persisted.packet;
+      if (!persisted || (!isWindowsExecutionPacket(persisted.packet) && !isWindowsAuthoringPacket(persisted.packet))) return { accepted: false };
+      const packet = persisted.packet as WindowsJobPacket;
       if (persisted.projectId !== result.projectId || persisted.taskId !== result.taskId || persisted.runId !== result.runId
         || packet.projectId !== result.projectId || packet.taskId !== result.taskId || packet.runId !== result.runId
-        || packet.checkId !== result.checkId || packet.jobId !== result.jobId || packet.leaseId !== result.leaseId
-        || packet.nonce !== result.nonce || packet.inputHash !== result.inputHash || packet.commitSha !== result.commitSha) return { accepted: false };
+        || packet.jobId !== result.jobId || packet.leaseId !== result.leaseId || packet.nonce !== result.nonce || packet.inputHash !== result.inputHash) return { accepted: false };
+      if (isWindowsAuthoringPacket(packet)) {
+        if (!isWindowsAuthoringResult(result) || result.protocolVersion !== packet.protocolVersion
+          || result.baseCommitSha !== packet.baseCommitSha
+          || result.completedOperationIds.some((id) => !packet.operations.some((operation) => operation.id === id))
+          || result.checkpointIds.some((id) => !packet.checkpoints.some((checkpoint) => checkpoint.id === id))) return { accepted: false };
+      } else {
+        if (!isWindowsExecutionResult(result) || packet.checkId !== result.checkId || packet.commitSha !== result.commitSha) return { accepted: false };
+      }
+      if (isWindowsAuthoringPacket(packet) && isWindowsAuthoringResult(result)) {
+        const status = result.status === 'succeeded' ? 'succeeded' : result.status === 'cancelled' ? 'cancelled' : 'failed';
+        const updated = await tx.windowsExecutionJob.updateMany({ where: { id: result.jobId, status: { in: ['leased', 'running'] } }, data: { status,
+          packet: asJson({ ...packet, authoringResult: result }) } });
+        if (updated.count !== 1) throw new Error('Execution job changed while its result was being reconciled.');
+        await tx.windowsExecutionLease.update({ where: { id: result.leaseId }, data: { status: result.status === 'cancelled' ? 'cancelled' : 'released', releasedAt: new Date() } });
+        await tx.workerDevice.update({ where: { id: deviceId }, data: { status: 'idle' } });
+        return { accepted: true, packet };
+      }
+      const validationResult = result as WindowsExecutionResult;
       const evidence = (packet as WindowsExecutionPacket & { evidenceUpload?: WindowsEvidenceUpload }).evidenceUpload;
-      if (!evidence || evidence.log.sha256.toLowerCase() !== result.logHash.toLowerCase()
-        || evidence.artifacts.length !== result.artifacts.length
-        || result.artifacts.some((artifact) => !evidence.artifacts.some((uploaded) => uploaded.name === artifact.name
+      if (!evidence || evidence.log.sha256.toLowerCase() !== validationResult.logHash.toLowerCase()
+        || evidence.artifacts.length !== validationResult.artifacts.length
+        || validationResult.artifacts.some((artifact) => !evidence.artifacts.some((uploaded) => uploaded.name === artifact.name
           && uploaded.relativePath === artifact.relativePath && uploaded.sizeBytes === artifact.sizeBytes
           && uploaded.sha256.toLowerCase() === artifact.sha256.toLowerCase()))) return { accepted: false };
       const status = result.status === 'succeeded' ? 'succeeded' : result.status === 'cancelled' ? 'cancelled' : 'failed';
@@ -364,7 +398,7 @@ export class WindowsWorkerRepository {
       lease: { schemaVersion: 1, id: lease.id, jobId: lease.jobId, deviceId: lease.deviceId, sessionId: lease.sessionId,
         status: lease.status, claimedAt: lease.claimedAt.toISOString(), expiresAt: lease.expiresAt.toISOString(), nonce: lease.nonce },
       job: { schemaVersion: 1, id: lease.job.id, projectId: lease.job.projectId, taskId: lease.job.taskId, runId: lease.job.runId,
-        status: lease.job.status, requiredCapabilities: lease.job.requiredCapabilities as string[], packet: lease.job.packet as unknown as WindowsExecutionPacket,
+        status: lease.job.status, requiredCapabilities: lease.job.requiredCapabilities as string[], packet: lease.job.packet as unknown as WindowsJobPacket,
         createdAt: lease.job.createdAt.toISOString(), updatedAt: lease.job.updatedAt.toISOString() }
     };
   }

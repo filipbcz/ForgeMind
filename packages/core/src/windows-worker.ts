@@ -5,6 +5,8 @@ export const WINDOWS_WORKER_SCHEMA_VERSION = 1 as const;
 export type WindowsWorkerSchemaVersion = typeof WINDOWS_WORKER_SCHEMA_VERSION;
 export const WINDOWS_EXECUTION_PACKET_VERSION = 2 as const;
 export type WindowsExecutionPacketVersion = typeof WINDOWS_EXECUTION_PACKET_VERSION;
+export const WINDOWS_AUTHORING_PROTOCOL_VERSION = 1 as const;
+export type WindowsAuthoringProtocolVersion = typeof WINDOWS_AUTHORING_PROTOCOL_VERSION;
 
 export interface WorkerCapability {
   key: string;
@@ -109,7 +111,7 @@ export interface WindowsExecutionJob {
   runId: string;
   status: ExecutionJobStatus;
   requiredCapabilities: string[];
-  packet: WindowsExecutionPacket;
+  packet: WindowsJobPacket;
   createdAt: IsoDateString;
   updatedAt: IsoDateString;
 }
@@ -170,6 +172,90 @@ export interface WindowsExecutionPacket {
   inputHash: string;
   evidenceContext?: WindowsExecutionEvidenceContext;
 }
+
+export type AuthoringOperationIntent =
+  | { id: string; kind: 'create' | 'modify' | 'delete' | 'move'; path: string; destinationPath?: string; rationale: string }
+  | { id: string; kind: 'tool'; tool: string; arguments: JsonValue; rationale: string };
+
+export interface AuthoringCheckpoint {
+  id: string;
+  label: string;
+  afterOperationIds: string[];
+  artifactExpectationNames: string[];
+}
+
+export interface AuthoringArtifactExpectation extends ExpectedExecutionArtifact {
+  delivery: 'inline' | 'artifact-store';
+  binary: boolean;
+  maxBytes: number;
+}
+
+/** An authoring packet conveys declarative intent only. Runners resolve intents
+ * through their locally trusted implementation; it never carries shell commands
+ * or service credentials. */
+export interface WindowsAuthoringPacket {
+  kind: 'authoring';
+  protocolVersion: WindowsAuthoringProtocolVersion;
+  projectId: string;
+  taskId: string;
+  runId: string;
+  jobId: string;
+  leaseId: string;
+  repository: string;
+  sourceUrl: string;
+  baseCommitSha: string;
+  workspaceRoot: string;
+  artifactRoot: string;
+  operations: AuthoringOperationIntent[];
+  requiredCapabilities: string[];
+  managedRoots: string[];
+  checkpoints: AuthoringCheckpoint[];
+  artifactExpectations: AuthoringArtifactExpectation[];
+  resourcePolicy: ExecutionResourcePolicy;
+  nonce: string;
+  inputHash: string;
+  authority: {
+    database: 'none';
+    productionHosts: 'none';
+    globalGitHubCredentials: 'none';
+  };
+}
+
+export interface AuthoringTreeEntry {
+  path: string;
+  kind: 'file' | 'symlink';
+  sha256: string;
+  sizeBytes: number;
+  binary: boolean;
+  mode: string;
+}
+
+export interface WindowsAuthoringResult {
+  kind: 'authoring-result';
+  protocolVersion: WindowsAuthoringProtocolVersion;
+  projectId: string;
+  taskId: string;
+  runId: string;
+  jobId: string;
+  leaseId: string;
+  deviceId: string;
+  sessionId: string;
+  nonce: string;
+  inputHash: string;
+  baseCommitSha: string;
+  resultTreeSha: string;
+  tree: AuthoringTreeEntry[];
+  completedOperationIds: string[];
+  checkpointIds: string[];
+  artifacts: ExecutionArtifactResult[];
+  status: 'succeeded' | 'failed' | 'cancelled';
+  startedAt: IsoDateString;
+  completedAt: IsoDateString;
+  summary: string;
+}
+
+export type WindowsJobPacket = WindowsExecutionPacket | WindowsAuthoringPacket;
+export type WindowsJobResult = WindowsExecutionResult | WindowsAuthoringResult;
 
 export interface ExecutionArtifactResult {
   name: string;
@@ -383,4 +469,56 @@ export function isWindowsExecutionResult(value: unknown): value is WindowsExecut
     && areCapabilities(value.observedCapabilities)
     && Array.isArray(value.toolVersions) && value.toolVersions.every(isToolVersion)
     && Array.isArray(value.artifacts) && value.artifacts.every(isArtifactResult);
+}
+
+const isAuthoringIntent = (value: unknown): value is AuthoringOperationIntent => {
+  if (!isRecord(value) || !isNonEmpty(value.id) || !isNonEmpty(value.rationale)) return false;
+  if (value.kind === 'tool') return isNonEmpty(value.tool) && isJsonValue(value.arguments);
+  return ['create', 'modify', 'delete', 'move'].includes(value.kind as string) && isSafeRelativePath(value.path)
+    && (value.destinationPath === undefined || isSafeRelativePath(value.destinationPath))
+    && (value.kind === 'move' ? isSafeRelativePath(value.destinationPath) : value.destinationPath === undefined);
+};
+
+export function isWindowsAuthoringPacket(value: unknown): value is WindowsAuthoringPacket {
+  if (!isRecord(value) || value.kind !== 'authoring' || value.protocolVersion !== WINDOWS_AUTHORING_PROTOCOL_VERSION) return false;
+  const identities = ['projectId', 'taskId', 'runId', 'jobId', 'leaseId', 'repository', 'sourceUrl', 'workspaceRoot', 'artifactRoot', 'nonce'];
+  if (!identities.every((key) => isNonEmpty(value[key])) || !isGitCommitSha(value.baseCommitSha) || !isSha256(value.inputHash)
+    || !areCapabilityKeys(value.requiredCapabilities) || !Array.isArray(value.managedRoots) || value.managedRoots.length === 0
+    || !value.managedRoots.every(isSafeRelativePath) || new Set(value.managedRoots).size !== value.managedRoots.length
+    || !Array.isArray(value.operations) || value.operations.length === 0 || !value.operations.every(isAuthoringIntent)) return false;
+  const operationIds = (value.operations as AuthoringOperationIntent[]).map(({ id }) => id);
+  const managedRoots = value.managedRoots as string[];
+  if (new Set(operationIds).size !== operationIds.length || !Array.isArray(value.checkpoints) || !value.checkpoints.every((checkpoint) => isRecord(checkpoint)
+    && isNonEmpty(checkpoint.id) && isNonEmpty(checkpoint.label) && areCapabilityKeys(checkpoint.afterOperationIds)
+    && checkpoint.afterOperationIds.every((id) => operationIds.includes(id)) && areCapabilityKeys(checkpoint.artifactExpectationNames))) return false;
+  if ((value.operations as AuthoringOperationIntent[]).some((operation) => operation.kind !== 'tool'
+    && ![operation.path, operation.destinationPath].filter((path): path is string => path !== undefined)
+      .every((path) => managedRoots.some((root) => path === root || path.startsWith(`${root}/`) || path.startsWith(`${root}\\`))))) return false;
+  if (!Array.isArray(value.artifactExpectations) || !value.artifactExpectations.every((artifact) => isExpectedArtifact(artifact)
+    && ['inline', 'artifact-store'].includes((artifact as unknown as Record<string, unknown>).delivery as string)
+    && typeof (artifact as unknown as Record<string, unknown>).binary === 'boolean'
+    && Number.isSafeInteger((artifact as unknown as Record<string, unknown>).maxBytes)
+    && ((artifact as unknown as Record<string, unknown>).maxBytes as number) >= 0)) return false;
+  const checkpointIds = (value.checkpoints as AuthoringCheckpoint[]).map(({ id }) => id);
+  const expectationNames = (value.artifactExpectations as AuthoringArtifactExpectation[]).map(({ name }) => name);
+  if (new Set(checkpointIds).size !== checkpointIds.length || new Set(expectationNames).size !== expectationNames.length
+    || (value.checkpoints as AuthoringCheckpoint[]).some((checkpoint) => checkpoint.artifactExpectationNames.some((name) => !expectationNames.includes(name)))) return false;
+  if (!isRecord(value.resourcePolicy) || !Number.isInteger(value.resourcePolicy.timeoutSeconds) || (value.resourcePolicy.timeoutSeconds as number) <= 0
+    || !Number.isInteger(value.resourcePolicy.maxLogBytes) || (value.resourcePolicy.maxLogBytes as number) < 0
+    || !Number.isInteger(value.resourcePolicy.maxArtifactBytes) || (value.resourcePolicy.maxArtifactBytes as number) < 0) return false;
+  return isRecord(value.authority) && value.authority.database === 'none' && value.authority.productionHosts === 'none'
+    && value.authority.globalGitHubCredentials === 'none';
+}
+
+export function isWindowsAuthoringResult(value: unknown): value is WindowsAuthoringResult {
+  if (!isRecord(value) || value.kind !== 'authoring-result' || value.protocolVersion !== WINDOWS_AUTHORING_PROTOCOL_VERSION) return false;
+  const identities = ['projectId', 'taskId', 'runId', 'jobId', 'leaseId', 'deviceId', 'sessionId', 'nonce', 'summary'];
+  return identities.every((key) => isNonEmpty(value[key])) && isSha256(value.inputHash) && isGitCommitSha(value.baseCommitSha)
+    && isGitCommitSha(value.resultTreeSha) && ['succeeded', 'failed', 'cancelled'].includes(value.status as string)
+    && isIsoDate(value.startedAt) && isIsoDate(value.completedAt) && areCapabilityKeys(value.completedOperationIds)
+    && areCapabilityKeys(value.checkpointIds) && Array.isArray(value.artifacts) && value.artifacts.every(isArtifactResult)
+    && Array.isArray(value.tree) && value.tree.every((entry) => isRecord(entry) && isSafeRelativePath(entry.path)
+      && ['file', 'symlink'].includes(entry.kind as string) && isSha256(entry.sha256) && Number.isSafeInteger(entry.sizeBytes)
+      && (entry.sizeBytes as number) >= 0 && typeof entry.binary === 'boolean' && /^[0-7]{6}$/.test(String(entry.mode)))
+    && new Set((value.tree as AuthoringTreeEntry[]).map(({ path }) => path)).size === value.tree.length;
 }
