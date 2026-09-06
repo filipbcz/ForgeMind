@@ -1,6 +1,6 @@
 # README Parity Checklist
 
-Posledni aktualizace: 2026-09-04
+Posledni aktualizace: 2026-09-06
 
 Tento dokument mapuje aktualni README pozadavky na runtime implementaci a executable test evidence.
 
@@ -8,6 +8,25 @@ Tento dokument mapuje aktualni README pozadavky na runtime implementaci a execut
 - `tested`: existuje executable test nebo validacni prikaz.
 - `production-verified`: existuje explicitni produkcni overeni.
 - `deferred`: oblast ceka na rucni nebo produkcni overeni.
+
+## Commit-bound baseline
+
+- Review date: `2026-09-06`
+- Current reviewed commit (squash): `c2f3befb976679e652fb82fa32f82932d8bbeb16`
+- Historical proposal commit (not current): `0fe5ec6aabdf6938a8896cc24fc7db01f915f49c`
+- Merge base: `0808319a973072d91b6987b9ff33646106dc7e79`
+
+The historical proposal and the current squash commit diverge from their merge base. The proposal SHA is retained only as historical planning provenance; it is not the current reviewed state. The current squash commit carries the post-proposal qualification corrections on its separate history.
+
+### Repository-backed correction ledger
+
+| Commit | Correction area | Repository evidence | Evidence classification |
+| --- | --- | --- | --- |
+| `c2f3befb976679e652fb82fa32f82932d8bbeb16` | Windows authoring checkout integrity and recovery | `apps/windows-runner/src/authoring-executor.ts`; `apps/windows-runner/src/authoring-executor.test.ts`; `apps/worker/src/workflow.test.ts` | Executable synthetic/fixture qualification: checks readable writable checkout ownership, corrupt resumed artifacts, and checkpoint-safe workflow recovery. Not physical-device or production evidence. |
+| `c2f3befb976679e652fb82fa32f82932d8bbeb16` | Windows repository qualification boundary | `packages/db/src/windows-worker-repository.ts`; `packages/db/src/windows-worker-repository.flying-qualification.test.ts` | Executable in-memory fixture qualification of repository and evidence reconciliation boundaries. Not physical BOREK-FILIP production verification. |
+| `c2f3befb976679e652fb82fa32f82932d8bbeb16` | Qualification scenario catalog | `qualification/platform-scenarios/README.md`; `qualification/platform-scenarios/evidence-sample.json`; `qualification/platform-scenarios/evidence-schema.json`; `qualification/platform-scenarios/scenarios.mjs` | Synthetic Flying-shaped scenario/catalog evidence. It exercises production interfaces but remains non-physical fixture evidence and does not establish BOREK-FILIP readiness, Unreal production content, or production verification. |
+
+Physical BOREK-FILIP verification remains `deferred`; none of the ledger entries above reclassifies it as `production-verified`.
 
 ## Pozadavky a evidence
 
