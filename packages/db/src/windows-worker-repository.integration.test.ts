@@ -96,6 +96,42 @@ describeDatabase('WindowsWorkerRepository PostgreSQL concurrency', () => {
     expect(await first.windowsExecutionLease.count({ where: { jobId: ids.job, status: 'active' } })).toBe(1);
   });
 
+  it('leases authoring work while its owning task is running AI implementation', async () => {
+    const authoring = {
+      task: 'lease_test_authoring_task', run: 'lease_test_authoring_run', job: 'lease_test_authoring_job'
+    };
+    const packet = {
+      kind: 'authoring' as const, protocolVersion: 1 as const, projectId: ids.project, taskId: authoring.task,
+      runId: authoring.run, jobId: authoring.job, leaseId: 'pending', repository: 'owner/repo',
+      sourceUrl: 'https://github.com/owner/repo.git', baseCommitSha: digest, workspaceRoot: 'runner-managed',
+      artifactRoot: 'runner-managed', step: { prompt: 'Author the scene.', acceptanceCriteria: ['The scene is saved.'] },
+      operations: [{ id: 'implementation', kind: 'tool' as const, tool: 'ai-implementation', arguments: {}, rationale: 'Author the scene.' }],
+      requiredCapabilities: ['windows'], managedRoots: ['.'], checkpoints: [], artifactExpectations: [],
+      contentPolicy: { requiresUnrealAssets: false, prohibitedDatasetExtensions: [], maxUnclassifiedFileBytes: 1024 },
+      resourcePolicy: { timeoutSeconds: 60, maxLogBytes: 1024, maxArtifactBytes: 1024 }, nonce: 'pending', inputHash: digest,
+      authority: { database: 'none' as const, productionHosts: 'none' as const, globalGitHubCredentials: 'none' as const }
+    };
+    await first.task.create({ data: { id: authoring.task, projectId: ids.project, createdByUserId: ids.user,
+      title: 'Authoring lease test', prompt: 'Author the scene.', status: 'running_ai' } });
+    await first.taskRun.create({ data: { id: authoring.run, taskId: authoring.task, provider: 'codex', model: 'test', status: 'running' } });
+    await new WindowsWorkerRepository(first).enqueueAuthoring({ id: authoring.job, projectId: ids.project,
+      taskId: authoring.task, runId: authoring.run, requiredCapabilities: ['windows'], packet });
+    await first.windowsExecutionLease.deleteMany({ where: { jobId: ids.job } });
+    await first.workerDevice.update({ where: { id: ids.device }, data: { status: 'idle' } });
+
+    try {
+      const claim = await new WindowsWorkerRepository(first).claimCompatible(
+        ids.session, 60, 'lease_test_authoring_request', undefined, [1]
+      );
+      expect(claim?.job.id).toBe(authoring.job);
+    } finally {
+      await first.windowsExecutionJob.delete({ where: { id: authoring.job } });
+      await first.taskRun.delete({ where: { id: authoring.run } });
+      await first.task.delete({ where: { id: authoring.task } });
+      await first.workerDevice.update({ where: { id: ids.device }, data: { status: 'idle' } });
+    }
+  });
+
   it('keeps heartbeat and timeout recovery outcomes internally consistent under a race', async () => {
     await first.windowsExecutionLease.deleteMany({ where: { jobId: ids.job } });
     await first.windowsExecutionJob.update({ where: { id: ids.job }, data: { status: 'queued' } });

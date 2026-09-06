@@ -352,7 +352,11 @@ export class WindowsWorkerRepository {
       if (!session) return undefined;
       const jobs = await tx.$queryRaw<Array<{ job_id: string }>>`
         SELECT candidate."id" AS job_id FROM "windows_execution_jobs" candidate
-        JOIN "tasks" task ON task."id" = candidate."task_id" AND task."status" IN ('completed', 'ready_for_user_review')
+        JOIN "tasks" task ON task."id" = candidate."task_id" AND (
+          (candidate."packet"->>'kind' = 'authoring' AND task."status" = 'running_ai')
+          OR (candidate."packet"->>'kind' IS DISTINCT FROM 'authoring'
+            AND task."status" IN ('completed', 'ready_for_user_review'))
+        )
         JOIN "task_runs" run ON run."id" = candidate."run_id" AND run."task_id" = task."id"
         JOIN "worker_devices" d ON d."id" = ${session.device_id}
         WHERE candidate."status" = 'queued'
