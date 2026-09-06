@@ -135,6 +135,9 @@ describe('Windows worker shared contracts', () => {
       startedAt: '2026-01-01T00:00:00Z', completedAt: '2026-01-01T00:01:00Z', summary: 'authored' };
     expect(isWindowsAuthoringResult(result)).toBe(true);
     expect(isWindowsAuthoringResult({ ...result, contentAssessment: undefined })).toBe(false);
+    expect(isWindowsAuthoringResult({ ...result, status: 'failed', contentAssessment: {
+      technicalVerification: 'failed', productionReviewRequired: false, rationale: 'Authoring failed before verification.'
+    } })).toBe(true);
     expect(isWindowsAuthoringResult({ ...result, processes: [{ ...result.processes[0], leaseId: 'other' }] })).toBe(false);
     expect(isWindowsAuthoringResult({ ...result, resultTreeSha: 'working-tree' })).toBe(false);
     expect(isWindowsAuthoringResult({ ...result, tree: [{ ...result.tree[0], binary: undefined }] })).toBe(false);

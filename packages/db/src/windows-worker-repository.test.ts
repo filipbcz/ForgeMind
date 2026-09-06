@@ -364,16 +364,23 @@ describe('WindowsWorkerRepository capability leases', () => {
     expect(create).toHaveBeenCalledWith({ data: expect.objectContaining({ taskId: 'task_1', reason: 'runtime_capture_ready', status: 'pending' }) });
   });
 
-  it('keeps an active lease reconcilable when cancellation is requested', async () => {
+  it('cancels an active lease and reconciles its job when cancellation is requested', async () => {
+    const updateJobs = vi.fn(async () => ({ count: 1 }));
     const tx: any = {
       workerSession: { update: vi.fn(async () => ({ deviceId: 'device_1' })) },
-      windowsExecutionLease: { count: vi.fn(async () => 1) },
+      windowsExecutionLease: {
+        findMany: vi.fn(async () => [{ jobId: 'job_1' }]), updateMany: vi.fn(async () => ({ count: 1 }))
+      },
+      windowsExecutionJob: { updateMany: updateJobs },
       workerDevice: { update: vi.fn(async () => undefined) }
     };
     const prisma: any = { $transaction: vi.fn(async (work: (client: unknown) => unknown) => work(tx)) };
     await new WindowsWorkerRepository(prisma).cancelSession('session_1');
     expect(tx.workerSession.update).toHaveBeenCalledWith(expect.objectContaining({ data: expect.objectContaining({ status: 'cancelled' }) }));
-    expect(tx.workerDevice.update).toHaveBeenCalledWith(expect.objectContaining({ data: { status: 'draining' } }));
+    expect(tx.windowsExecutionLease.updateMany).toHaveBeenCalledWith(expect.objectContaining({ data: expect.objectContaining({ status: 'cancelled' }) }));
+    expect(updateJobs).toHaveBeenNthCalledWith(1, expect.objectContaining({ where: expect.objectContaining({ status: 'leased' }), data: { status: 'queued' } }));
+    expect(updateJobs).toHaveBeenNthCalledWith(2, expect.objectContaining({ where: expect.objectContaining({ status: 'running' }), data: { status: 'expired' } }));
+    expect(tx.workerDevice.update).toHaveBeenCalledWith(expect.objectContaining({ data: { status: 'offline' } }));
   });
 
   it('reconciles leased and running jobs when closeSession terminates a session', async () => {

@@ -157,7 +157,9 @@ export async function executeWindowsAuthoring(packet: WindowsAuthoringPacket, co
   await rm(resolve(workspacePath, '.forgemind-tmp'), { recursive: true, force: true });
   const changedPaths = await stageChangedPaths(workspacePath, context.signal);
   await rejectProhibitedResultPaths(packet, workspacePath, context.signal);
-  const productionReviewRequired = await enforceRequiredUnrealAssets(packet, workspacePath, evidenceDirectory, changedPaths, processes, packet.resourcePolicy.timeoutSeconds * 1_000, context.signal);
+  const productionReviewRequired = status === 'succeeded'
+    ? await enforceRequiredUnrealAssets(packet, workspacePath, evidenceDirectory, changedPaths, processes, packet.resourcePolicy.timeoutSeconds * 1_000, context.signal)
+    : false;
   const tree = await collectTree(workspacePath);
   const treeSha = await gitTree(workspacePath, context.signal);
   const patchResult = await spawnComplete('git.exe', ['diff', '--binary', '--no-ext-diff', '--cached', 'HEAD'], workspacePath, 30_000, context.signal);
@@ -191,10 +193,13 @@ export async function executeWindowsAuthoring(packet: WindowsAuthoringPacket, co
     nonce: packet.nonce, inputHash: packet.inputHash, baseCommitSha: packet.baseCommitSha, resultTreeSha: treeSha, resultBundle,
     tree, patch: patchResult.stdout, completedOperationIds, checkpointIds,
     artifacts, ...(classified ? { realEngineEvidence: classified } : {}),
-    processes, status, contentAssessment: { technicalVerification: packet.contentPolicy.requiresUnrealAssets ? 'passed' : 'not-required',
-      productionReviewRequired, rationale: productionReviewRequired
-        ? 'Technical loadability and provenance are verified; usable production quality requires downstream visual or domain review.'
-        : 'No separate production-quality review was requested by the acceptance criteria.' },
+    processes, status, contentAssessment: { technicalVerification: status !== 'succeeded' ? 'failed'
+      : packet.contentPolicy.requiresUnrealAssets ? 'passed' : 'not-required',
+      productionReviewRequired, rationale: status !== 'succeeded'
+        ? `Technical verification did not complete because Windows authoring ${status}.`
+        : productionReviewRequired
+          ? 'Technical loadability and provenance are verified; usable production quality requires downstream visual or domain review.'
+          : 'No separate production-quality review was requested by the acceptance criteria.' },
     startedAt: startedAt.toISOString(), completedAt: completedAt.toISOString(), summary
   } };
 }

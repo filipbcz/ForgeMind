@@ -540,12 +540,7 @@ export class WindowsWorkerRepository {
   }
 
   async cancelSession(sessionId: string): Promise<void> {
-    await this.prisma.$transaction(async (tx) => {
-      const now = new Date();
-      const session = await tx.workerSession.update({ where: { id: sessionId }, data: { status: 'cancelled', endedAt: now } });
-      const activeLease = await tx.windowsExecutionLease.count({ where: { sessionId, status: 'active' } });
-      await tx.workerDevice.update({ where: { id: session.deviceId }, data: { status: activeLease ? 'draining' : 'offline' } });
-    });
+    await this.finishSession(sessionId, 'cancelled', 'cancelled');
   }
 
   async closeSession(sessionId: string): Promise<void> {

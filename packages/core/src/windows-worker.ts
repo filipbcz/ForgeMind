@@ -307,7 +307,7 @@ export interface WindowsAuthoringResult {
   checkpointIds: string[];
   artifacts: ExecutionArtifactResult[];
   processes: WindowsAuthoringProcessResult[];
-  contentAssessment: { technicalVerification: 'passed' | 'not-required'; productionReviewRequired: boolean; rationale: string };
+  contentAssessment: { technicalVerification: 'passed' | 'failed' | 'not-required'; productionReviewRequired: boolean; rationale: string };
   status: 'succeeded' | 'failed' | 'cancelled';
   startedAt: IsoDateString;
   completedAt: IsoDateString;
@@ -668,7 +668,7 @@ export function isWindowsAuthoringResult(value: unknown): value is WindowsAuthor
   return identities.every((key) => isNonEmpty(value[key])) && isSha256(value.inputHash) && isGitCommitSha(value.baseCommitSha)
     && isGitCommitSha(value.resultTreeSha) && ['succeeded', 'failed', 'cancelled'].includes(value.status as string)
     && isIsoDate(value.startedAt) && isIsoDate(value.completedAt) && areCapabilityKeys(value.completedOperationIds)
-    && isRecord(value.contentAssessment) && ['passed', 'not-required'].includes(value.contentAssessment.technicalVerification as string)
+    && isRecord(value.contentAssessment) && ['passed', 'failed', 'not-required'].includes(value.contentAssessment.technicalVerification as string)
     && typeof value.contentAssessment.productionReviewRequired === 'boolean' && isNonEmpty(value.contentAssessment.rationale)
     && areCapabilityKeys(value.checkpointIds) && Array.isArray(value.artifacts) && value.artifacts.every(isArtifactResult)
     && Array.isArray(value.processes) && value.processes.every((process) => isRecord(process) && isNonEmpty(process.checkId)
