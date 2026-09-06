@@ -108,7 +108,10 @@ The catalog also binds the consolidated runtime claims to existing executable co
 - `selective-validation-reuse` -> `apps/worker/src/validation.test.ts` and `apps/worker/src/workflow.test.ts`
 - `unbounded-technical-retry` -> `packages/db/src/repository.task-run.test.ts` and `apps/worker/src/db-worker.test.ts`
 - `delivery-only-recovery` -> `apps/worker/src/db-worker.test.ts` and `packages/github/src/index.test.ts`
+- `flying-authoring-fixture-recovery` -> `packages/db/src/windows-worker-repository.flying-qualification.test.ts`, `apps/windows-runner/src/authoring-executor.test.ts`, `apps/worker/src/workflow.test.ts`, and `packages/github/src/index.test.ts`
 - `repository-grounded-planning` -> `apps/studio-api/src/roadmap-resume.test.ts`, `apps/studio-api/src/roadmap.test.ts` and `packages/providers/src/roadmap-review-prompt.test.ts`
 - `audit-gap-proposal-decision` -> `apps/worker/src/db-worker.test.ts`, `packages/db/src/acceptance-evidence.test.ts` and `apps/studio-api/src/routes.test.ts`
 
 These scenario definitions are `tested` contract evidence when their linked tests pass. They are not production results and do not rewrite stored results from earlier qualification runs.
+
+The Flying-shaped scenario is deliberately synthetic and non-physical. It must use an isolated checkout identity and fixture provenance, never enroll or activate a real runner, and never read or mutate the Flying repository. Its binary bundle, capture-shaped metadata, operations projection, review, and delivery checkpoints exercise production interfaces, but cannot satisfy BOREK-FILIP readiness, prove Unreal content, or mark a Flying release complete.

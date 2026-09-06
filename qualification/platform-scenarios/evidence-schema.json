@@ -24,15 +24,15 @@
     },
     "scenarioCount": {
       "type": "integer",
-      "const": 15
+      "const": 16
     },
     "requiredAreas": {
       "type": "array",
       "items": {
         "type": "string"
       },
-      "minItems": 15,
-      "maxItems": 15,
+      "minItems": 16,
+      "maxItems": 16,
       "uniqueItems": true,
       "allOf": [
         {
@@ -99,13 +99,16 @@
         },
         {
           "contains": { "const": "audit_proposals" }
+        },
+        {
+          "contains": { "const": "flying_authoring_fixture" }
         }
       ]
     },
     "scenarios": {
       "type": "array",
-      "minItems": 15,
-      "maxItems": 15,
+      "minItems": 16,
+      "maxItems": 16,
       "items": {
         "type": "object",
         "additionalProperties": false,
@@ -139,7 +142,8 @@
               "technical_retry",
               "delivery_recovery",
               "repository_planning",
-              "audit_proposals"
+              "audit_proposals",
+              "flying_authoring_fixture"
             ]
           },
           "expectedStateCount": {

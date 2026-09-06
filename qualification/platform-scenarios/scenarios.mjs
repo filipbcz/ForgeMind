@@ -13,7 +13,8 @@ export const requiredScenarioAreas = [
   'technical_retry',
   'delivery_recovery',
   'repository_planning',
-  'audit_proposals'
+  'audit_proposals',
+  'flying_authoring_fixture'
 ];
 
 export const qualificationScenarios = [
@@ -408,6 +409,15 @@ export const qualificationScenarios = [
     expectedAuditEvents: ['project_planning_started', 'project_roadmap_validation_completed', 'project_roadmap_cycle_created'],
     evidenceArtifacts: ['commit identity', 'repository evidence references', 'independent roadmap review'],
     recoveryProcedure: ['Stop planning when no commit-bound repository is available.', 'Invalidate the checkpoint when tracked repository inputs change.', 'Regenerate and independently review every targeted repair.']
+  },
+  {
+    id: 'flying-authoring-fixture-recovery', area: 'flying_authoring_fixture', title: 'Non-physical Flying authoring fixture recovers without claiming qualification',
+    objective: 'Exercise exact-checkout Windows authoring, binary result and classified evidence reconciliation, independent review, and configured delivery while preserving a strict fixture-versus-production evidence boundary.',
+    activation: 'Run the in-memory Flying-shaped fake runner against an isolated synthetic checkout; do not enroll a device, start a manual session, or access the Flying repository.',
+    expectedStates: ['checkout:exact_fixture_commit', 'authoring:windows_owned', 'binary_checkpoint:preserved', 'text_checkpoint:preserved', 'review:repaired', 'delivery:confirmed_once', 'qualification:unverified', 'real_device:not_activated'],
+    expectedAuditEvents: ['windows_authoring_fixture_started', 'windows_authoring_result_reconciled', 'task_review_completed', 'task_external_effect_skipped_on_retry', 'task_github_operation_completed'],
+    evidenceArtifacts: ['synthetic binary result bundle', 'text checkpoint', 'classified fixture evidence manifest', 'delivery idempotency record', 'qualification separation assertion'],
+    recoveryProcedure: ['Treat failed probes, unreadable checkout or artifacts, missing interactive GPU, insufficient disk, and stale provenance as explicit blockers.', 'Resume from the matching binary and text checkpoints after interruption.', 'Look up the configured delivery effect and skip it when already confirmed.', 'Keep BOREK-FILIP readiness and Flying release completion unverified because fixture evidence is non-physical.']
   },
   {
     id: 'audit-gap-proposal-decision', area: 'audit_proposals', title: 'Audit gaps remain proposals until reviewed and accepted',

@@ -1,5 +1,9 @@
 import { describe, expect, it, vi } from 'vitest';
-import { classifyAuthoringFailure, collectAuthoringToolVersions, isProhibitedAuthoringPath, LifecycleNativeImplementationProvider, requiresProductionContent, type NativeAuthoringTools, unrealObjectPath, validateRequiredUnrealAssets } from './authoring-executor.js';
+import { assertReadableAuthoringCheckout, classifyAuthoringFailure, collectAuthoringToolVersions, isProhibitedAuthoringPath, LifecycleNativeImplementationProvider, materializeOutputs, requiresProductionContent, type NativeAuthoringTools, unrealObjectPath, validateRequiredUnrealAssets } from './authoring-executor.js';
+import { mkdtemp, rm } from 'node:fs/promises';
+import { join } from 'node:path';
+import { tmpdir } from 'node:os';
+import { createHash } from 'node:crypto';
 
 const implementation = {
   outcome: 'changes_made' as const, summary: 'implemented', changedFiles: ['src/a.ts'], evidenceFiles: [],
@@ -22,6 +26,15 @@ describe('native implementation provider lifecycle', () => {
     expect(classifyAuthoringFailure('provider timeout', false, [])).toBe('timed-out');
     expect(classifyAuthoringFailure('stopped', true, [])).toBe('cancelled');
     expect(classifyAuthoringFailure('executable not found', false, [])).toBe('missing-capability');
+  });
+  it('surfaces unreadable checkouts and corrupt resumed binary artifacts as explicit blockers', async () => {
+    await expect(assertReadableAuthoringCheckout('C:/fixture/Flying', async () => { const error = new Error('denied') as NodeJS.ErrnoException;
+      error.code = 'EACCES'; throw error; })).rejects.toThrow('checkout is unreadable or not owned');
+    const root = await mkdtemp(join(tmpdir(), 'forgemind-corrupt-output-'));
+    try {
+      await expect(materializeOutputs(root, [{ path: 'Artifacts/Flying.png', sha256: createHash('sha256').update('expected').digest('hex'),
+        sizeBytes: 8, contentBase64: Buffer.from('corrupt').toString('base64') }])).rejects.toThrow('checkpoint output is corrupt');
+    } finally { await rm(root, { recursive: true, force: true }); }
   });
   it('requires editor-authored packages to be loaded after saving and retains source and exact tool provenance', () => {
     const base = { leaseId: 'lease', sessionId: 'session', shell: 'system' as const, exitCode: 0, stdout: '', stderr: '',
