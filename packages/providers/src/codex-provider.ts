@@ -1385,7 +1385,10 @@ export function buildCodexExecArgs(input: {
   args.push('--model', input.model);
   if (input.nativeToolChannel) {
     args.push('--disable', 'shell_tool', '-c', `mcp_servers.forgemind_native.command=${JSON.stringify(input.nativeToolChannel.command)}`,
-      '-c', `mcp_servers.forgemind_native.args=${JSON.stringify(input.nativeToolChannel.args)}`);
+      '-c', `mcp_servers.forgemind_native.args=${JSON.stringify(input.nativeToolChannel.args)}`,
+      '-c', 'mcp_servers.forgemind_native.required=true',
+      '-c', 'mcp_servers.forgemind_native.default_tools_approval_mode="approve"',
+      '-c', 'mcp_servers.forgemind_native.tool_timeout_sec=36000');
   }
   args.push('--output-schema', input.schemaPath);
   args.push('--output-last-message', input.outputPath, '--skip-git-repo-check', '--json');

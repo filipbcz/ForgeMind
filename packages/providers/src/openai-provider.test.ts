@@ -349,12 +349,16 @@ describe('Codex provider', () => {
     expect(args).not.toContain('--dangerously-bypass-approvals-and-sandbox');
   });
 
-  it('disables the lossy built-in shell when a native MCP tool channel is supplied', () => {
+  it('pre-approves the required checkout-confined MCP channel while keeping the built-in shell disabled', () => {
     const args = buildCodexExecArgs({ sandbox: 'workspace-write', model: 'gpt-5.5', schemaPath: 'schema.json', outputPath: 'out.json',
       repositoryPath: 'C:/checkout', nativeToolChannel: { command: 'node.exe', args: ['native-tool-server.js', 'C:/checkout', 'C:/evidence.jsonl'] } });
     expect(args).toEqual(expect.arrayContaining(['--disable', 'shell_tool']));
     expect(args).toContain('mcp_servers.forgemind_native.command="node.exe"');
     expect(args).toContain('mcp_servers.forgemind_native.args=["native-tool-server.js","C:/checkout","C:/evidence.jsonl"]');
+    expect(args).toContain('mcp_servers.forgemind_native.required=true');
+    expect(args).toContain('mcp_servers.forgemind_native.default_tools_approval_mode="approve"');
+    expect(args).toContain('mcp_servers.forgemind_native.tool_timeout_sec=36000');
+    expect(args).not.toContain('--dangerously-bypass-approvals-and-sandbox');
   });
 
   it('can bypass the read-only sandbox inside an isolated worker container', () => {
