@@ -29,7 +29,11 @@ describe('capability probes', () => {
       expect.objectContaining({ capability: { key: 'interactive-desktop' }, executable: 'powershell.exe' }),
       expect.objectContaining({ capability: { key: 'gpu' }, executable: 'powershell.exe' }),
       expect.objectContaining({ capability: { key: 'disk-capacity' }, kind: 'disk' }),
-      expect.objectContaining({ capability: { key: 'unreal', version: '5.8', metadata: { executable: 'C:\\UE\\UnrealEditor-Cmd.exe' } }, executable: 'C:\\UE\\UnrealEditor-Cmd.exe' }),
+      expect.objectContaining({
+        capability: { key: 'unreal', version: '5.8', metadata: { executable: 'C:\\UE\\UnrealEditor-Cmd.exe' } },
+        executable: 'powershell.exe',
+        args: expect.arrayContaining(['-NonInteractive', expect.stringContaining('Get-Item -LiteralPath')])
+      }),
       expect.objectContaining({ capability: { key: 'custom-sdk' }, executable: 'sdk.exe', args: ['version'] })
     ]));
   });
@@ -45,5 +49,18 @@ describe('capability probes', () => {
     expect(result.evidence[0]).toMatchObject({ status: 'unsupported', summary: expect.stringContaining('token=[redacted]') });
     expect(result.evidence[0]?.summary).not.toContain('abc123');
     expect(redactProbeOutput('C:\\Users\\alice\\tool.exe password=hunter2')).toBe('%USERPROFILE%\\tool.exe password=[redacted]');
+  });
+
+  it('times out a hung probe without blocking the complete capability run', async () => {
+    const startedAt = Date.now();
+    const result = await runCapabilityProbes([{
+      capability: { key: 'hung-tool' },
+      executable: process.execPath,
+      args: ['-e', 'setInterval(() => {}, 1000)'],
+      timeoutMs: 50
+    }]);
+    expect(Date.now() - startedAt).toBeLessThan(2_000);
+    expect(result.capabilities).toEqual([]);
+    expect(result.evidence[0]).toMatchObject({ status: 'unsupported', summary: expect.stringContaining('timed out') });
   });
 });

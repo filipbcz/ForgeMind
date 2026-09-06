@@ -9,12 +9,28 @@ export interface CapabilityProbe {
   args?: readonly string[];
   kind?: 'process' | 'windows-platform' | 'disk';
   path?: string;
+  timeoutMs?: number;
 }
 export interface ProbeResult { capabilities: WorkerCapability[]; evidence: WorkerProbeEvidence[] }
 
-export const unrealCapabilityProbe = (executable: string, version: string): CapabilityProbe => ({
-  capability: { key: 'unreal', version, metadata: { executable } }, executable, args: ['-version']
-});
+const DEFAULT_PROBE_TIMEOUT_MS = 30_000;
+
+export const unrealCapabilityProbe = (executable: string, version: string): CapabilityProbe => {
+  const literal = `'${executable.replaceAll("'", "''")}'`;
+  const command = [
+    `$item = Get-Item -LiteralPath ${literal} -ErrorAction Stop`,
+    "if ($item.PSIsContainer) { throw 'Configured Unreal executable is not a file.' }",
+    '$observedVersion = $item.VersionInfo.ProductVersion',
+    'if ([string]::IsNullOrWhiteSpace($observedVersion)) { $observedVersion = $item.VersionInfo.FileVersion }',
+    "if ([string]::IsNullOrWhiteSpace($observedVersion)) { throw 'Unreal executable has no Windows version metadata.' }",
+    'Write-Output $observedVersion'
+  ].join('; ');
+  return {
+    capability: { key: 'unreal', version, metadata: { executable } },
+    executable: 'powershell.exe',
+    args: ['-NoProfile', '-NonInteractive', '-Command', command]
+  };
+};
 
 /**
  * Capabilities published by the runner must be backed by a local process probe.
@@ -84,7 +100,7 @@ export async function runCapabilityProbes(probes: readonly CapabilityProbe[], no
     let capability = probe.capability;
     try {
       if (probe.kind === 'windows-platform') {
-        const output = await executeProbe(probe.executable!, ['-e', "if(process.platform!=='win32')process.exit(2);process.stdout.write(process.execPath)"]);
+        const output = await executeProbe(probe.executable!, ['-e', "if(process.platform!=='win32')process.exit(2);process.stdout.write(process.execPath)"], probe.timeoutMs);
         capability = withEvidenceMetadata(capability, probe.executable!, output);
       } else if (probe.kind === 'disk') {
         const stats = await statfs(probe.path!);
@@ -93,7 +109,7 @@ export async function runCapabilityProbes(probes: readonly CapabilityProbe[], no
         capability = { ...capability, version: String(freeBytes), metadata: { path: probe.path!, freeBytes } };
         summary = `Local disk probe succeeded: ${freeBytes} bytes free.`;
       } else if (probe.executable) {
-        const output = await executeProbe(probe.executable, probe.args ?? []);
+        const output = await executeProbe(probe.executable, probe.args ?? [], probe.timeoutMs);
         capability = withEvidenceMetadata(capability, probe.executable, output);
         summary = `Local tool probe succeeded: ${redactProbeOutput(output)}`;
       } else throw new Error('probe has no executable evidence source');
@@ -107,21 +123,34 @@ export async function runCapabilityProbes(probes: readonly CapabilityProbe[], no
   return { evidence, capabilities: evidence.filter((item) => item.status === 'supported').map((item) => item.capability) };
 }
 
-function executeProbe(executable: string, args: readonly string[]): Promise<string> {
+function executeProbe(executable: string, args: readonly string[], timeoutMs = DEFAULT_PROBE_TIMEOUT_MS): Promise<string> {
   return new Promise((resolve, reject) => {
     const child = spawn(executable, [...args], { shell: false, windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'] });
     let stdout = ''; let stderr = '';
+    let settled = false;
+    const finish = (callback: () => void) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      callback();
+    };
+    const timer = setTimeout(() => {
+      child.kill('SIGKILL');
+      finish(() => reject(new Error(`probe timed out after ${timeoutMs}ms; executable=${executable}`)));
+    }, timeoutMs);
     child.stdout.setEncoding('utf8').on('data', (chunk: string) => { stdout = (stdout + chunk).slice(-4096); });
     child.stderr.setEncoding('utf8').on('data', (chunk: string) => { stderr = (stderr + chunk).slice(-4096); });
-    child.once('error', (error) => reject(new Error(`${error.message}; executable=${executable}`)));
-    child.once('close', (code) => code === 0 ? resolve(stdout || stderr) : reject(new Error(`probe exited with code ${code}: ${stderr || stdout || 'no output'}`)));
+    child.once('error', (error) => finish(() => reject(new Error(`${error.message}; executable=${executable}`))));
+    child.once('close', (code) => finish(() => code === 0
+      ? resolve(stdout || stderr)
+      : reject(new Error(`probe exited with code ${code}: ${stderr || stdout || 'no output'}`))));
   });
 }
 
 function withEvidenceMetadata(capability: WorkerCapability, executable: string, output: string): WorkerCapability {
   const observed = redactProbeOutput(output);
   return { ...capability, version: capability.version ?? observed.split(/\s+/).find((part) => /\d/.test(part)) ?? 'observed',
-    metadata: { ...capability.metadata, executable, observed } };
+    metadata: { executable, ...capability.metadata, observed } };
 }
 
 /** Keep diagnostics useful without persisting credentials, home paths, or command output floods. */
