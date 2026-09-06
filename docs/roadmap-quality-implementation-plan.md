@@ -1,8 +1,10 @@
 # ForgeMind - Plan rizeni kvality projektove roadmapy
 
 Datum zalozeni: 2026-08-07
-Stav: aktivni implementacni plan
+Stav: historicky plan, nahrazen aktualni dokumentacni autoritou
 Vlastnik toku: ForgeMind roadmap, worker a AI provider adaptery
+
+Tento dokument zachovava puvodni plan a dobova runtime pravidla jako historii; nepredstavuje aktualni runtime guidance. Aktualni stav udrzuje `docs/implementation-tracker.md`, ktery jako aktualni zdroj pravdy a evidence urcuje `docs/readme-parity.md`.
 
 ## 1. Cil
 
