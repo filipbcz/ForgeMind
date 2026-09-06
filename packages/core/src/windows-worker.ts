@@ -66,6 +66,7 @@ export interface WorkerManualSession {
   lastHeartbeatAt: IsoDateString;
   endedAt?: IsoDateString;
   currentJobId?: string;
+  selectedProjectIds: string[];
 }
 
 export interface WindowsValidationCheck {
@@ -362,13 +363,25 @@ export interface WindowsEvidenceUpload {
 
 export type WindowsCapabilityWaitReason = 'unavailable_capability' | 'insufficient_capacity';
 export type WindowsPendingPhase = 'probe' | 'author' | 'validate' | 'package';
+export interface WindowsAuthoringProgress {
+  schemaVersion: 1; jobId: string; leaseId: string; sessionId: string; phase: 'checkout' | 'author' | 'verify' | 'build' | 'cook' | 'package';
+  checkpoint: { resultTreeSha: string; updatedAt: IsoDateString; resumedFromCheckpoint: boolean };
+  log: { text: string; sizeBytes: number; sha256: string };
+}
 
 export interface WindowsWorkerOperationsReadModel {
   schemaVersion: WindowsWorkerSchemaVersion;
   devices: Array<WorkerDevice & { sessions: WorkerManualSession[] }>;
   waitingValidations: Array<{ jobId: string; taskId: string; criterion?: string; requiredCapabilities: string[]; compatibleDeviceIds: string[];
     waitReason: WindowsCapabilityWaitReason; pendingPhase: WindowsPendingPhase }>;
-  evidence: Array<{ jobId: string; taskId: string; checkId: string; criterion?: string; commitSha: string; log?: WindowsEvidenceUpload['log']; artifacts: Array<ExecutionArtifactResult & { criterion: string }> }>;
+  activeAuthoring: Array<{ jobId: string; projectId: string; taskId: string; sessionId: string; deviceId: string; phase: WindowsAuthoringProgress['phase'];
+    requiredCapabilities: string[]; lastCheckpoint?: string; resumedFromCheckpoint: boolean; logs: WindowsEvidenceUpload['log'][] }>;
+  evidence: Array<{ jobId: string; projectId: string; taskId: string; checkId: string; criterion?: string; commitSha: string;
+    provenance: 'real-toolchain' | 'fixture'; classification?: RealEngineEvidenceClassification; log?: WindowsEvidenceUpload['log'];
+    artifacts: Array<ExecutionArtifactResult & { criterion: string; previewUrl: string }> }>;
+  qualificationReadiness: { profileId: 'borek-filip'; state: 'unverified' | 'ready-for-physical-qualification';
+    requirements: Array<{ key: 'toolchain' | 'flying-content' | 'build' | 'render' | 'binary-delivery' | 'interruption-resume'; satisfied: boolean; evidenceJobIds: string[] }>;
+    reason: string };
 }
 
 export interface ExecutionToolVersionEvidence {

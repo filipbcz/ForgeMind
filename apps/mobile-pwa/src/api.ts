@@ -506,6 +506,12 @@ export async function drainWindowsWorkerSession(sessionId: string): Promise<{ ac
     body: '{}'
   });
 }
+export async function stopWindowsWorkerSession(sessionId: string): Promise<{ accepted: boolean }> {
+  return request(`/api/windows-runner/sessions/${sessionId}/stop`, { method: 'POST', body: '{}' });
+}
+export async function resumeWindowsWorkerSession(sessionId: string): Promise<{ accepted: boolean; sessionId: string }> {
+  return request(`/api/windows-runner/sessions/${sessionId}/resume`, { method: 'POST', body: '{}' });
+}
 
 export async function createWindowsRunnerEnrollment(input: {
   deviceId: string;

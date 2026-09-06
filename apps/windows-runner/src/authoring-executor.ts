@@ -100,6 +100,7 @@ function inferWindowsShell(command: string): 'powershell' | 'cmd' | 'system' {
 export async function executeWindowsAuthoring(packet: WindowsAuthoringPacket, context: {
   deviceId: string; sessionId: string; workspaceRoot: string; artifactRoot: string;
   managedRoots?: NativeAuthoringTools['managedRoots']; signal?: AbortSignal; provider: NativeImplementationProvider;
+  onProgress?: (progress: import('@forgemind/core').WindowsAuthoringProgress) => Promise<void>;
 }): Promise<{ result: WindowsAuthoringResult; workspacePath: string }> {
   if (process.platform !== 'win32') throw new Error('Windows authoring can run only on Windows.');
   const evidenceDirectory = managedChild(context.artifactRoot, packet.taskId);
@@ -123,10 +124,19 @@ export async function executeWindowsAuthoring(packet: WindowsAuthoringPacket, co
     if (prior.exitCode !== 0) throw new Error(`Could not materialize the previous Windows attempt: ${prior.stderr}`);
   }
   const processes: WindowsAuthoringProcessResult[] = [];
+  const publishCheckpoint = async (status: string) => {
+    const checkpoint = await persistCheckpoint(checkpointPath, packet, workspacePath, status, context.signal, outputDirectory);
+    if (!context.onProgress) return;
+    const text = redactSecrets(processes.map((process) => `${process.command}\n${process.stdout}\n${process.stderr}`).join('\n')).slice(-packet.resourcePolicy.maxLogBytes);
+    const phase = processes.at(-1)?.authoring?.phase ?? 'checkout';
+    await context.onProgress({ schemaVersion: 1, jobId: packet.jobId, leaseId: packet.leaseId, sessionId: context.sessionId, phase,
+      checkpoint: { resultTreeSha: checkpoint.resultTreeSha, updatedAt: checkpoint.updatedAt, resumedFromCheckpoint: checkout.resumed },
+      log: { text, sizeBytes: Buffer.byteLength(text), sha256: createHash('sha256').update(text).digest('hex') } });
+  };
   const tools = createTools(workspacePath, resolve(evidenceDirectory, 'native-processes.jsonl'), packet.resourcePolicy.timeoutSeconds * 1_000,
     context.signal, processes, packet.leaseId, context.sessionId, { ...suppliedRoots, cache: cacheDirectory, outputs: outputDirectory,
-      diagnostics: evidenceDirectory }, async () => persistCheckpoint(checkpointPath, packet, workspacePath, 'in-progress', context.signal, outputDirectory));
-  await persistCheckpoint(checkpointPath, packet, workspacePath, 'started', context.signal, outputDirectory);
+      diagnostics: evidenceDirectory }, async () => publishCheckpoint('in-progress'));
+  await publishCheckpoint('started');
   const startedAt = new Date();
   let status: WindowsAuthoringResult['status'] = 'succeeded';
   let authoringFailureState: import('@forgemind/core').RealEngineEvidenceState | undefined;
@@ -320,7 +330,7 @@ interface AuthoringDiskCheckpoint {
   updatedAt: string;
 }
 
-async function persistCheckpoint(path: string, packet: WindowsAuthoringPacket, workspacePath: string, status: string, signal?: AbortSignal, outputRoot?: string): Promise<void> {
+async function persistCheckpoint(path: string, packet: WindowsAuthoringPacket, workspacePath: string, status: string, signal?: AbortSignal, outputRoot?: string): Promise<AuthoringDiskCheckpoint> {
   const resultTreeSha = await gitTree(workspacePath, signal);
   const patchResult = await spawnComplete('git.exe', ['diff', '--binary', '--no-ext-diff', '--cached', 'HEAD'], workspacePath, 30_000, signal);
   if (patchResult.exitCode !== 0) throw new Error(`Could not persist Windows checkpoint: ${patchResult.stderr}`);
@@ -332,6 +342,7 @@ async function persistCheckpoint(path: string, packet: WindowsAuthoringPacket, w
     resultBundle: { version: 1, format: 'git-binary-patch', sha256: createHash('sha256').update(patchBytes).digest('hex'),
       sizeBytes: patchBytes.length, lfsObjects, outputs }, updatedAt: new Date().toISOString() };
   await writeCheckpointAtomically(path, JSON.stringify(checkpoint));
+  return checkpoint;
 }
 
 async function writeCheckpointAtomically(path: string, content: string): Promise<void> {

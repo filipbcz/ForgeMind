@@ -76,6 +76,7 @@ export async function main(args = process.argv.slice(2)): Promise<void> {
           const executed = await executeWindowsAuthoring(claim.job.packet, { deviceId: auth.deviceId, sessionId: context.sessionId,
             workspaceRoot: managedRoots.work, artifactRoot: managedRoots.diagnostics, signal: context.signal,
             managedRoots,
+            onProgress: (progress) => transport.publishAuthoringProgress(auth, progress).then(() => undefined),
             provider: new LifecycleNativeImplementationProvider(createProvider('codex')) });
           const submitted = await transport.submitResult(auth, executed.result);
           if (submitted.accepted && executed.result.status === 'succeeded') await cleanupAcceptedWindowsAuthoring(managedRoots, executed.result.taskId);

@@ -78,6 +78,8 @@ import {
   startGoogleLogin,
   setWorkerQueuePaused,
   drainWindowsWorkerSession,
+  stopWindowsWorkerSession,
+  resumeWindowsWorkerSession,
   startNextProjectRoadmapStep,
   subscribeNotification,
   startTask as startTaskRequest,
@@ -745,6 +747,10 @@ function AuthenticatedApp({ auth }: { auth: AuthSessionResponse }) {
     mutationFn: drainWindowsWorkerSession,
     onSuccess: () => queryClient.invalidateQueries({ queryKey: ['windows-worker-operations'] })
   });
+  const stopWindowsWorkerSessionMutation = useMutation({ mutationFn: stopWindowsWorkerSession,
+    onSuccess: () => queryClient.invalidateQueries({ queryKey: ['windows-worker-operations'] }) });
+  const resumeWindowsWorkerSessionMutation = useMutation({ mutationFn: resumeWindowsWorkerSession,
+    onSuccess: () => queryClient.invalidateQueries({ queryKey: ['windows-worker-operations'] }) });
 
   const createWindowsRunnerEnrollmentMutation = useMutation({
     mutationFn: createWindowsRunnerEnrollment,
@@ -1169,12 +1175,14 @@ function AuthenticatedApp({ auth }: { auth: AuthSessionResponse }) {
             onUpdateNotificationSettings={(input) => updateNotificationSettingsMutation.mutate(input)}
             windowsOperations={windowsOperationsQuery.data}
             windowsOperationsLoading={windowsOperationsQuery.isLoading}
-            windowsOperationsBusy={cancelWindowsValidationMutation.isPending || drainWindowsWorkerSessionMutation.isPending || createWindowsRunnerEnrollmentMutation.isPending || revokeWindowsRunnerMutation.isPending}
+            windowsOperationsBusy={cancelWindowsValidationMutation.isPending || drainWindowsWorkerSessionMutation.isPending || stopWindowsWorkerSessionMutation.isPending || resumeWindowsWorkerSessionMutation.isPending || createWindowsRunnerEnrollmentMutation.isPending || revokeWindowsRunnerMutation.isPending}
             windowsOperationsError={windowsOperationsQuery.error ? formatUiError(windowsOperationsQuery.error) : createWindowsRunnerEnrollmentMutation.error ? formatUiError(createWindowsRunnerEnrollmentMutation.error) : revokeWindowsRunnerMutation.error ? formatUiError(revokeWindowsRunnerMutation.error) : undefined}
             windowsEnrollment={createWindowsRunnerEnrollmentMutation.data}
             onCreateWindowsRunnerEnrollment={(displayName) => createWindowsRunnerEnrollmentMutation.mutate({ deviceId: crypto.randomUUID(), displayName, expiresInMinutes: 10 })}
             onCancelWindowsValidation={(jobId) => cancelWindowsValidationMutation.mutate(jobId)}
             onDrainWindowsWorkerSession={(sessionId) => drainWindowsWorkerSessionMutation.mutate(sessionId)}
+            onStopWindowsWorkerSession={(sessionId) => stopWindowsWorkerSessionMutation.mutate(sessionId)}
+            onResumeWindowsWorkerSession={(sessionId) => resumeWindowsWorkerSessionMutation.mutate(sessionId)}
             onRevokeWindowsRunner={(deviceId) => revokeWindowsRunnerMutation.mutate(deviceId)}
           />
         ) : null}
@@ -3643,6 +3651,8 @@ function SettingsPanel({
   onCreateWindowsRunnerEnrollment,
   onCancelWindowsValidation,
   onDrainWindowsWorkerSession,
+  onStopWindowsWorkerSession,
+  onResumeWindowsWorkerSession,
   onRevokeWindowsRunner
 }: {
   githubAdapterStatus?: GitHubAdapterStatusApi;
@@ -3678,6 +3688,8 @@ function SettingsPanel({
   onCreateWindowsRunnerEnrollment: (displayName: string) => void;
   onCancelWindowsValidation: (jobId: string) => void;
   onDrainWindowsWorkerSession: (sessionId: string) => void;
+  onStopWindowsWorkerSession: (sessionId: string) => void;
+  onResumeWindowsWorkerSession: (sessionId: string) => void;
   onRevokeWindowsRunner: (deviceId: string) => void;
 }) {
   const [providerForm, setProviderForm] = useState<ProviderConnectRequest>({
@@ -3816,6 +3828,11 @@ function SettingsPanel({
         <MetricBlock label="Zařízení" value={String(windowsOperations?.devices.length ?? 0)} />
         <MetricBlock label="Čekající kontroly" value={String(windowsOperations?.waitingValidations.length ?? 0)} />
         <MetricBlock label="Důkazy" value={String(windowsOperations?.evidence.length ?? 0)} />
+        <MetricBlock label="BOREK-FILIP" value={windowsOperations?.qualificationReadiness.state ?? 'unverified'} wide />
+        {windowsOperations?.qualificationReadiness ? <div className="wide">
+          <p>{windowsOperations.qualificationReadiness.reason}</p>
+          <p>{windowsOperations.qualificationReadiness.requirements.map((item) => `${item.satisfied ? '✓' : '✗'} ${item.key}`).join(' · ')}</p>
+        </div> : null}
         <label className="wide">
           Název nového zařízení
           <input value={windowsRunnerName} maxLength={200} onChange={(event) => setWindowsRunnerName(event.target.value)} />
@@ -3833,18 +3850,20 @@ function SettingsPanel({
         ) : null}
         {windowsOperations?.devices.map((device) => {
           const activeSession = device.sessions.find((session) => session.status === 'active' || session.status === 'draining');
+          const resumableSession = device.sessions.find((session) => ['cancelled', 'expired', 'closed'].includes(session.status));
           return (
             <div className="wide settings-operation-row" key={device.id}>
               <div>
                 <strong>{device.displayName}</strong>
                 <p>{device.status} · {device.runnerVersion} · {device.capabilities.map((capability) => capability.key).join(', ') || 'bez capability'}</p>
+                {activeSession ? <p>Relace {activeSession.status} · projekty: {activeSession.selectedProjectIds.join(', ')} · úloha: {activeSession.currentJobId ?? 'žádná'}</p> : <p>Relace není dostupná.</p>}
               </div>
               <div className="actions">
                 {activeSession ? (
-                  <button type="button" className="secondary-action" disabled={windowsOperationsBusy || activeSession.status === 'draining'} onClick={() => onDrainWindowsWorkerSession(activeSession.id)}>
-                    <Pause size={16} /> Odvodnit relaci
-                  </button>
+                  <><button type="button" className="secondary-action" disabled={windowsOperationsBusy || activeSession.status === 'draining'} onClick={() => onDrainWindowsWorkerSession(activeSession.id)}><Pause size={16} /> Odvodnit relaci</button>
+                  <button type="button" className="danger-action" disabled={windowsOperationsBusy} onClick={() => onStopWindowsWorkerSession(activeSession.id)}><Ban size={16} /> Zastavit relaci</button></>
                 ) : null}
+                {!activeSession && resumableSession ? <button type="button" className="secondary-action" disabled={windowsOperationsBusy || device.status === 'offline' || device.status === 'revoked'} onClick={() => onResumeWindowsWorkerSession(resumableSession.id)}>Obnovit relaci</button> : null}
                 <button type="button" className="danger-action" disabled={windowsOperationsBusy || device.status === 'revoked'} onClick={() => onRevokeWindowsRunner(device.id)}>
                   <Ban size={16} /> Odvolat
                 </button>
@@ -3856,13 +3875,21 @@ function SettingsPanel({
           <div className="wide settings-operation-row" key={validation.jobId}>
             <div>
               <strong>{validation.criterion ?? 'Windows validace'}</strong>
-              <p>{validation.requiredCapabilities.join(', ')} · kompatibilní zařízení: {validation.compatibleDeviceIds.length}</p>
+              <p>Fáze {validation.pendingPhase} · {validation.requiredCapabilities.join(', ')} · kompatibilní zařízení: {validation.compatibleDeviceIds.length} · čekání: {validation.waitReason}</p>
             </div>
             <button type="button" className="danger-action" disabled={windowsOperationsBusy} onClick={() => onCancelWindowsValidation(validation.jobId)}>
               <Ban size={16} /> Zrušit
             </button>
           </div>
         ))}
+        {windowsOperations?.activeAuthoring.map((task) => <div className="wide settings-operation-row" key={task.jobId}><div>
+          <strong>Aktivní authoring · {task.taskId}</strong><p>Projekt {task.projectId} · fáze {task.phase} · capability {task.requiredCapabilities.join(', ')} · checkpoint {task.lastCheckpoint ?? 'dosud žádný'}</p>
+          {task.logs.map((log) => <pre key={log.sha256}>{log.text}</pre>)}
+        </div></div>)}
+        {windowsOperations?.evidence.map((item) => <details className="wide" key={item.jobId}><summary>{item.classification ?? 'validation'} · {item.provenance} · {item.taskId}</summary>
+          {item.log ? <pre>{item.log.text}</pre> : <p>Úplný redigovaný výstup není dostupný.</p>}
+          <div className="actions">{item.artifacts.map((artifact) => <a className="secondary-action" href={artifact.previewUrl} target="_blank" rel="noreferrer" key={artifact.sha256}>{artifact.name} ({artifact.mimeType ?? 'binary'})</a>)}</div>
+        </details>)}
         {!windowsOperationsLoading && !windowsOperationsError && windowsOperations?.devices.length === 0 ? (
           <p className="wide">Není připojen žádný Windows worker.</p>
         ) : null}
