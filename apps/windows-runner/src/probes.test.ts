@@ -29,6 +29,7 @@ describe('capability probes', () => {
       expect.objectContaining({ capability: { key: 'interactive-desktop' }, executable: 'powershell.exe' }),
       expect.objectContaining({ capability: { key: 'gpu' }, executable: 'powershell.exe' }),
       expect.objectContaining({ capability: { key: 'disk-capacity' }, kind: 'disk' }),
+      expect.objectContaining({ capability: { key: 'codex' }, executable: expect.any(String), args: ['--version'] }),
       expect.objectContaining({
         capability: { key: 'unreal', version: '5.8', metadata: { executable: 'C:\\UE\\UnrealEditor-Cmd.exe' } },
         executable: 'powershell.exe',

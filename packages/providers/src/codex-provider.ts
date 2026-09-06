@@ -2,7 +2,7 @@ import { execFile, spawn } from 'node:child_process';
 import { existsSync, readdirSync, statSync, watch, type FSWatcher } from 'node:fs';
 import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import { createInterface } from 'node:readline';
 import { promisify } from 'node:util';
 import type { ProviderKind } from '@forgemind/core';
@@ -1716,16 +1716,43 @@ export function isNoisyWorkspaceActivityPath(path: string): boolean {
 export function resolveCodexBinary(env: NodeJS.ProcessEnv = process.env): string {
   const configuredPath = env.FORGEMIND_CODEX_CLI_PATH?.trim();
   if (configuredPath) {
-    return configuredPath;
+    return resolveWindowsNpmCodexBinary(configuredPath) ?? configuredPath;
   }
 
   for (const candidate of getCodexBinaryCandidates(env)) {
     if (existsSync(candidate)) {
-      return candidate;
+      return resolveWindowsNpmCodexBinary(candidate) ?? candidate;
     }
   }
 
   return 'codex';
+}
+
+/** npm exposes global Windows commands through codex.cmd, which Node cannot
+ * spawn with shell=false. Resolve the signed native executable shipped by the
+ * same optional platform package instead of weakening process execution. */
+export function resolveWindowsNpmCodexBinary(wrapperPath: string): string | undefined {
+  if (!/\.(?:cmd|bat)$/i.test(wrapperPath)) return undefined;
+  const npmRoot = dirname(wrapperPath);
+  const packages = [
+    ['codex-win32-x64', 'x86_64-pc-windows-msvc'],
+    ['codex-win32-arm64', 'aarch64-pc-windows-msvc']
+  ] as const;
+  for (const [packageName, targetTriple] of packages) {
+    const packageRoots = [
+      join(npmRoot, 'node_modules', '@openai', 'codex', 'node_modules', '@openai', packageName),
+      join(npmRoot, 'node_modules', '@openai', packageName)
+    ];
+    for (const packageRoot of packageRoots) {
+      const candidates = [
+        join(packageRoot, 'vendor', targetTriple, 'bin', 'codex.exe'),
+        join(packageRoot, 'vendor', targetTriple, 'codex', 'codex.exe')
+      ];
+      const executable = candidates.find((candidate) => existsSync(candidate));
+      if (executable) return executable;
+    }
+  }
+  return undefined;
 }
 
 function getCodexBinaryCandidates(env: NodeJS.ProcessEnv): string[] {

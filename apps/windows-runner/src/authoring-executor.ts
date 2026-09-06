@@ -6,7 +6,7 @@ import { basename, dirname, posix, relative, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import type { AuthoringTreeEntry, WindowsAuthoringPacket, WindowsAuthoringProcessResult, WindowsAuthoringResult } from '@forgemind/core';
 import { redactSecrets } from '@forgemind/core';
-import type { AIProvider } from '@forgemind/providers';
+import { resolveCodexBinary, type AIProvider } from '@forgemind/providers';
 import { buildSandboxedProcessInvocation } from './native-sandbox.js';
 
 export interface NativeAuthoringTools {
@@ -231,7 +231,7 @@ function managedChild(root: string, name: string): string {
 function createTools(root: string, evidencePath: string, timeoutMs: number, signal: AbortSignal | undefined, results: WindowsAuthoringProcessResult[], leaseId: string, sessionId: string,
   managedRoots: NativeAuthoringTools['managedRoots'], checkpoint: () => Promise<void>): NativeAuthoringTools {
   let evidenceOffset = 0;
-  const sandboxExecutable = process.env.FORGEMIND_CODEX_CLI_PATH?.trim() || 'codex';
+  const sandboxExecutable = resolveCodexBinary();
   const contained = (path: string) => { const target = resolve(root, path); const rel = relative(root, target); if (rel.startsWith('..') || rel === '..') throw new Error('Tool path escapes the leased checkout.'); return target; };
   return {
     root,

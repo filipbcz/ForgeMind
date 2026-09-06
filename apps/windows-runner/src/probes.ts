@@ -2,6 +2,7 @@ import { createHash } from 'node:crypto';
 import { spawn } from 'node:child_process';
 import { statfs } from 'node:fs/promises';
 import { canonicalizeWorkerProbeEvidence, type WorkerCapability, type WorkerProbeEvidence } from '@forgemind/core';
+import { resolveCodexBinary } from '@forgemind/providers';
 
 export interface CapabilityProbe {
   capability: WorkerCapability;
@@ -57,6 +58,7 @@ export function windowsRunnerCapabilityProbes(
     { capability: { key: 'gpu' }, executable: 'powershell.exe', args: ['-NoProfile', '-NonInteractive', '-Command', "$g=Get-CimInstance Win32_VideoController | Where-Object {$_.AdapterRAM -gt 0} | Select-Object -First 1; if (-not $g) { exit 2 }; \"$($g.Name) driver=$($g.DriverVersion)\""] },
     { capability: { key: 'disk-capacity' }, kind: 'disk', path: environment.FORGEMIND_WINDOWS_WORKSPACE_ROOT ?? process.cwd() }
   ];
+  probes.push({ capability: { key: 'codex' }, executable: resolveCodexBinary(environment), args: ['--version'] });
   if (environment.FORGEMIND_UNREAL_EXECUTABLE) {
     probes.push(unrealCapabilityProbe(environment.FORGEMIND_UNREAL_EXECUTABLE, environment.FORGEMIND_UNREAL_VERSION ?? 'configured'));
   }

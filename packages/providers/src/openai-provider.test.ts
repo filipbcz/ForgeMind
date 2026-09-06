@@ -428,6 +428,21 @@ describe('Codex provider', () => {
     expect(resolveCodexBinary({ FORGEMIND_CODEX_CLI_PATH: 'C:/tools/codex.exe' })).toBe('C:/tools/codex.exe');
   });
 
+  it('resolves a global Windows npm wrapper to its native Codex executable', () => {
+    const npmRoot = mkdtempSync(join(tmpdir(), 'forgemind-codex-npm-'));
+    const wrapper = join(npmRoot, 'codex.cmd');
+    const native = join(npmRoot, 'node_modules', '@openai', 'codex', 'node_modules', '@openai', 'codex-win32-x64',
+      'vendor', 'x86_64-pc-windows-msvc', 'bin', 'codex.exe');
+    mkdirSync(join(native, '..'), { recursive: true });
+    writeFileSync(wrapper, '');
+    writeFileSync(native, '');
+    try {
+      expect(resolveCodexBinary({ FORGEMIND_CODEX_CLI_PATH: wrapper })).toBe(native);
+    } finally {
+      rmSync(npmRoot, { recursive: true, force: true });
+    }
+  });
+
   it('falls back to the command name when no known Codex CLI path exists', () => {
     expect(resolveCodexBinary({ APPDATA: 'C:/missing/appdata', LOCALAPPDATA: 'C:/missing/local', USERPROFILE: 'C:/missing/user' })).toBe('codex');
   });
