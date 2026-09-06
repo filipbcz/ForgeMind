@@ -254,12 +254,13 @@ export class WindowsWorkerRepository {
         currentJobId: session.leases?.[0]?.jobId })) }));
     const evidence = jobs.flatMap((job) => { const packet = job.packet as unknown as WindowsExecutionPacket & { evidenceUpload?: WindowsEvidenceUpload };
       return packet.evidenceUpload ? [{ jobId: job.id, projectId: job.projectId, taskId: job.taskId, checkId: packet.checkId, criterion: packet.check.criterion,
-        commitSha: packet.commitSha, provenance: packet.evidenceUpload.realEngineEvidence ? 'real-toolchain' as const : 'fixture' as const,
+        commitSha: packet.commitSha, provenance: packet.evidenceUpload.realEngineEvidence
+          && packet.evidenceUpload.realEngineEvidence.settings?.fixture !== true ? 'real-toolchain' as const : 'fixture' as const,
         classification: packet.evidenceUpload.realEngineEvidence?.classification, log: packet.evidenceUpload.log,
         artifacts: packet.evidenceUpload.artifacts.map(({ contentBase64: _content, ...artifact }) => ({ ...artifact, previewUrl: `/api/windows-runner/jobs/${job.id}/artifacts/${encodeURIComponent(artifact.sha256)}` })) }] : []; });
     const realSucceeded = jobs.flatMap((job) => { const packet = job.packet as any;
       const real = packet.evidenceUpload?.realEngineEvidence ?? packet.authoringResult?.realEngineEvidence;
-      return job.status === 'succeeded' && real?.state === 'succeeded' && real.scenario === 'borek-filip'
+      return job.status === 'succeeded' && real?.state === 'succeeded' && real.settings?.fixture !== true && real.scenario === 'borek-filip'
         && real.settings?.qualificationProfile === 'borek-filip' && hasReadableRealArtifacts(packet, real) ? [{ job, packet, real,
         identity: qualificationEvidenceIdentity(job.projectId, real) }] : []; });
     const identityScores = new Map<string, number>();

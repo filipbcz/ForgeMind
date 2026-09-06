@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "generatedFrom": "qualification/platform-scenarios/scenarios.mjs",
   "note": "Scenario evidence is repeatable and redacted by construction",
-  "scenarioCount": 15,
+  "scenarioCount": 16,
   "requiredAreas": [
     "success",
     "repair",
@@ -18,7 +18,8 @@
     "technical_retry",
     "delivery_recovery",
     "repository_planning",
-    "audit_proposals"
+    "audit_proposals",
+    "flying_authoring_fixture"
   ],
   "scenarios": [
     {
@@ -146,6 +147,15 @@
       "evidenceArtifactCount": 3,
       "recoveryStepCount": 3,
       "definitionHash": "114ceecf5bf17e476f8def98ed7bed5ff8f6d1f0a5626275c87dff722478ade8"
+    },
+    {
+      "id": "flying-authoring-fixture-recovery",
+      "area": "flying_authoring_fixture",
+      "expectedStateCount": 8,
+      "expectedAuditEventCount": 5,
+      "evidenceArtifactCount": 5,
+      "recoveryStepCount": 4,
+      "definitionHash": "d1b42dbb7d3dec95715a949e6818e513cf23ae1237e931c3ec254c7d26c1aeb9"
     },
     {
       "id": "audit-gap-proposal-decision",

@@ -129,6 +129,57 @@ function createProvider(overrides: Partial<AIProvider> = {}): AIProvider {
 }
 
 describe('simple autonomous worker workflow', () => {
+  it('runs and resumes a Flying-shaped Windows-owned delivery without repeating confirmed effects', async () => {
+    const project = { ...createProject(), configYaml: projectConfig.replace('auto_push: false', 'auto_push: true'),
+      autoCreatePullRequest: true, autoMergePullRequest: true, autoCompleteTask: true };
+    const task = { ...createTask(project.id), title: 'Author synthetic Flying fixture',
+      prompt: 'Author the isolated synthetic Flying fixture.', acceptanceCriteria: ['binary and text checkpoints are preserved'],
+      pullRequestNumber: 42, pullRequestUrl: 'https://example.test/pull/42' };
+    const workspaceRoot = await mkdtemp(join(tmpdir(), 'forgemind-flying-authoring-'));
+    const checkout = join(workspaceRoot, task.id); await mkdir(checkout, { recursive: true });
+    const git = simpleGit(checkout); await git.init(); await git.addConfig('user.name', 'ForgeMind Test');
+    await git.addConfig('user.email', 'test@forgemind.local'); await writeFile(join(checkout, 'README.md'), 'synthetic fixture only\n');
+    await git.add('README.md'); await git.commit('fixture base'); const exactBase = (await git.revparse(['HEAD'])).trim();
+    const implementOnWindows = vi.fn(async (input: ImplementInput & { baseCommitSha: string }) => {
+      expect(input.baseCommitSha).toBe(exactBase);
+      await mkdir(join(input.repositoryPath, 'Content'), { recursive: true });
+      await writeFile(join(input.repositoryPath, 'Content', 'SyntheticFlying.uasset'), Buffer.from([0, 1, 2, 3, 255]));
+      await writeFile(join(input.repositoryPath, 'authoring-checkpoint.txt'), `base=${input.baseCommitSha}\n`);
+      return { outcome: 'changes_made' as const, summary: 'Windows authoring fixture completed.',
+        changedFiles: ['Content/SyntheticFlying.uasset', 'authoring-checkpoint.txt'],
+        evidenceFiles: ['Content/SyntheticFlying.uasset', 'authoring-checkpoint.txt'],
+        diffStat: { filesChanged: 2, insertions: 1, deletions: 0 }, validationChecks: [{ kind: 'command' as const,
+          command: `node -e "const f=require('node:fs');if(f.readFileSync('Content/SyntheticFlying.uasset').length!==5||!f.readFileSync('authoring-checkpoint.txt','utf8').includes('base='))process.exit(9)"`,
+          criterion: 'binary and text checkpoints are preserved', rationale: 'Reads both checkpoint forms.' }] };
+    });
+    const independentReview = vi.fn(async () => ({ verdict: 'satisfied' as const, summary: 'Independent fixture review passed.', blockers: [],
+      criterionResults: [{ criterion: 'binary and text checkpoints are preserved', status: 'satisfied' as const,
+        evidence: ['Content/SyntheticFlying.uasset', 'authoring-checkpoint.txt'] }] }));
+    const commitAndPush = vi.fn(async () => undefined); const mergePullRequest = vi.fn(async () => ({ merged: true, sha: 'a'.repeat(40), message: 'merged' }));
+    const github: any = { commitAndPush, mergePullRequest, createIssue: vi.fn(), createBranch: vi.fn(), createDraftPullRequest: vi.fn(),
+      commentOnIssue: vi.fn(), readCheckStatus: vi.fn(async () => 'success') };
+    const checkpoints: Array<{ key: string; status: string; output?: unknown }> = [];
+    const first = await runWorkerTask({ project, task, provider: createProvider({ implement: vi.fn(async () => { throw new Error('Linux authoring forbidden'); }) }),
+      reviewProvider: createProvider({ review: independentReview }), implementationOwner: 'windows', implementOnWindows, github, workspaceRoot,
+      hooks: { onCheckpoint: async (checkpoint) => { checkpoints.push(checkpoint); } } });
+    expect(first.status).toBe('completed'); expect(first.deliveryResult).toMatchObject({ status: 'completed', mergeConfirmed: true });
+    expect(independentReview).toHaveBeenCalledOnce(); expect(commitAndPush).toHaveBeenCalledOnce(); expect(mergePullRequest).toHaveBeenCalledOnce();
+    expect(checkpoints).toEqual(expect.arrayContaining([expect.objectContaining({ key: 'external:commit', status: 'completed' })]));
+
+    const resumedTask = { ...task, status: 'submitted' as const };
+    const resumed = await runWorkerTask({ project, task: resumedTask, provider: createProvider(), reviewProvider: createProvider({ review: independentReview }),
+      implementationOwner: 'windows', implementOnWindows, github, workspaceRoot, resume: { kind: 'worker_interrupted', resumeFrom: 'delivery', attempt: 2,
+        implementationSummary: 'Windows authoring fixture completed.', implementationOutcome: 'changes_made',
+        changedFiles: ['Content/SyntheticFlying.uasset', 'authoring-checkpoint.txt'], evidenceFiles: ['Content/SyntheticFlying.uasset', 'authoring-checkpoint.txt'],
+        diffStat: { filesChanged: 2, insertions: 1, deletions: 0 }, validation: first.validation,
+        validationChecks: [{ kind: 'command', command: first.validation.command, criterion: 'binary and text checkpoints are preserved' }],
+        reviewSummary: 'Independent fixture review passed.', completedOperations: ['commit', 'commit_and_push', 'merge_pr'], mergeCommitSha: 'a'.repeat(40) } });
+    expect(resumed.status).toBe('completed'); expect(resumed.deliveryResult).toMatchObject({ status: 'completed', mergeConfirmed: true });
+    expect(implementOnWindows).toHaveBeenCalledOnce(); expect(commitAndPush).toHaveBeenCalledOnce(); expect(mergePullRequest).toHaveBeenCalledOnce();
+    expect(await readFile(join(checkout, 'Content', 'SyntheticFlying.uasset'))).toEqual(Buffer.from([0, 1, 2, 3, 255]));
+    expect(await readFile(join(checkout, 'authoring-checkpoint.txt'), 'utf8')).toContain(`base=${exactBase}`);
+  }, workflowTestTimeoutMs);
+
   it('replaces a prior base-relative Windows patch instead of stacking correction patches', async () => {
     const workspace = await mkdtemp(join(tmpdir(), 'forgemind-native-patch-')); const git = simpleGit(workspace);
     await git.init(); await git.addConfig('user.name', 'ForgeMind Test'); await git.addConfig('user.email', 'test@forgemind.local');

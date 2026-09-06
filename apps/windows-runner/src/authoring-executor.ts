@@ -1,6 +1,7 @@
 import { createHash, randomUUID } from 'node:crypto';
 import { spawn } from 'node:child_process';
-import { lstat, mkdir, readFile, readdir, realpath, rename, rm, writeFile } from 'node:fs/promises';
+import { access, lstat, mkdir, readFile, readdir, realpath, rename, rm, writeFile } from 'node:fs/promises';
+import { constants as fsConstants } from 'node:fs';
 import { basename, dirname, posix, relative, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import type { AuthoringTreeEntry, WindowsAuthoringPacket, WindowsAuthoringProcessResult, WindowsAuthoringResult } from '@forgemind/core';
@@ -294,6 +295,7 @@ async function cloneCheckout(packet: WindowsAuthoringPacket, root: string, path:
   const actual = await spawnComplete('git.exe', ['rev-parse', 'HEAD'], path, 30_000, signal);
   if (actual.stdout.trim().toLowerCase() !== packet.baseCommitSha.toLowerCase()) throw new Error('Materialized checkout does not match the authoring base commit.');
   const canonical = await realpath(path);
+  await assertReadableAuthoringCheckout(canonical);
   if (checkpoint) {
     await materializeLfsObjects(canonical, checkpoint.resultBundle.lfsObjects);
     await materializeOutputs(outputRoot, checkpoint.resultBundle.outputs);
@@ -310,7 +312,13 @@ async function cloneCheckout(packet: WindowsAuthoringPacket, root: string, path:
   return { path: canonical, resumed: false };
 }
 
-async function materializeOutputs(root: string, outputs: AuthoringDiskCheckpoint['resultBundle']['outputs']): Promise<void> {
+export async function assertReadableAuthoringCheckout(path: string, readable: (path: string, mode?: number) => Promise<void> = access): Promise<void> {
+  try { await readable(path, fsConstants.R_OK | fsConstants.W_OK); } catch {
+    throw new Error(`Authoring checkout is unreadable or not owned for writing: ${path}`);
+  }
+}
+
+export async function materializeOutputs(root: string, outputs: AuthoringDiskCheckpoint['resultBundle']['outputs']): Promise<void> {
   await rm(root, { recursive: true, force: true }); await mkdir(root, { recursive: true });
   for (const output of outputs) {
     const content = Buffer.from(output.contentBase64, 'base64');
