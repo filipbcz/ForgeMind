@@ -37,7 +37,7 @@ Aktivne se udrzuje dokumentacni shoda s konsolidovanou AI-first specifikaci. Nen
 | AI validation bez command filtru | `packages/providers/src/provider.ts`; `apps/worker/src/validation.ts` | `apps/worker/src/validation.test.ts` | `deferred` |
 | Phase-aware checkpointy | `apps/worker/src/db-worker/checkpoints.ts` | `apps/worker/src/db-worker.test.ts` | `deferred` |
 | Queue persistence a neomezene technicke retry | `packages/db/src/repository.ts` | `packages/db/src/repository.task-run.test.ts`; `apps/worker/src/db-worker.test.ts` | `deferred` |
-| Odstraneni runtime approvals | `apps/worker/src/workflow.ts`; `apps/studio-api/src/routes.ts`; `packages/db/prisma/migrations/20260831160000_remove_runtime_approvals/migration.sql` | `apps/worker/src/workflow.test.ts`; `apps/studio-api/src/routes.test.ts` | `deferred` |
+| Odstraneni runtime approvals | `apps/worker/src/workflow.ts`; `apps/studio-api/src/routes.ts`; `packages/db/prisma/migrations/20260831150000_remove_runtime_approvals/migration.sql` | `apps/worker/src/workflow.test.ts`; `apps/studio-api/src/routes.test.ts` | `deferred` |
 
 Uplna aktualni evidence matice vcetne repository planningu, GitHub adapteru, Windows workeru a mobilniho runtime je v `docs/readme-parity.md`. Root prikazy `npm run build`, `npm run typecheck`, `npm test` a `npm run test:migrations` jsou executable release/CI evidence, nikoli povinna allowlist sada pro kazdy task.
 
