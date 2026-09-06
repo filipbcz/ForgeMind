@@ -54,6 +54,8 @@ describe('roadmap quality review prompt', () => {
     expect(prompt).toContain('observable outcomes');
     expect(prompt).toContain(`one result for each quality criterion`);
     expect(prompt).toContain('existing repository components');
+    expect(prompt).toContain('Reject self-referential commit-chasing steps');
+    expect(prompt).toContain('A different HEAD alone is not an implementation gap');
     expect(ROADMAP_QUALITY_CRITERIA).toHaveLength(7);
   });
 

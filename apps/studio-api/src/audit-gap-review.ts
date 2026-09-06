@@ -33,6 +33,8 @@ export async function reviewAndRepairAuditGapProposal(input: {
     input.reviewInput.objective,
     'The original audit proposal below defines the scope under consideration. Its historical findings are context, not proof that a gap still exists.',
     'Verify that every original gap is either addressed by a concrete candidate step or no longer requires work in the current repository. An empty candidate is valid only when no original gap remains.',
+    'The checkout commit is review provenance, not required checked-in output. A file changed by a task cannot contain the SHA of its own resulting commit.',
+    'Reject and remove any self-referential step whose only purpose is to advance a source-controlled current, latest, or audited commit marker to the checkout SHA. A stable reviewed ancestor is valid when later changes remain traceable through Git history or evidence lineage.',
     `Original audit proposal (scope boundary):\n${JSON.stringify(input.originalProposal ?? input.proposal)}`
   ].join('\n\n');
   const repairObjective = [

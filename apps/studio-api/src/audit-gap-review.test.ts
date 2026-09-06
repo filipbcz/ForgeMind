@@ -52,7 +52,10 @@ describe('audit proposal repair loop', () => {
     const f = fixture(); f.input.previousReview = f.rejected;
     f.provider.repairRoadmap.mockResolvedValue({ implementationSteps: [] });
     expect((await reviewAndRepairAuditGapProposal(f.input)).proposal.steps).toEqual([]);
+    expect(f.provider.repairRoadmap.mock.calls[0]![0].objective).toContain('cannot contain the SHA of its own resulting commit');
+    expect(f.provider.repairRoadmap.mock.calls[0]![0].objective).toContain('Reject and remove any self-referential step');
     expect(f.provider.reviewRoadmap).toHaveBeenCalledWith(expect.objectContaining({ implementationSteps: [], requiredRequirementIds: [] }));
+    expect(f.provider.reviewRoadmap.mock.calls[0]![0].objective).toContain('A stable reviewed ancestor is valid');
     expect(f.input.saveProposal).toHaveBeenCalledOnce();
   });
 

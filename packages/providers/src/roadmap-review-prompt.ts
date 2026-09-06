@@ -54,6 +54,8 @@ export function buildRoadmapQualityReviewPrompt(input: RoadmapQualityReviewInput
       ? 'Do not design a different product or modify the repository. Inspect the read-only repository in the current working directory and use it as evidence.'
       : 'Do not design a different product or modify the repository. Use the supplied commit-bound repository baseline as evidence.',
     'Reject any step that lacks a concrete gap proven by the baseline. Existing capabilities must not be recreated merely because requirement IDs or completed-step titles differ.',
+    'Reject self-referential commit-chasing steps. The repository baseline commit is review provenance; a checked-in file cannot identify the SHA of the commit created by editing that file. Remove any step whose only purpose is to advance a source-controlled current/latest/audited-commit marker to the supplied baseline SHA.',
+    'A checked-in planning baseline may name a stable reviewed ancestor when later changes remain traceable through Git history or evidence lineage. A different HEAD alone is not an implementation gap.',
     'Return verdict "satisfied" only when every quality criterion below is met.',
     'Return verdict "not_satisfied" with concrete blockers when changes are required. Each blocker must name the affected step or missing step and state the exact correction needed.',
     'Do not report stylistic preferences or validation results as blockers.',

@@ -43,6 +43,8 @@ describe('capability audit contract', () => {
     expect(prompt).toContain('Copy each acceptance criterion');
     expect(prompt).toContain('Do not rerun commands that already have passed trusted execution evidence');
     expect(prompt).toContain('status deferred identifies a Windows-specific check');
+    expect(prompt).toContain('cannot identify the SHA of the commit created by editing that file');
+    expect(prompt).toContain('Never fail a criterion or create a work item solely because a checked-in baseline names an ancestor');
   });
 
   it('keeps supplemental evidence separate from a native read-only repository checkout', () => {
@@ -181,6 +183,8 @@ describe('release audit contract', () => {
     expect(prompt).toContain('Step 1: Build leaderboard [completed; initial_roadmap] task=task_1');
     expect(prompt).toContain('must address missing product behavior');
     expect(prompt).toContain('status deferred identifies Windows-specific validation');
+    expect(prompt).toContain('cannot identify the SHA of the commit created by editing that file');
+    expect(prompt).toContain('Never fail a criterion or create a work item solely because a checked-in baseline names an ancestor');
   });
 
   it('allows a focused release gap linked to an existing requirement', () => {
