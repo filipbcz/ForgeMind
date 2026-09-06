@@ -6,8 +6,39 @@ import type {
   WindowsAuthoringPacket, WindowsCapabilityWaitReason, WindowsExecutionPacket, WindowsExecutionResult, WindowsJobPacket, WindowsJobResult, WindowsPendingPhase
 } from '@forgemind/core';
 import type { WindowsEvidenceUpload, WindowsWorkerOperationsReadModel } from '@forgemind/core';
+import type { WindowsAuthoringProgress } from '@forgemind/core';
 
 type TransactionClient = Omit<PrismaClient, '$connect' | '$disconnect' | '$on' | '$transaction' | '$use' | '$extends'>;
+
+function hasExactRequiredToolchain(real: import('@forgemind/core').RealEngineEvidence): boolean {
+  const required = real.settings.requiredToolVersions;
+  if (!required || typeof required !== 'object' || Array.isArray(required)) return false;
+  const entries = Object.entries(required);
+  return entries.length > 0 && entries.every(([tool, version]) => typeof version === 'string'
+    && real.toolVersions.some((observed) => observed.tool === tool && observed.version === version));
+}
+
+function qualificationEvidenceIdentity(projectId: string, real: import('@forgemind/core').RealEngineEvidence): string {
+  const tools = [...real.toolVersions].map(({ tool, version, driverVersion }) => ({ tool, version, driverVersion: driverVersion ?? '' }))
+    .sort((left, right) => `${left.tool}:${left.version}:${left.driverVersion}`.localeCompare(`${right.tool}:${right.version}:${right.driverVersion}`));
+  return JSON.stringify({ projectId, buildId: real.buildId, resultTreeSha: real.resultTreeSha,
+    flyingCommitSha: real.settings.flyingCommitSha, tools });
+}
+
+function hasReadableRealArtifacts(packet: any, real: import('@forgemind/core').RealEngineEvidence): boolean {
+  if (real.artifacts.length === 0) return false;
+  const uploaded = packet.evidenceUpload?.artifacts as Array<{ sha256: string; sizeBytes: number; contentBase64: string }> | undefined;
+  if (uploaded) return real.artifacts.every((artifact) => uploaded.some((candidate) => {
+    const content = Buffer.from(candidate.contentBase64, 'base64');
+    return candidate.sha256.toLowerCase() === artifact.sha256.toLowerCase() && candidate.sizeBytes === artifact.sizeBytes
+      && content.length === candidate.sizeBytes && createHash('sha256').update(content).digest('hex') === candidate.sha256.toLowerCase();
+  }));
+  const result = packet.authoringResult;
+  return real.artifacts.every((artifact: { relativePath: string; sha256: string; sizeBytes: number }) =>
+    result?.resultBundle?.outputs?.some((entry: any) => entry.path === artifact.relativePath && entry.sha256 === artifact.sha256
+      && entry.sizeBytes === artifact.sizeBytes && Buffer.from(entry.contentBase64, 'base64').length === entry.sizeBytes
+      && createHash('sha256').update(Buffer.from(entry.contentBase64, 'base64')).digest('hex') === entry.sha256));
+}
 
 export interface RegisterWorkerDeviceInput {
   id: string;
@@ -208,8 +239,8 @@ export class WindowsWorkerRepository {
 
   async readOperations(projectId?: string, now = new Date()): Promise<WindowsWorkerOperationsReadModel> {
     const [devices, jobs] = await Promise.all([
-      this.prisma.workerDevice.findMany({ include: { sessions: { orderBy: { startedAt: 'desc' }, take: 5 } }, orderBy: { displayName: 'asc' } }),
-      this.prisma.windowsExecutionJob.findMany({ where: projectId ? { projectId } : undefined, orderBy: { createdAt: 'desc' }, take: 100 })
+      this.prisma.workerDevice.findMany({ include: { sessions: { include: { leases: { where: { status: 'active' }, include: { job: true }, take: 1 } }, orderBy: { startedAt: 'desc' }, take: 5 } }, orderBy: { displayName: 'asc' } }),
+      this.prisma.windowsExecutionJob.findMany({ where: projectId ? { projectId } : undefined, include: { leases: { where: { status: 'active' }, take: 1 } }, orderBy: { createdAt: 'desc' }, take: 100 })
     ]);
     const heartbeatCutoff = now.getTime() - WINDOWS_DEVICE_OFFLINE_AFTER_MS;
     const mappedDevices = devices.map((device) => ({ schemaVersion: 1 as const, id: device.id, platform: 'windows' as const, runnerVersion: device.runnerVersion,
@@ -217,9 +248,44 @@ export class WindowsWorkerRepository {
       capabilities: device.capabilities as unknown as WorkerCapability[],
       probeEvidence: device.probeEvidence as unknown as WorkerProbeEvidence[],
       lastHeartbeatAt: device.lastHeartbeatAt?.toISOString(), sessions: device.sessions.map((session) => ({ schemaVersion: 1 as const, id: session.id,
-        deviceId: session.deviceId, status: session.status, startedAt: session.startedAt.toISOString(), expiresAt: session.expiresAt.toISOString(),
-        lastHeartbeatAt: session.lastHeartbeatAt.toISOString(), endedAt: session.endedAt?.toISOString() })) }));
-    return { schemaVersion: 1, devices: mappedDevices, waitingValidations: jobs.filter((job) => job.status === 'queued').map((job) => {
+        deviceId: session.deviceId, status: ['active', 'draining'].includes(session.status)
+          && (session.expiresAt.getTime() <= now.getTime() || session.lastHeartbeatAt.getTime() < heartbeatCutoff) ? 'expired' as const : session.status, startedAt: session.startedAt.toISOString(), expiresAt: session.expiresAt.toISOString(),
+        lastHeartbeatAt: session.lastHeartbeatAt.toISOString(), endedAt: session.endedAt?.toISOString(), selectedProjectIds: session.authorizedProjectIds as string[],
+        currentJobId: session.leases?.[0]?.jobId })) }));
+    const evidence = jobs.flatMap((job) => { const packet = job.packet as unknown as WindowsExecutionPacket & { evidenceUpload?: WindowsEvidenceUpload };
+      return packet.evidenceUpload ? [{ jobId: job.id, projectId: job.projectId, taskId: job.taskId, checkId: packet.checkId, criterion: packet.check.criterion,
+        commitSha: packet.commitSha, provenance: packet.evidenceUpload.realEngineEvidence ? 'real-toolchain' as const : 'fixture' as const,
+        classification: packet.evidenceUpload.realEngineEvidence?.classification, log: packet.evidenceUpload.log,
+        artifacts: packet.evidenceUpload.artifacts.map(({ contentBase64: _content, ...artifact }) => ({ ...artifact, previewUrl: `/api/windows-runner/jobs/${job.id}/artifacts/${encodeURIComponent(artifact.sha256)}` })) }] : []; });
+    const realSucceeded = jobs.flatMap((job) => { const packet = job.packet as any;
+      const real = packet.evidenceUpload?.realEngineEvidence ?? packet.authoringResult?.realEngineEvidence;
+      return job.status === 'succeeded' && real?.state === 'succeeded' && real.scenario === 'borek-filip'
+        && real.settings?.qualificationProfile === 'borek-filip' && hasReadableRealArtifacts(packet, real) ? [{ job, packet, real,
+        identity: qualificationEvidenceIdentity(job.projectId, real) }] : []; });
+    const identityScores = new Map<string, number>();
+    for (const record of realSucceeded) identityScores.set(record.identity, (identityScores.get(record.identity) ?? 0) + 1);
+    const qualificationIdentity = [...identityScores].sort((left, right) => right[1] - left[1])[0]?.[0];
+    const matching = realSucceeded.filter((record) => record.identity === qualificationIdentity);
+    const matches = (predicate: (record: typeof matching[number]) => boolean) => matching.filter(predicate).map(({ job }) => job.id);
+    const requirements = [
+      { key: 'toolchain' as const, evidenceJobIds: matches(({ real }) => hasExactRequiredToolchain(real)) },
+      { key: 'flying-content' as const, evidenceJobIds: matches(({ real }) => real.settings?.contentProvenance === 'flying-repository' && typeof real.settings?.flyingCommitSha === 'string' && /^(?:[a-f0-9]{40}|[a-f0-9]{64})$/i.test(real.settings.flyingCommitSha)) },
+      { key: 'build' as const, evidenceJobIds: matches(({ real }) => ['build-validation', 'shipping'].includes(real.classification)) },
+      { key: 'render' as const, evidenceJobIds: matches(({ real }) => real.classification === 'capture') },
+      { key: 'binary-delivery' as const, evidenceJobIds: matches(({ real }) => real.classification === 'shipping' && real.shippingExecutable?.current === true) },
+      { key: 'interruption-resume' as const, evidenceJobIds: matches(({ job, packet }) => packet.kind === 'authoring' && packet.authoringResult?.status === 'succeeded' && (job.authoringProgress as any)?.checkpoint?.resumedFromCheckpoint === true) }
+    ].map((requirement) => ({ ...requirement, satisfied: requirement.evidenceJobIds.length > 0 }));
+    const ready = requirements.every(({ satisfied }) => satisfied);
+    return { schemaVersion: 1, devices: mappedDevices, activeAuthoring: jobs.flatMap((job) => { const packet = job.packet as any; const lease = job.leases?.[0];
+      const device = lease && mappedDevices.find((candidate) => candidate.id === lease.deviceId);
+      const liveSession = device?.sessions.find((session) => session.id === lease?.sessionId && ['active', 'draining'].includes(session.status));
+      if (!lease || lease.expiresAt.getTime() <= now.getTime() || !liveSession || device?.status === 'offline'
+        || packet.kind !== 'authoring' || !['leased', 'running'].includes(job.status)) return [];
+      return [{ jobId: job.id, projectId: job.projectId, taskId: job.taskId, sessionId: lease.sessionId, deviceId: lease.deviceId,
+        phase: ((job.authoringProgress as any)?.phase ?? 'checkout') as import('@forgemind/core').WindowsAuthoringProgress['phase'], requiredCapabilities: job.requiredCapabilities as string[],
+        lastCheckpoint: (job.authoringProgress as any)?.checkpoint?.resultTreeSha,
+        resumedFromCheckpoint: (job.authoringProgress as any)?.checkpoint?.resumedFromCheckpoint === true,
+        logs: (job.authoringProgress as any)?.log ? [(job.authoringProgress as any).log] : [] }]; }), waitingValidations: jobs.filter((job) => job.status === 'queued').map((job) => {
       const packet = job.packet as unknown as WindowsExecutionPacket; const required = job.requiredCapabilities as string[];
       return { jobId: job.id, taskId: job.taskId, criterion: packet.check?.criterion, requiredCapabilities: required,
         waitReason: (job.waitReason === 'insufficient_capacity' ? 'insufficient_capacity' : 'unavailable_capability') as WindowsCapabilityWaitReason,
@@ -227,9 +293,30 @@ export class WindowsWorkerRepository {
         compatibleDeviceIds: mappedDevices.filter((device) => device.status === 'idle'
           && device.sessions.some((session) => session.status === 'active' && Date.parse(session.expiresAt) > now.getTime() && Date.parse(session.lastHeartbeatAt) >= heartbeatCutoff)
           && required.every((key) => capabilitySatisfies(device, key, now))).map((device) => device.id) };
-    }), evidence: jobs.flatMap((job) => { const packet = job.packet as unknown as WindowsExecutionPacket & { evidenceUpload?: WindowsEvidenceUpload };
-      return packet.evidenceUpload ? [{ jobId: job.id, taskId: job.taskId, checkId: packet.checkId, criterion: packet.check.criterion,
-        commitSha: packet.commitSha, log: packet.evidenceUpload.log, artifacts: packet.evidenceUpload.artifacts.map(({ contentBase64: _content, ...artifact }) => artifact) }] : []; }) };
+    }), evidence, qualificationReadiness: { profileId: 'borek-filip', state: ready ? 'ready-for-physical-qualification' : 'unverified', requirements,
+      reason: ready ? 'Matching real production evidence is complete; physical qualification remains separate.' : `Missing real evidence: ${requirements.filter((item) => !item.satisfied).map((item) => item.key).join(', ')}. Fixtures never satisfy qualification readiness.` } };
+  }
+
+  async readArtifact(jobId: string, sha256: string): Promise<{ content: Buffer; mimeType: string } | undefined> {
+    const job = await this.prisma.windowsExecutionJob.findUnique({ where: { id: jobId }, select: { packet: true } });
+    const upload = (job?.packet as any)?.evidenceUpload as WindowsEvidenceUpload | undefined;
+    const artifact = upload?.artifacts.find((item) => item.sha256.toLowerCase() === sha256.toLowerCase());
+    if (!artifact) return undefined;
+    const content = Buffer.from(artifact.contentBase64, 'base64');
+    if (content.length !== artifact.sizeBytes || createHash('sha256').update(content).digest('hex') !== artifact.sha256.toLowerCase()) return undefined;
+    return { content, mimeType: artifact.mimeType ?? 'application/octet-stream' };
+  }
+
+  async recordAuthoringProgress(deviceId: string, progress: WindowsAuthoringProgress): Promise<boolean> {
+    const changed = await this.prisma.windowsExecutionJob.updateMany({ where: { id: progress.jobId, status: { in: ['leased', 'running'] },
+      leases: { some: { id: progress.leaseId, sessionId: progress.sessionId, deviceId, status: 'active' } } },
+      data: { authoringProgress: asJson(progress) } });
+    return changed.count === 1;
+  }
+
+  async resumeSession(sessionId: string, now = new Date()): Promise<string> {
+    const prior = await this.prisma.workerSession.findUniqueOrThrow({ where: { id: sessionId } });
+    return this.startManualSession(prior.deviceId, new Date(now.getTime() + 60_000), prior.authorizedProjectIds as string[]);
   }
 
   async cancelJob(jobId: string): Promise<boolean> {

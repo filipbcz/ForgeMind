@@ -39,6 +39,9 @@ const sessionControl = z.object({ sessionId: z.string().uuid() });
 const controlQuery = z.object({ sessionId: z.string().uuid(), leaseId: z.string().uuid().optional() });
 const sha = z.string().regex(/^[a-f0-9]{64}$/i);
 const gitCommitSha = z.string().regex(/^(?:[a-f0-9]{40}|[a-f0-9]{64})$/i);
+const authoringProgress = z.object({ schemaVersion: z.literal(1), jobId: z.string().uuid(), leaseId: z.string().uuid(), sessionId: z.string().uuid(),
+  phase: z.enum(['checkout', 'author', 'verify', 'build', 'cook', 'package']), checkpoint: z.object({ resultTreeSha: gitCommitSha,
+    updatedAt: z.string().datetime(), resumedFromCheckpoint: z.boolean() }), log: z.object({ text: z.string(), sizeBytes: z.number().int().nonnegative(), sha256: sha }) });
 const artifactResult = z.object({ name: z.string().min(1), relativePath: z.string().min(1), mimeType: z.string().optional(),
   sizeBytes: z.number().int().nonnegative(), sha256: sha });
 const realEngineEvidence = z.object({ classification: z.enum(['automated-scenario', 'benchmark', 'soak', 'build-validation', 'capture', 'shipping']),
@@ -174,6 +177,15 @@ export function registerWindowsRunnerRoutes(app: FastifyInstance, repository: Fo
     await repository.writeAudit({ actorType: 'system', actorId: principal.deviceId, eventType: 'windows_runner_result_submitted', taskId: request.body.taskId, projectId: request.body.projectId, payload: { deviceId: principal.deviceId, jobId: request.body.jobId, leaseId: request.body.leaseId, status: request.body.status, commitSha: request.body.commitSha } });
     return { accepted: true, evidenceRecorded };
   });
+  app.post('/api/windows-runner/device/authoring-progress', { preHandler: runnerAuth(credentials) }, async (request, reply) => {
+    const principal = runnerPrincipal(request); const parsed = authoringProgress.safeParse(request.body);
+    if (!parsed.success) return reply.code(400).send({ error: 'Invalid authoring progress.' });
+    const progress = parsed.data; const text = redactSecrets(progress.log.text); const sizeBytes = Buffer.byteLength(text);
+    if (text !== progress.log.text || sizeBytes !== progress.log.sizeBytes || sizeBytes > WINDOWS_EVIDENCE_MAX_LOG_BYTES
+      || createHash('sha256').update(text).digest('hex') !== progress.log.sha256.toLowerCase()) return reply.code(400).send({ error: 'Authoring progress log is invalid.' });
+    const accepted = await workers.recordAuthoringProgress(principal.deviceId, progress);
+    return accepted ? { accepted } : reply.code(409).send({ error: 'Execution lease is not active for this device.' });
+  });
   app.post('/api/windows-runner/device/evidence', { preHandler: runnerAuth(credentials), bodyLimit: WINDOWS_EVIDENCE_MAX_ARTIFACT_BYTES + WINDOWS_EVIDENCE_MAX_LOG_BYTES + 100_000 }, async (request, reply) => {
     const principal = runnerPrincipal(request); const parsed = evidenceUpload.safeParse(request.body);
     if (!parsed.success) return reply.code(400).send({ error: 'Invalid evidence upload.' });
@@ -192,10 +204,20 @@ export function registerWindowsRunnerRoutes(app: FastifyInstance, repository: Fo
     return outcome === 'conflict' ? reply.code(409).send({ error: 'Evidence conflicts with the lease or an existing upload.' }) : { accepted: true, duplicate: outcome === 'duplicate' };
   });
   app.get('/api/windows-runner/operations', async (request) => workers.readOperations(z.object({ projectId: z.string().uuid().optional() }).parse(request.query).projectId));
+  app.get('/api/windows-runner/jobs/:jobId/artifacts/:sha256', async (request, reply) => {
+    const input = z.object({ jobId: z.string().uuid(), sha256: sha }).parse(request.params);
+    const artifact = await workers.readArtifact(input.jobId, input.sha256);
+    if (!artifact) return reply.code(404).send({ error: 'Artifact is missing, unreadable, or does not match its recorded hash.' });
+    return reply.header('content-type', artifact.mimeType).header('content-disposition', 'inline').send(artifact.content);
+  });
   app.post('/api/windows-runner/jobs/:jobId/cancel', async (request) => { const jobId = z.object({ jobId: z.string().uuid() }).parse(request.params).jobId; const accepted = await workers.cancelJob(jobId);
     await repository.writeAudit({ actorType: 'user', eventType: 'windows_runner_job_cancelled', payload: { jobId, accepted } }); return { accepted }; });
   app.post('/api/windows-runner/sessions/:sessionId/drain', async (request) => { const sessionId = z.object({ sessionId: z.string().uuid() }).parse(request.params).sessionId; await workers.drainSession(sessionId);
     await repository.writeAudit({ actorType: 'user', eventType: 'windows_runner_session_draining', payload: { sessionId } }); return { accepted: true }; });
+  app.post('/api/windows-runner/sessions/:sessionId/stop', async (request) => { const sessionId = z.object({ sessionId: z.string().uuid() }).parse(request.params).sessionId; await workers.cancelSession(sessionId);
+    await repository.writeAudit({ actorType: 'user', eventType: 'windows_runner_session_stopped', payload: { sessionId } }); return { accepted: true }; });
+  app.post('/api/windows-runner/sessions/:sessionId/resume', async (request) => { const sessionId = z.object({ sessionId: z.string().uuid() }).parse(request.params).sessionId; const resumedSessionId = await workers.resumeSession(sessionId);
+    await repository.writeAudit({ actorType: 'user', eventType: 'windows_runner_session_resumed', payload: { sessionId, resumedSessionId } }); return { accepted: true, sessionId: resumedSessionId }; });
 }
 
 function runnerAuth(credentials: WindowsRunnerCredentialAdapter) {

@@ -26,6 +26,31 @@ const leaseRow = {
 };
 
 describe('WindowsWorkerRepository capability leases', () => {
+  it('persists live authoring progress only through the matching active lifecycle lease', async () => {
+    const updateMany = vi.fn(async () => ({ count: 1 }));
+    const progress = { schemaVersion: 1 as const, jobId: 'job_1', leaseId: 'lease_1', sessionId: 'session_1', phase: 'author' as const,
+      checkpoint: { resultTreeSha: 'a'.repeat(40), updatedAt: '2026-09-06T00:00:00.000Z', resumedFromCheckpoint: true },
+      log: { text: 'saved package', sizeBytes: 13, sha256: 'b'.repeat(64) } };
+    await expect(new WindowsWorkerRepository({ windowsExecutionJob: { updateMany } } as any).recordAuthoringProgress('device_1', progress)).resolves.toBe(true);
+    expect(updateMany).toHaveBeenCalledWith({ where: { id: 'job_1', status: { in: ['leased', 'running'] }, leases: { some: {
+      id: 'lease_1', sessionId: 'session_1', deviceId: 'device_1', status: 'active' } } }, data: { authoringProgress: progress } });
+  });
+
+  it('projects the persisted live authoring phase instead of the static queue phase', async () => {
+    const now = new Date('2026-09-06T00:00:00.000Z'); const expiresAt = new Date(now.getTime() + 60_000);
+    const session = { id: 'session_1', deviceId: 'device_1', status: 'active', startedAt: now, expiresAt, lastHeartbeatAt: now,
+      endedAt: null, authorizedProjectIds: ['project_1'], leases: [{ jobId: 'job_1' }] };
+    const lease = { id: 'lease_1', deviceId: 'device_1', sessionId: 'session_1', expiresAt };
+    const authoringProgress = { phase: 'verify', checkpoint: { resultTreeSha: 'a'.repeat(40), resumedFromCheckpoint: false },
+      log: { text: 'live', sizeBytes: 4, sha256: 'b'.repeat(64) } };
+    const prisma: any = { workerDevice: { findMany: vi.fn(async () => [{ id: 'device_1', runnerVersion: '1', displayName: 'device', status: 'running',
+      capabilities: [], probeEvidence: [], lastHeartbeatAt: now, sessions: [session] }]) }, windowsExecutionJob: { findMany: vi.fn(async () => [{
+      id: 'job_1', projectId: 'project_1', taskId: 'task_1', status: 'running', pendingPhase: 'author', requiredCapabilities: [],
+      packet: { kind: 'authoring' }, authoringProgress, leases: [lease] }]) } };
+    const operations = await new WindowsWorkerRepository(prisma).readOperations(undefined, now);
+    expect(operations.activeAuthoring[0]).toMatchObject({ phase: 'verify', lastCheckpoint: 'a'.repeat(40), logs: [authoringProgress.log] });
+  });
+
   it('persists a versioned authoring packet with its exact base identity', async () => {
     const packet = { kind: 'authoring', protocolVersion: 1, projectId: 'project_1', taskId: 'task_1', runId: 'run_1', jobId: 'job_1', leaseId: 'pending',
       repository: 'owner/repo', sourceUrl: 'https://example.test/repo.git', baseCommitSha: 'b'.repeat(40), workspaceRoot: 'runner-managed', artifactRoot: 'runner-managed',
@@ -90,6 +115,27 @@ describe('WindowsWorkerRepository capability leases', () => {
     expect(readModel.devices.find(({ id }) => id === 'revoked')?.status).toBe('revoked');
     expect(readModel.waitingValidations[0]?.compatibleDeviceIds).toEqual(['eligible']);
     expect(readModel.waitingValidations[0]).toMatchObject({ waitReason: 'unavailable_capability', pendingPhase: 'validate' });
+  });
+
+  it('projects an elapsed session as expired even before recovery updates storage', async () => {
+    const now = new Date('2026-09-06T00:00:00.000Z');
+    const prisma: any = { workerDevice: { findMany: vi.fn(async () => [{ id: 'device_1', runnerVersion: '1', displayName: 'device', status: 'idle',
+      capabilities: [], probeEvidence: [], lastHeartbeatAt: now, sessions: [{ id: 'session_1', deviceId: 'device_1', status: 'active',
+        startedAt: new Date(now.getTime() - 120_000), expiresAt: new Date(now.getTime() - 1), lastHeartbeatAt: now, endedAt: null,
+        authorizedProjectIds: ['project_1'], leases: [] }] }]) }, windowsExecutionJob: { findMany: vi.fn(async () => []) } };
+    const operations = await new WindowsWorkerRepository(prisma).readOperations(undefined, now);
+    expect(operations.devices[0]?.sessions[0]?.status).toBe('expired');
+  });
+
+  it('projects a future-expiry session with a stale heartbeat as expired', async () => {
+    const now = new Date('2026-09-06T00:00:00.000Z');
+    const prisma: any = { workerDevice: { findMany: vi.fn(async () => [{ id: 'device_1', runnerVersion: '1', displayName: 'device', status: 'idle',
+      capabilities: [], probeEvidence: [], lastHeartbeatAt: new Date(now.getTime() - 60_000), sessions: [{ id: 'session_1', deviceId: 'device_1', status: 'active',
+        startedAt: new Date(now.getTime() - 120_000), expiresAt: new Date(now.getTime() + 60_000), lastHeartbeatAt: new Date(now.getTime() - 60_000), endedAt: null,
+        authorizedProjectIds: ['project_1'], leases: [] }] }]) }, windowsExecutionJob: { findMany: vi.fn(async () => []) } };
+    const operations = await new WindowsWorkerRepository(prisma).readOperations(undefined, now);
+    expect(operations.devices[0]?.status).toBe('offline');
+    expect(operations.devices[0]?.sessions[0]?.status).toBe('expired');
   });
 
   it('persists a recoverable capacity wait without leasing or changing the pending phase', async () => {

@@ -552,6 +552,7 @@ model WindowsExecutionJob {
   waitReason           String?            @map("wait_reason")
   pendingPhase         String             @default("validate") @map("pending_phase")
   packet               Json
+  authoringProgress    Json?              @map("authoring_progress")
   createdAt            DateTime           @default(now()) @map("created_at")
   updatedAt            DateTime           @updatedAt @map("updated_at")
 

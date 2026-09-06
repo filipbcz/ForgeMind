@@ -1,4 +1,4 @@
-import type { WindowsEvidenceUpload, WindowsExecutionJob, WindowsExecutionLease, WindowsJobResult, WorkerCapability, WorkerProbeEvidence } from '@forgemind/core';
+import type { WindowsAuthoringProgress, WindowsEvidenceUpload, WindowsExecutionJob, WindowsExecutionLease, WindowsJobResult, WorkerCapability, WorkerProbeEvidence } from '@forgemind/core';
 import type { RunnerCredential } from './credential-store.js';
 
 export interface RunnerControlState { deviceStatus: string; sessionStatus: string; leaseStatus?: string; jobStatus?: string }
@@ -25,6 +25,7 @@ export class WindowsRunnerTransport {
   drain(auth: RunnerCredential, sessionId: string) { return this.call('/api/windows-runner/device/session/drain', auth, { sessionId }); }
   stop(auth: RunnerCredential, sessionId: string) { return this.call('/api/windows-runner/device/session/stop', auth, { sessionId }); }
   uploadEvidence(auth: RunnerCredential, input: WindowsEvidenceUpload) { return this.call<{ accepted: boolean; duplicate: boolean }>('/api/windows-runner/device/evidence', auth, input); }
+  publishAuthoringProgress(auth: RunnerCredential, input: WindowsAuthoringProgress) { return this.call<{ accepted: boolean }>('/api/windows-runner/device/authoring-progress', auth, input); }
   submitResult(auth: RunnerCredential, input: WindowsJobResult) { return this.call<{ accepted: boolean }>('/api/windows-runner/device/result', auth, input); }
   close(auth: RunnerCredential, sessionId: string) { return this.call('/api/windows-runner/device/session/close', auth, { sessionId }); }
   private async call<T = unknown>(path: string, auth?: RunnerCredential, body?: unknown, method = 'POST'): Promise<T> {
