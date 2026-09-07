@@ -358,6 +358,7 @@ export class WindowsWorkerRepository {
             AND task."status" IN ('completed', 'ready_for_user_review'))
         )
         JOIN "task_runs" run ON run."id" = candidate."run_id" AND run."task_id" = task."id"
+          AND (candidate."packet"->>'kind' IS DISTINCT FROM 'authoring' OR run."status" = 'running')
         JOIN "worker_devices" d ON d."id" = ${session.device_id}
         WHERE candidate."status" = 'queued'
           AND candidate."project_id" IN (SELECT jsonb_array_elements_text(${JSON.stringify(session.authorized_project_ids)}::jsonb))

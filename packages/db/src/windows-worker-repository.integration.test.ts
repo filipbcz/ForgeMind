@@ -162,6 +162,19 @@ describeDatabase('WindowsWorkerRepository PostgreSQL concurrency', () => {
     expect(await first.windowsExecutionLease.count({ where: { jobId: ids.job } })).toBe(0);
   });
 
+  it('does not claim a queued job from a cancelled run after its task is retried', async () => {
+    await first.windowsExecutionLease.deleteMany({ where: { jobId: ids.job } });
+    await first.windowsExecutionJob.update({ where: { id: ids.job }, data: { status: 'queued' } });
+    await first.workerDevice.update({ where: { id: ids.device }, data: { status: 'idle' } });
+    await first.task.update({ where: { id: ids.task }, data: { status: 'running_ai' } });
+    await first.taskRun.update({ where: { id: ids.run }, data: { status: 'cancelled', finishedAt: new Date() } });
+
+    const claim = await new WindowsWorkerRepository(first).claimCompatible(ids.session, 60, 'cancelled_run_request');
+
+    expect(claim).toBeUndefined();
+    expect(await first.windowsExecutionLease.count({ where: { jobId: ids.job } })).toBe(0);
+  });
+
   it('returns deterministically when a session retries a terminal lease nonce', async () => {
     await first.task.update({ where: { id: ids.task }, data: { status: 'completed' } });
     await first.windowsExecutionJob.update({ where: { id: ids.job }, data: { status: 'queued' } });

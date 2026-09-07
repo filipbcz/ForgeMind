@@ -191,6 +191,16 @@ function createMockPrisma() {
     projectImplementationStep: {
       updateMany: vi.fn(async () => ({ count: 1 }))
     },
+    windowsExecutionLease: {
+      findMany: vi.fn(async () => [{ deviceId: 'windows_device_1' }]),
+      updateMany: vi.fn(async () => ({ count: 1 }))
+    },
+    windowsExecutionJob: {
+      updateMany: vi.fn(async () => ({ count: 1 }))
+    },
+    workerDevice: {
+      updateMany: vi.fn(async () => ({ count: 1 }))
+    },
     acceptanceEvidence: {
       updateMany: vi.fn(async () => ({ count: 1 }))
     },
@@ -892,6 +902,24 @@ describe('ForgeMindRepository task runs', () => {
     expect(prisma.projectImplementationStep.updateMany).toHaveBeenCalledWith({
       where: { taskId: 'task_1', status: 'running' },
       data: { status: 'cancelled', completedAt: null }
+    });
+    expect(prisma.windowsExecutionLease.updateMany).toHaveBeenCalledWith({
+      where: {
+        status: 'active',
+        job: { taskId: 'task_1', status: { in: ['queued', 'leased', 'running'] } }
+      },
+      data: { status: 'cancelled', releasedAt: expect.any(Date) }
+    });
+    expect(prisma.windowsExecutionJob.updateMany).toHaveBeenCalledWith({
+      where: { taskId: 'task_1', status: { in: ['queued', 'leased', 'running'] } },
+      data: { status: 'cancelled' }
+    });
+    expect(prisma.workerDevice.updateMany).toHaveBeenCalledWith({
+      where: {
+        id: { in: ['windows_device_1'] },
+        status: { in: ['reserved', 'running', 'draining'] }
+      },
+      data: { status: 'idle' }
     });
   });
 

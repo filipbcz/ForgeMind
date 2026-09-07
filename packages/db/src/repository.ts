@@ -3778,6 +3778,37 @@ export class ForgeMindRepository {
 
     const updated = await this.prisma.$transaction(async (tx) => {
       const finishedAt = new Date();
+      const activeWindowsLeases = await tx.windowsExecutionLease.findMany({
+        where: {
+          status: 'active',
+          job: {
+            taskId,
+            status: { in: ['queued', 'leased', 'running'] }
+          }
+        },
+        select: { deviceId: true }
+      });
+      const cancelledWindowsLeases = await tx.windowsExecutionLease.updateMany({
+        where: {
+          status: 'active',
+          job: {
+            taskId,
+            status: { in: ['queued', 'leased', 'running'] }
+          }
+        },
+        data: { status: 'cancelled', releasedAt: finishedAt }
+      });
+      const cancelledWindowsJobs = await tx.windowsExecutionJob.updateMany({
+        where: { taskId, status: { in: ['queued', 'leased', 'running'] } },
+        data: { status: 'cancelled' }
+      });
+      const leasedDeviceIds = [...new Set(activeWindowsLeases.map(({ deviceId }) => deviceId))];
+      if (leasedDeviceIds.length > 0) {
+        await tx.workerDevice.updateMany({
+          where: { id: { in: leasedDeviceIds }, status: { in: ['reserved', 'running', 'draining'] } },
+          data: { status: 'idle' }
+        });
+      }
       const cancelledTask = await tx.task.update({
         where: { id: taskId },
         data: { status: 'cancelled', finishedAt }
@@ -3794,7 +3825,9 @@ export class ForgeMindRepository {
         taskId: cancelledTask.id,
         payload: {
           cancelledQueueJobs: queueCancellation.count,
-          cancelledRoadmapSteps: cancelledSteps.count
+          cancelledRoadmapSteps: cancelledSteps.count,
+          cancelledWindowsJobs: cancelledWindowsJobs.count,
+          cancelledWindowsLeases: cancelledWindowsLeases.count
         }
       });
       if (cancelledSteps.count > 0) {
