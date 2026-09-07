@@ -18,6 +18,6 @@ export function buildSandboxedProcessInvocation(input: {
   const commandArgs = input.shell === 'cmd'
     ? ['/d', '/s', '/c', input.command]
     : ['-NoLogo', '-NoProfile', '-NonInteractive', '-Command', input.command];
-  return { executable: input.sandboxExecutable, args: ['sandbox', '-c', 'sandbox_mode="workspace-write"', '-C', input.checkoutRoot,
+  return { executable: input.sandboxExecutable, args: ['sandbox', '--permission-profile', ':workspace', '-C', input.checkoutRoot,
     '--sandbox-state-disable-network', '--', executable, ...commandArgs] };
 }

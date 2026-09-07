@@ -4,7 +4,7 @@ import { assertEvidenceOutsideCheckout, buildSandboxedProcessInvocation } from '
 describe('native process sandbox', () => {
   it('wraps unrestricted PowerShell and cmd text in a checkout-scoped networkless sandbox', () => {
     const powershell = buildSandboxedProcessInvocation({ sandboxExecutable: 'codex.exe', checkoutRoot: 'C:\\leases\\job', shell: 'powershell', command: 'project-build -All' });
-    expect(powershell).toEqual({ executable: 'codex.exe', args: ['sandbox', '-c', 'sandbox_mode="workspace-write"', '-C', 'C:\\leases\\job',
+    expect(powershell).toEqual({ executable: 'codex.exe', args: ['sandbox', '--permission-profile', ':workspace', '-C', 'C:\\leases\\job',
       '--sandbox-state-disable-network', '--', 'powershell.exe', '-NoLogo', '-NoProfile', '-NonInteractive', '-Command', 'project-build -All'] });
     expect(buildSandboxedProcessInvocation({ sandboxExecutable: 'codex.exe', checkoutRoot: 'C:\\leases\\job', shell: 'cmd', command: 'build.cmd /all' }).args)
       .toEqual(expect.arrayContaining(['--', 'cmd.exe', '/d', '/s', '/c', 'build.cmd /all']));
