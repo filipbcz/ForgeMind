@@ -112,11 +112,11 @@ export async function executeWindowsAuthoring(packet: WindowsAuthoringPacket, co
   const cacheDirectory = managedChild(suppliedRoots.cache, packet.taskId); const outputDirectory = managedChild(suppliedRoots.outputs, packet.taskId);
   const cacheIdentityPath = resolve(cacheDirectory, 'forgemind-cache-identity.json');
   try {
-    const identity = JSON.parse(await readFile(cacheIdentityPath, 'utf8')) as { inputHash?: string; baseCommitSha?: string };
-    if (identity.inputHash !== packet.inputHash || identity.baseCommitSha?.toLowerCase() !== packet.baseCommitSha.toLowerCase()) await rm(cacheDirectory, { recursive: true, force: true });
+    const identity = JSON.parse(await readFile(cacheIdentityPath, 'utf8')) as { taskId?: string; baseCommitSha?: string };
+    if (identity.taskId !== packet.taskId || identity.baseCommitSha?.toLowerCase() !== packet.baseCommitSha.toLowerCase()) await rm(cacheDirectory, { recursive: true, force: true });
   } catch { await rm(cacheDirectory, { recursive: true, force: true }); }
   await Promise.all([mkdir(cacheDirectory, { recursive: true }), mkdir(outputDirectory, { recursive: true })]);
-  await writeFile(cacheIdentityPath, JSON.stringify({ version: 1, inputHash: packet.inputHash, baseCommitSha: packet.baseCommitSha }), 'utf8');
+  await writeFile(cacheIdentityPath, JSON.stringify({ version: 2, taskId: packet.taskId, baseCommitSha: packet.baseCommitSha }), 'utf8');
   const checkpointPath = resolve(evidenceDirectory, 'authoring-checkpoint.json');
   const checkout = await prepareCheckout(packet, context.workspaceRoot, checkpointPath, outputDirectory, context.signal);
   const workspacePath = checkout.path;
@@ -130,9 +130,11 @@ export async function executeWindowsAuthoring(packet: WindowsAuthoringPacket, co
     if (!context.onProgress) return;
     const text = redactSecrets(processes.map((process) => `${process.command}\n${process.stdout}\n${process.stderr}`).join('\n')).slice(-packet.resourcePolicy.maxLogBytes);
     const phase = processes.at(-1)?.authoring?.phase ?? 'checkout';
-    await context.onProgress({ schemaVersion: 1, jobId: packet.jobId, leaseId: packet.leaseId, sessionId: context.sessionId, phase,
-      checkpoint: { resultTreeSha: checkpoint.resultTreeSha, updatedAt: checkpoint.updatedAt, resumedFromCheckpoint: checkout.resumed },
-      log: { text, sizeBytes: Buffer.byteLength(text), sha256: createHash('sha256').update(text).digest('hex') } });
+    try {
+      await context.onProgress({ schemaVersion: 1, jobId: packet.jobId, leaseId: packet.leaseId, sessionId: context.sessionId, phase,
+        checkpoint: { resultTreeSha: checkpoint.resultTreeSha, updatedAt: checkpoint.updatedAt, resumedFromCheckpoint: checkout.resumed },
+        log: { text, sizeBytes: Buffer.byteLength(text), sha256: createHash('sha256').update(text).digest('hex') } });
+    } catch { /* the durable local checkpoint remains available while the session monitor handles connectivity */ }
   };
   const tools = createTools(workspacePath, resolve(evidenceDirectory, 'native-processes.jsonl'), packet.resourcePolicy.timeoutSeconds * 1_000,
     context.signal, processes, packet.leaseId, context.sessionId, { ...suppliedRoots, cache: cacheDirectory, outputs: outputDirectory,
@@ -157,9 +159,18 @@ export async function executeWindowsAuthoring(packet: WindowsAuthoringPacket, co
   await rm(resolve(workspacePath, '.forgemind-tmp'), { recursive: true, force: true });
   const changedPaths = await stageChangedPaths(workspacePath, context.signal);
   await rejectProhibitedResultPaths(packet, workspacePath, context.signal);
-  const productionReviewRequired = status === 'succeeded'
-    ? await enforceRequiredUnrealAssets(packet, workspacePath, evidenceDirectory, changedPaths, processes, packet.resourcePolicy.timeoutSeconds * 1_000, context.signal)
-    : false;
+  let productionReviewRequired = false;
+  if (status === 'succeeded') {
+    try {
+      productionReviewRequired = await enforceRequiredUnrealAssets(packet, workspacePath, evidenceDirectory, changedPaths, processes,
+        packet.resourcePolicy.timeoutSeconds * 1_000, context.signal);
+    } catch (error) {
+      status = context.signal?.aborted ? 'cancelled' : 'failed';
+      summary = `Final native Unreal verification failed: ${redactSecrets(error instanceof Error ? error.message : String(error))}`;
+      authoringFailureState = classifyAuthoringFailure(summary, context.signal?.aborted === true, processes);
+    }
+    await publishCheckpoint(status === 'succeeded' ? 'verified' : 'verification-failed');
+  }
   const tree = await collectTree(workspacePath);
   const treeSha = await gitTree(workspacePath, context.signal);
   const patchResult = await spawnComplete('git.exe', ['diff', '--binary', '--no-ext-diff', '--cached', 'HEAD'], workspacePath, 30_000, context.signal);
@@ -275,8 +286,7 @@ async function prepareCheckout(packet: WindowsAuthoringPacket, root: string, che
   for (const candidate of [...generations, checkpointPath, `${checkpointPath}.previous`]) {
     try { checkpoint = JSON.parse(await readFile(candidate, 'utf8')) as AuthoringDiskCheckpoint; if (checkpoint.version === 2) break; } catch { /* try last complete generation */ }
   }
-  const checkpointMatches = checkpoint?.version === 2 && checkpoint.inputHash === packet.inputHash
-    && checkpoint.baseCommitSha.toLowerCase() === packet.baseCommitSha.toLowerCase();
+  const checkpointMatches = canResumeAuthoringCheckpoint(checkpoint, packet);
   try {
     const actual = await spawnComplete('git.exe', ['rev-parse', 'HEAD'], path, 30_000, signal);
     if (checkpointMatches
@@ -341,6 +351,14 @@ interface AuthoringDiskCheckpoint {
     lfsObjects: Array<{ oid: string; sha256: string; sizeBytes: number; contentBase64: string }>;
     outputs: Array<{ path: string; sha256: string; sizeBytes: number; contentBase64: string }> };
   updatedAt: string;
+}
+
+export function canResumeAuthoringCheckpoint(
+  checkpoint: Pick<AuthoringDiskCheckpoint, 'version' | 'taskId' | 'baseCommitSha'> | undefined,
+  packet: Pick<WindowsAuthoringPacket, 'taskId' | 'baseCommitSha'>
+): boolean {
+  return checkpoint?.version === 2 && checkpoint.taskId === packet.taskId
+    && checkpoint.baseCommitSha.toLowerCase() === packet.baseCommitSha.toLowerCase();
 }
 
 async function persistCheckpoint(path: string, packet: WindowsAuthoringPacket, workspacePath: string, status: string, signal?: AbortSignal, outputRoot?: string): Promise<AuthoringDiskCheckpoint> {
@@ -473,7 +491,7 @@ async function verifyUnrealPackages(root: string, evidenceRoot: string, assets: 
   const projectPath = await realpath(resolve(root, authoring.projectRelativePath));
   const relativeProject = relative(root, projectPath);
   if (relativeProject === '..' || relativeProject.startsWith(`..${process.platform === 'win32' ? '\\' : '/'}`)) throw new Error('Selected Unreal project escapes the leased checkout.');
-  const args = [projectPath, '-unattended', '-nop4', '-nosplash', `-ExecutePythonScript=${scriptPath}`];
+  const args = buildUnrealPackageVerificationArgs(projectPath, scriptPath);
   const startedAt = new Date();
   const output = await spawnComplete(authoring.executablePath, args, root, timeoutMs, signal);
   const inspections = output.stdout.split(/\r?\n/).filter((line) => line.includes(marker)).flatMap((line) => {
@@ -483,6 +501,11 @@ async function verifyUnrealPackages(root: string, evidenceRoot: string, assets: 
   return { checkId: 'unreal-saved-content-load', command: [authoring.executablePath, ...args].join(' '), shell: 'system', ...output,
     startedAt: startedAt.toISOString(), completedAt: new Date().toISOString(), authoring: { tool: 'unreal-python', phase: 'verify',
       projectRelativePath: authoring.projectRelativePath, executablePath: authoring.executablePath, args: args.slice(1), sourceRelativePaths: [], loadedPackages, inspections } };
+}
+
+export function buildUnrealPackageVerificationArgs(projectPath: string, scriptPath: string): string[] {
+  return [projectPath, '-unattended', '-nop4', '-nosplash', '-NullRHI', '-DDC-ForceMemoryCache', '-NoSaveConfig', '-stdout', '-FullStdOutLogOutput',
+    `-ExecutePythonScript=${scriptPath}`];
 }
 
 export function unrealObjectPath(assetPath: string, projectRelativePath: string): string {

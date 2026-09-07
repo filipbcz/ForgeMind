@@ -171,9 +171,9 @@ async function implementThroughWindowsLease(windowsWorkers: WindowsWorkerReposit
       prohibitedDatasetExtensions: ['.tif', '.tiff', '.geotiff', '.shp', '.dbf', '.shx', '.prj', '.gpkg', '.geojson', '.kml', '.kmz', '.gdb', '.fgb', '.las', '.laz', '.copc', '.dem', '.dt0', '.dt1', '.dt2', '.asc', '.img', '.jp2', '.ecw', '.mrf', '.mbtiles', '.pmtiles', '.osm', '.pbf', '.grib', '.nc', '.hdf'],
       maxUnclassifiedFileBytes: 50 * 1024 * 1024 },
     resourcePolicy: { timeoutSeconds: 36_000, maxLogBytes: WINDOWS_EVIDENCE_MAX_LOG_BYTES, maxArtifactBytes: WINDOWS_EVIDENCE_MAX_ARTIFACT_BYTES },
-    nonce: 'pending', inputHash: createHash('sha256').update(JSON.stringify({ taskId: input.taskId, runId: input.taskRunId, baseCommitSha: input.baseCommitSha,
+    nonce: 'pending', inputHash: createWindowsAuthoringInputHash({ taskId: input.taskId, baseCommitSha: input.baseCommitSha,
       prompt: input.prompt, acceptanceCriteria: input.acceptanceCriteria, previousValidationError: input.previousValidationError,
-      previousReviewBlockers: input.previousReviewBlockers, priorPatch, requiresUnrealAssets: input.requiresUnrealAssets })).digest('hex'),
+      previousReviewBlockers: input.previousReviewBlockers, priorPatch, requiresUnrealAssets: input.requiresUnrealAssets }),
     ...(realEngineEvidence ? { realEngineEvidence } : {}),
     authority: { database: 'none', productionHosts: 'none', globalGitHubCredentials: 'none' }
   };
@@ -209,6 +209,13 @@ async function implementThroughWindowsLease(windowsWorkers: WindowsWorkerReposit
     summary: `${outputEvidence.length > 0 ? `${result.summary}\n\nManaged output evidence: ${outputEvidence.join(', ')}` : result.summary}${reviewNotice}`,
     changedFiles: result.tree.map(({ path }) => path), evidenceFiles: outputEvidence, diffStat: { filesChanged: result.tree.length, insertions: 0, deletions: 0 },
     validationChecks: [], architectureUpdate: undefined };
+}
+
+export function createWindowsAuthoringInputHash(input: {
+  taskId: string; baseCommitSha: string; prompt: string; acceptanceCriteria: string[];
+  previousValidationError?: string; previousReviewBlockers?: string[]; priorPatch: string; requiresUnrealAssets: boolean;
+}): string {
+  return createHash('sha256').update(JSON.stringify(input)).digest('hex');
 }
 
 export function classifyAuthoringEvidence(prompt: string, acceptanceCriteria: string[], buildId: string,

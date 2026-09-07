@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from 'vitest';
-import { assertReadableAuthoringCheckout, classifyAuthoringFailure, collectAuthoringToolVersions, isProhibitedAuthoringPath, LifecycleNativeImplementationProvider, materializeOutputs, requiresProductionContent, type NativeAuthoringTools, unrealObjectPath, validateRequiredUnrealAssets } from './authoring-executor.js';
+import { assertReadableAuthoringCheckout, buildUnrealPackageVerificationArgs, canResumeAuthoringCheckpoint, classifyAuthoringFailure, collectAuthoringToolVersions, isProhibitedAuthoringPath, LifecycleNativeImplementationProvider, materializeOutputs, requiresProductionContent, type NativeAuthoringTools, unrealObjectPath, validateRequiredUnrealAssets } from './authoring-executor.js';
 import { mkdtemp, rm } from 'node:fs/promises';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
@@ -35,6 +35,18 @@ describe('native implementation provider lifecycle', () => {
       await expect(materializeOutputs(root, [{ path: 'Artifacts/Flying.png', sha256: createHash('sha256').update('expected').digest('hex'),
         sizeBytes: 8, contentBase64: Buffer.from('corrupt').toString('base64') }])).rejects.toThrow('checkpoint output is corrupt');
     } finally { await rm(root, { recursive: true, force: true }); }
+  });
+  it('resumes a durable task checkpoint across a new run identity on the same base commit', () => {
+    const checkpoint = { version: 2 as const, taskId: 'task-1', baseCommitSha: 'a'.repeat(40) };
+    expect(canResumeAuthoringCheckpoint(checkpoint, { taskId: 'task-1', baseCommitSha: 'a'.repeat(40) })).toBe(true);
+    expect(canResumeAuthoringCheckpoint(checkpoint, { taskId: 'task-2', baseCommitSha: 'a'.repeat(40) })).toBe(false);
+    expect(canResumeAuthoringCheckpoint(checkpoint, { taskId: 'task-1', baseCommitSha: 'b'.repeat(40) })).toBe(false);
+  });
+  it('uses headless memory-backed flags for final saved-package verification', () => {
+    expect(buildUnrealPackageVerificationArgs('C:/work/Game.uproject', 'C:/diagnostics/verify.py')).toEqual([
+      'C:/work/Game.uproject', '-unattended', '-nop4', '-nosplash', '-NullRHI', '-DDC-ForceMemoryCache', '-NoSaveConfig',
+      '-stdout', '-FullStdOutLogOutput', '-ExecutePythonScript=C:/diagnostics/verify.py'
+    ]);
   });
   it('requires editor-authored packages to be loaded after saving and retains source and exact tool provenance', () => {
     const base = { leaseId: 'lease', sessionId: 'session', shell: 'system' as const, exitCode: 0, stdout: '', stderr: '',

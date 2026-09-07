@@ -3172,4 +3172,11 @@ describe('real-engine authoring packet classification', () => {
     expect(classifyAuthoringEvidence('Execute an endurance soak', ['Survive four hours'], 'build-2', ['unreal'], true))
       .toMatchObject({ classification: 'soak', buildId: 'build-2', scenario: 'Survive four hours' });
   });
+  it('keeps the semantic authoring input hash stable across task-run retries', async () => {
+    const { createWindowsAuthoringInputHash } = await import('./db-worker.js');
+    const input = { taskId: 'task-1', baseCommitSha: 'a'.repeat(40), prompt: 'Create a scene', acceptanceCriteria: ['Map loads'],
+      priorPatch: '', requiresUnrealAssets: true };
+    expect(createWindowsAuthoringInputHash(input)).toBe(createWindowsAuthoringInputHash({ ...input }));
+    expect(createWindowsAuthoringInputHash(input)).not.toBe(createWindowsAuthoringInputHash({ ...input, prompt: 'Create another scene' }));
+  });
 });
