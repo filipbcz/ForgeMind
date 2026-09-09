@@ -11,25 +11,20 @@ export interface CapabilityProbe {
   kind?: 'process' | 'windows-platform' | 'disk';
   path?: string;
   timeoutMs?: number;
+  expectedVersion?: string;
 }
 export interface ProbeResult { capabilities: WorkerCapability[]; evidence: WorkerProbeEvidence[] }
 
 const DEFAULT_PROBE_TIMEOUT_MS = 30_000;
 
 export const unrealCapabilityProbe = (executable: string, version: string): CapabilityProbe => {
-  const literal = `'${executable.replaceAll("'", "''")}'`;
-  const command = [
-    `$item = Get-Item -LiteralPath ${literal} -ErrorAction Stop`,
-    "if ($item.PSIsContainer) { throw 'Configured Unreal executable is not a file.' }",
-    '$observedVersion = $item.VersionInfo.ProductVersion',
-    'if ([string]::IsNullOrWhiteSpace($observedVersion)) { $observedVersion = $item.VersionInfo.FileVersion }',
-    "if ([string]::IsNullOrWhiteSpace($observedVersion)) { throw 'Unreal executable has no Windows version metadata.' }",
-    'Write-Output $observedVersion'
-  ].join('; ');
   return {
     capability: { key: 'unreal', version, metadata: { executable } },
-    executable: 'powershell.exe',
-    args: ['-NoProfile', '-NonInteractive', '-Command', command]
+    executable,
+    args: ['-version', '-unattended', '-RUNNINGUNATTENDEDSCRIPT', '-nop4', '-nosplash', '-NullRHI', '-DDC-ForceMemoryCache',
+      '-NoSaveConfig', '-NoEpicPortal', '-stdout', '-FullStdOutLogOutput'],
+    timeoutMs: 180_000,
+    ...(version === 'configured' ? {} : { expectedVersion: version })
   };
 };
 
@@ -112,6 +107,9 @@ export async function runCapabilityProbes(probes: readonly CapabilityProbe[], no
         summary = `Local disk probe succeeded: ${freeBytes} bytes free.`;
       } else if (probe.executable) {
         const output = await executeProbe(probe.executable, probe.args ?? [], probe.timeoutMs);
+        if (probe.expectedVersion && !new RegExp(`(?:^|\\D)${escapeRegExp(probe.expectedVersion)}(?:\\D|$)`).test(output)) {
+          throw new Error(`tool reported a different version than ${probe.expectedVersion}: ${output}`);
+        }
         capability = withEvidenceMetadata(capability, probe.executable, output);
         summary = `Local tool probe succeeded: ${redactProbeOutput(output)}`;
       } else throw new Error('probe has no executable evidence source');
@@ -125,6 +123,10 @@ export async function runCapabilityProbes(probes: readonly CapabilityProbe[], no
   return { evidence, capabilities: evidence.filter((item) => item.status === 'supported').map((item) => item.capability) };
 }
 
+function escapeRegExp(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
 function executeProbe(executable: string, args: readonly string[], timeoutMs = DEFAULT_PROBE_TIMEOUT_MS): Promise<string> {
   return new Promise((resolve, reject) => {
     const child = spawn(executable, [...args], { shell: false, windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'] });
@@ -136,8 +138,12 @@ function executeProbe(executable: string, args: readonly string[], timeoutMs = D
       clearTimeout(timer);
       callback();
     };
+    const kill = () => {
+      if (process.platform === 'win32' && child.pid) spawn('taskkill.exe', ['/PID', String(child.pid), '/T', '/F'], { windowsHide: true });
+      else child.kill('SIGKILL');
+    };
     const timer = setTimeout(() => {
-      child.kill('SIGKILL');
+      kill();
       finish(() => reject(new Error(`probe timed out after ${timeoutMs}ms; executable=${executable}`)));
     }, timeoutMs);
     child.stdout.setEncoding('utf8').on('data', (chunk: string) => { stdout = (stdout + chunk).slice(-4096); });

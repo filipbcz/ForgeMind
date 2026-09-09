@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from 'vitest';
-import { buildCodexImplementationPrompt, buildCodexReviewSchema, codexProcessActivity, CodexProvider, isNoisyWorkspaceActivityPath, parseCodexCliTotalTokens, runCodexProcess } from './codex-provider.js';
+import { buildCodexImplementationPrompt, buildCodexReviewSchema, codexProcessActivity, CodexProvider, formatCodexJsonEvent, isNoisyWorkspaceActivityPath, parseCodexCliTotalTokens, runCodexProcess } from './codex-provider.js';
 
 describe('Codex structured output schemas', () => {
   it.each(['implementation', 'chat'] as const)('serializes typed Windows adapters in the actual %s request schema', async (operation) => {
@@ -104,6 +104,14 @@ describe('Codex process activity timeouts', () => {
     });
     expect(codexProcessActivity({ type: 'item.completed', item: { type: 'command_execution', command: 'legacy', aggregated_output: 'combined' } }))
       .toMatchObject({ stdout: undefined, stderr: undefined });
+  });
+  it('reports native MCP tool progress without echoing file contents', () => {
+    expect(formatCodexJsonEvent({ type: 'item.started', item: { type: 'mcp_tool_call', tool: 'run_unreal_authoring',
+      arguments: { checkId: 'author-scene', phase: 'author', content: 'secret source' } } }))
+      .toBe('Running native tool: run_unreal_authoring (check=author-scene, phase=author)');
+    expect(formatCodexJsonEvent({ type: 'item.completed', item: { type: 'mcp_tool_call', tool: 'write_file',
+      arguments: { path: 'Scripts/author.py', content: 'secret source' } } }))
+      .toBe('Native tool finished: write_file (path=Scripts/author.py)');
   });
   it('builds a strict review schema accepted by Codex structured output', () => {
     expectStrictObjectSchemas(buildCodexReviewSchema());
@@ -229,6 +237,14 @@ describe('Codex process activity timeouts', () => {
 
     expect(received.some((message) => message.includes('live'))).toBe(true);
     expect(received.at(-1)).toContain('completed');
+  });
+
+  it('surfaces the structured Codex failure instead of copying the complete JSON event history into task errors', async () => {
+    const history = JSON.stringify({ type: 'item.completed', item: { type: 'agent_message', text: 'x'.repeat(50_000) } });
+    const failure = JSON.stringify({ type: 'turn.failed', error: { message: 'Selected model is unavailable.' } });
+    await expect(runCodexProcess(['-e', `process.stdout.write(${JSON.stringify(`${history}\n${failure}\n`)});process.exit(1)`, '--', '--json'], '', {
+      binary: process.execPath, inactivityTimeoutMs: 1_500, maxRuntimeMs: 3_000
+    })).rejects.toThrow('Selected model is unavailable.');
   });
 
   it('captures a persisted Codex session from JSONL events', async () => {

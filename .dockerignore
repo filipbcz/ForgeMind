@@ -7,8 +7,8 @@
 !.env.example
 **/dist
 **/node_modules
+**/*.tsbuildinfo
 coverage
 node_modules
 *.log
 tmp-*
-

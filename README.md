@@ -1322,16 +1322,16 @@ Aktualni stav tohoto repozitare:
 - Produkcni overeni realneho GitHubu, realneho providera a nasazene PWA je `deferred`.
 - Automaticky produkcni deploy projektu spravovanych ForgeMindem zustava `deferred` a mimo aktualni scope.
 
-### Windows validation worker (vNext)
+### Windows validation and native authoring worker
 
-- `implemented`: uzce omezeny Windows CLI runner, odchozi Studio API transport, manualni session, capability probe, lease/cancel/result flow, bezpecny fixture executor, upload logu a artefaktu a pinned Unreal command adapter jsou v `apps/windows-runner/src`, `apps/studio-api/src/routes/windows-runner-routes.ts`, `packages/core/src/windows-worker.ts` a `packages/db/src/windows-worker-repository.ts`.
+- `implemented`: Windows CLI runner podporuje odchozi Studio API transport, manualni session, capability probe, lease/cancel/result flow, validaci i AI rizene nativni Unreal authoring nad izolovanym checkoutem. Vysledek se vraci jako autentizovany Git binary patch vcetne zmenenych LFS objektu a artefaktu.
 - `tested`: schema a policy testy jsou v `packages/core/src/windows-worker.test.ts`; runner testy v `apps/windows-runner/src/*.test.ts`; API a fake-runner tok v `apps/studio-api/src/routes/windows-runner-routes.test.ts` a `apps/studio-api/src/routes/windows-runner-routes.integration.test.ts`; persistence lease toku v `packages/db/src/windows-worker-repository.test.ts` a `packages/db/src/windows-worker-repository.integration.test.ts`.
 - `production-verified`: zadna cast Windows/Unreal rollout zatim tento status nema.
 - `deferred`: realna BOREK-FILIP Unreal validace vyzaduje lokalni rucni session, fyzicky dostupne lokalne pripnute/probed tooling a uspesne typed execution na presnem commitu. Jeji provedeni i manualni finalni audit jsou rucne spoustene produkcni kroky, nikoli runtime approval gate; fixture ani staticka evidence je nenahrazuji.
 
-Windows runner je pouze validacni executor pro presny commit SHA a verzovane schema z `packages/core`. Neni obecny remote shell: nesmi planovat ani implementovat, pouzivat Git push, merge, PR nebo deploy, pristupovat primo do databaze, provozovat Docker, bezet bezobsluzne jako sluzba ani menit UAC, restart nebo security konfiguraci.
+Windows runner pracuje pouze nad presnym commit SHA a verzovanym schematem z `packages/core`. Implementacni AI ma pristup jen k checkoutu a runnerem poskytovanym filesystem/process nastrojum; nema GitHub ani produkcni prihlasovaci udaje a neprovadi push, merge, PR ani deploy. Serverovy worker vysledek znovu sestavi, overi jeho Git tree a teprve potom pokracuje standardni validaci, read-only review a delivery.
 
-Lokalni adapter policy se runneru predava v `FORGEMIND_WINDOWS_ADAPTER_POLICY` jako JSON s poli `allowedFixtureExecutablePaths`, `pinnedUnrealTools` a `approvedUnrealProfiles`. Prazdna nebo chybejici policy nic nespusti. Operator aktivuje obnovovanou foreground relaci prikazem `session start --project <uuid>`; muze povolit vice projektu opakovanim `--project`. `session drain` zastavi nove claimy a necha aktualni ulohu dobehnout, zatimco `session stop` okamzite zrusi relaci i vlastneny process tree. Velke schvalene profily po aktivaci nevyzaduji dalsi potvrzeni, ale zachovavaji diskovy preflight; instalace, UAC, restart a licencni/globalni zmeny zustavaji zakazane.
+Pred vytvorenim relace runner bez AI turnu overi aktivni Codex OAuth prihlaseni, nacte modely skutecne dostupne lokalnimu uctu a vybere jeho vychozi model. Explicitni `CODEX_MODEL` musi byt v tomto seznamu. `FORGEMIND_UNREAL_EXECUTABLE` se nyni overuje skutecnym headless startem s bezpecnymi DDC a unattended parametry, ne pouze existenci souboru. UnrealEditor lze behem authoringu spustit jen strukturovanym nastrojem nad timto probed executable; obecny process nastroj jej odmitne. Operator aktivuje obnovovanou foreground relaci prikazem `session start --project <uuid>`; `session drain` zastavi nove claimy a necha aktualni ulohu dobehnout, zatimco `session stop` relaci zrusi.
 
 Root/CI test foundation pro release a migracni matrix zustava dostupny:
 

@@ -300,6 +300,9 @@ export interface ReviewInput {
   repositoryPath: string;
   changedFiles: string[];
   acceptanceCriteria: string[];
+  /** Runner-produced or implementation-produced evidence that the reviewer
+   * must inspect in addition to the authored repository paths. */
+  evidenceFiles?: string[];
   previousReviewSummary?: string;
   previousReviewBlockers?: string[];
   diff: string;

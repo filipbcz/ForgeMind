@@ -43,7 +43,7 @@ import { buildRepositoryChatPrompt } from './chat-prompt.js';
 import type { ProviderModelOption } from './openai-provider.js';
 
 const DEFAULT_CODEX_API_URL = 'https://api.openai.com/v1/responses';
-const DEFAULT_CODEX_MODEL = 'gpt-5.5';
+const DEFAULT_CODEX_MODEL = 'gpt-6-astra';
 const execFileAsync = promisify(execFile);
 export function buildCodexReviewSchema(): Record<string, unknown> {
   return {
@@ -1021,7 +1021,7 @@ export class CodexProvider implements AIProvider {
       Boolean(resolveCompatibleSessionId(input.session, 'codex', this.model))
     );
     const providerPrompt = input.nativeToolChannel
-      ? `Use only the discoverable forgemind_native filesystem and process tools for repository access and commands. The built-in shell is disabled so every process preserves separate stdout and stderr.\n\n${baseProviderPrompt}`
+      ? `Use only the discoverable forgemind_native filesystem and process tools for repository access and commands. The built-in shell is disabled so every process preserves separate stdout and stderr. Work directly in this one checkout; do not delegate or spawn subagents. Invoke UnrealEditor only through run_unreal_authoring, which selects the runner-probed editor and adds the required automation flags.\n\n${baseProviderPrompt}`
       : baseProviderPrompt;
     const beforeSnapshot = await collectChangedFileSnapshot(input.repositoryPath);
     let content: string;
@@ -1384,7 +1384,8 @@ export function buildCodexExecArgs(input: {
 
   args.push('--model', input.model);
   if (input.nativeToolChannel) {
-    args.push('--disable', 'shell_tool', '-c', `mcp_servers.forgemind_native.command=${JSON.stringify(input.nativeToolChannel.command)}`,
+    args.push('--ignore-user-config', '--ignore-rules', '--disable', 'shell_tool', '--disable', 'multi_agent',
+      '-c', `mcp_servers.forgemind_native.command=${JSON.stringify(input.nativeToolChannel.command)}`,
       '-c', `mcp_servers.forgemind_native.args=${JSON.stringify(input.nativeToolChannel.args)}`,
       '-c', 'mcp_servers.forgemind_native.required=true',
       '-c', 'mcp_servers.forgemind_native.default_tools_approval_mode="approve"',
@@ -1481,6 +1482,7 @@ export async function runCodexProcess(
     let sessionId: string | undefined;
     let jsonLineBuffer = '';
     let jsonTotalTokens: number | undefined;
+    let jsonFailureMessage = '';
     const expectsJsonEvents = args.includes('--json');
     let activityQueue = Promise.resolve();
     let activityFlushTimer: NodeJS.Timeout | undefined;
@@ -1585,6 +1587,7 @@ export async function runCodexProcess(
             jsonTotalTokens = usage.input_tokens + usage.output_tokens;
           }
           const message = formatCodexJsonEvent(event);
+          if ((event.type === 'turn.failed' || event.type === 'error') && message) jsonFailureMessage = message;
           if (message) messages.push({ message, process: codexProcessActivity(event) });
         } catch {
           if (line.trim()) messages.push({ message: line });
@@ -1648,7 +1651,8 @@ export async function runCodexProcess(
         return;
       }
 
-      finish(new Error(`Codex OAuth provider execution failed with ${code}: ${stripAnsi(stderr || stdout)}`));
+      const diagnostic = stripAnsi(stderr).trim() || jsonFailureMessage.trim() || stripAnsi(stdout).trim().slice(-16_000);
+      finish(new Error(`Codex OAuth provider execution failed with ${code}: ${diagnostic || 'no diagnostic output'}`));
     });
     child.stdin?.end(stdin);
   });
@@ -1670,6 +1674,11 @@ interface CodexJsonEvent {
     stderr?: string;
     status?: string;
     exit_code?: number;
+    server?: string;
+    tool?: string;
+    arguments?: Record<string, unknown>;
+    result?: unknown;
+    error?: unknown;
   };
 }
 
@@ -1688,7 +1697,23 @@ export function formatCodexJsonEvent(event: CodexJsonEvent): string | undefined 
     const status = event.item.exit_code === undefined ? event.item.status : `exit ${event.item.exit_code}`;
     return [event.item.command ? `Finished (${status}): ${event.item.command}` : `Command finished (${status}).`, output].filter(Boolean).join('\n');
   }
+  if (event.item.type === 'mcp_tool_call') {
+    const tool = event.item.tool ?? 'unknown';
+    const context = formatNativeToolContext(tool, event.item.arguments);
+    if (event.type === 'item.started') return `Running native tool: ${tool}${context}`;
+    const failed = event.item.error !== undefined && event.item.error !== null;
+    return `Native tool ${failed ? 'failed' : 'finished'}: ${tool}${context}`;
+  }
   return event.item.text?.trim() || undefined;
+}
+
+function formatNativeToolContext(tool: string, args: Record<string, unknown> | undefined): string {
+  if (!args) return '';
+  const checkId = typeof args.checkId === 'string' ? args.checkId : undefined;
+  const path = typeof args.path === 'string' ? args.path : undefined;
+  const phase = tool === 'run_unreal_authoring' && typeof args.phase === 'string' ? args.phase : undefined;
+  const values = [checkId ? `check=${checkId}` : undefined, phase ? `phase=${phase}` : undefined, path ? `path=${path}` : undefined].filter(Boolean);
+  return values.length > 0 ? ` (${values.join(', ')})` : '';
 }
 
 export function codexProcessActivity(event: CodexJsonEvent): import('./provider.js').ProviderActivity['process'] | undefined {

@@ -563,7 +563,7 @@ function resolveChatProviderKind(connection?: AIProviderConnectionSecret): Provi
 function resolveChatProviderModel(provider: ProviderKind, connection?: AIProviderConnectionSecret): string {
   if (connection?.model) return connection.model;
   if (provider === 'openai') return process.env.OPENAI_MODEL ?? 'gpt-4o-mini';
-  if (provider === 'codex') return process.env.CODEX_MODEL ?? 'gpt-5.5';
+  if (provider === 'codex') return process.env.CODEX_MODEL ?? 'gpt-6-astra';
   return provider;
 }
 

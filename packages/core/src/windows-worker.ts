@@ -309,6 +309,7 @@ export interface WindowsAuthoringResult {
   processes: WindowsAuthoringProcessResult[];
   contentAssessment: { technicalVerification: 'passed' | 'failed' | 'not-required'; productionReviewRequired: boolean; rationale: string };
   status: 'succeeded' | 'failed' | 'cancelled';
+  failure?: { kind: 'provider-configuration' | 'missing-capability' | 'timeout' | 'validation' | 'tool-failure' | 'cancelled' | 'unknown'; retryable: boolean };
   startedAt: IsoDateString;
   completedAt: IsoDateString;
   summary: string;
@@ -348,6 +349,7 @@ export interface ExecutionArtifactResult {
 export const WINDOWS_EVIDENCE_MAX_LOG_BYTES = 256_000;
 export const WINDOWS_EVIDENCE_MAX_ARTIFACT_BYTES = 10_000_000;
 export const WINDOWS_EVIDENCE_MAX_ARTIFACTS = 16;
+export const WINDOWS_AUTHORING_RESULT_MAX_BYTES = 64 * 1024 * 1024;
 export const WINDOWS_DEVICE_OFFLINE_AFTER_MS = 30_000;
 
 export interface WindowsEvidenceUpload {
@@ -667,6 +669,9 @@ export function isWindowsAuthoringResult(value: unknown): value is WindowsAuthor
   const identities = ['projectId', 'taskId', 'runId', 'jobId', 'leaseId', 'deviceId', 'sessionId', 'nonce', 'summary'];
   return identities.every((key) => isNonEmpty(value[key])) && isSha256(value.inputHash) && isGitCommitSha(value.baseCommitSha)
     && isGitCommitSha(value.resultTreeSha) && ['succeeded', 'failed', 'cancelled'].includes(value.status as string)
+    && (value.failure === undefined || (isRecord(value.failure)
+      && ['provider-configuration', 'missing-capability', 'timeout', 'validation', 'tool-failure', 'cancelled', 'unknown'].includes(value.failure.kind as string)
+      && typeof value.failure.retryable === 'boolean'))
     && isIsoDate(value.startedAt) && isIsoDate(value.completedAt) && areCapabilityKeys(value.completedOperationIds)
     && isRecord(value.contentAssessment) && ['passed', 'failed', 'not-required'].includes(value.contentAssessment.technicalVerification as string)
     && typeof value.contentAssessment.productionReviewRequired === 'boolean' && isNonEmpty(value.contentAssessment.rationale)

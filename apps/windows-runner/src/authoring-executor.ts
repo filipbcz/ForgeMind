@@ -6,8 +6,8 @@ import { basename, dirname, posix, relative, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import type { AuthoringTreeEntry, WindowsAuthoringPacket, WindowsAuthoringProcessResult, WindowsAuthoringResult } from '@forgemind/core';
 import { redactSecrets } from '@forgemind/core';
-import { resolveCodexBinary, type AIProvider } from '@forgemind/providers';
-import { buildSandboxedProcessInvocation } from './native-sandbox.js';
+import { resolveCodexBinary, type AIProvider, type ProviderSessionContext } from '@forgemind/providers';
+import { buildSandboxedProcessInvocation, buildUnrealAuthoringArgs, containsUnrealEditorInvocation } from './native-sandbox.js';
 
 export interface NativeAuthoringTools {
   root: string;
@@ -18,6 +18,7 @@ export interface NativeAuthoringTools {
   record(result: Omit<WindowsAuthoringProcessResult, 'leaseId' | 'sessionId'>): Promise<void>;
   nativeToolChannel: { command: string; args: string[] };
   drainNativeProcesses(): Promise<void>;
+  progress?(message: string): Promise<void>;
   run(input: { command: string; shell: 'powershell' | 'cmd' | 'system'; checkId?: string }): Promise<WindowsAuthoringProcessResult>;
 }
 
@@ -33,6 +34,8 @@ export class LifecycleNativeImplementationProvider implements NativeImplementati
   constructor(private readonly provider: AIProvider) {}
   async implement(input: Parameters<NativeImplementationProvider['implement']>[0]) {
     const passed = new Map<string, WindowsAuthoringProcessResult>();
+    const failedFingerprints = new Set<string>();
+    const providerSession: ProviderSessionContext = {};
     let failure: WindowsAuthoringProcessResult | undefined;
     let result;
     for (let attempt = 1; ; attempt += 1) {
@@ -47,12 +50,14 @@ export class LifecycleNativeImplementationProvider implements NativeImplementati
         result = await this.provider.implement({
           taskId: 'native-windows-authoring', prompt: input.prompt,
           plan: { summary: input.prompt, steps: input.operations.map((operation) => operation.rationale), acceptanceCriteria: input.acceptanceCriteria },
-          repositoryPath: input.tools.root, signal: input.signal, attemptNumber: attempt,
+          repositoryPath: input.tools.root, signal: input.signal, attemptNumber: attempt, session: providerSession,
           previousValidationError: failure ? `${failure.checkId}: ${failure.command}\n${failure.stderr || failure.stdout}` : input.previousValidationError,
           previousReviewBlockers: input.previousReviewBlockers,
           nativeToolChannel: input.tools.nativeToolChannel,
           onActivity: async (activity) => {
-            if (activity.kind === 'stdout') providerStdout += activity.message; else if (activity.kind === 'stderr') providerStderr += activity.message;
+            if (activity.kind === 'stdout') providerStdout += `${activity.message}\n`; else if (activity.kind === 'stderr') providerStderr += `${activity.message}\n`;
+            await input.tools.progress?.(activity.message);
+            await input.tools.drainNativeProcesses();
             if (!activity.process) return;
             const identity = activity.process.id ?? activity.process.command;
             if (activity.process.event === 'started') { processStarts.set(identity, new Date().toISOString()); return; }
@@ -86,6 +91,12 @@ export class LifecycleNativeImplementationProvider implements NativeImplementati
         if (process.exitCode === 0) passed.set(identity, process); else { failure = process; break; }
       }
       if (!failure) break;
+      const fingerprint = createHash('sha256').update(JSON.stringify({ command: failure.command, shell: failure.shell,
+        exitCode: failure.exitCode, stdout: failure.stdout, stderr: failure.stderr })).digest('hex');
+      if (failedFingerprints.has(fingerprint)) {
+        throw new Error(`The same Windows validation failed again without progress: ${failure.checkId}: ${failure.command}\n${failure.stderr || failure.stdout}`);
+      }
+      failedFingerprints.add(fingerprint);
     }
     if (!result) throw new Error('Implementation provider returned no result.');
     return { summary: result.summary, completedOperationIds: input.operations.map(({ id }) => id), checkpointIds: [] };
@@ -101,6 +112,7 @@ function inferWindowsShell(command: string): 'powershell' | 'cmd' | 'system' {
 export async function executeWindowsAuthoring(packet: WindowsAuthoringPacket, context: {
   deviceId: string; sessionId: string; workspaceRoot: string; artifactRoot: string;
   managedRoots?: NativeAuthoringTools['managedRoots']; signal?: AbortSignal; provider: NativeImplementationProvider;
+  observedCapabilities?: import('@forgemind/core').WorkerCapability[];
   onProgress?: (progress: import('@forgemind/core').WindowsAuthoringProgress) => Promise<void>;
 }): Promise<{ result: WindowsAuthoringResult; workspacePath: string }> {
   if (process.platform !== 'win32') throw new Error('Windows authoring can run only on Windows.');
@@ -125,20 +137,30 @@ export async function executeWindowsAuthoring(packet: WindowsAuthoringPacket, co
     if (prior.exitCode !== 0) throw new Error(`Could not materialize the previous Windows attempt: ${prior.stderr}`);
   }
   const processes: WindowsAuthoringProcessResult[] = [];
+  let latestCheckpoint: AuthoringDiskCheckpoint | undefined;
+  let liveActivity = '';
+  let progressDelivery = Promise.resolve();
+  const emitProgress = async (phase: import('@forgemind/core').WindowsAuthoringProgress['phase']) => {
+    if (!context.onProgress || !latestCheckpoint) return;
+    const processLog = processes.map((process) => `${process.command}\n${process.stdout}\n${process.stderr}`).join('\n');
+    const text = redactSecrets(`${liveActivity}\n${processLog}`).slice(-packet.resourcePolicy.maxLogBytes);
+    const progress = { schemaVersion: 1 as const, jobId: packet.jobId, leaseId: packet.leaseId, sessionId: context.sessionId, phase,
+      checkpoint: { resultTreeSha: latestCheckpoint.resultTreeSha, updatedAt: latestCheckpoint.updatedAt, resumedFromCheckpoint: checkout.resumed },
+      log: { text, sizeBytes: Buffer.byteLength(text), sha256: createHash('sha256').update(text).digest('hex') } };
+    progressDelivery = progressDelivery.then(() => context.onProgress!(progress)).catch(() => undefined);
+    await progressDelivery;
+  };
   const publishCheckpoint = async (status: string) => {
     const checkpoint = await persistCheckpoint(checkpointPath, packet, workspacePath, status, context.signal, outputDirectory);
-    if (!context.onProgress) return;
-    const text = redactSecrets(processes.map((process) => `${process.command}\n${process.stdout}\n${process.stderr}`).join('\n')).slice(-packet.resourcePolicy.maxLogBytes);
-    const phase = processes.at(-1)?.authoring?.phase ?? 'checkout';
-    try {
-      await context.onProgress({ schemaVersion: 1, jobId: packet.jobId, leaseId: packet.leaseId, sessionId: context.sessionId, phase,
-        checkpoint: { resultTreeSha: checkpoint.resultTreeSha, updatedAt: checkpoint.updatedAt, resumedFromCheckpoint: checkout.resumed },
-        log: { text, sizeBytes: Buffer.byteLength(text), sha256: createHash('sha256').update(text).digest('hex') } });
-    } catch { /* the durable local checkpoint remains available while the session monitor handles connectivity */ }
+    latestCheckpoint = checkpoint;
+    await emitProgress(processes.at(-1)?.authoring?.phase ?? 'checkout');
   };
-  const tools = createTools(workspacePath, resolve(evidenceDirectory, 'native-processes.jsonl'), packet.resourcePolicy.timeoutSeconds * 1_000,
+  const selectedUnrealExecutable = context.observedCapabilities?.find((capability) => capability.key === 'unreal')?.metadata?.executable;
+  const tools = createTools(workspacePath, resolve(evidenceDirectory, `native-processes-${packet.jobId}.jsonl`), packet.resourcePolicy.timeoutSeconds * 1_000,
     context.signal, processes, packet.leaseId, context.sessionId, { ...suppliedRoots, cache: cacheDirectory, outputs: outputDirectory,
-      diagnostics: evidenceDirectory }, async () => publishCheckpoint('in-progress'));
+      diagnostics: evidenceDirectory }, async () => publishCheckpoint('in-progress'),
+    typeof selectedUnrealExecutable === 'string' ? selectedUnrealExecutable : undefined,
+    async (message) => { liveActivity = `${liveActivity}\n${message}`.slice(-packet.resourcePolicy.maxLogBytes); await emitProgress('author'); });
   await publishCheckpoint('started');
   const startedAt = new Date();
   let status: WindowsAuthoringResult['status'] = 'succeeded';
@@ -157,26 +179,29 @@ export async function executeWindowsAuthoring(packet: WindowsAuthoringPacket, co
     authoringFailureState = classifyAuthoringFailure(summary, context.signal?.aborted === true, processes);
   }
   await rm(resolve(workspacePath, '.forgemind-tmp'), { recursive: true, force: true });
+  await cleanupIgnoredUnrealRuntimeState(workspacePath, processes, context.signal);
   const changedPaths = await stageChangedPaths(workspacePath, context.signal);
   await rejectProhibitedResultPaths(packet, workspacePath, context.signal);
   let productionReviewRequired = false;
   if (status === 'succeeded') {
     try {
-      productionReviewRequired = await enforceRequiredUnrealAssets(packet, workspacePath, evidenceDirectory, changedPaths, processes,
+      productionReviewRequired = await enforceRequiredUnrealAssets(packet, workspacePath, evidenceDirectory, outputDirectory, changedPaths, processes,
         packet.resourcePolicy.timeoutSeconds * 1_000, context.signal);
     } catch (error) {
       status = context.signal?.aborted ? 'cancelled' : 'failed';
       summary = `Final native Unreal verification failed: ${redactSecrets(error instanceof Error ? error.message : String(error))}`;
       authoringFailureState = classifyAuthoringFailure(summary, context.signal?.aborted === true, processes);
     }
+    await cleanupIgnoredUnrealRuntimeState(workspacePath, processes, context.signal);
+    await copyReviewableChangedImages(workspacePath, outputDirectory, changedPaths);
     await publishCheckpoint(status === 'succeeded' ? 'verified' : 'verification-failed');
   }
-  const tree = await collectTree(workspacePath);
+  const tree = await collectTree(workspacePath, changedPaths);
   const treeSha = await gitTree(workspacePath, context.signal);
   const patchResult = await spawnComplete('git.exe', ['diff', '--binary', '--no-ext-diff', '--cached', 'HEAD'], workspacePath, 30_000, context.signal);
   if (patchResult.exitCode !== 0) throw new Error(`Could not package result tree: ${patchResult.stderr}`);
   const patchBytes = Buffer.from(patchResult.stdout, 'utf8');
-  const lfsObjects = await collectLfsObjects(workspacePath, context.signal);
+  const lfsObjects = await collectLfsObjects(workspacePath, changedPaths, context.signal);
   const outputs = await collectManagedOutputs(outputDirectory, packet.resourcePolicy.maxArtifactBytes);
   const resultBundle = { version: 1 as const, format: 'git-binary-patch' as const,
     sha256: createHash('sha256').update(patchBytes).digest('hex'), sizeBytes: patchBytes.length, lfsObjects, outputs };
@@ -188,6 +213,16 @@ export async function executeWindowsAuthoring(packet: WindowsAuthoringPacket, co
   const incomplete = packet.artifactExpectations.some((expectation) => expectation.required
     && !artifacts.some((artifact) => artifact.relativePath === expectation.relativePath || artifact.name === expectation.name)
     && !tree.some((entry) => entry.path === expectation.relativePath || entry.path.startsWith(`${expectation.relativePath.replace(/[\\/]$/, '')}/`)));
+  if (status === 'succeeded' && incomplete) {
+    status = 'failed';
+    summary = `Required authoring artifacts are missing: ${packet.artifactExpectations.filter((expectation) => expectation.required
+      && !artifacts.some((artifact) => artifact.relativePath === expectation.relativePath || artifact.name === expectation.name)
+      && !tree.some((entry) => entry.path === expectation.relativePath || entry.path.startsWith(`${expectation.relativePath.replace(/[\\/]$/, '')}/`)))
+      .map((expectation) => expectation.relativePath).join(', ')}`;
+    authoringFailureState = 'failed';
+    await publishCheckpoint('verification-failed');
+  }
+  const failure = status === 'succeeded' ? undefined : classifyWindowsAuthoringFailure(summary, status === 'cancelled', processes);
   const classified = packet.realEngineEvidence ? {
     ...packet.realEngineEvidence, projectId: packet.projectId, taskId: packet.taskId, runId: packet.runId,
     inputHash: packet.inputHash, resultTreeSha: treeSha, toolVersions: collectAuthoringToolVersions(processes), startedAt: startedAt.toISOString(), completedAt: completedAt.toISOString(),
@@ -204,7 +239,7 @@ export async function executeWindowsAuthoring(packet: WindowsAuthoringPacket, co
     nonce: packet.nonce, inputHash: packet.inputHash, baseCommitSha: packet.baseCommitSha, resultTreeSha: treeSha, resultBundle,
     tree, patch: patchResult.stdout, completedOperationIds, checkpointIds,
     artifacts, ...(classified ? { realEngineEvidence: classified } : {}),
-    processes, status, contentAssessment: { technicalVerification: status !== 'succeeded' ? 'failed'
+    processes, status, ...(failure ? { failure } : {}), contentAssessment: { technicalVerification: status !== 'succeeded' ? 'failed'
       : packet.contentPolicy.requiresUnrealAssets ? 'passed' : 'not-required',
       productionReviewRequired, rationale: status !== 'succeeded'
         ? `Technical verification did not complete because Windows authoring ${status}.`
@@ -238,6 +273,39 @@ export function classifyAuthoringFailure(summary: string, cancelled: boolean,
     : 'failed';
 }
 
+export function classifyWindowsAuthoringFailure(summary: string, cancelled: boolean,
+  processes: WindowsAuthoringProcessResult[]): NonNullable<WindowsAuthoringResult['failure']> {
+  if (cancelled) return { kind: 'cancelled', retryable: false };
+  const normalized = summary.toLowerCase();
+  if (/model .*does not exist|do not have access to it|unknown model|model_not_found|collab spawn failed|no thread with id|input exceeds the maximum|input_too_large|oauth session is not active|not logged in|authentication|unauthorized|forbidden/.test(normalized)) {
+    return { kind: 'provider-configuration', retryable: false };
+  }
+  if (processes.some((process) => process.terminationReason === 'missing-capability') || /missing capability|not found|enoent|no runner-probed/.test(normalized)) {
+    return { kind: 'missing-capability', retryable: false };
+  }
+  if (processes.some((process) => process.terminationReason === 'timed-out') || /timed?\s*out|timeout/.test(normalized)) {
+    return { kind: 'timeout', retryable: true };
+  }
+  if (/validation failed|verification failed|required authoring artifacts are missing|failed again without progress/.test(normalized)) {
+    return { kind: 'validation', retryable: !/failed again without progress/.test(normalized) };
+  }
+  if (processes.some((process) => process.exitCode !== undefined && process.exitCode !== 0)) return { kind: 'tool-failure', retryable: false };
+  return { kind: 'unknown', retryable: false };
+}
+
+async function cleanupIgnoredUnrealRuntimeState(root: string, processes: WindowsAuthoringProcessResult[], signal?: AbortSignal): Promise<void> {
+  const projectDirectories = new Set(processes.flatMap((process) => process.authoring
+    ? [posix.dirname(process.authoring.projectRelativePath.replaceAll('\\', '/'))]
+    : []));
+  for (const projectDirectory of projectDirectories) {
+    for (const name of ['DerivedDataCache', 'Intermediate', 'Saved']) {
+      const relativePath = projectDirectory === '.' ? name : `${projectDirectory}/${name}`;
+      const ignored = await spawnComplete('git.exe', ['check-ignore', '-q', '--', relativePath], root, 30_000, signal);
+      if (ignored.exitCode === 0) await rm(resolve(root, relativePath), { recursive: true, force: true });
+    }
+  }
+}
+
 function managedChild(root: string, name: string): string {
   const target = resolve(root, name); const rel = relative(resolve(root), target);
   if (!name || rel === '..' || rel.startsWith(`..${process.platform === 'win32' ? '\\' : '/'}`)) throw new Error('Managed authoring path escapes its root.');
@@ -245,7 +313,8 @@ function managedChild(root: string, name: string): string {
 }
 
 function createTools(root: string, evidencePath: string, timeoutMs: number, signal: AbortSignal | undefined, results: WindowsAuthoringProcessResult[], leaseId: string, sessionId: string,
-  managedRoots: NativeAuthoringTools['managedRoots'], checkpoint: () => Promise<void>): NativeAuthoringTools {
+  managedRoots: NativeAuthoringTools['managedRoots'], checkpoint: () => Promise<void>, unrealExecutable?: string,
+  progress?: (message: string) => Promise<void>): NativeAuthoringTools {
   let evidenceOffset = 0;
   const sandboxExecutable = resolveCodexBinary();
   const contained = (path: string) => { const target = resolve(root, path); const rel = relative(root, target); if (rel.startsWith('..') || rel === '..') throw new Error('Tool path escapes the leased checkout.'); return target; };
@@ -253,21 +322,28 @@ function createTools(root: string, evidencePath: string, timeoutMs: number, sign
     root,
     managedRoots,
     nativeToolChannel: { command: process.execPath, args: [fileURLToPath(new URL('./native-tool-server.js', import.meta.url)), root, evidencePath,
-      sandboxExecutable] },
+      sandboxExecutable, unrealExecutable ?? '', String(timeoutMs)] },
+    progress,
     async drainNativeProcesses() {
       let content = '';
       try { content = await readFile(evidencePath, 'utf8'); } catch { return; }
       const additions = content.slice(evidenceOffset); evidenceOffset = content.length;
+      let added = false;
       for (const line of additions.split(/\r?\n/).filter(Boolean)) {
         const value = JSON.parse(line) as Omit<WindowsAuthoringProcessResult, 'leaseId' | 'sessionId'>;
         results.push({ ...value, leaseId, sessionId });
+        added = true;
       }
+      if (added) await checkpoint();
     },
     read: (path) => readFile(contained(path)),
     async write(path, content) { const target = contained(path); await mkdir(resolve(target, '..'), { recursive: true }); await writeFile(target, content); await checkpoint(); },
     async remove(path) { await rm(contained(path), { recursive: true, force: true }); await checkpoint(); },
     async record(result) { results.push({ ...result, leaseId, sessionId, stdout: redactSecrets(result.stdout), stderr: redactSecrets(result.stderr) }); await checkpoint(); },
     async run(input) {
+      if (containsUnrealEditorInvocation(input.command)) {
+        throw new Error('UnrealEditor validation must use the structured run_unreal_authoring tool so the probed executable and required automation flags are applied.');
+      }
       const startedAt = new Date();
       const sandboxed = buildSandboxedProcessInvocation({ sandboxExecutable, checkoutRoot: root, command: input.command, shell: input.shell });
       const output = await spawnComplete(sandboxed.executable, sandboxed.args, root, timeoutMs, signal);
@@ -365,9 +441,10 @@ async function persistCheckpoint(path: string, packet: WindowsAuthoringPacket, w
   const resultTreeSha = await gitTree(workspacePath, signal);
   const patchResult = await spawnComplete('git.exe', ['diff', '--binary', '--no-ext-diff', '--cached', 'HEAD'], workspacePath, 30_000, signal);
   if (patchResult.exitCode !== 0) throw new Error(`Could not persist Windows checkpoint: ${patchResult.stderr}`);
-  const patchBytes = Buffer.from(patchResult.stdout, 'utf8'); const lfsObjects = await collectLfsObjects(workspacePath, signal);
+  const changedPaths = await indexedChangedPaths(workspacePath, signal);
+  const patchBytes = Buffer.from(patchResult.stdout, 'utf8'); const lfsObjects = await collectLfsObjects(workspacePath, changedPaths, signal);
   const outputs = outputRoot ? await collectManagedOutputs(outputRoot, packet.resourcePolicy.maxArtifactBytes) : [];
-  const tree = await collectTree(workspacePath);
+  const tree = await collectTree(workspacePath, changedPaths);
   const checkpoint: AuthoringDiskCheckpoint = { version: 2, status, taskId: packet.taskId, inputHash: packet.inputHash,
     baseCommitSha: packet.baseCommitSha, resultTreeSha, tree, patch: patchResult.stdout,
     resultBundle: { version: 1, format: 'git-binary-patch', sha256: createHash('sha256').update(patchBytes).digest('hex'),
@@ -414,19 +491,33 @@ export function isProhibitedAuthoringPath(path: string, sizeBytes: number, polic
 async function stageChangedPaths(root: string, signal?: AbortSignal): Promise<string[]> {
   const staged = await spawnComplete('git.exe', ['add', '-A'], root, 30_000, signal);
   if (staged.exitCode !== 0) throw new Error(`Could not stage the complete authored result: ${staged.stderr}`);
+  return indexedChangedPaths(root, signal);
+}
+
+async function indexedChangedPaths(root: string, signal?: AbortSignal): Promise<string[]> {
   const changed = await spawnComplete('git.exe', ['diff', '--cached', '--name-only', '-z', 'HEAD'], root, 30_000, signal);
   if (changed.exitCode !== 0) throw new Error(`Could not inspect the staged authored result: ${changed.stderr}`);
   return changed.stdout.split('\0').filter(Boolean).map((path) => path.replaceAll('\\', '/'));
 }
 
-async function enforceRequiredUnrealAssets(packet: WindowsAuthoringPacket, root: string, evidenceRoot: string, changedPaths: string[], processes: WindowsAuthoringProcessResult[], timeoutMs: number, signal?: AbortSignal): Promise<boolean> {
+async function enforceRequiredUnrealAssets(packet: WindowsAuthoringPacket, root: string, evidenceRoot: string, outputRoot: string, changedPaths: string[], processes: WindowsAuthoringProcessResult[], timeoutMs: number, signal?: AbortSignal): Promise<boolean> {
   if (!packet.contentPolicy.requiresUnrealAssets) return false;
-  const assets = changedPaths.filter((path) => /\.(?:uasset|umap)$/i.test(path));
+  const assets: string[] = [];
+  for (const path of changedPaths.filter((candidate) => /\.(?:uasset|umap)$/i.test(candidate))) {
+    try { if ((await lstat(resolve(root, path))).isFile()) assets.push(path); } catch { /* deleted packages are not loadable result assets */ }
+  }
   const authored = processes.find((process) => process.exitCode === 0 && process.authoring?.phase === 'author'
     && ['unreal-editor', 'unreal-python'].includes(process.authoring.tool));
   if (assets.length > 0 && authored?.authoring) {
     const verification = await verifyUnrealPackages(root, evidenceRoot, assets, authored.authoring, timeoutMs, signal);
     processes.push({ ...verification, leaseId: packet.leaseId, sessionId: processes[0]?.sessionId ?? 'authoring-session' });
+    await writeFile(resolve(outputRoot, 'unreal-package-inspection.json'), JSON.stringify({
+      schemaVersion: 1,
+      projectRelativePath: authored.authoring.projectRelativePath,
+      assets,
+      loadedPackages: verification.authoring?.loadedPackages ?? [],
+      inspections: verification.authoring?.inspections ?? []
+    }, null, 2), 'utf8');
   }
   return validateRequiredUnrealAssets(assets, processes, requiresProductionContent(packet.step.acceptanceCriteria));
 }
@@ -473,16 +564,26 @@ async function verifyUnrealPackages(root: string, evidenceRoot: string, assets: 
     "            pass",
     "    if package['path'].lower().endswith('.umap'):",
     "        unreal.EditorLevelLibrary.load_level(package['objectPath'])",
+    "        non_basic_present = False",
     "        for actor in unreal.EditorLevelLibrary.get_all_level_actors():",
     "            class_name = actor.get_class().get_name()",
+    "            actor_label = actor.get_actor_label()",
+    "            observations.append('actor:' + actor_label + ':' + class_name)",
     "            if class_name in ['WorldSettings', 'DefaultPhysicsVolume', 'Brush']: continue",
     "            mesh_path = ''",
     "            if class_name == 'StaticMeshActor':",
     "                component = actor.get_component_by_class(unreal.StaticMeshComponent)",
     "                if component and component.static_mesh: mesh_path = component.static_mesh.get_path_name()",
+    "                if component:",
+    "                    try:",
+    "                        for material in component.get_materials():",
+    "                            if material: observations.append('actor-material:' + actor_label + ':' + material.get_path_name())",
+    "                    except Exception:",
+    "                        pass",
     "            if class_name != 'StaticMeshActor' or (mesh_path and not mesh_path.startswith('/Engine/BasicShapes/')):",
-    "                observations.append('non-basic-level-actor-present')",
-    "                break",
+    "                non_basic_present = True",
+    "        if non_basic_present: observations.append('non-basic-level-actor-present')",
+    "    observations = list(dict.fromkeys(observations))",
     "    inspection = {'path': package['path'], 'className': loaded.get_class().get_name(), 'technicalObservations': observations}",
     `    print('${marker}' + __import__('json').dumps(inspection, separators=(',', ':')))`,
     "if failed: raise RuntimeError('Could not load saved packages: ' + ', '.join(failed))"
@@ -504,8 +605,7 @@ async function verifyUnrealPackages(root: string, evidenceRoot: string, assets: 
 }
 
 export function buildUnrealPackageVerificationArgs(projectPath: string, scriptPath: string): string[] {
-  return [projectPath, '-unattended', '-nop4', '-nosplash', '-NullRHI', '-DDC-ForceMemoryCache', '-NoSaveConfig', '-stdout', '-FullStdOutLogOutput',
-    `-ExecutePythonScript=${scriptPath}`];
+  return buildUnrealAuthoringArgs(projectPath, [`-ExecutePythonScript=${scriptPath}`], 'verify');
 }
 
 export function unrealObjectPath(assetPath: string, projectRelativePath: string): string {
@@ -516,14 +616,15 @@ export function unrealObjectPath(assetPath: string, projectRelativePath: string)
   return `/Game/${normalizedAsset.slice(contentPrefix.length).replace(/\.(?:uasset|umap)$/i, '')}`;
 }
 
-async function collectLfsObjects(root: string, signal?: AbortSignal): Promise<Array<{ oid: string; sha256: string; sizeBytes: number; contentBase64: string }>> {
+async function collectLfsObjects(root: string, changedPaths: string[], signal?: AbortSignal): Promise<Array<{ oid: string; sha256: string; sizeBytes: number; contentBase64: string }>> {
   const objects: Array<{ oid: string; sha256: string; sizeBytes: number; contentBase64: string }> = [];
-  for (const entry of await collectTree(root)) {
-    const indexed = await spawnComplete('git.exe', ['show', `:${entry.path}`], root, 30_000, signal);
+  for (const path of changedPaths) {
+    const indexed = await spawnComplete('git.exe', ['show', `:${path}`], root, 30_000, signal);
+    if (indexed.exitCode !== 0) continue;
     const pointer = indexed.stdout.match(/^version https:\/\/git-lfs\.github\.com\/spec\/v1\r?\noid sha256:([a-f0-9]{64})\r?\nsize (\d+)\r?\n?$/);
     if (!pointer) continue;
     const oid = pointer[1]!; const object = await readFile(resolve(root, '.git', 'lfs', 'objects', oid.slice(0, 2), oid.slice(2, 4), oid));
-    if (createHash('sha256').update(object).digest('hex') !== oid || object.length !== Number(pointer[2])) throw new Error(`Git LFS object does not match pointer: ${entry.path}`);
+    if (createHash('sha256').update(object).digest('hex') !== oid || object.length !== Number(pointer[2])) throw new Error(`Git LFS object does not match pointer: ${path}`);
     objects.push({ oid, sha256: oid, sizeBytes: object.length, contentBase64: object.toString('base64') });
   }
   return objects;
@@ -543,6 +644,19 @@ async function collectManagedOutputs(root: string, maxBytes: number): Promise<Ar
     }
   }
   await visit(root); return outputs.sort((a, b) => a.path.localeCompare(b.path));
+}
+
+/** Makes visual evidence available to the server-side read-only reviewer even
+ * when the repository stores the image through Git LFS. */
+async function copyReviewableChangedImages(root: string, outputRoot: string, changedPaths: string[]): Promise<void> {
+  for (const relativePath of changedPaths.filter((path) => /\.(?:png|jpe?g)$/i.test(path))) {
+    const source = resolve(root, relativePath);
+    let content: Buffer;
+    try { content = await readFile(source); } catch { continue; }
+    const target = resolve(outputRoot, 'repository-preview', relativePath);
+    await mkdir(dirname(target), { recursive: true });
+    await writeFile(target, content);
+  }
 }
 
 async function spawnComplete(executable: string, args: string[], cwd: string, timeoutMs: number, signal?: AbortSignal) {
@@ -572,8 +686,17 @@ async function gitTree(root: string, signal?: AbortSignal): Promise<string> {
   return result.stdout.trim();
 }
 
-async function collectTree(root: string): Promise<AuthoringTreeEntry[]> {
+async function collectTree(root: string, paths: string[]): Promise<AuthoringTreeEntry[]> {
   const entries: AuthoringTreeEntry[] = [];
-  async function visit(directory: string): Promise<void> { for (const name of await readdir(directory)) { if (name === '.git') continue; const path = resolve(directory, name); const info = await lstat(path); if (info.isDirectory()) await visit(path); else { const content = info.isSymbolicLink() ? Buffer.from(await realpath(path)) : await readFile(path); entries.push({ path: relative(root, path).replaceAll('\\', '/'), kind: info.isSymbolicLink() ? 'symlink' : 'file', sha256: createHash('sha256').update(content).digest('hex'), sizeBytes: content.length, binary: content.includes(0), mode: info.isSymbolicLink() ? '120000' : (info.mode & 0o111) ? '100755' : '100644' }); } } }
-  await visit(root); return entries.sort((a, b) => a.path.localeCompare(b.path));
+  for (const relativePath of paths) {
+    const path = resolve(root, relativePath);
+    let info;
+    try { info = await lstat(path); } catch { continue; }
+    if (!info.isFile() && !info.isSymbolicLink()) continue;
+    const content = info.isSymbolicLink() ? Buffer.from(await realpath(path)) : await readFile(path);
+    entries.push({ path: relativePath.replaceAll('\\', '/'), kind: info.isSymbolicLink() ? 'symlink' : 'file',
+      sha256: createHash('sha256').update(content).digest('hex'), sizeBytes: content.length, binary: content.includes(0),
+      mode: info.isSymbolicLink() ? '120000' : (info.mode & 0o111) ? '100755' : '100644' });
+  }
+  return entries.sort((a, b) => a.path.localeCompare(b.path));
 }

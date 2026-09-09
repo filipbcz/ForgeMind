@@ -378,8 +378,10 @@ describe('WindowsWorkerRepository capability leases', () => {
     await new WindowsWorkerRepository(prisma).cancelSession('session_1');
     expect(tx.workerSession.update).toHaveBeenCalledWith(expect.objectContaining({ data: expect.objectContaining({ status: 'cancelled' }) }));
     expect(tx.windowsExecutionLease.updateMany).toHaveBeenCalledWith(expect.objectContaining({ data: expect.objectContaining({ status: 'cancelled' }) }));
-    expect(updateJobs).toHaveBeenNthCalledWith(1, expect.objectContaining({ where: expect.objectContaining({ status: 'leased' }), data: { status: 'queued' } }));
-    expect(updateJobs).toHaveBeenNthCalledWith(2, expect.objectContaining({ where: expect.objectContaining({ status: 'running' }), data: { status: 'expired' } }));
+    expect(updateJobs).toHaveBeenCalledTimes(1);
+    expect(updateJobs).toHaveBeenCalledWith(expect.objectContaining({
+      where: expect.objectContaining({ status: { in: ['leased', 'running'] } }), data: { status: 'cancelled' }
+    }));
     expect(tx.workerDevice.update).toHaveBeenCalledWith(expect.objectContaining({ data: { status: 'offline' } }));
   });
 

@@ -54,6 +54,13 @@ export function buildReviewPrompt(input: ReviewInput): string {
     '',
     'Changed files:',
     renderChangedFiles(input.changedFiles),
+    ...(input.evidenceFiles?.length
+      ? [
+          '',
+          'Implementation evidence files (inspect these exact files before deciding):',
+          renderChangedFiles(input.evidenceFiles)
+        ]
+      : []),
     ...(!input.nativeRepositoryAccess && input.diff
       ? [
           '',

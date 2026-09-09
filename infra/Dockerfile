@@ -27,7 +27,8 @@ RUN npm ci
 COPY apps apps
 COPY packages packages
 
-RUN npm run build
+RUN find apps packages -name '*.tsbuildinfo' -delete \
+  && npm run build
 
 FROM node:22-bookworm-slim AS runtime-base
 
@@ -39,6 +40,7 @@ RUN apt-get update \
     ca-certificates \
     cmake \
     git \
+    git-lfs \
     ninja-build \
     openssh-client \
     pkg-config \

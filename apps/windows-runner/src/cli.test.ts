@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { parseCliArgs } from './cli.js';
+import { assertNativeCodexCliCompatibility, parseCliArgs, selectLocalCodexModel } from './cli.js';
 
 describe('Windows runner CLI parsing', () => {
   it.each([
@@ -13,5 +13,20 @@ describe('Windows runner CLI parsing', () => {
   });
   it('requires explicit project-scoped activation', () => {
     expect(() => parseCliArgs(['session', 'start', '--api-url', 'https://forgemind.test'])).toThrow(/--project/);
+  });
+
+  it('selects the account default model and rejects an unavailable explicit override before a session starts', () => {
+    const models = [
+      { id: 'gpt-6-astra', name: 'GPT-6 Astra' },
+      { id: 'gpt-5.6-sol', name: 'GPT-5.6 Sol', isDefault: true }
+    ];
+    expect(selectLocalCodexModel(models)).toBe('gpt-5.6-sol');
+    expect(selectLocalCodexModel(models, 'gpt-6-astra')).toBe('gpt-6-astra');
+    expect(() => selectLocalCodexModel(models, 'gpt-5.5')).toThrow(/not available.*gpt-6-astra, gpt-5\.6-sol/i);
+    expect(() => selectLocalCodexModel([])).toThrow(/no models available/i);
+  });
+  it('rejects an outdated Codex CLI before it can claim an authoring task', () => {
+    expect(() => assertNativeCodexCliCompatibility('--disable --ignore-user-config --ignore-rules --output-schema --permission-profile')).not.toThrow();
+    expect(() => assertNativeCodexCliCompatibility('--output-schema')).toThrow(/update @openai\/codex/i);
   });
 });

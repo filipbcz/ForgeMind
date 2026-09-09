@@ -353,6 +353,8 @@ describe('Codex provider', () => {
     const args = buildCodexExecArgs({ sandbox: 'workspace-write', model: 'gpt-5.5', schemaPath: 'schema.json', outputPath: 'out.json',
       repositoryPath: 'C:/checkout', nativeToolChannel: { command: 'node.exe', args: ['native-tool-server.js', 'C:/checkout', 'C:/evidence.jsonl'] } });
     expect(args).toEqual(expect.arrayContaining(['--disable', 'shell_tool']));
+    expect(args).toEqual(expect.arrayContaining(['--disable', 'multi_agent']));
+    expect(args).toEqual(expect.arrayContaining(['--ignore-user-config', '--ignore-rules']));
     expect(args).toContain('mcp_servers.forgemind_native.command="node.exe"');
     expect(args).toContain('mcp_servers.forgemind_native.args=["native-tool-server.js","C:/checkout","C:/evidence.jsonl"]');
     expect(args).toContain('mcp_servers.forgemind_native.required=true');

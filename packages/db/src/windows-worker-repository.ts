@@ -590,8 +590,12 @@ export class WindowsWorkerRepository {
       const session = await tx.workerSession.update({ where: { id: sessionId }, data: { status: sessionStatus, endedAt: now } });
       const leases = await tx.windowsExecutionLease.findMany({ where: { sessionId, status: 'active' }, select: { jobId: true } });
       await tx.windowsExecutionLease.updateMany({ where: { sessionId, status: 'active' }, data: { status: leaseStatus, releasedAt: now } });
-      await tx.windowsExecutionJob.updateMany({ where: { id: { in: leases.map(({ jobId }) => jobId) }, status: 'leased' }, data: { status: 'queued' } });
-      await tx.windowsExecutionJob.updateMany({ where: { id: { in: leases.map(({ jobId }) => jobId) }, status: 'running' }, data: { status: 'expired' } });
+      if (sessionStatus === 'cancelled') {
+        await tx.windowsExecutionJob.updateMany({ where: { id: { in: leases.map(({ jobId }) => jobId) }, status: { in: ['leased', 'running'] } }, data: { status: 'cancelled' } });
+      } else {
+        await tx.windowsExecutionJob.updateMany({ where: { id: { in: leases.map(({ jobId }) => jobId) }, status: 'leased' }, data: { status: 'queued' } });
+        await tx.windowsExecutionJob.updateMany({ where: { id: { in: leases.map(({ jobId }) => jobId) }, status: 'running' }, data: { status: 'expired' } });
+      }
       await tx.workerDevice.update({ where: { id: session.deviceId }, data: { status: 'offline' } });
     });
   }

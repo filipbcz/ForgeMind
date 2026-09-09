@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from 'vitest';
-import { assertReadableAuthoringCheckout, buildUnrealPackageVerificationArgs, canResumeAuthoringCheckpoint, classifyAuthoringFailure, collectAuthoringToolVersions, isProhibitedAuthoringPath, LifecycleNativeImplementationProvider, materializeOutputs, requiresProductionContent, type NativeAuthoringTools, unrealObjectPath, validateRequiredUnrealAssets } from './authoring-executor.js';
+import { assertReadableAuthoringCheckout, buildUnrealPackageVerificationArgs, canResumeAuthoringCheckpoint, classifyAuthoringFailure, classifyWindowsAuthoringFailure, collectAuthoringToolVersions, isProhibitedAuthoringPath, LifecycleNativeImplementationProvider, materializeOutputs, requiresProductionContent, type NativeAuthoringTools, unrealObjectPath, validateRequiredUnrealAssets } from './authoring-executor.js';
 import { mkdtemp, rm } from 'node:fs/promises';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
@@ -26,6 +26,9 @@ describe('native implementation provider lifecycle', () => {
     expect(classifyAuthoringFailure('provider timeout', false, [])).toBe('timed-out');
     expect(classifyAuthoringFailure('stopped', true, [])).toBe('cancelled');
     expect(classifyAuthoringFailure('executable not found', false, [])).toBe('missing-capability');
+    expect(classifyWindowsAuthoringFailure('The model gpt-5.5 does not exist or you do not have access to it.', false, []))
+      .toEqual({ kind: 'provider-configuration', retryable: false });
+    expect(classifyWindowsAuthoringFailure('provider timeout', false, [])).toEqual({ kind: 'timeout', retryable: true });
   });
   it('surfaces unreadable checkouts and corrupt resumed binary artifacts as explicit blockers', async () => {
     await expect(assertReadableAuthoringCheckout('C:/fixture/Flying', async () => { const error = new Error('denied') as NodeJS.ErrnoException;
@@ -44,8 +47,8 @@ describe('native implementation provider lifecycle', () => {
   });
   it('uses headless memory-backed flags for final saved-package verification', () => {
     expect(buildUnrealPackageVerificationArgs('C:/work/Game.uproject', 'C:/diagnostics/verify.py')).toEqual([
-      'C:/work/Game.uproject', '-unattended', '-nop4', '-nosplash', '-NullRHI', '-DDC-ForceMemoryCache', '-NoSaveConfig',
-      '-stdout', '-FullStdOutLogOutput', '-ExecutePythonScript=C:/diagnostics/verify.py'
+      'C:/work/Game.uproject', '-ExecutePythonScript=C:/diagnostics/verify.py', '-unattended', '-RUNNINGUNATTENDEDSCRIPT', '-nop4',
+      '-nosplash', '-DDC-ForceMemoryCache', '-NoSaveConfig', '-NoEpicPortal', '-stdout', '-FullStdOutLogOutput', '-NullRHI'
     ]);
   });
   it('requires editor-authored packages to be loaded after saving and retains source and exact tool provenance', () => {
@@ -112,6 +115,20 @@ describe('native implementation provider lifecycle', () => {
     expect(completed).toEqual(['provider-check-1', 'provider-check-2']);
     expect(provider.implement).toHaveBeenCalledTimes(2);
     expect(provider.implement.mock.calls[1][0]).toMatchObject({ previousValidationError: expect.stringContaining('provider-check-2') });
+  });
+
+  it('stops when a repair repeats the exact same failing validation instead of spending turns forever', async () => {
+    const failing = { ...implementation, validationChecks: [implementation.validationChecks[0]] };
+    const provider: any = { implement: vi.fn(async () => failing) };
+    const tools = { root: 'C:/exact/job', nativeToolChannel: { command: 'node', args: ['server'] }, drainNativeProcesses: vi.fn(),
+      read: vi.fn(), write: vi.fn(), remove: vi.fn(), record: vi.fn(), run: vi.fn(async ({ checkId, command, shell }) => ({
+        leaseId: 'lease', sessionId: 'session', checkId, command, shell, exitCode: 1, stdout: '', stderr: 'same failure',
+        startedAt: new Date().toISOString(), completedAt: new Date().toISOString()
+      })) } as unknown as NativeAuthoringTools;
+    await expect(new LifecycleNativeImplementationProvider(provider).implement({ prompt: 'repair', acceptanceCriteria: ['works'], operations: [], tools }))
+      .rejects.toThrow(/same Windows validation failed again without progress/i);
+    expect(provider.implement).toHaveBeenCalledTimes(2);
+    expect(provider.implement.mock.calls[1][0].session).toBe(provider.implement.mock.calls[0][0].session);
   });
 
   it('blocks an aggregated-only provider command instead of fabricating empty stderr', async () => {

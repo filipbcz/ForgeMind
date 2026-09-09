@@ -516,6 +516,15 @@ function isActiveQueueStatus(status: QueueJobStatus): status is (typeof ACTIVE_Q
   return status === 'pending' || status === 'claimed';
 }
 
+export function queueRetryFingerprint(message: string | null | undefined): string | undefined {
+  const normalized = message?.toLowerCase()
+    .replace(/\b\d{4}-\d{2}-\d{2}t\d{2}:\d{2}:\d{2}(?:\.\d+)?z\b/g, '<timestamp>')
+    .replace(/\b[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\b/g, '<uuid>')
+    .replace(/\b\d+(?:\.\d+)?\s*(?:ms|milliseconds?|s|seconds?)\b/g, '<duration>')
+    .replace(/\s+/g, ' ').trim();
+  return normalized || undefined;
+}
+
 export class ForgeMindRepository {
   constructor(private readonly prisma: PrismaClient) {}
 
@@ -4096,13 +4105,16 @@ export class ForgeMindRepository {
         id: true,
         taskId: true,
         status: true,
-        attemptCount: true
+        attemptCount: true,
+        errorMessage: true
       }
     });
     if (!queueJob) return;
     if (!isActiveQueueStatus(queueJob.status)) return;
 
-    if (status === 'failed' && retryable) {
+    const repeatedFailure = status === 'failed' && retryable && queueJob.attemptCount > 1
+      && queueRetryFingerprint(queueJob.errorMessage) === queueRetryFingerprint(redactedErrorMessage);
+    if (status === 'failed' && retryable && !repeatedFailure) {
       const backoffSeconds = Math.max(1, Number(process.env.FORGEMIND_QUEUE_RETRY_BACKOFF_SECONDS ?? DEFAULT_QUEUE_BACKOFF_SECONDS));
       const backoffExponent = Math.min(MAX_QUEUE_BACKOFF_EXPONENT, Math.max(0, queueJob.attemptCount - 1));
       const delaySeconds = backoffSeconds * (2 ** backoffExponent);
@@ -4190,6 +4202,10 @@ export class ForgeMindRepository {
         finishedAt: new Date()
       }
     });
+    if (repeatedFailure) {
+      await this.writeAudit({ actorType: 'system', eventType: 'task_queue_retry_suppressed', taskId: queueJob.taskId,
+        payload: { queueJobId, attemptCount: queueJob.attemptCount, reason: 'same_failure_repeated_without_progress', errorMessage: redactedErrorMessage ?? null } });
+    }
   }
 
   async createIteration(input: {

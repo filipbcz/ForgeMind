@@ -1,11 +1,12 @@
 #!/usr/bin/env node
+import { execFile } from 'node:child_process';
 import { createInterface } from 'node:readline/promises';
-import { release as osRelease } from 'node:os';
+import { homedir, release as osRelease } from 'node:os';
 import { join } from 'node:path';
 import { stdin, stdout } from 'node:process';
 import { pathToFileURL } from 'node:url';
 import { classifyWindowsExecutionPacket, isWindowsAuthoringPacket, isWindowsExecutionPacket } from '@forgemind/core';
-import { createProvider } from '@forgemind/providers';
+import { createProvider, listCodexModels, resolveCodexBinary, type AIProvider, type ProviderModelOption } from '@forgemind/providers';
 import { WindowsCredentialStore } from './credential-store.js';
 import { cleanupWindowsValidationWorkspace, executeWindowsValidation } from './executor.js';
 import { executeWindowsAuthoring, LifecycleNativeImplementationProvider } from './authoring-executor.js';
@@ -47,6 +48,54 @@ export function parseCliArgs(args: string[]): CliCommand {
   throw new Error('Usage: forgemind-windows-runner enroll|probe|session start --project <uuid>|session drain|session stop --api-url https://...');
 }
 
+export function selectLocalCodexModel(models: ProviderModelOption[], requestedModel?: string): string {
+  const requested = requestedModel?.trim();
+  if (models.length === 0) throw new Error('Codex reported no models available to the signed-in Windows account.');
+  if (requested) {
+    const selected = models.find((model) => model.id === requested);
+    if (!selected) throw new Error(`Configured CODEX_MODEL "${requested}" is not available to the signed-in Windows account. Available models: ${models.map(({ id }) => id).join(', ')}.`);
+    return selected.id;
+  }
+  return (models.find((model) => model.isDefault) ?? models[0])!.id;
+}
+
+export function assertNativeCodexCliCompatibility(help: string): void {
+  const missing = ['--disable', '--ignore-user-config', '--ignore-rules', '--output-schema', '--permission-profile']
+    .filter((flag) => !help.includes(flag));
+  if (missing.length > 0) throw new Error(`The installed Codex CLI cannot run deterministic Windows authoring. Missing options: ${missing.join(', ')}. Update @openai/codex before starting a session.`);
+}
+
+async function runCodexCommand(binary: string, args: string[], codexHome: string): Promise<string> {
+  return await new Promise<string>((resolveHelp, reject) => {
+    execFile(binary, args, { windowsHide: true, timeout: 20_000, maxBuffer: 1_000_000,
+      env: { ...process.env, CODEX_HOME: codexHome } }, (error, stdoutText, stderrText) => {
+      if (error) return reject(new Error(`Could not inspect the installed Codex CLI: ${stderrText || error.message}`));
+      resolveHelp(`${stdoutText}\n${stderrText}`);
+    });
+  });
+}
+
+export async function prepareLocalCodexRuntime(environment: NodeJS.ProcessEnv = process.env): Promise<{
+  provider: AIProvider; model: string; codexHome: string; availableModels: string[];
+}> {
+  const codexHome = environment.CODEX_HOME?.trim() || join(homedir(), '.codex');
+  const binary = resolveCodexBinary(environment);
+  const [execHelp, sandboxHelp] = await Promise.all([
+    runCodexCommand(binary, ['exec', '--help'], codexHome),
+    runCodexCommand(binary, ['sandbox', '--help'], codexHome)
+  ]);
+  assertNativeCodexCliCompatibility(`${execHelp}\n${sandboxHelp}`);
+  const sandboxProbe = await runCodexCommand(binary, ['sandbox', '--permission-profile', ':workspace', '-C', process.cwd(), '--',
+    'cmd.exe', '/d', '/c', 'echo FORGEMIND_SANDBOX_OK'], codexHome);
+  if (!sandboxProbe.includes('FORGEMIND_SANDBOX_OK')) throw new Error('Codex Windows sandbox preflight did not execute the expected checkout-confined command.');
+  const models = await listCodexModels({ codexHome, binary });
+  const model = selectLocalCodexModel(models, environment.CODEX_MODEL);
+  const provider = createProvider('codex', { authMode: 'codex_oauth', codexHome, model });
+  const preflight = await provider.preflight();
+  if (!preflight.ok) throw new Error(`Codex OAuth preflight failed before starting a Windows session: ${preflight.error?.auditSafeMessage ?? 'unknown error'}`);
+  return { provider, model, codexHome, availableModels: models.map(({ id }) => id) };
+}
+
 export async function main(args = process.argv.slice(2)): Promise<void> {
   if (process.platform !== 'win32') throw new Error('ForgeMind Windows runner can run only on Windows.');
   const parsed = parseCliArgs(args);
@@ -58,7 +107,11 @@ export async function main(args = process.argv.slice(2)): Promise<void> {
     stdout.write(`Enrolled device ${credential.deviceId}.\n`); return;
   }
   const auth = await store.load(); if (!auth) throw new Error('Runner is not enrolled.');
+  if (parsed.command === 'session-drain') { await transport.drain(auth, parsed.sessionId); return; }
+  if (parsed.command === 'session-stop') { await transport.stop(auth, parsed.sessionId); return; }
+  const codexRuntime = await prepareLocalCodexRuntime();
   const probes = await runCapabilityProbes(windowsRunnerCapabilityProbes(osRelease()));
+  stdout.write(`Codex preflight passed. Selected model: ${codexRuntime.model}. Available models: ${codexRuntime.availableModels.join(', ')}.\n`);
   if (parsed.command === 'probe') {
     await transport.publishDevice(auth, { runnerVersion: RUNNER_VERSION, displayName: process.env.COMPUTERNAME ?? 'Windows runner', capabilities: probes.capabilities, probeEvidence: probes.evidence });
     stdout.write(`${JSON.stringify(probes.evidence, null, 2)}\n`); return;
@@ -75,10 +128,11 @@ export async function main(args = process.argv.slice(2)): Promise<void> {
           stdout.write(`Running native Windows implementation ${claim.job.packet.jobId}.\n`);
           const executed = await executeWindowsAuthoring(claim.job.packet, { deviceId: auth.deviceId, sessionId: context.sessionId,
             workspaceRoot: managedRoots.work, artifactRoot: managedRoots.diagnostics, signal: context.signal,
-            managedRoots,
+            managedRoots, observedCapabilities: probes.capabilities,
             onProgress: (progress) => transport.publishAuthoringProgress(auth, progress).then(() => undefined),
-            provider: new LifecycleNativeImplementationProvider(createProvider('codex')) });
+            provider: new LifecycleNativeImplementationProvider(codexRuntime.provider) });
           const submitted = await transport.submitResult(auth, executed.result);
+          if (!submitted.accepted) throw new Error(`ForgeMind rejected Windows authoring result ${executed.result.jobId}. The durable local checkpoint was preserved.`);
           if (submitted.accepted && executed.result.status === 'succeeded') await cleanupAcceptedWindowsAuthoring(managedRoots, executed.result.taskId);
           stdout.write(`${executed.result.summary}\n`);
           return;
@@ -109,7 +163,8 @@ export async function main(args = process.argv.slice(2)): Promise<void> {
             showLocally: (summary) => stdout.write(`${summary}\n`)
           });
           await transport.uploadEvidence(auth, executed.evidence);
-          await transport.submitResult(auth, executed.result);
+          const submitted = await transport.submitResult(auth, executed.result);
+          if (!submitted.accepted) throw new Error(`ForgeMind rejected Windows validation result ${executed.result.jobId}.`);
           stdout.write(`${executed.result.summary}\n`);
         } finally {
           await cleanupWindowsValidationWorkspace(parsed.workspaceRoot, parsed.artifactRoot, claim.job.id);
@@ -117,8 +172,6 @@ export async function main(args = process.argv.slice(2)): Promise<void> {
       } });
     return;
   }
-  if (parsed.command === 'session-drain') { await transport.drain(auth, parsed.sessionId); return; }
-  if (parsed.command === 'session-stop') { await transport.stop(auth, parsed.sessionId); return; }
 }
 
 interface LocalAdapterPolicy {

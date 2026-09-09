@@ -3,6 +3,7 @@ import { join, resolve } from 'node:path';
 import { access, mkdir, rm, utimes, writeFile } from 'node:fs/promises';
 import { randomUUID } from 'node:crypto';
 import { tmpdir } from 'node:os';
+import { simpleGit } from 'simple-git';
 
 const createProviderMock = vi.fn();
 const runWorkerTaskMock = vi.fn();
@@ -3165,6 +3166,25 @@ github:
 });
 
 describe('real-engine authoring packet classification', () => {
+  it('stages a reconciled Windows patch so the authenticated result tree can be verified and committed', async () => {
+    const workspace = join(tmpdir(), `forgemind-reconcile-workspace-${randomUUID()}`);
+    await mkdir(workspace);
+    try {
+      const git = simpleGit({ baseDir: workspace });
+      await git.init(); await git.addConfig('user.name', 'ForgeMind Test'); await git.addConfig('user.email', 'test@forgemind.local');
+      await writeFile(join(workspace, 'scene.txt'), 'before\n'); await git.add('scene.txt'); await git.commit('base');
+      await writeFile(join(workspace, 'scene.txt'), 'after\n');
+      const patch = await git.diff(['HEAD', '--binary']);
+      await writeFile(join(workspace, 'scene.txt'), 'before\n');
+      await git.status();
+      const { replaceGitPatch } = await import('./db-worker.js');
+      await replaceGitPatch(workspace, '', patch);
+      expect((await git.diff(['--cached', '--name-only'])).trim()).toBe('scene.txt');
+      expect((await git.show([':scene.txt'])).trim()).toBe('after');
+    } finally {
+      await rm(workspace, { recursive: true, force: true });
+    }
+  });
   it('derives distinct benchmark and soak intent for native authoring orchestration', async () => {
     const { classifyAuthoringEvidence } = await import('./db-worker.js');
     expect(classifyAuthoringEvidence('Run the city benchmark', ['Record frame timings'], 'build-1', ['unreal'], true))
@@ -3178,5 +3198,25 @@ describe('real-engine authoring packet classification', () => {
       priorPatch: '', requiresUnrealAssets: true };
     expect(createWindowsAuthoringInputHash(input)).toBe(createWindowsAuthoringInputHash({ ...input }));
     expect(createWindowsAuthoringInputHash(input)).not.toBe(createWindowsAuthoringInputHash({ ...input, prompt: 'Create another scene' }));
+  });
+  it('turns exact acceptance paths into required authoring artifacts', async () => {
+    const { deriveWindowsAuthoringArtifactExpectations } = await import('./db-worker.js');
+    expect(deriveWindowsAuthoringArtifactExpectations([
+      'Save Content/Maps/Scene.umap.',
+      'Materials are under Content\\Materials.',
+      'Capture Documentation/Scene.png.',
+      'Game.uproject declares the selected engine version.',
+      'No DerivedDataCache or Saved output is delivered.'
+    ], true).map(({ relativePath }) => relativePath)).toEqual([
+      'Content', 'Content/Maps/Scene.umap', 'Content/Materials', 'Documentation/Scene.png', 'Game.uproject'
+    ]);
+    expect(deriveWindowsAuthoringArtifactExpectations(['Nothing native'], false)).toEqual([]);
+  });
+  it('does not automatically retry deterministic Windows authoring configuration failures', async () => {
+    const { resolveTaskFailureRetryability, WindowsAuthoringExecutionError } = await import('./db-worker.js');
+    expect(resolveTaskFailureRetryability(new WindowsAuthoringExecutionError('model is unavailable', false, 'provider-configuration'))).toBe(false);
+    expect(resolveTaskFailureRetryability(new WindowsAuthoringExecutionError('temporary timeout', true, 'timeout'))).toBe(true);
+    expect(resolveTaskFailureRetryability(new Error('Windows result reconciliation failed: corrupt patch'))).toBe(false);
+    expect(resolveTaskFailureRetryability(new Error('Windows authoring job cancelled.'))).toBe(false);
   });
 });

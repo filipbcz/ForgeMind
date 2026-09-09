@@ -32,8 +32,9 @@ describe('capability probes', () => {
       expect.objectContaining({ capability: { key: 'codex' }, executable: expect.any(String), args: ['--version'] }),
       expect.objectContaining({
         capability: { key: 'unreal', version: '5.8', metadata: { executable: 'C:\\UE\\UnrealEditor-Cmd.exe' } },
-        executable: 'powershell.exe',
-        args: expect.arrayContaining(['-NonInteractive', expect.stringContaining('Get-Item -LiteralPath')])
+        executable: 'C:\\UE\\UnrealEditor-Cmd.exe',
+        args: expect.arrayContaining(['-version', '-unattended', '-RUNNINGUNATTENDEDSCRIPT', '-NullRHI', '-DDC-ForceMemoryCache', '-NoSaveConfig']),
+        timeoutMs: 180_000
       }),
       expect.objectContaining({ capability: { key: 'custom-sdk' }, executable: 'sdk.exe', args: ['version'] })
     ]));
@@ -63,5 +64,13 @@ describe('capability probes', () => {
     expect(Date.now() - startedAt).toBeLessThan(2_000);
     expect(result.capabilities).toEqual([]);
     expect(result.evidence[0]).toMatchObject({ status: 'unsupported', summary: expect.stringContaining('timed out') });
+  });
+
+  it('does not advertise a tool whose executable reports a different configured version', async () => {
+    const result = await runCapabilityProbes([{
+      capability: { key: 'versioned-tool', version: '999.1' }, executable: process.execPath, args: ['--version'], expectedVersion: '999.1'
+    }]);
+    expect(result.capabilities).toEqual([]);
+    expect(result.evidence[0]).toMatchObject({ status: 'unsupported', summary: expect.stringContaining('different version than 999.1') });
   });
 });

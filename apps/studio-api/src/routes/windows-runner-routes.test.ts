@@ -46,6 +46,16 @@ describe('Windows runner enrollment API', () => {
     expect(response.statusCode).toBe(401);
   });
 
+  it('allows an authoring result body beyond Fastify default-size deployments to reach protocol validation', async () => {
+    const app = Fastify({ bodyLimit: 1_024 });
+    const credentials: any = { authenticate: vi.fn(async () => ({ deviceId: '11111111-1111-4111-8111-111111111111' })) };
+    registerWindowsRunnerRoutes(app, {} as any, credentials, {} as any);
+    const response = await app.inject({ method: 'POST', url: '/api/windows-runner/device/result',
+      headers: { authorization: 'Bearer device-token' }, payload: { invalidProtocolPayload: 'x'.repeat(2_048) } });
+    expect(response.statusCode).toBe(400);
+    expect(response.json()).toEqual({ error: 'Invalid execution result.' });
+  });
+
   it('uses only the authenticated device for sessions and writes an audit event', async () => {
     const app = Fastify();
     const repository: any = { writeAudit: vi.fn(async () => undefined) };

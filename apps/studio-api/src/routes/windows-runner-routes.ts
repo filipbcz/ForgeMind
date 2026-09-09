@@ -2,7 +2,7 @@ import type { FastifyInstance, FastifyReply, FastifyRequest } from 'fastify';
 import { createHash } from 'node:crypto';
 import { z } from 'zod';
 import type { ForgeMindRepository, WindowsRunnerCredentialAdapter, WindowsRunnerPrincipal, WindowsWorkerRepository } from '@forgemind/db';
-import { canonicalizeWorkerProbeEvidence, isWindowsAuthoringPacket, isWindowsAuthoringResult, isWindowsExecutionResult, redactSecrets, WINDOWS_EVIDENCE_MAX_ARTIFACT_BYTES, WINDOWS_EVIDENCE_MAX_ARTIFACTS, WINDOWS_EVIDENCE_MAX_LOG_BYTES } from '@forgemind/core';
+import { canonicalizeWorkerProbeEvidence, isWindowsAuthoringPacket, isWindowsAuthoringResult, isWindowsExecutionResult, redactSecrets, WINDOWS_AUTHORING_RESULT_MAX_BYTES, WINDOWS_EVIDENCE_MAX_ARTIFACT_BYTES, WINDOWS_EVIDENCE_MAX_ARTIFACTS, WINDOWS_EVIDENCE_MAX_LOG_BYTES } from '@forgemind/core';
 
 const deviceParams = z.object({ deviceId: z.string().uuid() });
 const enrollment = z.object({
@@ -123,7 +123,7 @@ export function registerWindowsRunnerRoutes(app: FastifyInstance, repository: Fo
     const principal = runnerPrincipal(request); const input = claim.parse(request.body);
     return (await workers.claimCompatible(input.sessionId, input.leaseSeconds, input.requestId, principal.deviceId, input.authoringProtocolVersions)) ?? { job: null, lease: null };
   });
-  app.post('/api/windows-runner/device/result', { preHandler: runnerAuth(credentials) }, async (request, reply) => {
+  app.post('/api/windows-runner/device/result', { preHandler: runnerAuth(credentials), bodyLimit: WINDOWS_AUTHORING_RESULT_MAX_BYTES }, async (request, reply) => {
     const principal = runnerPrincipal(request);
     if ((!isWindowsExecutionResult(request.body) && !isWindowsAuthoringResult(request.body)) || request.body.deviceId !== principal.deviceId) return reply.code(400).send({ error: 'Invalid execution result.' });
     const outcome = await workers.submitResult(principal.deviceId, request.body);

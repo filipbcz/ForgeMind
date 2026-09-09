@@ -357,6 +357,7 @@ export async function runWorkerTask(input: WorkerTaskInput): Promise<WorkerTaskR
       : undefined;
   const retryReasons: string[] = [];
   const resolvedReviewBlockers = new Set<string>();
+  const failedReviewStates = new Set<string>();
   let completedAttempts = 0;
   let review: ReviewResult | undefined = input.resume?.previousReviewBlockers?.length
       ? {
@@ -698,7 +699,8 @@ export async function runWorkerTask(input: WorkerTaskInput): Promise<WorkerTaskR
         input.task.prompt,
         plan.acceptanceCriteria,
         reviewProvider.kind,
-        input.reviewProviderSession?.model
+        input.reviewProviderSession?.model,
+        implementation.evidenceFiles ?? []
       );
       const reusableReview = input.resume?.completedReview?.inputHash === reviewInputHash
         ? input.resume.completedReview
@@ -754,6 +756,7 @@ export async function runWorkerTask(input: WorkerTaskInput): Promise<WorkerTaskR
             repositoryPath: workspacePath,
             changedFiles: reviewChangedFiles,
             acceptanceCriteria: plan.acceptanceCriteria,
+            evidenceFiles: implementation.evidenceFiles,
             previousReviewSummary: previousReviewForCorrection?.summary,
             previousReviewBlockers: previousReviewForCorrection?.blockers,
             diff: reviewPacket.diff,
@@ -887,6 +890,15 @@ export async function runWorkerTask(input: WorkerTaskInput): Promise<WorkerTaskR
       for (const blocker of review.blockers) {
         resolvedReviewBlockers.add(blocker);
       }
+
+      if (failedReviewStates.has(reviewInputHash)) {
+        const summary = `Review reported unresolved blockers again without any repository or evidence change: ${review.blockers.join('; ')}`;
+        await emitTaskActivity(input.hooks, { phase: 'review', state: 'failed', title: 'Review se zastavilo bez pokroku',
+          detail: summary, operation: 'provider_review', attempt });
+        return { taskId: input.task.id, status: 'failed', issueUrl: issue.issueUrl, branchName, workspacePath,
+          validation, externalValidationChecks, summary, completedAt: nowIso() };
+      }
+      failedReviewStates.add(reviewInputHash);
 
       retryReasons.push(`Review retry before attempt ${attempt + 1}: ${review.blockers.join('; ')}`);
       await input.hooks?.onStatus?.('running_ai', {
@@ -1417,10 +1429,12 @@ async function collectReviewInputHash(
   taskPrompt: string,
   acceptanceCriteria: string[],
   reviewProviderKind: ProviderKind,
-  reviewProviderModel: string | undefined
+  reviewProviderModel: string | undefined,
+  evidenceFiles: string[]
 ): Promise<string> {
   return createHash('sha256').update(JSON.stringify({
-    repositoryContentHash: await collectRepositoryContentHash(git, workspacePath),
+    repositoryContentHash: await collectRepositoryStateInputHash(git, workspacePath),
+    evidenceContentHash: await collectEvidenceContentHash(workspacePath, evidenceFiles),
     taskPrompt,
     acceptanceCriteria,
     reviewProviderKind,
@@ -1428,18 +1442,13 @@ async function collectReviewInputHash(
   })).digest('hex');
 }
 
-async function collectRepositoryContentHash(git: SimpleGit, workspacePath: string): Promise<string> {
+async function collectEvidenceContentHash(workspacePath: string, evidenceFiles: string[]): Promise<string> {
   const hash = createHash('sha256');
-  const paths = uniqueStrings((await git.raw(['ls-files', '-co', '--exclude-standard', '-z']))
-    .split('\0')
-    .map((path) => path.trim())
-    .filter(Boolean))
-    .sort((left, right) => left.localeCompare(right));
   const workspaceRoot = resolve(workspacePath);
-  for (const path of paths) {
+  for (const path of uniqueStrings(evidenceFiles).sort((left, right) => left.localeCompare(right))) {
     const target = resolve(workspaceRoot, path);
     const relativeTarget = relative(workspaceRoot, target);
-    if (relativeTarget.startsWith('..') || isAbsolute(relativeTarget)) continue;
+    if (relativeTarget === '..' || relativeTarget.startsWith(`..${process.platform === 'win32' ? '\\' : '/'}`) || isAbsolute(relativeTarget)) continue;
     hash.update(path);
     hash.update('\0');
     try {

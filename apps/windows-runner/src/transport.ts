@@ -1,4 +1,4 @@
-import type { WindowsAuthoringProgress, WindowsEvidenceUpload, WindowsExecutionJob, WindowsExecutionLease, WindowsJobResult, WorkerCapability, WorkerProbeEvidence } from '@forgemind/core';
+import { redactSecrets, type WindowsAuthoringProgress, type WindowsEvidenceUpload, type WindowsExecutionJob, type WindowsExecutionLease, type WindowsJobResult, type WorkerCapability, type WorkerProbeEvidence } from '@forgemind/core';
 import type { RunnerCredential } from './credential-store.js';
 
 export interface RunnerControlState { deviceStatus: string; sessionStatus: string; leaseStatus?: string; jobStatus?: string }
@@ -31,9 +31,18 @@ export class WindowsRunnerTransport {
   private async call<T = unknown>(path: string, auth?: RunnerCredential, body?: unknown, method = 'POST'): Promise<T> {
     const response = await this.request(new URL(path, this.baseUrl), {
       method, headers: { ...(auth ? { authorization: `Bearer ${auth.credential}` } : {}), ...(body ? { 'content-type': 'application/json' } : {}) },
-      body: body ? JSON.stringify(body) : undefined
+      body: body ? JSON.stringify(body) : undefined,
+      signal: AbortSignal.timeout(path === '/api/windows-runner/device/result' ? 300_000 : 30_000)
     });
-    if (!response.ok) throw new Error(`ForgeMind API request failed (${response.status}).`);
-    return await response.json() as T;
+    const responseText = await response.text();
+    if (!response.ok) {
+      let diagnostic = responseText;
+      try {
+        const parsed = JSON.parse(responseText) as { error?: unknown };
+        if (typeof parsed.error === 'string') diagnostic = parsed.error;
+      } catch { /* preserve a plain-text server diagnostic */ }
+      throw new Error(`ForgeMind API request failed (${response.status}): ${redactSecrets(diagnostic).slice(0, 4_000) || 'no server diagnostic'}`);
+    }
+    try { return JSON.parse(responseText) as T; } catch { throw new Error(`ForgeMind API returned invalid JSON (${response.status}).`); }
   }
 }

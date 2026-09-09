@@ -60,6 +60,16 @@ describe('review prompt', () => {
     expect(prompt).toContain('did not introduce regressions elsewhere');
   });
 
+  it('directs the reviewer to inspect implementation evidence', () => {
+    const prompt = buildReviewPrompt({
+      taskId: 'task-evidence', taskTitle: 'Author scene', taskPrompt: 'Create a scene.', repositoryPath: '/workspace',
+      changedFiles: ['Content/Maps/Scene.umap'], evidenceFiles: ['.forgemind-outputs/unreal-package-inspection.json'],
+      acceptanceCriteria: ['The scene contains three colored subjects.'], diff: '', nativeRepositoryAccess: true
+    });
+    expect(prompt).toContain('Implementation evidence files (inspect these exact files before deciding)');
+    expect(prompt).toContain('.forgemind-outputs/unreal-package-inspection.json');
+  });
+
   it('bounds changed-file context because the repository remains authoritative', () => {
     const changedFiles = Array.from({ length: 1_000 }, (_, index) => `generated/path-${index}/artifact.cpp`);
     const prompt = buildReviewPrompt({

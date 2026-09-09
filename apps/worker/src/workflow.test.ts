@@ -186,9 +186,13 @@ describe('simple autonomous worker workflow', () => {
     const target = join(workspace, 'value.txt'); await writeFile(target, 'base\n'); await git.add('value.txt'); await git.commit('base');
     await writeFile(target, 'first\n'); const first = await git.diff(['--binary', 'HEAD']); await git.raw(['checkout', '--', 'value.txt']);
     await writeFile(target, 'corrected\n'); const corrected = await git.diff(['--binary', 'HEAD']); await git.raw(['checkout', '--', 'value.txt']);
+    await writeFile(target, 'final\n'); const final = await git.diff(['--binary', 'HEAD']); await git.raw(['checkout', '--', 'value.txt']);
     await writeFile(join(workspace, 'first.patch'), first); await git.raw(['apply', '--binary', 'first.patch']);
     await replaceGitPatch(workspace, first, corrected);
     expect(await readFile(target, 'utf8')).toBe('corrected\n');
+    await replaceGitPatch(workspace, corrected, final);
+    expect(await readFile(target, 'utf8')).toBe('final\n');
+    expect(await git.diff(['--cached', '--name-only', 'HEAD'])).toBe('value.txt\n');
   });
   it('includes untracked names and contents in the workspace inputs shown to impact AI', async () => {
     const workspace = await mkdtemp(join(tmpdir(), 'forgemind-validation-inputs-'));
@@ -349,6 +353,19 @@ describe('simple autonomous worker workflow', () => {
     expect(implementInputs[1]?.previousReviewBlockers).toEqual(['status.txt must end with a newline.']);
     expect(reviewInputs).toHaveLength(2);
     expect(validationAttempts).toEqual([1, 2]);
+  }, workflowTestTimeoutMs);
+
+  it('stops a repeated review correction when repository and evidence do not change', async () => {
+    const project = createProject(); const task = createTask(project.id);
+    const implement = vi.fn(async () => implementation('pass\n'));
+    const reviewer = vi.fn(async () => review('not_satisfied', ['The same concrete blocker remains.']));
+    const provider = createProvider({ implement, review: reviewer });
+    const result = await runWorkerTask({ project, task, provider,
+      workspaceRoot: join(tmpdir(), `forgemind-review-no-progress-${randomUUID()}`) });
+    expect(result).toMatchObject({ status: 'failed' });
+    expect(result.summary).toContain('without any repository or evidence change');
+    expect(implement).toHaveBeenCalledTimes(2);
+    expect(reviewer).toHaveBeenCalledTimes(2);
   }, workflowTestTimeoutMs);
 
   it('lets AI explicitly skip executable validation when it is not applicable', async () => {

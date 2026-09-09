@@ -153,9 +153,14 @@ async function implementThroughWindowsLease(windowsWorkers: WindowsWorkerReposit
 }): Promise<ImplementResult> {
   if (!input.project.githubOwner || !input.project.githubRepo) throw new Error('Windows authoring requires a GitHub repository.');
   const jobId = randomUUID();
+  const requiredCapabilities = Array.from(new Set([
+    'windows', 'codex', 'git',
+    ...(input.requiresUnrealAssets ? ['git-lfs', 'unreal'] : []),
+    ...input.requiredCapabilities
+  ]));
   const priorPatch = await readGitPatch(input.workspacePath, input.signal);
   const realEngineEvidence = classifyAuthoringEvidence(input.prompt, input.acceptanceCriteria, input.baseCommitSha,
-    input.requiredCapabilities, input.requiresUnrealAssets);
+    requiredCapabilities, input.requiresUnrealAssets);
   const packet: WindowsAuthoringPacket = {
     kind: 'authoring', protocolVersion: 1, projectId: input.project.id, taskId: input.taskId, runId: input.taskRunId,
     jobId, leaseId: 'pending', repository: `${input.project.githubOwner}/${input.project.githubRepo}`,
@@ -163,10 +168,8 @@ async function implementThroughWindowsLease(windowsWorkers: WindowsWorkerReposit
     workspaceRoot: 'runner-managed', artifactRoot: 'runner-managed', step: { prompt: input.prompt, acceptanceCriteria: input.acceptanceCriteria,
       previousValidationError: input.previousValidationError, previousReviewBlockers: input.previousReviewBlockers, priorPatch },
     operations: [{ id: 'implementation', kind: 'tool', tool: 'ai-implementation', arguments: { acceptanceCriteria: input.acceptanceCriteria }, rationale: 'Implement the current task step in the exact native checkout.' }],
-    requiredCapabilities: input.requiredCapabilities, managedRoots: ['.'], checkpoints: [], artifactExpectations: input.requiresUnrealAssets
-      ? [{ name: 'authored-unreal-assets', relativePath: 'Content', required: true, delivery: 'artifact-store', binary: true,
-        maxBytes: WINDOWS_EVIDENCE_MAX_ARTIFACT_BYTES }]
-      : [],
+    requiredCapabilities, managedRoots: ['.'], checkpoints: [],
+    artifactExpectations: deriveWindowsAuthoringArtifactExpectations(input.acceptanceCriteria, input.requiresUnrealAssets),
     contentPolicy: { requiresUnrealAssets: input.requiresUnrealAssets,
       prohibitedDatasetExtensions: ['.tif', '.tiff', '.geotiff', '.shp', '.dbf', '.shx', '.prj', '.gpkg', '.geojson', '.kml', '.kmz', '.gdb', '.fgb', '.las', '.laz', '.copc', '.dem', '.dt0', '.dt1', '.dt2', '.asc', '.img', '.jp2', '.ecw', '.mrf', '.mbtiles', '.pmtiles', '.osm', '.pbf', '.grib', '.nc', '.hdf'],
       maxUnclassifiedFileBytes: 50 * 1024 * 1024 },
@@ -177,9 +180,13 @@ async function implementThroughWindowsLease(windowsWorkers: WindowsWorkerReposit
     ...(realEngineEvidence ? { realEngineEvidence } : {}),
     authority: { database: 'none', productionHosts: 'none', globalGitHubCredentials: 'none' }
   };
-  await windowsWorkers.enqueueAuthoring({ id: jobId, projectId: input.project.id, taskId: input.taskId, runId: input.taskRunId, requiredCapabilities: input.requiredCapabilities, packet });
+  await windowsWorkers.enqueueAuthoring({ id: jobId, projectId: input.project.id, taskId: input.taskId, runId: input.taskRunId, requiredCapabilities, packet });
   const result = await windowsWorkers.waitForAuthoringResult(jobId, input.signal);
-  if (result.status !== 'succeeded') throw new Error(`Windows authoring ${result.status}: ${result.summary}`);
+  if (result.status !== 'succeeded') throw new WindowsAuthoringExecutionError(
+    `Windows authoring ${result.status}: ${result.summary}`,
+    result.failure?.retryable ?? false,
+    result.failure?.kind ?? 'unknown'
+  );
   const patchBytes = Buffer.from(result.patch, 'utf8');
   const patchHash = createHash('sha256').update(patchBytes).digest('hex');
   if (result.resultBundle.version !== 1 || result.resultBundle.format !== 'git-binary-patch'
@@ -194,6 +201,9 @@ async function implementThroughWindowsLease(windowsWorkers: WindowsWorkerReposit
     const objectPath = resolve(input.workspacePath, '.git', 'lfs', 'objects', object.oid.slice(0, 2), object.oid.slice(2, 4), object.oid);
     await mkdir(resolve(objectPath, '..'), { recursive: true }); await writeFile(objectPath, content);
   }
+  if (result.resultBundle.lfsObjects.length > 0) {
+    await runGitCapture(input.workspacePath, ['lfs', 'install', '--local'], input.signal);
+  }
   for (const output of result.resultBundle.outputs) {
     const content = Buffer.from(output.contentBase64, 'base64');
     if (content.length !== output.sizeBytes || createHash('sha256').update(content).digest('hex') !== output.sha256.toLowerCase()) {
@@ -202,12 +212,24 @@ async function implementThroughWindowsLease(windowsWorkers: WindowsWorkerReposit
   }
   await replaceGitPatch(input.workspacePath, priorPatch, result.patch, input.signal);
   await verifyWindowsResultTree(input.workspacePath, result, input.signal);
+  if (result.resultBundle.lfsObjects.length > 0) {
+    const supplied = new Set(result.resultBundle.lfsObjects.map(({ oid }) => oid.toLowerCase()));
+    const lfsPaths: string[] = [];
+    for (const { path } of result.tree) {
+      const indexed = await runGitCapture(input.workspacePath, ['show', `:${path}`], input.signal);
+      const pointer = indexed.match(/^version https:\/\/git-lfs\.github\.com\/spec\/v1\r?\noid sha256:([a-f0-9]{64})\r?\nsize \d+\r?\n?$/);
+      if (pointer && supplied.has(pointer[1]!.toLowerCase())) lfsPaths.push(path);
+    }
+    if (lfsPaths.length > 0) await runGitCapture(input.workspacePath, ['lfs', 'checkout', '--', ...lfsPaths], input.signal);
+  }
+  const changedFiles = (await runGitCapture(input.workspacePath, ['diff', '--cached', '--name-only', '-z', 'HEAD'], input.signal))
+    .split('\0').filter(Boolean).map((path) => path.replaceAll('\\', '/'));
   const outputEvidence = await materializeWindowsOutputs(input.workspacePath, result.resultBundle.outputs);
   const reviewNotice = result.contentAssessment.productionReviewRequired
     ? '\n\nProduction-content review required: technical loadability and provenance passed, but these signals do not approve visual or domain quality.' : '';
   return { outcome: result.patch.trim() ? 'changes_made' : 'already_satisfied',
     summary: `${outputEvidence.length > 0 ? `${result.summary}\n\nManaged output evidence: ${outputEvidence.join(', ')}` : result.summary}${reviewNotice}`,
-    changedFiles: result.tree.map(({ path }) => path), evidenceFiles: outputEvidence, diffStat: { filesChanged: result.tree.length, insertions: 0, deletions: 0 },
+    changedFiles, evidenceFiles: outputEvidence, diffStat: { filesChanged: changedFiles.length, insertions: 0, deletions: 0 },
     validationChecks: [], architectureUpdate: undefined };
 }
 
@@ -216,6 +238,23 @@ export function createWindowsAuthoringInputHash(input: {
   previousValidationError?: string; previousReviewBlockers?: string[]; priorPatch: string; requiresUnrealAssets: boolean;
 }): string {
   return createHash('sha256').update(JSON.stringify(input)).digest('hex');
+}
+
+export function deriveWindowsAuthoringArtifactExpectations(criteria: string[], requiresUnrealAssets: boolean): WindowsAuthoringPacket['artifactExpectations'] {
+  if (!requiresUnrealAssets) return [];
+  const paths = new Set<string>(['Content']);
+  for (const criterion of criteria) {
+    for (const match of criterion.matchAll(/(?:^|\s)(((?:Content|Documentation|Config|Source|Plugins)(?:[\\/][A-Za-z0-9_.-]+)+)|(?:[A-Za-z0-9_.-]+\.uproject))/g)) {
+      const path = match[1]?.replaceAll('\\', '/').replace(/[.,;:]+$/, '');
+      if (!path || path.split('/').includes('..')) continue;
+      const prefix = criterion.slice(Math.max(0, (match.index ?? 0) - 20), match.index ?? 0);
+      if (/\b(?:no|not|without|exclude|excluding)\s*$/i.test(prefix)) continue;
+      paths.add(path);
+    }
+  }
+  return [...paths].map((relativePath) => ({ name: relativePath === 'Content' ? 'authored-unreal-assets' : `required-path:${relativePath}`,
+    relativePath, required: true, delivery: 'artifact-store' as const, binary: relativePath === 'Content' || /\.(?:uasset|umap|png|jpe?g|exr)$/i.test(relativePath),
+    maxBytes: WINDOWS_EVIDENCE_MAX_ARTIFACT_BYTES }));
 }
 
 export function classifyAuthoringEvidence(prompt: string, acceptanceCriteria: string[], buildId: string,
@@ -253,9 +292,8 @@ async function verifyWindowsResultTree(workspacePath: string, result: WindowsAut
     child.once('close', (code) => { signal?.removeEventListener('abort', abort); code === 0 ? resolve(stdout.trim()) : reject(new Error(`Windows tree verification failed: ${stderr}`)); });
   });
   if (tree.toLowerCase() !== result.resultTreeSha.toLowerCase()) throw new Error('Windows result reconciliation failed: reconstructed Git tree does not match the runner result tree.');
-  const files = await runGitCapture(workspacePath, ['ls-files', '-z'], signal);
   const supplied = new Set(result.resultBundle.lfsObjects.map(({ oid }) => oid.toLowerCase()));
-  for (const path of files.split('\0').filter(Boolean)) {
+  for (const { path } of result.tree) {
     const indexed = await runGitCapture(workspacePath, ['show', `:${path}`], signal);
     const pointer = indexed.match(/^version https:\/\/git-lfs\.github\.com\/spec\/v1\r?\noid sha256:([a-f0-9]{64})\r?\nsize \d+\r?\n?$/);
     if (pointer && !supplied.has(pointer[1]!.toLowerCase())) throw new Error(`Windows result reconciliation failed: missing Git LFS object ${pointer[1]} for ${path}.`);
@@ -272,18 +310,23 @@ async function runGitCapture(workspacePath: string, args: string[], signal?: Abo
 }
 
 export async function replaceGitPatch(workspacePath: string, previousPatch: string, patch: string, signal?: AbortSignal): Promise<void> {
-  if (previousPatch.trim()) await runGitApply(workspacePath, previousPatch, true, signal);
+  if (previousPatch.trim()) {
+    // Both patches are complete, base-relative representations of the managed
+    // checkout. Restore tracked paths to that base first so replacement works
+    // whether the previous result was staged, unstaged, or LFS-hydrated.
+    await runGitCapture(workspacePath, ['restore', '--source=HEAD', '--staged', '--worktree', '--', '.'], signal);
+  }
   try {
-    if (patch.trim()) await runGitApply(workspacePath, patch, false, signal);
+    if (patch.trim()) await runGitApply(workspacePath, patch, false, signal, true);
   } catch (error) {
-    if (previousPatch.trim()) await runGitApply(workspacePath, previousPatch, false, signal);
+    if (previousPatch.trim()) await runGitApply(workspacePath, previousPatch, false, signal, true);
     throw error;
   }
 }
 
-async function runGitApply(workspacePath: string, patch: string, reverse: boolean, signal?: AbortSignal): Promise<void> {
+async function runGitApply(workspacePath: string, patch: string, reverse: boolean, signal?: AbortSignal, updateIndex = false): Promise<void> {
   await new Promise<void>((resolve, reject) => {
-    const child = spawn('git', ['apply', ...(reverse ? ['--reverse'] : []), '--binary', '--whitespace=nowarn', '-'], { cwd: workspacePath, stdio: ['pipe', 'pipe', 'pipe'] });
+    const child = spawn('git', ['apply', ...(reverse ? ['--reverse'] : []), ...(updateIndex ? ['--index'] : []), '--binary', '--whitespace=nowarn', '-'], { cwd: workspacePath, stdio: ['pipe', 'pipe', 'pipe'] });
     let stderr = ''; child.stderr.on('data', (chunk) => { stderr += String(chunk); });
     const abort = () => child.kill('SIGTERM'); signal?.addEventListener('abort', abort, { once: true }); child.stdin.end(patch);
     child.once('error', reject); child.once('close', (code) => { signal?.removeEventListener('abort', abort); code === 0 ? resolve() : reject(new Error(`Windows result reconciliation failed: ${stderr}`)); });
@@ -904,6 +947,7 @@ export async function runDatabaseWorkerOnce(options: { deferInterruptSignals?: b
     }
     const message = sanitizeAuditErrorMessage(toErrorMessage(error));
     const status = error instanceof ProviderExecutionError ? 'provider_failed' : 'failed';
+    const retryable = resolveTaskFailureRetryability(error);
     await repository.failTask(claimed.task.id, message, status);
     await repository.finishTaskRun({
       taskRunId: claimed.taskRun.id,
@@ -913,7 +957,7 @@ export async function runDatabaseWorkerOnce(options: { deferInterruptSignals?: b
       iterationCount: attemptCount,
       ...getRunUsageFields()
     });
-    await finalizeQueueJob('failed', message, !(error instanceof ProviderExecutionError) || error.retryable);
+    await finalizeQueueJob('failed', message, retryable);
     return {
       claimed: true,
       taskId: claimed.task.id,
@@ -1712,4 +1756,18 @@ class ProviderExecutionError extends Error {
     super(`Provider ${providerKind} ${operation} failed: ${message}`);
     this.name = 'ProviderExecutionError';
   }
+}
+
+export class WindowsAuthoringExecutionError extends Error {
+  constructor(message: string, readonly retryable: boolean, readonly failureKind: string) {
+    super(message);
+    this.name = 'WindowsAuthoringExecutionError';
+  }
+}
+
+export function resolveTaskFailureRetryability(error: unknown): boolean {
+  if (error instanceof ProviderExecutionError || error instanceof WindowsAuthoringExecutionError) return error.retryable;
+  const message = toErrorMessage(error).toLowerCase();
+  if (/windows authoring job cancelled|windows result reconciliation failed|configured codex_model .* is not available|model .* does not exist|do not have access to it|collab spawn failed|no thread with id|input_too_large|input exceeds the maximum/.test(message)) return false;
+  return true;
 }

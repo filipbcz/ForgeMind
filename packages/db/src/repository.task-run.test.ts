@@ -1149,6 +1149,31 @@ describe('ForgeMindRepository task runs', () => {
     delete process.env.FORGEMIND_QUEUE_MAX_ATTEMPTS;
   });
 
+  it('stops an automatic queue loop when the same failure repeats without progress', async () => {
+    const { prisma, taskQueueJobFindUnique } = createMockPrisma();
+    taskQueueJobFindUnique.mockResolvedValueOnce({
+      id: 'queue_1',
+      taskId: 'task_1',
+      status: 'claimed',
+      attemptCount: 2,
+      errorMessage: 'Provider failed at 2026-09-08T11:42:51.735Z for thread 01a080d3-c193-49b0-9cb9-13f47a751dcb'
+    } as any);
+    const repository = new ForgeMindRepository(prisma);
+
+    await repository.finalizeQueueJob('queue_1', 'failed',
+      'Provider failed at 2026-09-08T11:45:00.000Z for thread 01b191e4-d204-4ac1-8dca-24f58b862edc');
+
+    expect(prisma.task.updateMany).not.toHaveBeenCalled();
+    expect(prisma.taskQueueJob.update).toHaveBeenCalledWith({
+      where: { id: 'queue_1' },
+      data: expect.objectContaining({ status: 'failed', nextAttemptAt: null })
+    });
+    expect(prisma.auditLog.create).toHaveBeenCalledWith({
+      data: expect.objectContaining({ eventType: 'task_queue_retry_suppressed', taskId: 'task_1',
+        payload: expect.objectContaining({ reason: 'same_failure_repeated_without_progress' }) })
+    });
+  });
+
   it('does not revive a completed or cancelled task while finalizing a retryable failure', async () => {
     const { prisma, taskQueueJobFindUnique } = createMockPrisma();
     taskQueueJobFindUnique.mockResolvedValueOnce({
