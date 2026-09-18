@@ -1,6 +1,8 @@
 import { describe, expect, it } from 'vitest';
 import { parseConfiguredToolProbes, redactProbeOutput, runCapabilityProbes, windowsRunnerCapabilityProbes } from './probes.js';
 
+const itWindows = process.platform === 'win32' ? it : it.skip;
+
 describe('capability probes', () => {
   it('advertises tool capabilities only when local probe evidence succeeds', async () => {
     const result = await runCapabilityProbes([
@@ -22,8 +24,9 @@ describe('capability probes', () => {
     }, 'C:\\node.exe');
     expect(probes.find(({ capability }) => capability.key === 'windows')?.kind).toBe('windows-platform');
     expect(probes).toEqual(expect.arrayContaining([
+      expect.objectContaining({ capability: { key: 'npm', metadata: { executable: 'npm.cmd' } }, executable: 'cmd.exe', args: ['/d', '/s', '/c', 'npm.cmd --version'] }),
       expect.objectContaining({ capability: { key: 'cmake' }, executable: 'cmake.exe' }),
-      expect.objectContaining({ capability: { key: 'msvc' }, executable: 'cl.exe' }),
+      expect.objectContaining({ capability: { key: 'msvc', metadata: { target: 'x64' } }, kind: 'msvc', executable: expect.stringContaining('vswhere.exe') }),
       expect.objectContaining({ capability: { key: 'git-lfs' }, executable: 'git-lfs.exe' }),
       expect.objectContaining({ capability: { key: 'windows-sdk' }, executable: 'where.exe' }),
       expect.objectContaining({ capability: { key: 'interactive-desktop' }, executable: 'powershell.exe' }),
@@ -33,8 +36,8 @@ describe('capability probes', () => {
       expect.objectContaining({
         capability: { key: 'unreal', version: '5.8', metadata: { executable: 'C:\\UE\\UnrealEditor-Cmd.exe' } },
         executable: 'C:\\UE\\UnrealEditor-Cmd.exe',
-        args: expect.arrayContaining(['-version', '-unattended', '-RUNNINGUNATTENDEDSCRIPT', '-NullRHI', '-DDC-ForceMemoryCache', '-NoSaveConfig']),
-        timeoutMs: 180_000
+        kind: 'unreal',
+        timeoutMs: 240_000
       }),
       expect.objectContaining({ capability: { key: 'custom-sdk' }, executable: 'sdk.exe', args: ['version'] })
     ]));
@@ -66,6 +69,13 @@ describe('capability probes', () => {
     expect(result.evidence[0]).toMatchObject({ status: 'unsupported', summary: expect.stringContaining('timed out') });
   });
 
+  it('reports progress when each probe starts and completes', async () => {
+    const progress: string[] = [];
+    await runCapabilityProbes([{ capability: { key: 'node' }, executable: process.execPath, args: ['--version'] }], new Date(),
+      ({ capability, state, status }) => progress.push(`${capability.key}:${state}:${status ?? ''}`));
+    expect(progress).toEqual(['node:started:', 'node:completed:supported']);
+  });
+
   it('does not advertise a tool whose executable reports a different configured version', async () => {
     const result = await runCapabilityProbes([{
       capability: { key: 'versioned-tool', version: '999.1' }, executable: process.execPath, args: ['--version'], expectedVersion: '999.1'
@@ -73,4 +83,13 @@ describe('capability probes', () => {
     expect(result.capabilities).toEqual([]);
     expect(result.evidence[0]).toMatchObject({ status: 'unsupported', summary: expect.stringContaining('different version than 999.1') });
   });
+
+  itWindows('executes the real Windows npm wrapper and x64 MSVC compile probes', async () => {
+    const probes = windowsRunnerCapabilityProbes('test').filter(({ capability }) => ['npm', 'msvc'].includes(capability.key));
+    const result = await runCapabilityProbes(probes);
+    expect(result.evidence).toEqual([
+      expect.objectContaining({ capability: expect.objectContaining({ key: 'npm' }), status: 'supported' }),
+      expect.objectContaining({ capability: expect.objectContaining({ key: 'msvc', metadata: expect.objectContaining({ target: 'x64' }) }), status: 'supported' })
+    ]);
+  }, 60_000);
 });

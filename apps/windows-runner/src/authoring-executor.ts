@@ -1,5 +1,4 @@
 import { createHash, randomUUID } from 'node:crypto';
-import { spawn } from 'node:child_process';
 import { access, lstat, mkdir, readFile, readdir, realpath, rename, rm, writeFile } from 'node:fs/promises';
 import { constants as fsConstants } from 'node:fs';
 import { basename, dirname, posix, relative, resolve } from 'node:path';
@@ -8,6 +7,7 @@ import type { AuthoringTreeEntry, WindowsAuthoringPacket, WindowsAuthoringProces
 import { redactSecrets } from '@forgemind/core';
 import { resolveCodexBinary, type AIProvider, type ProviderSessionContext } from '@forgemind/providers';
 import { buildSandboxedProcessInvocation, buildUnrealAuthoringArgs, containsUnrealEditorInvocation } from './native-sandbox.js';
+import { runBoundedProcess } from './process-runner.js';
 
 export interface NativeAuthoringTools {
   root: string;
@@ -660,23 +660,11 @@ async function copyReviewableChangedImages(root: string, outputRoot: string, cha
 }
 
 async function spawnComplete(executable: string, args: string[], cwd: string, timeoutMs: number, signal?: AbortSignal) {
-  const child = spawn(executable, args, { cwd, shell: false, windowsHide: true }); let stdout = ''; let stderr = ''; let timedOut = false;
-  let missingCapability = false;
-  child.stdout?.on('data', (v) => { stdout += String(v); }); child.stderr?.on('data', (v) => { stderr += String(v); });
-  const kill = () => { if (child.pid) spawn('taskkill.exe', ['/PID', String(child.pid), '/T', '/F'], { windowsHide: true }); };
-  const timer = setTimeout(() => { timedOut = true; kill(); }, timeoutMs); signal?.addEventListener('abort', kill, { once: true });
-  const exitCode = await new Promise<number | undefined>((done) => { child.once('error', (e: NodeJS.ErrnoException) => { stderr += e.message; missingCapability = e.code === 'ENOENT'; done(undefined); }); child.once('close', (code) => done(code ?? undefined)); });
-  clearTimeout(timer); signal?.removeEventListener('abort', kill); return { exitCode: timedOut ? undefined : exitCode, stdout, stderr,
-    ...(timedOut ? { terminationReason: 'timed-out' as const } : signal?.aborted ? { terminationReason: 'cancelled' as const }
-      : missingCapability ? { terminationReason: 'missing-capability' as const } : {}) };
+  return await runBoundedProcess(executable, args, { cwd, timeoutMs, signal, maxOutputBytes: 16_000_000 });
 }
 
 async function spawnWithInput(executable: string, args: string[], cwd: string, input: string, signal?: AbortSignal) {
-  const child = spawn(executable, args, { cwd, shell: false, windowsHide: true }); let stdout = ''; let stderr = '';
-  child.stdout?.on('data', (value) => { stdout += String(value); }); child.stderr?.on('data', (value) => { stderr += String(value); });
-  const abort = () => child.kill(); signal?.addEventListener('abort', abort, { once: true }); child.stdin?.end(input);
-  const exitCode = await new Promise<number | undefined>((resolveExit) => { child.once('error', (error) => { stderr += error.message; resolveExit(undefined); }); child.once('close', (code) => resolveExit(code ?? undefined)); });
-  signal?.removeEventListener('abort', abort); return { exitCode, stdout, stderr };
+  return await runBoundedProcess(executable, args, { cwd, input, timeoutMs: 300_000, signal, maxOutputBytes: 16_000_000 });
 }
 
 async function gitTree(root: string, signal?: AbortSignal): Promise<string> {

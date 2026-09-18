@@ -1,11 +1,11 @@
 #!/usr/bin/env node
 import { createInterface } from 'node:readline';
-import { spawn } from 'node:child_process';
 import { appendFile, mkdir, readFile, readdir, realpath, rm, stat, writeFile } from 'node:fs/promises';
 import { dirname, relative, resolve } from 'node:path';
 import { redactSecrets } from '@forgemind/core';
 import { assertEvidenceOutsideCheckout, buildSandboxedExecutableInvocation, buildSandboxedProcessInvocation,
   buildUnrealAuthoringArgs, containsUnrealEditorInvocation } from './native-sandbox.js';
+import { runBoundedProcess } from './process-runner.js';
 
 const root = resolve(process.argv[2] ?? '');
 const evidencePath = resolve(process.argv[3] ?? '');
@@ -18,7 +18,7 @@ const processTimeoutMs = Number.isFinite(configuredProcessTimeoutMs) && configur
 if (!root || !evidencePath || !sandboxExecutable) throw new Error('Native tool server requires checkout, evidence, and sandbox executable paths.');
 assertEvidenceOutsideCheckout(root, evidencePath);
 const canonicalRoot = await realpath(root);
-const activeProcesses = new Set<ReturnType<typeof spawn>>();
+const activeProcesses = new Set<AbortController>();
 
 const input = createInterface({ input: process.stdin, crlfDelay: Infinity });
 input.on('line', (line) => void handle(line));
@@ -97,25 +97,18 @@ async function runProcess(checkId: string, command: string, shell: 'powershell' 
   const sandboxed = directInvocation ?? buildSandboxedProcessInvocation({ sandboxExecutable, checkoutRoot: root, command, shell });
   const temporaryDirectory = resolve(root, '.forgemind-tmp'); await mkdir(temporaryDirectory, { recursive: true });
   const startedAt = new Date().toISOString();
-  const child = spawn(sandboxed.executable, sandboxed.args, { cwd: root, shell: false, windowsHide: true,
-    env: sandboxEnvironment(temporaryDirectory, dirname(evidencePath)) });
-  activeProcesses.add(child);
-  let stdout = ''; let stderr = ''; child.stdout?.on('data', (chunk) => { stdout += String(chunk); }); child.stderr?.on('data', (chunk) => { stderr += String(chunk); });
-  let timedOut = false; let missingCapability = false;
-  const killTree = () => { if (child.pid) spawn('taskkill.exe', ['/PID', String(child.pid), '/T', '/F'], { windowsHide: true }); };
-  const timer = setTimeout(() => { timedOut = true; killTree(); }, processTimeoutMs);
-  const exitCode = await new Promise<number | undefined>((done) => { child.once('error', (error: NodeJS.ErrnoException) => { stderr += error.message; missingCapability = error.code === 'ENOENT'; done(undefined); }); child.once('close', (code) => done(code ?? undefined)); });
-  activeProcesses.delete(child);
-  clearTimeout(timer);
-  const result = { checkId, command, shell, exitCode: timedOut ? undefined : exitCode, stdout: redactSecrets(stdout), stderr: redactSecrets(stderr), startedAt, completedAt: new Date().toISOString(),
-    ...(timedOut ? { terminationReason: 'timed-out' } : missingCapability ? { terminationReason: 'missing-capability' } : {}), ...(authoring ? { authoring } : {}) };
+  const controller = new AbortController();
+  activeProcesses.add(controller);
+  const executed = await runBoundedProcess(sandboxed.executable, sandboxed.args, { cwd: root, timeoutMs: processTimeoutMs,
+    env: sandboxEnvironment(temporaryDirectory, dirname(evidencePath)), signal: controller.signal, maxOutputBytes: 16_000_000 })
+    .finally(() => activeProcesses.delete(controller));
+  const result = { checkId, command, shell, exitCode: executed.exitCode, stdout: redactSecrets(executed.stdout), stderr: redactSecrets(executed.stderr), startedAt, completedAt: new Date().toISOString(),
+    ...(executed.terminationReason ? { terminationReason: executed.terminationReason } : {}), ...(authoring ? { authoring } : {}) };
   await appendFile(evidencePath, `${JSON.stringify(result)}\n`, 'utf8'); return result;
 }
 
 function terminateActiveProcesses(): void {
-  for (const child of activeProcesses) {
-    if (child.pid) spawn('taskkill.exe', ['/PID', String(child.pid), '/T', '/F'], { windowsHide: true });
-  }
+  for (const controller of activeProcesses) controller.abort();
 }
 
 function quoteWindowsArgument(value: unknown): string {

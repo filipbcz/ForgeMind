@@ -1,11 +1,10 @@
 #!/usr/bin/env node
-import { execFile } from 'node:child_process';
 import { createInterface } from 'node:readline/promises';
 import { homedir, release as osRelease } from 'node:os';
 import { join } from 'node:path';
 import { stdin, stdout } from 'node:process';
 import { pathToFileURL } from 'node:url';
-import { classifyWindowsExecutionPacket, isWindowsAuthoringPacket, isWindowsExecutionPacket } from '@forgemind/core';
+import { classifyWindowsExecutionPacket, isWindowsAuthoringPacket, isWindowsExecutionPacket, type WorkerProbeEvidence } from '@forgemind/core';
 import { createProvider, listCodexModels, resolveCodexBinary, type AIProvider, type ProviderModelOption } from '@forgemind/providers';
 import { WindowsCredentialStore } from './credential-store.js';
 import { cleanupWindowsValidationWorkspace, executeWindowsValidation } from './executor.js';
@@ -14,11 +13,13 @@ import { runCapabilityProbes, windowsRunnerCapabilityProbes } from './probes.js'
 import { runManualSession } from './session.js';
 import { cleanupAcceptedWindowsAuthoring, prepareWindowsManagedRoots } from './managed-roots.js';
 import { WindowsRunnerTransport } from './transport.js';
+import { runBoundedProcess } from './process-runner.js';
 
 const RUNNER_VERSION = '0.1.0';
 
 export type CliCommand =
-  | { command: 'enroll' | 'probe'; apiUrl: string }
+  | { command: 'enroll'; apiUrl: string }
+  | { command: 'probe'; apiUrl: string; json: boolean }
   | { command: 'session-start'; apiUrl: string; projectIds: string[]; workspaceRoot: string; artifactRoot: string }
   | { command: 'session-drain' | 'session-stop'; apiUrl: string; sessionId: string };
 
@@ -28,7 +29,8 @@ export function parseCliArgs(args: string[]): CliCommand {
   const options = command === 'session' ? args.slice(2) : args.slice(1);
   const apiUrl = option(options, '--api-url');
   if (!apiUrl) throw new Error('--api-url is required.');
-  if (command === 'enroll' || command === 'probe') return { command, apiUrl };
+  if (command === 'enroll') return { command, apiUrl };
+  if (command === 'probe') return { command, apiUrl, json: options.includes('--json') };
   if (command === 'session' && action === 'start') {
     const projectIds = optionsFor(options, '--project');
     if (projectIds.length === 0) throw new Error('At least one --project UUID is required for local activation.');
@@ -65,14 +67,24 @@ export function assertNativeCodexCliCompatibility(help: string): void {
   if (missing.length > 0) throw new Error(`The installed Codex CLI cannot run deterministic Windows authoring. Missing options: ${missing.join(', ')}. Update @openai/codex before starting a session.`);
 }
 
+export function requiredProbeFailures(
+  evidence: readonly WorkerProbeEvidence[],
+  environment: NodeJS.ProcessEnv = process.env
+): WorkerProbeEvidence[] {
+  const required = new Set(['windows', 'powershell', 'cmd', 'git', 'git-lfs', 'node', 'npm', 'codex', 'disk-capacity']);
+  if (environment.FORGEMIND_UNREAL_EXECUTABLE) {
+    for (const key of ['cmake', 'msvc', 'windows-sdk', 'interactive-desktop', 'gpu', 'unreal']) required.add(key);
+  }
+  return evidence.filter(({ capability, status }) => status !== 'supported' && required.has(capability.key));
+}
+
 async function runCodexCommand(binary: string, args: string[], codexHome: string): Promise<string> {
-  return await new Promise<string>((resolveHelp, reject) => {
-    execFile(binary, args, { windowsHide: true, timeout: 20_000, maxBuffer: 1_000_000,
-      env: { ...process.env, CODEX_HOME: codexHome } }, (error, stdoutText, stderrText) => {
-      if (error) return reject(new Error(`Could not inspect the installed Codex CLI: ${stderrText || error.message}`));
-      resolveHelp(`${stdoutText}\n${stderrText}`);
-    });
-  });
+  const result = await runBoundedProcess(binary, args, { timeoutMs: 20_000, maxOutputBytes: 1_000_000,
+    env: { ...process.env, CODEX_HOME: codexHome } });
+  if (result.exitCode !== 0 || result.terminationReason) {
+    throw new Error(`Could not inspect the installed Codex CLI: ${result.stderr || result.stdout || result.terminationReason || `exit ${result.exitCode}`}`);
+  }
+  return `${result.stdout}\n${result.stderr}`;
 }
 
 export async function prepareLocalCodexRuntime(environment: NodeJS.ProcessEnv = process.env): Promise<{
@@ -109,17 +121,29 @@ export async function main(args = process.argv.slice(2)): Promise<void> {
   const auth = await store.load(); if (!auth) throw new Error('Runner is not enrolled.');
   if (parsed.command === 'session-drain') { await transport.drain(auth, parsed.sessionId); return; }
   if (parsed.command === 'session-stop') { await transport.stop(auth, parsed.sessionId); return; }
+  stdout.write('[preflight] Checking Codex CLI, sandbox and OAuth...\n');
   const codexRuntime = await prepareLocalCodexRuntime();
-  const probes = await runCapabilityProbes(windowsRunnerCapabilityProbes(osRelease()));
+  stdout.write(`[preflight] Codex passed; selected model ${codexRuntime.model}.\n`);
+  stdout.write('[preflight] Checking local Windows capabilities...\n');
+  const probes = await runCapabilityProbes(windowsRunnerCapabilityProbes(osRelease()), new Date(), (progress) => {
+    stdout.write(progress.state === 'started'
+      ? `[preflight] ${progress.capability.key}: checking...\n`
+      : `[preflight] ${progress.capability.key}: ${progress.status === 'supported' ? 'passed' : 'FAILED'}\n`);
+  });
   stdout.write(`Codex preflight passed. Selected model: ${codexRuntime.model}. Available models: ${codexRuntime.availableModels.join(', ')}.\n`);
+  const failedRequiredProbes = requiredProbeFailures(probes.evidence);
   if (parsed.command === 'probe') {
     await transport.publishDevice(auth, { runnerVersion: RUNNER_VERSION, displayName: process.env.COMPUTERNAME ?? 'Windows runner', capabilities: probes.capabilities, probeEvidence: probes.evidence });
-    stdout.write(`${JSON.stringify(probes.evidence, null, 2)}\n`); return;
+    if (parsed.json) stdout.write(`${JSON.stringify(probes.evidence, null, 2)}\n`);
+    else for (const item of probes.evidence) stdout.write(`${item.status === 'supported' ? 'PASS' : 'FAIL'} ${item.capability.key}: ${item.summary}\n`);
+    assertRequiredProbesPassed(failedRequiredProbes);
+    return;
   }
   if (parsed.command === 'session-start') {
+    await transport.publishDevice(auth, { runnerVersion: RUNNER_VERSION, displayName: process.env.COMPUTERNAME ?? 'Windows runner', capabilities: probes.capabilities, probeEvidence: probes.evidence });
+    assertRequiredProbesPassed(failedRequiredProbes);
     const managedRoots = await prepareWindowsManagedRoots(join(parsed.workspaceRoot, '..'));
     const adapterPolicy = readLocalAdapterPolicy();
-    await transport.publishDevice(auth, { runnerVersion: RUNNER_VERSION, displayName: process.env.COMPUTERNAME ?? 'Windows runner', capabilities: probes.capabilities, probeEvidence: probes.evidence });
     const controller = new AbortController(); process.once('SIGINT', () => controller.abort());
     await runManualSession(transport, auth, { projectIds: parsed.projectIds, signal: controller.signal,
       onClaim: async (claim, context) => {
@@ -172,6 +196,11 @@ export async function main(args = process.argv.slice(2)): Promise<void> {
       } });
     return;
   }
+}
+
+function assertRequiredProbesPassed(failures: readonly WorkerProbeEvidence[]): void {
+  if (failures.length === 0) return;
+  throw new Error(`Windows runner preflight failed. No session was started. Fix: ${failures.map(({ capability, summary }) => `${capability.key} (${summary})`).join('; ')}`);
 }
 
 interface LocalAdapterPolicy {

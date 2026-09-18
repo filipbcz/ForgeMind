@@ -1,6 +1,5 @@
 import { createHash } from 'node:crypto';
 import { inflateSync } from 'node:zlib';
-import { spawn } from 'node:child_process';
 import { mkdir, readFile, realpath, rm, stat } from 'node:fs/promises';
 import { basename, dirname, isAbsolute, relative, resolve } from 'node:path';
 import type {
@@ -14,6 +13,7 @@ import type {
 import { redactSecrets } from '@forgemind/core';
 import { SafeFixtureExecutor } from './fixture-executor.js';
 import { PinnedUnrealCommandAdapter, type ApprovedUnrealProfile, type PinnedUnrealTool } from './unreal-adapter.js';
+import { runBoundedProcess } from './process-runner.js';
 
 interface ProcessResult {
   status: 'succeeded' | 'failed' | 'cancelled' | 'timed_out' | 'deferred';
@@ -264,40 +264,14 @@ async function runProcess(
   args: string[],
   options: { cwd: string; timeoutMs: number; maxOutputBytes: number; signal?: AbortSignal }
 ): Promise<ProcessResult> {
-  if (options.signal?.aborted) return { status: 'cancelled', stdout: '', stderr: '' };
-  const child = spawn(executable, args, { cwd: options.cwd, shell: false, windowsHide: true });
-  let stdout: Buffer<ArrayBufferLike> = Buffer.alloc(0);
-  let stderr: Buffer<ArrayBufferLike> = Buffer.alloc(0);
-  child.stdout?.on('data', (chunk: Buffer) => { stdout = appendBounded(stdout, chunk, options.maxOutputBytes); });
-  child.stderr?.on('data', (chunk: Buffer) => { stderr = appendBounded(stderr, chunk, options.maxOutputBytes); });
-  let controlled: 'cancelled' | 'timed_out' | undefined;
-  const terminate = async (reason: 'cancelled' | 'timed_out') => {
-    if (controlled) return;
-    controlled = reason;
-    if (!child.pid) return;
-    await new Promise<void>((resolveKill) => {
-      const killer = spawn('taskkill.exe', ['/PID', String(child.pid), '/T', '/F'], { windowsHide: true, stdio: 'ignore' });
-      killer.once('error', () => resolveKill());
-      killer.once('close', () => resolveKill());
-    });
-  };
-  const timer = setTimeout(() => void terminate('timed_out'), options.timeoutMs);
-  const abortListener = () => void terminate('cancelled');
-  options.signal?.addEventListener('abort', abortListener, { once: true });
-  const exitCode = await new Promise<number | undefined>((resolveExit) => {
-    child.once('error', (error) => {
-      stderr = appendBounded(stderr, Buffer.from(error.message), options.maxOutputBytes);
-      resolveExit(undefined);
-    });
-    child.once('close', (code) => resolveExit(code ?? undefined));
-  });
-  clearTimeout(timer);
-  options.signal?.removeEventListener('abort', abortListener);
+  const executed = await runBoundedProcess(executable, args, options);
   return {
-    status: controlled ?? (exitCode === 0 ? 'succeeded' : 'failed'),
-    exitCode,
-    stdout: stdout.toString('utf8'),
-    stderr: stderr.toString('utf8')
+    status: executed.terminationReason === 'cancelled' ? 'cancelled'
+      : executed.terminationReason === 'timed-out' ? 'timed_out'
+        : executed.exitCode === 0 ? 'succeeded' : 'failed',
+    exitCode: executed.exitCode,
+    stdout: executed.stdout,
+    stderr: executed.stderr
   };
 }
 
@@ -457,11 +431,6 @@ function resolveContained(root: string, relativePath: string): string {
   const childPath = relative(resolve(root), candidate);
   if (!childPath || childPath.startsWith('..') || isAbsolute(childPath)) throw new Error('Artifact path escapes the validation workspace.');
   return candidate;
-}
-
-function appendBounded(current: Buffer, next: Uint8Array, maxBytes: number): Buffer {
-  const combined = Buffer.concat([current, next]);
-  return Buffer.from(combined.length <= maxBytes ? combined : combined.subarray(combined.length - maxBytes));
 }
 
 function truncateUtf8(value: string, maxBytes: number): string {

@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { assertNativeCodexCliCompatibility, parseCliArgs, selectLocalCodexModel } from './cli.js';
+import { assertNativeCodexCliCompatibility, parseCliArgs, requiredProbeFailures, selectLocalCodexModel } from './cli.js';
 
 describe('Windows runner CLI parsing', () => {
   it.each([
@@ -13,6 +13,21 @@ describe('Windows runner CLI parsing', () => {
   });
   it('requires explicit project-scoped activation', () => {
     expect(() => parseCliArgs(['session', 'start', '--api-url', 'https://forgemind.test'])).toThrow(/--project/);
+  });
+
+  it('enables detailed JSON only when requested for a probe', () => {
+    expect(parseCliArgs(['probe', '--api-url', 'https://forgemind.test'])).toMatchObject({ json: false });
+    expect(parseCliArgs(['probe', '--json', '--api-url', 'https://forgemind.test'])).toMatchObject({ json: true });
+  });
+
+  it('blocks an Unreal session on failed authoring prerequisites', () => {
+    const evidence = [
+      { schemaVersion: 1 as const, capability: { key: 'npm' }, status: 'unsupported' as const, probedAt: '2026-09-18T00:00:00.000Z', probeVersion: '3', provenance: 'local-probe' as const, summary: 'npm failed', evidenceHash: 'a'.repeat(64) },
+      { schemaVersion: 1 as const, capability: { key: 'msvc' }, status: 'unsupported' as const, probedAt: '2026-09-18T00:00:00.000Z', probeVersion: '3', provenance: 'local-probe' as const, summary: 'x64 compile failed', evidenceHash: 'b'.repeat(64) },
+      { schemaVersion: 1 as const, capability: { key: 'asset-tool' }, status: 'unsupported' as const, probedAt: '2026-09-18T00:00:00.000Z', probeVersion: '3', provenance: 'local-probe' as const, summary: 'optional', evidenceHash: 'c'.repeat(64) }
+    ];
+    expect(requiredProbeFailures(evidence, { FORGEMIND_UNREAL_EXECUTABLE: 'UnrealEditor.exe' }).map(({ capability }) => capability.key)).toEqual(['npm', 'msvc']);
+    expect(requiredProbeFailures(evidence, {}).map(({ capability }) => capability.key)).toEqual(['npm']);
   });
 
   it('selects the account default model and rejects an unavailable explicit override before a session starts', () => {
