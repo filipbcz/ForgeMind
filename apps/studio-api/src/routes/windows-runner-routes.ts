@@ -84,7 +84,9 @@ export function registerWindowsRunnerRoutes(app: FastifyInstance, repository: Fo
   });
   app.put('/api/windows-runner/device', { preHandler: runnerAuth(credentials) }, async (request, reply) => {
     const principal = runnerPrincipal(request); const parsed = deviceRegistration.safeParse(request.body);
-    if (!parsed.success) return reply.code(400).send({ error: 'Capabilities require unique, successful matching local probe evidence.' });
+    if (!parsed.success) return reply.code(400).send({
+      error: `Capability evidence is invalid: ${parsed.error.issues.map((issue) => `${issue.path.join('.') || 'payload'}: ${issue.message}`).join('; ')}`
+    });
     const input = parsed.data;
     await workers.registerDevice({ id: principal.deviceId, ...input });
     return { accepted: true, deviceId: principal.deviceId };

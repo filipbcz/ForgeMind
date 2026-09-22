@@ -132,12 +132,23 @@ export async function runCapabilityProbes(
       status = 'unsupported';
       summary = `Local probe failed: ${redactProbeOutput(error instanceof Error ? error.message : 'unknown error')}`;
     }
+    capability = normalizeCapability(capability);
     const unsigned = { capability, status, probedAt: now.toISOString(), probeVersion: '3', provenance: 'local-probe' as const, summary };
     const item = { schemaVersion: 1 as const, ...unsigned, evidenceHash: createHash('sha256').update(canonicalizeWorkerProbeEvidence(unsigned)).digest('hex') };
     onProgress?.({ capability: probe.capability, state: 'completed', status, summary });
     return item;
   }));
   return { evidence, capabilities: evidence.filter((item) => item.status === 'supported').map((item) => item.capability) };
+}
+
+/** Keep capability property order stable across JSON transport and Zod parsing,
+ * because the evidence hash intentionally covers the canonical JSON payload. */
+function normalizeCapability(capability: WorkerCapability): WorkerCapability {
+  return {
+    key: capability.key,
+    ...(capability.version ? { version: capability.version } : {}),
+    ...(capability.metadata ? { metadata: capability.metadata } : {})
+  };
 }
 
 async function runMsvcCapabilityProbe(probe: CapabilityProbe): Promise<{ capability: WorkerCapability; summary: string }> {

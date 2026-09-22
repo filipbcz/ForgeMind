@@ -2,7 +2,7 @@ import { describe, expect, it } from 'vitest';
 import {
   WINDOWS_WORKER_SCHEMA_VERSION, canTransitionExecutionJob, canTransitionWorkerDevice, classifyWindowsExecutionPacket,
   canTransitionWorkerSession, isWindowsAuthoringPacket, isWindowsAuthoringResult, isWindowsExecutionPacket, isWindowsExecutionResult,
-  reconcileRealEngineEvidence,
+  canonicalizeWorkerProbeEvidence, reconcileRealEngineEvidence,
   type WindowsAuthoringPacket, type WindowsExecutionPacket, type WindowsExecutionResult
 } from './windows-worker.js';
 
@@ -50,6 +50,14 @@ const packet: WindowsExecutionPacket = {
 };
 
 describe('Windows worker shared contracts', () => {
+  it('canonicalizes probe capability fields independently of insertion order', () => {
+    const common = { status: 'supported' as const, probedAt: '2026-09-22T00:00:00.000Z', probeVersion: '3', provenance: 'local-probe' as const, summary: 'ok' };
+    const metadataFirst = { key: 'npm', metadata: { executable: 'npm.cmd' }, version: '11.0.0' };
+    const versionFirst = { key: 'npm', version: '11.0.0', metadata: { executable: 'npm.cmd' } };
+    expect(canonicalizeWorkerProbeEvidence({ ...common, capability: metadataFirst }))
+      .toBe(canonicalizeWorkerProbeEvidence({ ...common, capability: versionFirst }));
+  });
+
   it('validates a versioned packet and rejects mutable source identities', () => {
     expect(isWindowsExecutionPacket(packet)).toBe(true);
     expect(isWindowsExecutionPacket({ ...packet, expectedArtifacts: [{ name: 'legacy', relativePath: 'result.txt', required: true }] })).toBe(true);

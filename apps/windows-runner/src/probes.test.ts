@@ -76,6 +76,14 @@ describe('capability probes', () => {
     expect(progress).toEqual(['node:started:', 'node:completed:supported']);
   });
 
+  it('normalizes capability field order before hashing and publishing evidence', async () => {
+    const result = await runCapabilityProbes([{
+      capability: { key: 'ordered-tool', metadata: { configured: true } }, executable: process.execPath, args: ['--version']
+    }]);
+    expect(Object.keys(result.evidence[0]!.capability)).toEqual(['key', 'version', 'metadata']);
+    expect(result.capabilities).toEqual([result.evidence[0]!.capability]);
+  });
+
   it('does not advertise a tool whose executable reports a different configured version', async () => {
     const result = await runCapabilityProbes([{
       capability: { key: 'versioned-tool', version: '999.1' }, executable: process.execPath, args: ['--version'], expectedVersion: '999.1'

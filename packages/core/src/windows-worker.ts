@@ -28,7 +28,11 @@ export interface WorkerProbeEvidence {
 
 export function canonicalizeWorkerProbeEvidence(evidence: Omit<WorkerProbeEvidence, 'schemaVersion' | 'evidenceHash' | 'metadata'>): string {
   return JSON.stringify({
-    capability: evidence.capability,
+    capability: {
+      key: evidence.capability.key,
+      ...(evidence.capability.version ? { version: evidence.capability.version } : {}),
+      ...(evidence.capability.metadata ? { metadata: evidence.capability.metadata } : {})
+    },
     status: evidence.status,
     probedAt: evidence.probedAt,
     probeVersion: evidence.probeVersion,

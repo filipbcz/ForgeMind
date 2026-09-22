@@ -133,9 +133,9 @@ export async function main(args = process.argv.slice(2)): Promise<void> {
   stdout.write(`Codex preflight passed. Selected model: ${codexRuntime.model}. Available models: ${codexRuntime.availableModels.join(', ')}.\n`);
   const failedRequiredProbes = requiredProbeFailures(probes.evidence);
   if (parsed.command === 'probe') {
-    await transport.publishDevice(auth, { runnerVersion: RUNNER_VERSION, displayName: process.env.COMPUTERNAME ?? 'Windows runner', capabilities: probes.capabilities, probeEvidence: probes.evidence });
     if (parsed.json) stdout.write(`${JSON.stringify(probes.evidence, null, 2)}\n`);
     else for (const item of probes.evidence) stdout.write(`${item.status === 'supported' ? 'PASS' : 'FAIL'} ${item.capability.key}: ${item.summary}\n`);
+    await transport.publishDevice(auth, { runnerVersion: RUNNER_VERSION, displayName: process.env.COMPUTERNAME ?? 'Windows runner', capabilities: probes.capabilities, probeEvidence: probes.evidence });
     assertRequiredProbesPassed(failedRequiredProbes);
     return;
   }

@@ -120,6 +120,7 @@ describe('Windows runner enrollment API', () => {
     registerWindowsRunnerRoutes(app, {} as any, credentials, workers);
     const response = await app.inject({ method: 'PUT', url: '/api/windows-runner/device', headers: { authorization: 'Bearer device-token' }, payload: { runnerVersion: '0.1.0', displayName: 'Runner', capabilities, probeEvidence } });
     expect(response.statusCode).toBe(400);
+    expect(response.json().error).toMatch(/^Capability evidence is invalid:/);
     expect(workers.registerDevice).not.toHaveBeenCalled();
   });
 });
