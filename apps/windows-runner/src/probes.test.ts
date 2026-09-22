@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
-import { buildMsvcProbeScript, parseConfiguredToolProbes, redactProbeOutput, runCapabilityProbes, windowsRunnerCapabilityProbes } from './probes.js';
+import { buildMsvcProbeScript, buildUnrealProbeProjectDescriptor, parseConfiguredToolProbes, redactProbeOutput, runCapabilityProbes,
+  summarizeUnrealFailure, windowsRunnerCapabilityProbes } from './probes.js';
 
 const itWindows = process.platform === 'win32' ? it : it.skip;
 
@@ -51,6 +52,34 @@ describe('capability probes', () => {
       'echo FORGEMIND_MSVC_VERSION=%VCToolsVersion%',
       'cl.exe /nologo /c /Foprobe.obj probe.cpp'
     ].join('\r\n'));
+  });
+
+  it('isolates the Unreal Python probe from unrelated default engine plugins', () => {
+    expect(buildUnrealProbeProjectDescriptor('5.8')).toEqual({
+      FileVersion: 3,
+      EngineAssociation: '5.8',
+      Category: '',
+      Description: 'Ephemeral ForgeMind Unreal capability probe',
+      DisableEnginePluginsByDefault: true,
+      Plugins: [
+        { Name: 'ContentBrowserFileDataSource', Enabled: true },
+        { Name: 'PythonScriptPlugin', Enabled: true }
+      ]
+    });
+  });
+
+  it('selects the fatal Unreal diagnostic instead of unrelated startup noise', () => {
+    expect(summarizeUnrealFailure([
+      'LogPackageName: Display: InterchangeAxF/Content/',
+      'LogPackageName: Display: ConcertSyncClient/Content/',
+      'Fatal error: [File:CoreUObject/Private/Misc/PackageName.cpp] [Line: 42]',
+      'Assertion failed: Invalid package mount point',
+      'stack frame'
+    ].join('\n'))).toBe([
+      'Fatal error: [File:CoreUObject/Private/Misc/PackageName.cpp] [Line: 42]',
+      'Assertion failed: Invalid package mount point',
+      'stack frame'
+    ].join('\n'));
   });
 
   it('does not allow configured capabilities to masquerade as the Windows platform probe', () => {

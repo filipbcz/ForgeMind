@@ -207,21 +207,17 @@ async function runUnrealCapabilityProbe(probe: CapabilityProbe): Promise<{ capab
   const projectPath = join(projectDirectory, 'ForgeMindProbe.uproject');
   const scriptPath = join(temporaryRoot, 'probe.py');
   const markerPath = join(temporaryRoot, 'probe-succeeded.txt');
+  const logPath = join(temporaryRoot, 'unreal-probe.log');
   try {
     await mkdir(projectDirectory, { recursive: true });
-    await writeFile(projectPath, `${JSON.stringify({
-      FileVersion: 3,
-      EngineAssociation: engineAssociation,
-      Category: '',
-      Description: 'Ephemeral ForgeMind Unreal capability probe',
-      Plugins: [{ Name: 'PythonScriptPlugin', Enabled: true }]
-    }, null, 2)}\n`, 'utf8');
+    await writeFile(projectPath, `${JSON.stringify(buildUnrealProbeProjectDescriptor(engineAssociation), null, 2)}\n`, 'utf8');
     const markerForPython = markerPath.replace(/\\/g, '\\\\').replace(/'/g, "\\'");
-    await writeFile(scriptPath, `from pathlib import Path\nPath(r'${markerForPython}').write_text('FORGEMIND_UNREAL_PROBE_OK', encoding='utf-8')\n`, 'utf8');
-    const output = await executeProbe(commandletExecutable, [
+    await writeFile(scriptPath, `import unreal\nfrom pathlib import Path\nunreal.log('FORGEMIND_UNREAL_PYTHON_API_OK')\nPath(r'${markerForPython}').write_text('FORGEMIND_UNREAL_PROBE_OK', encoding='utf-8')\n`, 'utf8');
+    const output = await executeUnrealProbe(commandletExecutable, [
       projectPath, '-run=pythonscript', `-script=${scriptPath}`, '-unattended', '-nop4', '-nosplash', '-NullRHI', '-NoSound',
-      '-NoShaderCompile', '-NoSaveConfig', '-NoEpicPortal', '-stdout', '-FullStdOutLogOutput'
-    ], probe.timeoutMs);
+      '-NoShaderCompile', '-DDC-ForceMemoryCache', '-RUNNINGUNATTENDEDSCRIPT', '-NoSaveConfig', '-NoEpicPortal',
+      `-AbsLog=${logPath}`, '-stdout', '-FullStdOutLogOutput'
+    ], probe.timeoutMs, logPath);
     const marker = await readFile(markerPath, 'utf8');
     if (marker.trim() !== 'FORGEMIND_UNREAL_PROBE_OK') throw new Error('Unreal commandlet exited without writing the Python probe marker.');
     return {
@@ -231,6 +227,41 @@ async function runUnrealCapabilityProbe(probe: CapabilityProbe): Promise<{ capab
   } finally {
     await rm(temporaryRoot, { recursive: true, force: true }).catch(() => undefined);
   }
+}
+
+export function buildUnrealProbeProjectDescriptor(engineAssociation: string): Record<string, unknown> {
+  return {
+    FileVersion: 3,
+    EngineAssociation: engineAssociation,
+    Category: '',
+    Description: 'Ephemeral ForgeMind Unreal capability probe',
+    DisableEnginePluginsByDefault: true,
+    Plugins: [
+      { Name: 'ContentBrowserFileDataSource', Enabled: true },
+      { Name: 'PythonScriptPlugin', Enabled: true }
+    ]
+  };
+}
+
+async function executeUnrealProbe(executable: string, args: readonly string[], timeoutMs: number | undefined, logPath: string): Promise<string> {
+  const result = await runBoundedProcess(executable, args, { timeoutMs: timeoutMs ?? UNREAL_PROBE_TIMEOUT_MS, maxOutputBytes: 64 * 1024 });
+  if (result.terminationReason === 'timed-out') throw new Error(`Unreal probe timed out after ${timeoutMs ?? UNREAL_PROBE_TIMEOUT_MS}ms; executable=${executable}`);
+  if (result.terminationReason === 'cancelled') throw new Error(`Unreal probe was cancelled; executable=${executable}`);
+  if (result.terminationReason === 'missing-capability') throw new Error(`${result.stderr || 'Unreal commandlet was not found'}; executable=${executable}`);
+  if (result.exitCode !== 0) {
+    const log = await readFile(logPath, 'utf8').catch(() => '');
+    throw new Error(`Unreal probe exited with code ${result.exitCode}: ${summarizeUnrealFailure(`${result.stderr}\n${result.stdout}\n${log}`)}`);
+  }
+  return result.stdout || result.stderr;
+}
+
+export function summarizeUnrealFailure(output: string): string {
+  const normalized = output.replace(/\r/g, '');
+  const fatalIndex = normalized.toLocaleLowerCase('en-US').lastIndexOf('fatal error:');
+  if (fatalIndex >= 0) return normalized.slice(fatalIndex, fatalIndex + 2_000).trim();
+  const errorLines = normalized.split('\n').filter((line) => /(?:error|assertion failed|ensure condition failed)/i.test(line));
+  if (errorLines.length > 0) return errorLines.slice(-8).join('\n').trim();
+  return normalized.slice(-2_000).trim() || 'no Unreal diagnostic output';
 }
 
 function numericVersionPart(value: unknown, name: string): number {
