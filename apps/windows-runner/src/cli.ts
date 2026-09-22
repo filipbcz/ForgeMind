@@ -130,6 +130,9 @@ export async function main(args = process.argv.slice(2)): Promise<void> {
       ? `[preflight] ${progress.capability.key}: checking...\n`
       : `[preflight] ${progress.capability.key}: ${progress.status === 'supported' ? 'passed' : 'FAILED'}\n`);
   });
+  if (!process.env.FORGEMIND_UNREAL_EXECUTABLE) {
+    stdout.write('[preflight] unreal: not configured; set FORGEMIND_UNREAL_EXECUTABLE in this process before testing Unreal authoring.\n');
+  }
   stdout.write(`Codex preflight passed. Selected model: ${codexRuntime.model}. Available models: ${codexRuntime.availableModels.join(', ')}.\n`);
   const failedRequiredProbes = requiredProbeFailures(probes.evidence);
   if (parsed.command === 'probe') {

@@ -160,10 +160,11 @@ async function runMsvcCapabilityProbe(probe: CapabilityProbe): Promise<{ capabil
   const temporaryRoot = await mkdtemp(join(tmpdir(), 'forgemind-msvc-probe-'));
   const source = join(temporaryRoot, 'probe.cpp');
   const object = join(temporaryRoot, 'probe.obj');
+  const script = join(temporaryRoot, 'probe.cmd');
   try {
     await writeFile(source, 'int forgemind_probe() { return 0; }\n', 'utf8');
-    const command = `call "${vcvars}" >nul && cl.exe /nologo /c /Fo"${object}" "${source}"`;
-    const output = await executeProbe(process.env.ComSpec ?? 'cmd.exe', ['/d', '/s', '/c', command], probe.timeoutMs);
+    await writeFile(script, buildMsvcProbeScript(vcvars), 'utf8');
+    const output = await executeProbe(process.env.ComSpec ?? 'cmd.exe', ['/d', '/c', 'probe.cmd'], probe.timeoutMs, temporaryRoot);
     const objectStats = await stat(object);
     if (!objectStats.isFile() || objectStats.size === 0) throw new Error('MSVC returned success without creating the x64 object file.');
     const observed = redactProbeOutput(output || 'x64 compile succeeded');
@@ -174,6 +175,16 @@ async function runMsvcCapabilityProbe(probe: CapabilityProbe): Promise<{ capabil
   } finally {
     await rm(temporaryRoot, { recursive: true, force: true }).catch(() => undefined);
   }
+}
+
+export function buildMsvcProbeScript(vcvarsPath: string): string {
+  return [
+    '@echo off',
+    `call "${vcvarsPath}" >nul`,
+    'if errorlevel 1 exit /b %errorlevel%',
+    'echo FORGEMIND_MSVC_VERSION=%VCToolsVersion%',
+    'cl.exe /nologo /c /Foprobe.obj probe.cpp'
+  ].join('\r\n');
 }
 
 async function runUnrealCapabilityProbe(probe: CapabilityProbe): Promise<{ capability: WorkerCapability; summary: string }> {
@@ -232,7 +243,8 @@ function versionMatches(expected: string, observed: string): boolean {
 }
 
 function extractMsvcVersion(output: string): string | undefined {
-  return output.match(/Version\s+(\d+\.\d+(?:\.\d+)?)/i)?.[1];
+  return output.match(/FORGEMIND_MSVC_VERSION=([^\s]+)/i)?.[1]
+    ?? output.match(/Version\s+(\d+\.\d+(?:\.\d+)?)/i)?.[1];
 }
 
 function assertExpectedVersion(probe: CapabilityProbe, output: string): void {
@@ -245,8 +257,8 @@ function escapeRegExp(value: string): string {
   return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }
 
-async function executeProbe(executable: string, args: readonly string[], timeoutMs = DEFAULT_PROBE_TIMEOUT_MS): Promise<string> {
-  const result = await runBoundedProcess(executable, args, { timeoutMs, maxOutputBytes: 4096 });
+async function executeProbe(executable: string, args: readonly string[], timeoutMs = DEFAULT_PROBE_TIMEOUT_MS, cwd?: string): Promise<string> {
+  const result = await runBoundedProcess(executable, args, { timeoutMs, maxOutputBytes: 4096, ...(cwd ? { cwd } : {}) });
   if (result.terminationReason === 'timed-out') throw new Error(`probe timed out after ${timeoutMs}ms; executable=${executable}`);
   if (result.terminationReason === 'cancelled') throw new Error(`probe was cancelled; executable=${executable}`);
   if (result.terminationReason === 'missing-capability') throw new Error(`${result.stderr || 'executable was not found'}; executable=${executable}`);

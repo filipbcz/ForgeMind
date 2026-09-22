@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { parseConfiguredToolProbes, redactProbeOutput, runCapabilityProbes, windowsRunnerCapabilityProbes } from './probes.js';
+import { buildMsvcProbeScript, parseConfiguredToolProbes, redactProbeOutput, runCapabilityProbes, windowsRunnerCapabilityProbes } from './probes.js';
 
 const itWindows = process.platform === 'win32' ? it : it.skip;
 
@@ -41,6 +41,16 @@ describe('capability probes', () => {
       }),
       expect.objectContaining({ capability: { key: 'custom-sdk' }, executable: 'sdk.exe', args: ['version'] })
     ]));
+  });
+
+  it('uses a standalone batch script for the quoted Visual Studio environment path', () => {
+    expect(buildMsvcProbeScript('C:\\Program Files (x86)\\Microsoft Visual Studio\\vcvars64.bat')).toBe([
+      '@echo off',
+      'call "C:\\Program Files (x86)\\Microsoft Visual Studio\\vcvars64.bat" >nul',
+      'if errorlevel 1 exit /b %errorlevel%',
+      'echo FORGEMIND_MSVC_VERSION=%VCToolsVersion%',
+      'cl.exe /nologo /c /Foprobe.obj probe.cpp'
+    ].join('\r\n'));
   });
 
   it('does not allow configured capabilities to masquerade as the Windows platform probe', () => {
