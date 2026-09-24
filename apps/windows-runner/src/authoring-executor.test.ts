@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from 'vitest';
-import { assertReadableAuthoringCheckout, buildUnrealPackageVerificationArgs, canResumeAuthoringCheckpoint, classifyAuthoringFailure, classifyWindowsAuthoringFailure, collectAuthoringToolVersions, hasRestorableAuthoringCheckpoint, isProhibitedAuthoringPath, LifecycleNativeImplementationProvider, materializeOutputs, requiresProductionContent, type NativeAuthoringTools, unrealObjectPath, validateRequiredUnrealAssets } from './authoring-executor.js';
+import { assertReadableAuthoringCheckout, buildUnrealPackageVerificationArgs, buildUnrealPackageVerificationScript, canResumeAuthoringCheckpoint, classifyAuthoringFailure, classifyWindowsAuthoringFailure, collectAuthoringToolVersions, hasRestorableAuthoringCheckpoint, isProhibitedAuthoringPath, LifecycleNativeImplementationProvider, materializeOutputs, requiresProductionContent, type NativeAuthoringTools, unrealObjectPath, validateRequiredUnrealAssets } from './authoring-executor.js';
 import { mkdtemp, rm } from 'node:fs/promises';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
@@ -57,6 +57,17 @@ describe('native implementation provider lifecycle', () => {
       'C:/work/Game.uproject', '-ExecutePythonScript=C:/diagnostics/verify.py', '-unattended', '-RUNNINGUNATTENDEDSCRIPT', '-nop4',
       '-nosplash', '-DDC-ForceMemoryCache', '-NoSaveConfig', '-NoEpicPortal', '-stdout', '-FullStdOutLogOutput', '-NullRHI'
     ]);
+  });
+  it('opens map packages without retaining a duplicate Python world reference', () => {
+    const script = buildUnrealPackageVerificationScript([
+      { path: 'Content/Maps/World.umap', objectPath: '/Game/Maps/World', sourceNames: [] },
+      { path: 'Content/Props/Tree.uasset', objectPath: '/Game/Props/Tree', sourceNames: ['tree.fbx'] }
+    ], 'INSPECTION:');
+    const mapBranch = script.slice(script.indexOf("if package['path'].lower().endswith('.umap')"), script.indexOf('    else:'));
+    expect(mapBranch).toContain('LevelEditorSubsystem).load_level');
+    expect(mapBranch).toContain('UnrealEditorSubsystem).get_editor_world');
+    expect(mapBranch).not.toContain('unreal.load_asset');
+    expect(script.slice(script.indexOf('    else:'))).toContain("unreal.load_asset(package['objectPath'])");
   });
   it('requires editor-authored packages to be loaded after saving and retains source and exact tool provenance', () => {
     const base = { leaseId: 'lease', sessionId: 'session', shell: 'system' as const, exitCode: 0, stdout: '', stderr: '',

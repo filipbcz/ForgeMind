@@ -570,27 +570,38 @@ async function verifyUnrealPackages(root: string, evidenceRoot: string, assets: 
   const sourceNames = authoring.sourceRelativePaths.map((path) => posix.basename(path.replaceAll('\\', '/')).toLowerCase());
   const packages = assets.map((path) => ({ path, objectPath: unrealObjectPath(path, authoring.projectRelativePath), sourceNames }));
   const scriptPath = resolve(evidenceRoot, 'verify-saved-unreal-content.py');
-  const script = [
+  const script = buildUnrealPackageVerificationScript(packages, marker);
+  await writeFile(scriptPath, script, 'utf8');
+  const projectPath = await realpath(resolve(root, authoring.projectRelativePath));
+  const relativeProject = relative(root, projectPath);
+  if (relativeProject === '..' || relativeProject.startsWith(`..${process.platform === 'win32' ? '\\' : '/'}`)) throw new Error('Selected Unreal project escapes the leased checkout.');
+  const args = buildUnrealPackageVerificationArgs(projectPath, scriptPath);
+  const startedAt = new Date();
+  const output = await spawnComplete(authoring.executablePath, args, root, timeoutMs, signal);
+  const inspections = output.stdout.split(/\r?\n/).filter((line) => line.includes(marker)).flatMap((line) => {
+    try { return [JSON.parse(line.slice(line.indexOf(marker) + marker.length).trim()) as { path: string; className: string; technicalObservations: string[] }]; } catch { return []; }
+  });
+  const loadedPackages = inspections.map(({ path }) => path);
+  return { checkId: 'unreal-saved-content-load', command: [authoring.executablePath, ...args].join(' '), shell: 'system', ...output,
+    startedAt: startedAt.toISOString(), completedAt: new Date().toISOString(), authoring: { tool: 'unreal-python', phase: 'verify',
+      projectRelativePath: authoring.projectRelativePath, executablePath: authoring.executablePath, args: args.slice(1), sourceRelativePaths: [], loadedPackages, inspections } };
+}
+
+export function buildUnrealPackageVerificationScript(packages: Array<{ path: string; objectPath: string; sourceNames: string[] }>, marker: string): string {
+  return [
     'import unreal',
     `packages = ${JSON.stringify(packages)}`,
     'failed = []',
     'for package in packages:',
-    "    loaded = unreal.load_asset(package['objectPath'])",
-    "    if loaded is None:",
-    "        failed.append(package['path'])",
-    "        continue",
     "    observations = []",
-    "    if not package['path'].lower().endswith('.umap'):",
-    "        try:",
-    "            import_data = loaded.get_editor_property('asset_import_data')",
-    "            imported_names = [__import__('os').path.basename(path).lower() for path in import_data.extract_filenames()] if import_data else []",
-    "            if any(name in package['sourceNames'] for name in imported_names): observations.append('asset-import-data-matches-recorded-source')",
-    "        except Exception:",
-    "            pass",
     "    if package['path'].lower().endswith('.umap'):",
-    "        unreal.EditorLevelLibrary.load_level(package['objectPath'])",
+    "        loaded_ok = unreal.get_editor_subsystem(unreal.LevelEditorSubsystem).load_level(package['objectPath'])",
+    "        loaded = unreal.get_editor_subsystem(unreal.UnrealEditorSubsystem).get_editor_world() if loaded_ok else None",
+    "        if loaded is None:",
+    "            failed.append(package['path'])",
+    "            continue",
     "        non_basic_present = False",
-    "        for actor in unreal.EditorLevelLibrary.get_all_level_actors():",
+    "        for actor in unreal.get_editor_subsystem(unreal.EditorActorSubsystem).get_all_level_actors():",
     "            class_name = actor.get_class().get_name()",
     "            actor_label = actor.get_actor_label()",
     "            observations.append('actor:' + actor_label + ':' + class_name)",
@@ -608,25 +619,22 @@ async function verifyUnrealPackages(root: string, evidenceRoot: string, assets: 
     "            if class_name != 'StaticMeshActor' or (mesh_path and not mesh_path.startswith('/Engine/BasicShapes/')):",
     "                non_basic_present = True",
     "        if non_basic_present: observations.append('non-basic-level-actor-present')",
+    "    else:",
+    "        loaded = unreal.load_asset(package['objectPath'])",
+    "        if loaded is None:",
+    "            failed.append(package['path'])",
+    "            continue",
+    "        try:",
+    "            import_data = loaded.get_editor_property('asset_import_data')",
+    "            imported_names = [__import__('os').path.basename(path).lower() for path in import_data.extract_filenames()] if import_data else []",
+    "            if any(name in package['sourceNames'] for name in imported_names): observations.append('asset-import-data-matches-recorded-source')",
+    "        except Exception:",
+    "            pass",
     "    observations = list(dict.fromkeys(observations))",
     "    inspection = {'path': package['path'], 'className': loaded.get_class().get_name(), 'technicalObservations': observations}",
     `    print('${marker}' + __import__('json').dumps(inspection, separators=(',', ':')))`,
     "if failed: raise RuntimeError('Could not load saved packages: ' + ', '.join(failed))"
   ].join('\n');
-  await writeFile(scriptPath, script, 'utf8');
-  const projectPath = await realpath(resolve(root, authoring.projectRelativePath));
-  const relativeProject = relative(root, projectPath);
-  if (relativeProject === '..' || relativeProject.startsWith(`..${process.platform === 'win32' ? '\\' : '/'}`)) throw new Error('Selected Unreal project escapes the leased checkout.');
-  const args = buildUnrealPackageVerificationArgs(projectPath, scriptPath);
-  const startedAt = new Date();
-  const output = await spawnComplete(authoring.executablePath, args, root, timeoutMs, signal);
-  const inspections = output.stdout.split(/\r?\n/).filter((line) => line.includes(marker)).flatMap((line) => {
-    try { return [JSON.parse(line.slice(line.indexOf(marker) + marker.length).trim()) as { path: string; className: string; technicalObservations: string[] }]; } catch { return []; }
-  });
-  const loadedPackages = inspections.map(({ path }) => path);
-  return { checkId: 'unreal-saved-content-load', command: [authoring.executablePath, ...args].join(' '), shell: 'system', ...output,
-    startedAt: startedAt.toISOString(), completedAt: new Date().toISOString(), authoring: { tool: 'unreal-python', phase: 'verify',
-      projectRelativePath: authoring.projectRelativePath, executablePath: authoring.executablePath, args: args.slice(1), sourceRelativePaths: [], loadedPackages, inspections } };
 }
 
 export function buildUnrealPackageVerificationArgs(projectPath: string, scriptPath: string): string[] {
