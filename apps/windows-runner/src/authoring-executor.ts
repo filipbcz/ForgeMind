@@ -362,7 +362,8 @@ async function prepareCheckout(packet: WindowsAuthoringPacket, root: string, che
   for (const candidate of [...generations, checkpointPath, `${checkpointPath}.previous`]) {
     try { checkpoint = JSON.parse(await readFile(candidate, 'utf8')) as AuthoringDiskCheckpoint; if (checkpoint.version === 2) break; } catch { /* try last complete generation */ }
   }
-  const checkpointMatches = canResumeAuthoringCheckpoint(checkpoint, packet);
+  const checkpointMatches = canResumeAuthoringCheckpoint(checkpoint, packet)
+    && hasRestorableAuthoringCheckpoint(checkpoint);
   try {
     const actual = await spawnComplete('git.exe', ['rev-parse', 'HEAD'], path, 30_000, signal);
     if (checkpointMatches
@@ -390,8 +391,10 @@ async function cloneCheckout(packet: WindowsAuthoringPacket, root: string, path:
   if (checkpoint) {
     await materializeLfsObjects(canonical, checkpoint.resultBundle.lfsObjects);
     await materializeOutputs(outputRoot, checkpoint.resultBundle.outputs);
-    const restored = await spawnWithInput('git.exe', ['apply', '--binary', '--index', '--whitespace=nowarn', '-'], canonical, checkpoint.patch, signal);
-    if (restored.exitCode !== 0) throw new Error(`Could not restore durable Windows checkpoint: ${restored.stderr}`);
+    if (checkpoint.patch.trim().length > 0) {
+      const restored = await spawnWithInput('git.exe', ['apply', '--binary', '--index', '--whitespace=nowarn', '-'], canonical, checkpoint.patch, signal);
+      if (restored.exitCode !== 0) throw new Error(`Could not restore durable Windows checkpoint: ${restored.stderr}`);
+    }
     if (checkpoint.resultBundle.lfsObjects.length > 0) {
       const checkoutLfs = await spawnComplete('git.exe', ['lfs', 'checkout'], canonical, 30_000, signal);
       if (checkoutLfs.exitCode !== 0) throw new Error(`Could not restore Git LFS working files: ${checkoutLfs.stderr}`);
@@ -435,6 +438,14 @@ export function canResumeAuthoringCheckpoint(
 ): boolean {
   return checkpoint?.version === 2 && checkpoint.taskId === packet.taskId
     && checkpoint.baseCommitSha.toLowerCase() === packet.baseCommitSha.toLowerCase();
+}
+
+export function hasRestorableAuthoringCheckpoint(
+  checkpoint: { patch: string; resultBundle: Pick<AuthoringDiskCheckpoint['resultBundle'], 'lfsObjects' | 'outputs'> } | undefined
+): boolean {
+  return Boolean(checkpoint && (checkpoint.patch.trim().length > 0
+    || checkpoint.resultBundle.lfsObjects.length > 0
+    || checkpoint.resultBundle.outputs.length > 0));
 }
 
 async function persistCheckpoint(path: string, packet: WindowsAuthoringPacket, workspacePath: string, status: string, signal?: AbortSignal, outputRoot?: string): Promise<AuthoringDiskCheckpoint> {

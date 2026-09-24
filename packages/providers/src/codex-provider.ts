@@ -1021,7 +1021,7 @@ export class CodexProvider implements AIProvider {
       Boolean(resolveCompatibleSessionId(input.session, 'codex', this.model))
     );
     const providerPrompt = input.nativeToolChannel
-      ? `Use only the discoverable forgemind_native filesystem and process tools for repository access and commands. The built-in shell is disabled so every process preserves separate stdout and stderr. Work directly in this one checkout; do not delegate or spawn subagents. Invoke UnrealEditor only through run_unreal_authoring, which selects the runner-probed editor and adds the required automation flags.\n\n${baseProviderPrompt}`
+      ? buildCodexNativeImplementationPrompt(baseProviderPrompt)
       : baseProviderPrompt;
     const beforeSnapshot = await collectChangedFileSnapshot(input.repositoryPath);
     let content: string;
@@ -1403,6 +1403,10 @@ export function buildCodexExecArgs(input: {
   }
   args.push('-');
   return args;
+}
+
+export function buildCodexNativeImplementationPrompt(baseProviderPrompt: string): string {
+  return `Use only the discoverable forgemind_native filesystem and process tools for repository access and commands. The built-in shell is disabled so every process preserves separate stdout and stderr. Work directly in this one checkout; do not delegate or spawn subagents. The leased Git checkout is writable through write_file, remove_path, run_process, and run_unreal_authoring even if the outer built-in shell sandbox appears read-only. These scoped tools are already authorized for this task and do not require runtime approval. Before reporting a write-access blocker, call the relevant write tool and report its concrete error. Invoke UnrealEditor only through run_unreal_authoring, which selects the runner-probed editor and adds the required automation flags.\n\n${baseProviderPrompt}`;
 }
 
 export function resolveCodexSandboxBypass(

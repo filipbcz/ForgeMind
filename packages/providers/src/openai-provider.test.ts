@@ -3,7 +3,7 @@ import { mkdirSync, mkdtempSync, rmSync, utimesSync, writeFileSync } from 'node:
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { listOpenAIModels, OpenAIProvider } from './openai-provider.js';
-import { CodexProvider, buildCodexExecArgs, normalizeCodexModels, resolveCodexBinary, resolveCodexSandboxBypass } from './codex-provider.js';
+import { CodexProvider, buildCodexExecArgs, buildCodexNativeImplementationPrompt, normalizeCodexModels, resolveCodexBinary, resolveCodexSandboxBypass } from './codex-provider.js';
 import { ProviderContractError, normalizeProviderError } from './provider.js';
 
 function successfulResponse(body: unknown): Response {
@@ -361,6 +361,14 @@ describe('Codex provider', () => {
     expect(args).toContain('mcp_servers.forgemind_native.default_tools_approval_mode="approve"');
     expect(args).toContain('mcp_servers.forgemind_native.tool_timeout_sec=36000');
     expect(args).not.toContain('--dangerously-bypass-approvals-and-sandbox');
+  });
+
+  it('directs native implementations to exercise scoped writes before claiming the checkout is read-only', () => {
+    const prompt = buildCodexNativeImplementationPrompt('Implement the task.');
+    expect(prompt).toContain('leased Git checkout is writable through write_file');
+    expect(prompt).toContain('do not require runtime approval');
+    expect(prompt).toContain('call the relevant write tool');
+    expect(prompt).toContain('Implement the task.');
   });
 
   it('can bypass the read-only sandbox inside an isolated worker container', () => {

@@ -5,6 +5,7 @@ import { dirname, relative, resolve } from 'node:path';
 import { redactSecrets } from '@forgemind/core';
 import { assertEvidenceOutsideCheckout, buildSandboxedExecutableInvocation, buildSandboxedProcessInvocation,
   buildUnrealAuthoringArgs, containsUnrealEditorInvocation } from './native-sandbox.js';
+import { nativeToolDefinitions, nativeToolServerInstructions } from './native-tool-contract.js';
 import { runBoundedProcess } from './process-runner.js';
 
 const root = resolve(process.argv[2] ?? '');
@@ -31,24 +32,14 @@ async function handle(line: string) {
   try { request = JSON.parse(line); } catch { return; }
   if (request.id === undefined) return;
   try {
-    if (request.method === 'initialize') return send(request.id, { protocolVersion: '2025-06-18', capabilities: { tools: {} }, serverInfo: { name: 'forgemind-native', version: '1' } });
+    if (request.method === 'initialize') return send(request.id, { protocolVersion: '2025-06-18', capabilities: { tools: {} },
+      serverInfo: { name: 'forgemind-native', version: '2' }, instructions: nativeToolServerInstructions });
     if (request.method === 'ping') return send(request.id, {});
-    if (request.method === 'tools/list') return send(request.id, { tools: toolDefinitions });
+    if (request.method === 'tools/list') return send(request.id, { tools: nativeToolDefinitions });
     if (request.method === 'tools/call') return send(request.id, await callTool(request.params?.name, request.params?.arguments ?? {}));
     sendError(request.id, -32601, 'Method not found');
   } catch (error) { sendError(request.id, -32000, error instanceof Error ? error.message : String(error)); }
 }
-
-const toolDefinitions = [
-  { name: 'read_file', description: 'Read a UTF-8 file from the exact leased checkout.', inputSchema: { type: 'object', required: ['path'], properties: { path: { type: 'string' } }, additionalProperties: false } },
-  { name: 'list_directory', description: 'List entries inside the exact leased checkout.', inputSchema: { type: 'object', properties: { path: { type: 'string' } }, additionalProperties: false } },
-  { name: 'write_file', description: 'Create or replace a UTF-8 file inside the exact leased checkout.', inputSchema: { type: 'object', required: ['path', 'content'], properties: { path: { type: 'string' }, content: { type: 'string' } }, additionalProperties: false } },
-  { name: 'remove_path', description: 'Remove a file or directory inside the exact leased checkout.', inputSchema: { type: 'object', required: ['path'], properties: { path: { type: 'string' } }, additionalProperties: false } },
-  { name: 'run_process', description: 'Run any non-Unreal PowerShell, cmd, or project command in the exact leased checkout without an approval or command profile. UnrealEditor must be invoked through run_unreal_authoring so the probed executable and reliable automation flags are enforced. Returns separate complete redacted stdout and stderr.', inputSchema: { type: 'object', required: ['checkId', 'command', 'shell'], properties: { checkId: { type: 'string' }, command: { type: 'string' }, shell: { type: 'string', enum: ['powershell', 'cmd', 'system'] } }, additionalProperties: false } },
-  { name: 'run_unreal_authoring', description: `Open the selected existing Unreal project with the runner-probed editor${configuredUnrealExecutable ? ` (${configuredUnrealExecutable})` : ''}. Reliable unattended, DDC, config, portal, and logging flags are added automatically. Use phase=author for creation or rendering and phase=verify after saving to load changed production packages.`, inputSchema: { type: 'object', required: ['checkId', 'tool', 'phase', 'projectRelativePath', 'args', 'sourceRelativePaths'], properties: {
-    checkId: { type: 'string' }, tool: { type: 'string', enum: ['unreal-editor', 'unreal-python', 'project-script', 'cpp-tool'] }, phase: { type: 'string', enum: ['author', 'verify', 'build', 'cook', 'package'] }, executablePath: { type: 'string' }, projectRelativePath: { type: 'string' }, args: { type: 'array', items: { type: 'string' } }, sourceRelativePaths: { type: 'array', items: { type: 'string' } }
-  }, additionalProperties: false } }
-];
 
 async function callTool(name: string, args: any) {
   if (name === 'read_file') return text(await readFile(await existingContained(args.path), 'utf8'));

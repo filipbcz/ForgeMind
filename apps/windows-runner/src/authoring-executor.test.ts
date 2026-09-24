@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from 'vitest';
-import { assertReadableAuthoringCheckout, buildUnrealPackageVerificationArgs, canResumeAuthoringCheckpoint, classifyAuthoringFailure, classifyWindowsAuthoringFailure, collectAuthoringToolVersions, isProhibitedAuthoringPath, LifecycleNativeImplementationProvider, materializeOutputs, requiresProductionContent, type NativeAuthoringTools, unrealObjectPath, validateRequiredUnrealAssets } from './authoring-executor.js';
+import { assertReadableAuthoringCheckout, buildUnrealPackageVerificationArgs, canResumeAuthoringCheckpoint, classifyAuthoringFailure, classifyWindowsAuthoringFailure, collectAuthoringToolVersions, hasRestorableAuthoringCheckpoint, isProhibitedAuthoringPath, LifecycleNativeImplementationProvider, materializeOutputs, requiresProductionContent, type NativeAuthoringTools, unrealObjectPath, validateRequiredUnrealAssets } from './authoring-executor.js';
 import { mkdtemp, rm } from 'node:fs/promises';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
@@ -44,6 +44,13 @@ describe('native implementation provider lifecycle', () => {
     expect(canResumeAuthoringCheckpoint(checkpoint, { taskId: 'task-1', baseCommitSha: 'a'.repeat(40) })).toBe(true);
     expect(canResumeAuthoringCheckpoint(checkpoint, { taskId: 'task-2', baseCommitSha: 'a'.repeat(40) })).toBe(false);
     expect(canResumeAuthoringCheckpoint(checkpoint, { taskId: 'task-1', baseCommitSha: 'b'.repeat(40) })).toBe(false);
+  });
+  it('does not restore an empty checkpoint as a Git patch', () => {
+    const empty = { patch: '', resultBundle: { lfsObjects: [], outputs: [] } };
+    expect(hasRestorableAuthoringCheckpoint(empty)).toBe(false);
+    expect(hasRestorableAuthoringCheckpoint({ ...empty, patch: 'diff --git a/a b/a' })).toBe(true);
+    expect(hasRestorableAuthoringCheckpoint({ ...empty,
+      resultBundle: { lfsObjects: [], outputs: [{ path: 'preview.png', sha256: 'a', sizeBytes: 1, contentBase64: 'YQ==' }] } })).toBe(true);
   });
   it('uses headless memory-backed flags for final saved-package verification', () => {
     expect(buildUnrealPackageVerificationArgs('C:/work/Game.uproject', 'C:/diagnostics/verify.py')).toEqual([
