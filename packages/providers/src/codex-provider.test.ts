@@ -1,7 +1,13 @@
 import { describe, expect, it, vi } from 'vitest';
-import { buildCodexImplementationPrompt, buildCodexReviewSchema, codexProcessActivity, CodexProvider, formatCodexJsonEvent, isNoisyWorkspaceActivityPath, parseCodexCliTotalTokens, runCodexProcess } from './codex-provider.js';
+import { buildCodexImplementationPrompt, buildCodexNativeImplementationPrompt, buildCodexReviewSchema, codexProcessActivity, CodexProvider, formatCodexJsonEvent, isNoisyWorkspaceActivityPath, parseCodexCliTotalTokens, runCodexProcess } from './codex-provider.js';
 
 describe('Codex structured output schemas', () => {
+  it('keeps native Unreal validation on the structured runner path', () => {
+    const prompt = buildCodexNativeImplementationPrompt('Implement the scene.');
+    expect(prompt).toContain('Invoke UnrealEditor only through run_unreal_authoring');
+    expect(prompt).toContain('Do not return a validationChecks command that invokes UnrealEditor');
+  });
+
   it.each(['implementation', 'chat'] as const)('serializes typed Windows adapters in the actual %s request schema', async (operation) => {
     const provider = new CodexProvider({ authMode: 'codex_oauth' });
     const intercepted = new Error('Stop before invoking Codex.');

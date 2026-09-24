@@ -87,6 +87,20 @@ export class LifecycleNativeImplementationProvider implements NativeImplementati
         const identity = `${check.shell ?? 'system'}\0${check.command}`;
         if (passed.has(identity)) continue;
         const shell = check.shell === 'cmd' ? 'cmd' : check.shell === 'system' ? 'system' : 'powershell';
+        if (containsUnrealEditorInvocation(check.command)) {
+          const recordedAt = new Date().toISOString();
+          await input.tools.record({
+            checkId: `provider-check-${index + 1}`,
+            command: `deferred Unreal validation: ${check.command}`,
+            shell,
+            exitCode: 0,
+            stdout: 'Deferred to the mandatory structured final Unreal verification.',
+            stderr: '',
+            startedAt: recordedAt,
+            completedAt: recordedAt
+          });
+          continue;
+        }
         const process = await input.tools.run({ command: check.command, shell, checkId: `provider-check-${index + 1}` });
         if (process.exitCode === 0) passed.set(identity, process); else { failure = process; break; }
       }

@@ -112,6 +112,43 @@ describe('native implementation provider lifecycle', () => {
     expect(tools.record).toHaveBeenCalledWith(expect.objectContaining({ checkId: 'tool-1', command: 'cmd /c npm test', shell: 'cmd', exitCode: 0, stdout: 'all passed', stderr: 'compiler warning' }));
   });
 
+  it('defers direct UnrealEditor validation to the mandatory structured verifier', async () => {
+    const provider: any = { implement: vi.fn(async () => ({
+      ...implementation,
+      validationChecks: [{
+        kind: 'command' as const,
+        command: '& "C:\\Program Files\\Epic Games\\UE_5.8\\Engine\\Binaries\\Win64\\UnrealEditor-Cmd.exe" Game.uproject -run=pythonscript',
+        target: 'windows' as const,
+        shell: 'powershell' as const
+      }]
+    })) };
+    const tools = {
+      root: 'C:/exact/job',
+      nativeToolChannel: { command: 'node', args: ['server'] },
+      drainNativeProcesses: vi.fn(),
+      read: vi.fn(),
+      write: vi.fn(),
+      remove: vi.fn(),
+      record: vi.fn(),
+      run: vi.fn()
+    } as unknown as NativeAuthoringTools;
+
+    await new LifecycleNativeImplementationProvider(provider).implement({
+      prompt: 'implement Unreal scene',
+      acceptanceCriteria: ['saved scene loads'],
+      operations: [],
+      tools
+    });
+
+    expect(tools.run).not.toHaveBeenCalled();
+    expect(tools.record).toHaveBeenCalledWith(expect.objectContaining({
+      checkId: 'provider-check-1',
+      command: expect.stringContaining('deferred Unreal validation:'),
+      exitCode: 0,
+      stdout: 'Deferred to the mandatory structured final Unreal verification.'
+    }));
+  });
+
   it('returns a failed check to repair without discarding an earlier valid result', async () => {
     const provider: any = { implement: vi.fn(async () => implementation), review: vi.fn() }; const completed: string[] = [];
     const tools = { root: 'C:/exact/job', managedRoots: { inputs: 'C:/inputs', sourceAssets: 'C:/source-assets', cache: 'C:/cache', outputs: 'C:/outputs', diagnostics: 'C:/diagnostics' }, nativeToolChannel: { command: 'node', args: ['server'] }, drainNativeProcesses: vi.fn(), read: vi.fn(), write: vi.fn(), remove: vi.fn(), record: vi.fn(), run: vi.fn(async ({ checkId, command, shell }) => {
