@@ -97,20 +97,19 @@ function verifiedCapabilities(input: RegisterWorkerDeviceInput, now = new Date()
   }));
 }
 
-function capabilitySatisfies(device: { capabilities: WorkerCapability[]; probeEvidence: WorkerProbeEvidence[] }, key: string, now: Date): boolean {
+// Registration accepts only fresh, hash-verified probe evidence. Once a manual
+// session is live, its heartbeats—not the original probe timestamp—bound how
+// long that verified capability set may be used.
+function capabilitySatisfies(device: { capabilities: WorkerCapability[]; probeEvidence: WorkerProbeEvidence[] }, key: string): boolean {
   if (key === 'disk-free-100gb') {
     const disk = device.capabilities.find((item) => item.key === 'disk-capacity');
     const evidence = device.probeEvidence.find((item) => item.status === 'supported' && item.provenance === 'local-probe' && JSON.stringify(item.capability) === JSON.stringify(disk));
-    const age = evidence ? now.getTime() - Date.parse(evidence.probedAt) : Number.NaN;
-    return Number.isFinite(age) && age >= 0 && age <= PROBE_MAX_AGE_MS
-      && typeof disk?.metadata?.freeBytes === 'number' && disk.metadata.freeBytes >= LARGE_FLYING_FREE_BYTES;
+    return Boolean(evidence) && typeof disk?.metadata?.freeBytes === 'number' && disk.metadata.freeBytes >= LARGE_FLYING_FREE_BYTES;
   }
   const advertised = device.capabilities.find((item) => item.key === key);
   if (!advertised) return false;
   const evidence = device.probeEvidence.find((item) => item.status === 'supported' && item.provenance === 'local-probe' && JSON.stringify(item.capability) === JSON.stringify(advertised));
-  const age = evidence ? now.getTime() - Date.parse(evidence.probedAt) : Number.NaN;
-  if (!Number.isFinite(age) || age < 0 || age > PROBE_MAX_AGE_MS) return false;
-  return true;
+  return Boolean(evidence);
 }
 
 /** Persistence boundary for the manually activated Windows validation executor. */
@@ -293,7 +292,7 @@ export class WindowsWorkerRepository {
         pendingPhase: job.pendingPhase as WindowsPendingPhase,
         compatibleDeviceIds: mappedDevices.filter((device) => device.status === 'idle'
           && device.sessions.some((session) => session.status === 'active' && Date.parse(session.expiresAt) > now.getTime() && Date.parse(session.lastHeartbeatAt) >= heartbeatCutoff)
-          && required.every((key) => capabilitySatisfies(device, key, now))).map((device) => device.id) };
+          && required.every((key) => capabilitySatisfies(device, key))).map((device) => device.id) };
     }), evidence, qualificationReadiness: { profileId: 'borek-filip', state: ready ? 'ready-for-physical-qualification' : 'unverified', requirements,
       reason: ready ? 'Matching real production evidence is complete; physical qualification remains separate.' : `Missing real evidence: ${requirements.filter((item) => !item.satisfied).map((item) => item.key).join(', ')}. Fixtures never satisfy qualification readiness.` } };
   }
@@ -374,7 +373,6 @@ export class WindowsWorkerRepository {
             WHERE capability->>'key' = ANY(ARRAY(SELECT jsonb_array_elements_text(candidate."required_capabilities")))
               AND NOT EXISTS (SELECT 1 FROM jsonb_array_elements(d."probe_evidence") evidence
                 WHERE evidence->>'status' = 'supported' AND evidence->>'provenance' = 'local-probe' AND evidence->'capability' = capability
-                  AND (evidence->>'probedAt')::timestamptz >= CURRENT_TIMESTAMP - INTERVAL '5 minutes'
                   AND evidence->>'evidenceHash' ~ '^[a-f0-9]{64}$')
           )
           AND (NOT (candidate."required_capabilities" @> '["disk-free-100gb"]'::jsonb)
@@ -382,7 +380,6 @@ export class WindowsWorkerRepository {
               JOIN LATERAL jsonb_array_elements(d."probe_evidence") evidence ON evidence->'capability' = disk
               WHERE disk->>'key' = 'disk-capacity' AND (disk->'metadata'->>'freeBytes')::numeric >= ${LARGE_FLYING_FREE_BYTES}
                 AND evidence->>'status' = 'supported' AND evidence->>'provenance' = 'local-probe'
-                AND (evidence->>'probedAt')::timestamptz >= CURRENT_TIMESTAMP - INTERVAL '5 minutes'
                 AND evidence->>'evidenceHash' ~ '^[a-f0-9]{64}$'))
         ORDER BY candidate."created_at", candidate."id"
         FOR UPDATE OF candidate SKIP LOCKED LIMIT 1
@@ -398,7 +395,6 @@ export class WindowsWorkerRepository {
                 WHERE capacity_device."id" = ${session.device_id} AND disk->>'key' = 'disk-capacity'
                   AND evidence->'capability' = disk AND evidence->>'status' = 'supported'
                   AND evidence->>'provenance' = 'local-probe'
-                  AND (evidence->>'probedAt')::timestamptz >= CURRENT_TIMESTAMP - INTERVAL '5 minutes'
                   AND evidence->>'evidenceHash' ~ '^[a-f0-9]{64}$'
                   AND (disk->'metadata'->>'freeBytes')::numeric >= ${LARGE_FLYING_FREE_BYTES})
               THEN 'insufficient_capacity' ELSE 'unavailable_capability' END

@@ -372,6 +372,7 @@ export interface ClaimedTask {
   taskRun: ReturnType<typeof toTaskRun>;
   queueJobId?: string;
   queueReason?: string;
+  queueErrorMessage?: string;
 }
 
 export interface TaskQueuePosition {
@@ -4085,7 +4086,8 @@ export class ForgeMindRepository {
         project: taskArchitecture ? { ...project, projectArchitecture: taskArchitecture } : project,
         taskRun: toTaskRun(taskRun),
         queueJobId: claimedQueueJob.id,
-        queueReason: claimedQueueJob.reason
+        queueReason: claimedQueueJob.reason,
+        queueErrorMessage: claimedQueueJob.errorMessage ?? undefined
       };
     });
   }

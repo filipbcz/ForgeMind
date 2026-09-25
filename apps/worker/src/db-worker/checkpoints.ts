@@ -56,7 +56,8 @@ export async function resolveTaskResumeContext(
   },
   taskId: string,
   queueReason?: string,
-  currentTaskRunId?: string
+  currentTaskRunId?: string,
+  queueErrorMessage?: string
 ): Promise<TaskResumeContext | undefined> {
   const [diff, audit, checkpoints] = await Promise.all([
     repository.getTaskDiff(taskId),
@@ -75,7 +76,8 @@ export async function resolveTaskResumeContext(
       diff.iterations,
       audit,
       currentTaskRunId,
-      checkpoints
+      checkpoints,
+      queueErrorMessage
     );
     if (phaseRetryResume) {
       return {
@@ -123,7 +125,8 @@ function buildPhaseRetryResume(
   iterations: TaskDiffIterationSnapshot[],
   audit: TaskAuditSnapshot[],
   currentTaskRunId?: string,
-  checkpoints: TaskCheckpointSnapshot[] = []
+  checkpoints: TaskCheckpointSnapshot[] = [],
+  queueErrorMessage?: string
 ): WorkerTaskResume | undefined {
   const completedIterations = [...iterations].sort((left, right) => timestampOf(left.createdAt) - timestampOf(right.createdAt));
   const latestIteration = completedIterations.at(-1);
@@ -163,6 +166,12 @@ function buildPhaseRetryResume(
     const payload = asRecord(event.payload);
     return !currentTaskRunId || payload?.taskRunId !== currentTaskRunId;
   });
+  const latestTechnicalFailure = [...relevantAudit].reverse().find((event) => {
+    const errorMessage = asRecord(event.payload)?.errorMessage;
+    return event.eventType === 'task_failed' && typeof errorMessage === 'string'
+      && !/\bcancelled\b/i.test(errorMessage);
+  });
+  const latestTechnicalFailureMessage = asRecord(latestTechnicalFailure?.payload)?.errorMessage;
   const latestGitHubFailure = [...relevantAudit]
     .reverse()
     .find((event) => event.eventType === 'task_github_operation_failed' && timestampOf(event.createdAt) <= resumeCutoff);
@@ -321,8 +330,10 @@ function buildPhaseRetryResume(
     changedFiles,
     diffStat,
     architectureUpdate: extractArchitectureUpdate(latestImplementation),
-    previousValidationError: resumeFrom === 'implementation' && validation && !validation.passed
-      ? formatValidationFailure(validation)
+    previousValidationError: resumeFrom === 'implementation'
+      ? validation && !validation.passed
+        ? formatValidationFailure(validation)
+        : queueErrorMessage ?? (typeof latestTechnicalFailureMessage === 'string' ? latestTechnicalFailureMessage : undefined)
       : undefined,
     previousReviewBlockers: resumeFrom === 'implementation' ? reviewBlockers : undefined,
     validation,

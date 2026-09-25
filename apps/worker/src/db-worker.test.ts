@@ -20,7 +20,7 @@ const prepareCapabilityAuditWorkspaceMock = vi.fn(async () => ({
 const buildTargetedRepositoryContextMock = vi.fn(async () => 'src/index.ts');
 const enqueueWindowsValidationMock = vi.fn(async () => 'windows_job_1');
 
-function createClaimedTask(queueReason = 'task_started') {
+function createClaimedTask(queueReason = 'task_started', queueErrorMessage?: string) {
   return {
     task: {
       id: 'task_1',
@@ -49,7 +49,8 @@ function createClaimedTask(queueReason = 'task_started') {
       id: 'run_1'
     },
     queueJobId: 'queue_1',
-    queueReason
+    queueReason,
+    queueErrorMessage
   };
 }
 
@@ -919,6 +920,40 @@ github:
 
     expect(runWorkerTaskMock).toHaveBeenCalledWith(expect.objectContaining({
       resume: expect.objectContaining({ kind: 'phase_retry', ...expected })
+    }));
+  });
+
+  it('returns the last technical implementation failure to a manually retried Windows attempt', async () => {
+    const queueError = 'Windows authoring failed: Required Unreal content was not created through an authoring API call.';
+    repositoryMock.claimNextSubmittedTask.mockResolvedValueOnce(createClaimedTask('phase_retry'));
+    repositoryMock.getTaskDiff.mockResolvedValueOnce({
+      taskId: 'task_1', filesChanged: 0, insertions: 0, deletions: 0,
+      iterations: [{
+        phase: 'planning', prompt: 'Plan', resultSummary: 'Plan ready', validationResult: {
+          steps: ['Author scene'], acceptanceCriteria: ['Scene is saved']
+        }, createdAt: '2026-08-02T10:00:10.000Z'
+      }]
+    });
+    repositoryMock.listTaskAudit.mockResolvedValueOnce([
+      { eventType: 'task_iteration_started', payload: { taskRunId: 'run_old', phase: 'implementation', attempt: 1 }, createdAt: '2026-08-02T10:00:20.000Z' },
+      { eventType: 'task_failed', payload: { taskRunId: 'run_old', status: 'failed', errorMessage: queueError }, createdAt: '2026-08-02T10:00:30.000Z' },
+      { eventType: 'task_failed', payload: { taskRunId: 'run_cancelled', status: 'failed', errorMessage: 'Windows authoring job cancelled.' }, createdAt: '2026-08-02T10:00:40.000Z' }
+    ]);
+    runWorkerTaskMock.mockResolvedValueOnce({
+      taskId: 'task_1', status: 'ready_for_user_review', issueUrl: '', branchName: 'ai/1-task', workspacePath: 'C:/tmp/worker',
+      validation: { command: 'native verifier', exitCode: 0, stdout: 'ok', stderr: '', passed: true },
+      summary: 'Corrected.', approvals: [], completedAt: new Date().toISOString()
+    });
+
+    const { runDatabaseWorkerOnce } = await import('./db-worker.js');
+    await runDatabaseWorkerOnce();
+
+    expect(runWorkerTaskMock).toHaveBeenCalledWith(expect.objectContaining({
+      resume: expect.objectContaining({
+        kind: 'phase_retry',
+        resumeFrom: 'implementation',
+        previousValidationError: queueError
+      })
     }));
   });
 

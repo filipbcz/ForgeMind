@@ -25,6 +25,12 @@ interface PostgreSqlClient {
 }
 const ids = { user: 'lease_test_user', project: 'lease_test_project', task: 'lease_test_task', run: 'lease_test_run', device: 'lease_test_device', session: 'lease_test_session', job: 'lease_test_job' };
 const digest = 'a'.repeat(64);
+const windowsProbeEvidence = (probedAt: string) => {
+  const probe = { capability: { key: 'windows' }, status: 'supported' as const, provenance: 'local-probe' as const,
+    probedAt, probeVersion: 'test', summary: 'test' };
+  return [{ schemaVersion: 1, ...probe,
+    evidenceHash: createHash('sha256').update(canonicalizeWorkerProbeEvidence(probe)).digest('hex') }];
+};
 const integrationPacket = { schemaVersion: 2 as const, projectId: ids.project, taskId: ids.task, runId: ids.run, checkId: 'lease_test_check', jobId: ids.job,
   leaseId: 'pending', repository: 'owner/repo', sourceUrl: 'https://example.test/repo.git', commitSha: digest, workspaceRoot: 'C:\\work', artifactRoot: 'C:\\artifacts',
   check: { command: 'fixture.exe', category: 'smoke' as const, requiredCapabilities: ['windows'] }, requiredCapabilities: ['windows'],
@@ -61,10 +67,7 @@ describeDatabase('WindowsWorkerRepository PostgreSQL concurrency', () => {
       ON CONFLICT ("id") DO NOTHING`;
     await first.$executeRaw`INSERT INTO "task_runs" ("id", "task_id", "provider", "model", "status")
       VALUES (${ids.run}, ${ids.task}, 'codex', 'test', 'queued') ON CONFLICT ("id") DO NOTHING`;
-    const probe = { capability: { key: 'windows' }, status: 'supported' as const, provenance: 'local-probe' as const,
-      probedAt: new Date().toISOString(), probeVersion: 'test', summary: 'test' };
-    const probeEvidence = [{ schemaVersion: 1, ...probe,
-      evidenceHash: createHash('sha256').update(canonicalizeWorkerProbeEvidence(probe)).digest('hex') }];
+    const probeEvidence = windowsProbeEvidence(new Date().toISOString());
     await first.$executeRaw`INSERT INTO "worker_devices" ("id", "platform", "runner_version", "display_name", "status", "capabilities", "probe_evidence")
       VALUES (${ids.device}, 'windows', 'test', 'Test', 'idle', ${JSON.stringify([{ key: 'windows' }])}::jsonb, ${JSON.stringify(probeEvidence)}::jsonb)
       ON CONFLICT ("id") DO UPDATE SET "status" = 'idle'`;
@@ -96,7 +99,7 @@ describeDatabase('WindowsWorkerRepository PostgreSQL concurrency', () => {
     expect(await first.windowsExecutionLease.count({ where: { jobId: ids.job, status: 'active' } })).toBe(1);
   });
 
-  it('leases authoring work while its owning task is running AI implementation', async () => {
+  it('leases authoring work throughout a live session after its registration probe ages past five minutes', async () => {
     const authoring = {
       task: 'lease_test_authoring_task', run: 'lease_test_authoring_run', job: 'lease_test_authoring_job'
     };
@@ -118,6 +121,8 @@ describeDatabase('WindowsWorkerRepository PostgreSQL concurrency', () => {
       taskId: authoring.task, runId: authoring.run, requiredCapabilities: ['windows'], packet });
     await first.windowsExecutionLease.deleteMany({ where: { jobId: ids.job } });
     await first.workerDevice.update({ where: { id: ids.device }, data: { status: 'idle' } });
+    const staleEvidence = windowsProbeEvidence(new Date(Date.now() - 10 * 60_000).toISOString());
+    await first.$executeRaw`UPDATE "worker_devices" SET "probe_evidence" = ${JSON.stringify(staleEvidence)}::jsonb WHERE "id" = ${ids.device}`;
 
     try {
       const claim = await new WindowsWorkerRepository(first).claimCompatible(
@@ -128,7 +133,8 @@ describeDatabase('WindowsWorkerRepository PostgreSQL concurrency', () => {
       await first.windowsExecutionJob.delete({ where: { id: authoring.job } });
       await first.taskRun.delete({ where: { id: authoring.run } });
       await first.task.delete({ where: { id: authoring.task } });
-      await first.workerDevice.update({ where: { id: ids.device }, data: { status: 'idle' } });
+      const freshEvidence = windowsProbeEvidence(new Date().toISOString());
+      await first.$executeRaw`UPDATE "worker_devices" SET "status" = 'idle', "probe_evidence" = ${JSON.stringify(freshEvidence)}::jsonb WHERE "id" = ${ids.device}`;
     }
   });
 

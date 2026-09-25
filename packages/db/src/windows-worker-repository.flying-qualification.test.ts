@@ -65,8 +65,7 @@ describe('non-physical Flying authoring qualification fixture', () => {
   it.each([
     ['failed probes', ['interactive-desktop', 'gpu'], [probe({ key: 'interactive-desktop' }, 'failed'), probe({ key: 'gpu' })]],
     ['missing interactive GPU', ['windows-authoring'], [probe({ key: 'windows-authoring' })]],
-    ['insufficient disk', ['interactive-desktop', 'gpu', 'disk-capacity'], [probe({ key: 'interactive-desktop' }), probe({ key: 'gpu' }), probe({ key: 'disk-capacity', metadata: { freeBytes: 99 } })]],
-    ['stale provenance', ['interactive-desktop', 'gpu'], [probe({ key: 'interactive-desktop' }, 'supported', 6 * 60_000), probe({ key: 'gpu' }, 'supported', 6 * 60_000)]]
+    ['insufficient disk', ['interactive-desktop', 'gpu', 'disk-capacity'], [probe({ key: 'interactive-desktop' }), probe({ key: 'gpu' }), probe({ key: 'disk-capacity', metadata: { freeBytes: 99 } })]]
   ])('keeps %s as an explicit capability blocker', async (_label, keys, probes) => {
     const capabilities = probes.map(({ capability }) => capability);
     const requiredCapabilities = keys.includes('disk-capacity') ? ['interactive-desktop', 'gpu', 'disk-free-100gb'] : ['interactive-desktop', 'gpu'];
@@ -74,6 +73,19 @@ describe('non-physical Flying authoring qualification fixture', () => {
       pendingPhase: 'author', requiredCapabilities, packet: { kind: 'authoring' }, leases: [], createdAt: now };
     const model = await new WindowsWorkerRepository(operationsPrisma([device(capabilities, probes)], [job])).readOperations('fixture-project', now);
     expect(model.waitingValidations[0]).toMatchObject({ compatibleDeviceIds: [], waitReason: job.waitReason, pendingPhase: 'author' });
+  });
+
+  it('keeps registered capabilities usable while their manually started session remains live', async () => {
+    const probes = [probe({ key: 'interactive-desktop' }, 'supported', 6 * 60_000), probe({ key: 'gpu' }, 'supported', 6 * 60_000)];
+    const job = { id: 'fixture-job', taskId: 'fixture-task', status: 'queued', waitReason: 'unavailable_capability',
+      pendingPhase: 'author', requiredCapabilities: ['interactive-desktop', 'gpu'], packet: { kind: 'authoring' }, leases: [], createdAt: now };
+    const model = await new WindowsWorkerRepository(operationsPrisma([device(probes.map(({ capability }) => capability), probes)], [job]))
+      .readOperations('fixture-project', now);
+
+    expect(model.waitingValidations[0]).toMatchObject({
+      compatibleDeviceIds: ['fixture-device'],
+      pendingPhase: 'author'
+    });
   });
 
   it('preserves binary and text checkpoints while readable fixture evidence remains non-qualifying', async () => {

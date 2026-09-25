@@ -551,7 +551,8 @@ export async function runDatabaseWorkerOnce(options: { deferInterruptSignals?: b
     repository,
     claimed.task.id,
     claimed.queueReason,
-    claimed.taskRun.id
+    claimed.taskRun.id,
+    claimed.queueErrorMessage
   );
   if (resumeContext?.workflowResume) {
     const resume = resumeContext.workflowResume;
