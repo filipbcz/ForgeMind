@@ -65,7 +65,10 @@ describe('native implementation provider lifecycle', () => {
     ], 'INSPECTION:');
     const mapBranch = script.slice(script.indexOf("if package['path'].lower().endswith('.umap')"), script.indexOf('    else:'));
     expect(mapBranch).toContain('LevelEditorSubsystem).load_level');
-    expect(mapBranch).toContain('UnrealEditorSubsystem).get_editor_world');
+    expect(mapBranch).toContain('unreal.UnrealEditorSubsystem)');
+    expect(mapBranch).toContain('editor_subsystem.get_editor_world()');
+    expect(mapBranch).toContain("current_path != package['objectPath']");
+    expect(mapBranch).toContain('del loaded');
     expect(mapBranch).not.toContain('unreal.load_asset');
     expect(script.slice(script.indexOf('    else:'))).toContain("unreal.load_asset(package['objectPath'])");
   });
