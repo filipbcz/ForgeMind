@@ -150,7 +150,7 @@ export async function executeWindowsAuthoring(packet: WindowsAuthoringPacket, co
     const prior = await spawnWithInput('git.exe', ['apply', '--binary', '--whitespace=nowarn', '-'], workspacePath, packet.step.priorPatch, context.signal);
     if (prior.exitCode !== 0) throw new Error(`Could not materialize the previous Windows attempt: ${prior.stderr}`);
   }
-  const processes: WindowsAuthoringProcessResult[] = [];
+  const processes = restoreCheckpointAuthoringProvenance(checkout.checkpoint, packet.leaseId, context.sessionId);
   let latestCheckpoint: AuthoringDiskCheckpoint | undefined;
   let liveActivity = '';
   let progressDelivery = Promise.resolve();
@@ -165,7 +165,7 @@ export async function executeWindowsAuthoring(packet: WindowsAuthoringPacket, co
     await progressDelivery;
   };
   const publishCheckpoint = async (status: string) => {
-    const checkpoint = await persistCheckpoint(checkpointPath, packet, workspacePath, status, context.signal, outputDirectory);
+    const checkpoint = await persistCheckpoint(checkpointPath, packet, workspacePath, status, processes, context.signal, outputDirectory);
     latestCheckpoint = checkpoint;
     await emitProgress(processes.at(-1)?.authoring?.phase ?? 'checkout');
   };
@@ -368,7 +368,7 @@ function createTools(root: string, evidencePath: string, timeoutMs: number, sign
   };
 }
 
-async function prepareCheckout(packet: WindowsAuthoringPacket, root: string, checkpointPath: string, outputRoot: string, signal?: AbortSignal): Promise<{ path: string; resumed: boolean }> {
+async function prepareCheckout(packet: WindowsAuthoringPacket, root: string, checkpointPath: string, outputRoot: string, signal?: AbortSignal): Promise<{ path: string; resumed: boolean; checkpoint?: AuthoringDiskCheckpoint }> {
   await mkdir(root, { recursive: true }); const path = resolve(root, packet.taskId);
   let checkpoint: AuthoringDiskCheckpoint | undefined;
   let generations: string[] = [];
@@ -383,7 +383,7 @@ async function prepareCheckout(packet: WindowsAuthoringPacket, root: string, che
     if (checkpointMatches
       && actual.exitCode === 0 && actual.stdout.trim().toLowerCase() === packet.baseCommitSha.toLowerCase()) {
       const status = await spawnComplete('git.exe', ['status', '--porcelain=v1'], path, 30_000, signal);
-      if (status.exitCode === 0 && status.stdout.trim().length > 0) return { path: await realpath(path), resumed: true };
+      if (status.exitCode === 0 && status.stdout.trim().length > 0) return { path: await realpath(path), resumed: true, checkpoint };
     }
   } catch { /* missing or invalid retained checkout */ }
   try { await rename(path, resolve(root, `${packet.taskId}.preserved-${Date.now()}`)); } catch (error) {
@@ -393,7 +393,7 @@ async function prepareCheckout(packet: WindowsAuthoringPacket, root: string, che
   return cloneCheckout(packet, root, path, outputRoot, signal, checkpointMatches ? checkpoint : undefined);
 }
 
-async function cloneCheckout(packet: WindowsAuthoringPacket, root: string, path: string, outputRoot: string, signal?: AbortSignal, checkpoint?: AuthoringDiskCheckpoint): Promise<{ path: string; resumed: boolean }> {
+async function cloneCheckout(packet: WindowsAuthoringPacket, root: string, path: string, outputRoot: string, signal?: AbortSignal, checkpoint?: AuthoringDiskCheckpoint): Promise<{ path: string; resumed: boolean; checkpoint?: AuthoringDiskCheckpoint }> {
   const clone = await spawnComplete('git.exe', ['clone', '--no-checkout', packet.sourceUrl, path], root, packet.resourcePolicy.timeoutSeconds * 1000, signal);
   if (clone.exitCode !== 0) throw new Error(`Checkout clone failed: ${clone.stderr}`);
   const checkout = await spawnComplete('git.exe', ['checkout', '--detach', packet.baseCommitSha], path, packet.resourcePolicy.timeoutSeconds * 1000, signal);
@@ -415,7 +415,7 @@ async function cloneCheckout(packet: WindowsAuthoringPacket, root: string, path:
     }
     const restoredTree = await gitTree(canonical, signal);
     if (restoredTree.toLowerCase() !== checkpoint.resultTreeSha.toLowerCase()) throw new Error('Restored Windows checkpoint tree does not match its recorded tree.');
-    return { path: canonical, resumed: true };
+    return { path: canonical, resumed: true, checkpoint };
   }
   return { path: canonical, resumed: false };
 }
@@ -443,7 +443,47 @@ interface AuthoringDiskCheckpoint {
   resultBundle: { version: 1; format: 'git-binary-patch'; sha256: string; sizeBytes: number;
     lfsObjects: Array<{ oid: string; sha256: string; sizeBytes: number; contentBase64: string }>;
     outputs: Array<{ path: string; sha256: string; sizeBytes: number; contentBase64: string }> };
+  authoringProvenance?: AuthoringCheckpointProvenance[];
   updatedAt: string;
+}
+
+interface AuthoringCheckpointProvenance {
+  checkId: string; command: string; shell: WindowsAuthoringProcessResult['shell']; startedAt: string; completedAt: string;
+  authoring: {
+    tool: 'unreal-editor' | 'unreal-python'; phase: 'author'; projectRelativePath: string; executablePath: string;
+    args: string[]; sourceRelativePaths: string[];
+  };
+}
+
+export function collectCheckpointAuthoringProvenance(processes: WindowsAuthoringProcessResult[]): AuthoringCheckpointProvenance[] {
+  return processes.flatMap((process) => {
+    const authoring = process.authoring;
+    if (process.exitCode !== 0 || authoring?.phase !== 'author' || !['unreal-editor', 'unreal-python'].includes(authoring.tool)) return [];
+    return [{ checkId: process.checkId, command: process.command, shell: process.shell, startedAt: process.startedAt, completedAt: process.completedAt,
+      authoring: { tool: authoring.tool as 'unreal-editor' | 'unreal-python', phase: 'author' as const,
+        projectRelativePath: authoring.projectRelativePath, executablePath: authoring.executablePath,
+        args: [...authoring.args], sourceRelativePaths: [...authoring.sourceRelativePaths] } }];
+  });
+}
+
+export function restoreCheckpointAuthoringProvenance(
+  checkpoint: Pick<AuthoringDiskCheckpoint, 'authoringProvenance'> | undefined,
+  leaseId: string,
+  sessionId: string
+): WindowsAuthoringProcessResult[] {
+  return (checkpoint?.authoringProvenance ?? []).flatMap((entry) => {
+    if (!entry || typeof entry.checkId !== 'string' || typeof entry.command !== 'string'
+      || !['system', 'powershell', 'cmd'].includes(entry.shell)
+      || typeof entry.startedAt !== 'string' || typeof entry.completedAt !== 'string'
+      || !entry.authoring || !['unreal-editor', 'unreal-python'].includes(entry.authoring.tool)
+      || entry.authoring.phase !== 'author' || typeof entry.authoring.projectRelativePath !== 'string'
+      || typeof entry.authoring.executablePath !== 'string' || !Array.isArray(entry.authoring.args)
+      || entry.authoring.args.some((value) => typeof value !== 'string') || !Array.isArray(entry.authoring.sourceRelativePaths)
+      || entry.authoring.sourceRelativePaths.some((value) => typeof value !== 'string')) return [];
+    return [{ leaseId, sessionId, checkId: entry.checkId, command: entry.command, shell: entry.shell,
+      exitCode: 0, stdout: '', stderr: '', startedAt: entry.startedAt, completedAt: entry.completedAt,
+      authoring: { ...entry.authoring, args: [...entry.authoring.args], sourceRelativePaths: [...entry.authoring.sourceRelativePaths] } }];
+  });
 }
 
 export function canResumeAuthoringCheckpoint(
@@ -462,7 +502,8 @@ export function hasRestorableAuthoringCheckpoint(
     || checkpoint.resultBundle.outputs.length > 0));
 }
 
-async function persistCheckpoint(path: string, packet: WindowsAuthoringPacket, workspacePath: string, status: string, signal?: AbortSignal, outputRoot?: string): Promise<AuthoringDiskCheckpoint> {
+async function persistCheckpoint(path: string, packet: WindowsAuthoringPacket, workspacePath: string, status: string,
+  processes: WindowsAuthoringProcessResult[], signal?: AbortSignal, outputRoot?: string): Promise<AuthoringDiskCheckpoint> {
   const resultTreeSha = await gitTree(workspacePath, signal);
   const patchResult = await spawnComplete('git.exe', ['diff', '--binary', '--no-ext-diff', '--cached', 'HEAD'], workspacePath, 30_000, signal);
   if (patchResult.exitCode !== 0) throw new Error(`Could not persist Windows checkpoint: ${patchResult.stderr}`);
@@ -473,7 +514,8 @@ async function persistCheckpoint(path: string, packet: WindowsAuthoringPacket, w
   const checkpoint: AuthoringDiskCheckpoint = { version: 2, status, taskId: packet.taskId, inputHash: packet.inputHash,
     baseCommitSha: packet.baseCommitSha, resultTreeSha, tree, patch: patchResult.stdout,
     resultBundle: { version: 1, format: 'git-binary-patch', sha256: createHash('sha256').update(patchBytes).digest('hex'),
-      sizeBytes: patchBytes.length, lfsObjects, outputs }, updatedAt: new Date().toISOString() };
+      sizeBytes: patchBytes.length, lfsObjects, outputs }, authoringProvenance: collectCheckpointAuthoringProvenance(processes),
+    updatedAt: new Date().toISOString() };
   await writeCheckpointAtomically(path, JSON.stringify(checkpoint));
   return checkpoint;
 }

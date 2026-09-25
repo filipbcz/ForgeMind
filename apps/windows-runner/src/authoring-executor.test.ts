@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from 'vitest';
-import { assertReadableAuthoringCheckout, buildUnrealPackageVerificationArgs, buildUnrealPackageVerificationScript, canResumeAuthoringCheckpoint, classifyAuthoringFailure, classifyWindowsAuthoringFailure, collectAuthoringToolVersions, hasRestorableAuthoringCheckpoint, isProhibitedAuthoringPath, LifecycleNativeImplementationProvider, materializeOutputs, requiresProductionContent, type NativeAuthoringTools, unrealObjectPath, validateRequiredUnrealAssets } from './authoring-executor.js';
+import { assertReadableAuthoringCheckout, buildUnrealPackageVerificationArgs, buildUnrealPackageVerificationScript, canResumeAuthoringCheckpoint, classifyAuthoringFailure, classifyWindowsAuthoringFailure, collectAuthoringToolVersions, collectCheckpointAuthoringProvenance, hasRestorableAuthoringCheckpoint, isProhibitedAuthoringPath, LifecycleNativeImplementationProvider, materializeOutputs, requiresProductionContent, restoreCheckpointAuthoringProvenance, type NativeAuthoringTools, unrealObjectPath, validateRequiredUnrealAssets } from './authoring-executor.js';
 import { mkdtemp, rm } from 'node:fs/promises';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
@@ -51,6 +51,22 @@ describe('native implementation provider lifecycle', () => {
     expect(hasRestorableAuthoringCheckpoint({ ...empty, patch: 'diff --git a/a b/a' })).toBe(true);
     expect(hasRestorableAuthoringCheckpoint({ ...empty,
       resultBundle: { lfsObjects: [], outputs: [{ path: 'preview.png', sha256: 'a', sizeBytes: 1, contentBase64: 'YQ==' }] } })).toBe(true);
+  });
+  it('carries only successful Unreal authoring provenance across durable retries', () => {
+    const base = { leaseId: 'old-lease', sessionId: 'old-session', shell: 'system' as const, stdout: 'large log', stderr: '',
+      startedAt: '2026-09-05T00:00:00.000Z', completedAt: '2026-09-05T00:01:00.000Z' };
+    const authoring = { tool: 'unreal-python' as const, phase: 'author' as const, projectRelativePath: 'Game.uproject',
+      executablePath: 'C:/UE/UnrealEditor.exe', args: ['-ExecutePythonScript=Scripts/create.py'], sourceRelativePaths: ['Scripts/create.py'] };
+    const provenance = collectCheckpointAuthoringProvenance([
+      { ...base, checkId: 'author', command: 'editor author', exitCode: 0, authoring },
+      { ...base, checkId: 'failed-author', command: 'editor author failed', exitCode: 3, authoring },
+      { ...base, checkId: 'verify', command: 'editor verify', exitCode: 0, authoring: { ...authoring, phase: 'verify' as const } }
+    ]);
+    expect(provenance).toEqual([{ checkId: 'author', command: 'editor author', shell: 'system',
+      startedAt: base.startedAt, completedAt: base.completedAt, authoring }]);
+    expect(restoreCheckpointAuthoringProvenance({ authoringProvenance: provenance }, 'new-lease', 'new-session'))
+      .toEqual([{ leaseId: 'new-lease', sessionId: 'new-session', checkId: 'author', command: 'editor author', shell: 'system',
+        exitCode: 0, stdout: '', stderr: '', startedAt: base.startedAt, completedAt: base.completedAt, authoring }]);
   });
   it('uses headless memory-backed flags for final saved-package verification', () => {
     expect(buildUnrealPackageVerificationArgs('C:/work/Game.uproject', 'C:/diagnostics/verify.py')).toEqual([
