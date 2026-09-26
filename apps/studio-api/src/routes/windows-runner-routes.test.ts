@@ -56,6 +56,25 @@ describe('Windows runner enrollment API', () => {
     expect(response.json()).toEqual({ error: 'Invalid execution result.' });
   });
 
+  it('accepts bounded authoring blob chunks and binds them to the authenticated device', async () => {
+    const app = Fastify(); const deviceId = '11111111-1111-4111-8111-111111111111';
+    const credentials: any = { authenticate: vi.fn(async () => ({ deviceId })) };
+    const workers: any = { uploadAuthoringBlobChunk: vi.fn(async () => 'accepted'), completeAuthoringBlob: vi.fn(async () => 'duplicate') };
+    registerWindowsRunnerRoutes(app, {} as any, credentials, workers);
+    const identity = { jobId: '22222222-2222-4222-8222-222222222222', leaseId: '33333333-3333-4333-8333-333333333333',
+      sessionId: '44444444-4444-4444-8444-444444444444', nonce: 'nonce-value', inputHash: 'a'.repeat(64), sha256: 'b'.repeat(64) };
+    const chunk = { ...identity, sizeBytes: 3, chunkIndex: 0, totalChunks: 1, contentBase64: Buffer.from('abc').toString('base64') };
+    const headers = { authorization: 'Bearer device-token' };
+    const uploaded = await app.inject({ method: 'POST', url: '/api/windows-runner/device/authoring-blob/chunk', headers, payload: chunk });
+    expect(uploaded.statusCode).toBe(200); expect(uploaded.json()).toEqual({ accepted: true, duplicate: false });
+    expect(workers.uploadAuthoringBlobChunk).toHaveBeenCalledWith(deviceId, chunk);
+    const completed = await app.inject({ method: 'POST', url: '/api/windows-runner/device/authoring-blob/complete', headers,
+      payload: { ...identity, sizeBytes: 3, totalChunks: 1 } });
+    expect(completed.statusCode).toBe(200); expect(completed.json()).toEqual({ accepted: true, duplicate: true });
+    expect((await app.inject({ method: 'POST', url: '/api/windows-runner/device/authoring-blob/chunk', headers,
+      payload: { ...chunk, contentBase64: 'not-base64!' } })).statusCode).toBe(400);
+  });
+
   it('uses only the authenticated device for sessions and writes an audit event', async () => {
     const app = Fastify();
     const repository: any = { writeAudit: vi.fn(async () => undefined) };

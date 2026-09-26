@@ -162,7 +162,7 @@ async function implementThroughWindowsLease(windowsWorkers: WindowsWorkerReposit
   const realEngineEvidence = classifyAuthoringEvidence(input.prompt, input.acceptanceCriteria, input.baseCommitSha,
     requiredCapabilities, input.requiresUnrealAssets);
   const packet: WindowsAuthoringPacket = {
-    kind: 'authoring', protocolVersion: 1, projectId: input.project.id, taskId: input.taskId, runId: input.taskRunId,
+    kind: 'authoring', protocolVersion: 2, projectId: input.project.id, taskId: input.taskId, runId: input.taskRunId,
     jobId, leaseId: 'pending', repository: `${input.project.githubOwner}/${input.project.githubRepo}`,
     sourceUrl: `https://github.com/${input.project.githubOwner}/${input.project.githubRepo}.git`, baseCommitSha: input.baseCommitSha,
     workspaceRoot: 'runner-managed', artifactRoot: 'runner-managed', step: { prompt: input.prompt, acceptanceCriteria: input.acceptanceCriteria,
@@ -183,7 +183,7 @@ async function implementThroughWindowsLease(windowsWorkers: WindowsWorkerReposit
   await windowsWorkers.enqueueAuthoring({ id: jobId, projectId: input.project.id, taskId: input.taskId, runId: input.taskRunId, requiredCapabilities, packet });
   const result = await windowsWorkers.waitForAuthoringResult(jobId, input.signal);
   if (result.status !== 'succeeded') throw new WindowsAuthoringExecutionError(
-    `Windows authoring ${result.status}: ${result.summary}`,
+    `Windows authoring ${result.status} at result tree ${result.resultTreeSha}: ${result.summary}`,
     result.failure?.retryable ?? false,
     result.failure?.kind ?? 'unknown'
   );
@@ -194,7 +194,7 @@ async function implementThroughWindowsLease(windowsWorkers: WindowsWorkerReposit
     throw new Error('Windows result reconciliation failed: result bundle hash or size does not match its binary patch.');
   }
   for (const object of result.resultBundle.lfsObjects) {
-    const content = Buffer.from(object.contentBase64, 'base64');
+    const content = decodeHydratedAuthoringPayload(object, `Git LFS object ${object.oid}`);
     if (content.length !== object.sizeBytes || createHash('sha256').update(content).digest('hex') !== object.oid.toLowerCase()) {
       throw new Error(`Windows result reconciliation failed: Git LFS object ${object.oid} is corrupt.`);
     }
@@ -205,7 +205,7 @@ async function implementThroughWindowsLease(windowsWorkers: WindowsWorkerReposit
     await runGitCapture(input.workspacePath, ['lfs', 'install', '--local'], input.signal);
   }
   for (const output of result.resultBundle.outputs) {
-    const content = Buffer.from(output.contentBase64, 'base64');
+    const content = decodeHydratedAuthoringPayload(output, `managed output ${output.path}`);
     if (content.length !== output.sizeBytes || createHash('sha256').update(content).digest('hex') !== output.sha256.toLowerCase()) {
       throw new Error(`Windows result reconciliation failed: managed output ${output.path} is corrupt.`);
     }
@@ -278,10 +278,15 @@ async function materializeWindowsOutputs(workspacePath: string, outputs: Windows
   if (!exclude.split(/\r?\n/).includes('.forgemind-outputs/')) await writeFile(excludePath, `${exclude}${exclude.endsWith('\n') || !exclude ? '' : '\n'}.forgemind-outputs/\n`, 'utf8');
   const evidence: string[] = [];
   for (const output of outputs) {
-    const target = resolve(root, output.path); const content = Buffer.from(output.contentBase64, 'base64');
+    const target = resolve(root, output.path); const content = decodeHydratedAuthoringPayload(output, `managed output ${output.path}`);
     await mkdir(resolve(target, '..'), { recursive: true }); await writeFile(target, content); evidence.push(`.forgemind-outputs/${output.path}`);
   }
   return evidence;
+}
+
+function decodeHydratedAuthoringPayload(entry: { contentBase64?: string }, label: string): Buffer {
+  if (entry.contentBase64 === undefined) throw new Error(`Windows result reconciliation failed: ${label} was not hydrated from artifact storage.`);
+  return Buffer.from(entry.contentBase64, 'base64');
 }
 
 async function verifyWindowsResultTree(workspacePath: string, result: WindowsAuthoringResult, signal?: AbortSignal): Promise<void> {

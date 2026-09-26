@@ -2,7 +2,7 @@ import type { FastifyInstance, FastifyReply, FastifyRequest } from 'fastify';
 import { createHash } from 'node:crypto';
 import { z } from 'zod';
 import type { ForgeMindRepository, WindowsRunnerCredentialAdapter, WindowsRunnerPrincipal, WindowsWorkerRepository } from '@forgemind/db';
-import { canonicalizeWorkerProbeEvidence, isWindowsAuthoringPacket, isWindowsAuthoringResult, isWindowsExecutionResult, redactSecrets, WINDOWS_AUTHORING_RESULT_MAX_BYTES, WINDOWS_EVIDENCE_MAX_ARTIFACT_BYTES, WINDOWS_EVIDENCE_MAX_ARTIFACTS, WINDOWS_EVIDENCE_MAX_LOG_BYTES } from '@forgemind/core';
+import { canonicalizeWorkerProbeEvidence, isWindowsAuthoringPacket, isWindowsAuthoringResult, isWindowsExecutionResult, redactSecrets, WINDOWS_AUTHORING_BLOB_CHUNK_BYTES, WINDOWS_AUTHORING_MANIFEST_MAX_BYTES, WINDOWS_EVIDENCE_MAX_ARTIFACT_BYTES, WINDOWS_EVIDENCE_MAX_ARTIFACTS, WINDOWS_EVIDENCE_MAX_LOG_BYTES } from '@forgemind/core';
 
 const deviceParams = z.object({ deviceId: z.string().uuid() });
 const enrollment = z.object({
@@ -54,6 +54,13 @@ const evidenceUpload = z.object({ schemaVersion: z.literal(1), jobId: z.string()
   log: z.object({ text: z.string(), sizeBytes: z.number().int().nonnegative(), sha256: sha }), artifacts: z.array(z.object({ name: z.string().min(1).max(200),
     relativePath: z.string().min(1).max(500), mimeType: z.string().min(1).max(200).optional(), sizeBytes: z.number().int().nonnegative(), sha256: sha, contentBase64: z.string(), criterion: z.string().min(1).max(2000) })).max(WINDOWS_EVIDENCE_MAX_ARTIFACTS),
   realEngineEvidence: realEngineEvidence.optional() });
+const authoringBlobIdentity = z.object({ jobId: z.string().uuid(), leaseId: z.string().uuid(), sessionId: z.string().uuid(),
+  nonce: z.string().min(8).max(128), inputHash: sha, sha256: sha });
+const authoringBlobChunk = authoringBlobIdentity.extend({ sizeBytes: z.number().int().nonnegative().max(WINDOWS_AUTHORING_BLOB_CHUNK_BYTES),
+  chunkIndex: z.number().int().nonnegative(), totalChunks: z.number().int().positive().max(65_536),
+  contentBase64: z.string().max(Math.ceil(WINDOWS_AUTHORING_BLOB_CHUNK_BYTES / 3) * 4 + 4).regex(/^[A-Za-z0-9+/]*={0,2}$/) });
+const authoringBlobComplete = authoringBlobIdentity.extend({ sizeBytes: z.number().int().nonnegative(),
+  totalChunks: z.number().int().positive().max(65_536) });
 
 export function registerWindowsRunnerRoutes(app: FastifyInstance, repository: ForgeMindRepository, credentials: WindowsRunnerCredentialAdapter, workers: WindowsWorkerRepository) {
   app.post('/api/windows-runner/enrollments', async (request) => {
@@ -125,7 +132,21 @@ export function registerWindowsRunnerRoutes(app: FastifyInstance, repository: Fo
     const principal = runnerPrincipal(request); const input = claim.parse(request.body);
     return (await workers.claimCompatible(input.sessionId, input.leaseSeconds, input.requestId, principal.deviceId, input.authoringProtocolVersions)) ?? { job: null, lease: null };
   });
-  app.post('/api/windows-runner/device/result', { preHandler: runnerAuth(credentials), bodyLimit: WINDOWS_AUTHORING_RESULT_MAX_BYTES }, async (request, reply) => {
+  app.post('/api/windows-runner/device/authoring-blob/chunk', { preHandler: runnerAuth(credentials), bodyLimit: Math.ceil(WINDOWS_AUTHORING_BLOB_CHUNK_BYTES / 3) * 4 + 16_384 }, async (request, reply) => {
+    const principal = runnerPrincipal(request); const parsed = authoringBlobChunk.safeParse(request.body);
+    if (!parsed.success) return reply.code(400).send({ error: 'Invalid authoring blob chunk.' });
+    const outcome = await workers.uploadAuthoringBlobChunk(principal.deviceId, parsed.data);
+    return outcome === 'conflict' ? reply.code(409).send({ error: 'Authoring blob chunk conflicts with the active lease.' })
+      : { accepted: true, duplicate: outcome === 'duplicate' };
+  });
+  app.post('/api/windows-runner/device/authoring-blob/complete', { preHandler: runnerAuth(credentials) }, async (request, reply) => {
+    const principal = runnerPrincipal(request); const parsed = authoringBlobComplete.safeParse(request.body);
+    if (!parsed.success) return reply.code(400).send({ error: 'Invalid authoring blob completion request.' });
+    const outcome = await workers.completeAuthoringBlob(principal.deviceId, parsed.data);
+    return outcome === 'conflict' ? reply.code(409).send({ error: 'Authoring blob is incomplete or conflicts with the active lease.' })
+      : { accepted: true, duplicate: outcome === 'duplicate' };
+  });
+  app.post('/api/windows-runner/device/result', { preHandler: runnerAuth(credentials), bodyLimit: WINDOWS_AUTHORING_MANIFEST_MAX_BYTES }, async (request, reply) => {
     const principal = runnerPrincipal(request);
     if ((!isWindowsExecutionResult(request.body) && !isWindowsAuthoringResult(request.body)) || request.body.deviceId !== principal.deviceId) return reply.code(400).send({ error: 'Invalid execution result.' });
     const outcome = await workers.submitResult(principal.deviceId, request.body);

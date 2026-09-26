@@ -314,6 +314,42 @@ describe('WindowsWorkerRepository capability leases', () => {
       outputs: [{ path: 'reports/result.bin', sha256: '0'.repeat(64), sizeBytes: 1, contentBase64: 'YQ==' }] } } as any)).toEqual({ accepted: false });
   });
 
+  it('assembles idempotent content-addressed authoring chunks only for the active lease', async () => {
+    const content = Buffer.from('chunked-unreal-payload'); const sha256 = createHash('sha256').update(content).digest('hex');
+    const packet = { kind: 'authoring', protocolVersion: 2, projectId: 'project_1', taskId: 'task_1', runId: 'run_1', jobId: 'job_1', leaseId: 'lease_1',
+      repository: 'owner/repo', sourceUrl: 'https://example.test/repo.git', baseCommitSha: 'b'.repeat(40), workspaceRoot: 'runner-managed', artifactRoot: 'runner-managed',
+      step: { prompt: 'Update map', acceptanceCriteria: ['Map is updated'] }, operations: [{ id: 'op-1', kind: 'tool', tool: 'ai', arguments: {}, rationale: 'Update' }],
+      requiredCapabilities: ['windows'], managedRoots: ['.'], checkpoints: [], artifactExpectations: [],
+      contentPolicy: { requiresUnrealAssets: true, prohibitedDatasetExtensions: ['.gpkg'], maxUnclassifiedFileBytes: 1024 },
+      resourcePolicy: { timeoutSeconds: 60, maxLogBytes: 100, maxArtifactBytes: 100 }, nonce: 'nonce_1', inputHash: packetDigest,
+      authority: { database: 'none', productionHosts: 'none', globalGitHubCredentials: 'none' } };
+    const chunks: any[] = []; let blob: any;
+    const tx: any = {
+      windowsExecutionLease: { findFirst: vi.fn(async () => ({ job: { packet } })) },
+      windowsAuthoringBlob: {
+        findUnique: vi.fn(async () => blob),
+        create: vi.fn(async ({ data }) => { blob = data; return data; })
+      },
+      windowsAuthoringBlobChunk: {
+        findUnique: vi.fn(async ({ where }) => chunks.find((item) => item.chunkIndex === where.jobId_sha256_chunkIndex.chunkIndex)),
+        create: vi.fn(async ({ data }) => { chunks.push(data); return data; }),
+        findMany: vi.fn(async () => [...chunks].sort((left, right) => left.chunkIndex - right.chunkIndex)),
+        deleteMany: vi.fn(async () => ({ count: chunks.splice(0).length }))
+      }
+    };
+    const repository = new WindowsWorkerRepository({ $transaction: vi.fn(async (work: any) => work(tx)) } as any);
+    const identity = { jobId: 'job_1', leaseId: 'lease_1', sessionId: 'session_1', nonce: 'nonce_1', inputHash: packetDigest,
+      sha256, totalChunks: 2 };
+    const first = { ...identity, chunkIndex: 0, sizeBytes: 8, contentBase64: content.subarray(0, 8).toString('base64') };
+    const second = { ...identity, chunkIndex: 1, sizeBytes: content.length - 8, contentBase64: content.subarray(8).toString('base64') };
+    await expect(repository.uploadAuthoringBlobChunk('device_1', first)).resolves.toBe('accepted');
+    await expect(repository.uploadAuthoringBlobChunk('device_1', first)).resolves.toBe('duplicate');
+    await expect(repository.uploadAuthoringBlobChunk('device_1', second)).resolves.toBe('accepted');
+    await expect(repository.completeAuthoringBlob('device_1', { ...identity, sizeBytes: content.length })).resolves.toBe('accepted');
+    expect(Buffer.from(blob.content)).toEqual(content);
+    expect(blob.sha256).toBe(sha256);
+  });
+
   it('accepts the exact deferred check result without restarting the completed task', async () => {
     const digest = 'b'.repeat(64);
     const packet = {

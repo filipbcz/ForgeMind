@@ -69,7 +69,7 @@ describeDatabase('WindowsWorkerRepository PostgreSQL concurrency', () => {
       VALUES (${ids.run}, ${ids.task}, 'codex', 'test', 'queued') ON CONFLICT ("id") DO NOTHING`;
     const probeEvidence = windowsProbeEvidence(new Date().toISOString());
     await first.$executeRaw`INSERT INTO "worker_devices" ("id", "platform", "runner_version", "display_name", "status", "capabilities", "probe_evidence")
-      VALUES (${ids.device}, 'windows', 'test', 'Test', 'idle', ${JSON.stringify([{ key: 'windows' }])}::jsonb, ${JSON.stringify(probeEvidence)}::jsonb)
+      VALUES (${ids.device}, 'windows', '0.2.0+authoring-v2', 'Test', 'idle', ${JSON.stringify([{ key: 'windows' }])}::jsonb, ${JSON.stringify(probeEvidence)}::jsonb)
       ON CONFLICT ("id") DO UPDATE SET "status" = 'idle'`;
     await first.$executeRaw`INSERT INTO "worker_sessions" ("id", "device_id", "status", "expires_at", "authorized_project_ids")
       VALUES (${ids.session}, ${ids.device}, 'active', CURRENT_TIMESTAMP + INTERVAL '10 minutes', ${JSON.stringify([ids.project])}::jsonb)

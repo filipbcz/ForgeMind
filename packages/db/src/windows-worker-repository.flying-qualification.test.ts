@@ -114,5 +114,13 @@ describe('non-physical Flying authoring qualification fixture', () => {
         ...authoringResult.resultBundle.outputs[0]!, contentBase64: Buffer.from('corrupt').toString('base64') }] } } } };
     const unreadable = await new WindowsWorkerRepository(operationsPrisma([], [unreadableJob])).readOperations('fixture-project', now);
     expect(unreadable.qualificationReadiness.state).toBe('unverified');
+
+    const realJob = { ...job, id: 'real-lfs-job', packet: { ...job.packet, authoringResult: { ...authoringResult,
+      realEngineEvidence: { ...real, settings: { ...real.settings, fixture: false } },
+      tree: [{ path: 'Artifacts/Flying.png', kind: 'file', sha256: binarySha, sizeBytes: binary.length, binary: true, mode: '100644' }],
+      patch: 'diff --git', resultBundle: { outputs: [], lfsObjects: [{ oid: binarySha, sha256: binarySha,
+        sizeBytes: binary.length, blobSha256: binarySha }] } } } };
+    const readable = await new WindowsWorkerRepository(operationsPrisma([], [realJob])).readOperations('fixture-project', now);
+    expect(readable.qualificationReadiness.requirements.find(({ key }) => key === 'render')?.satisfied).toBe(true);
   });
 });

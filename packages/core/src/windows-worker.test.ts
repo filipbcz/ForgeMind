@@ -131,7 +131,8 @@ describe('Windows worker shared contracts', () => {
       authority: { database: 'none', productionHosts: 'none', globalGitHubCredentials: 'none' }
     };
     expect(isWindowsAuthoringPacket(authoring)).toBe(true);
-    expect(isWindowsAuthoringPacket({ ...authoring, protocolVersion: 2 })).toBe(false);
+    expect(isWindowsAuthoringPacket({ ...authoring, protocolVersion: 2 })).toBe(true);
+    expect(isWindowsAuthoringPacket({ ...authoring, protocolVersion: 3 })).toBe(false);
     expect(isWindowsAuthoringPacket({ ...authoring, baseCommitSha: 'main' })).toBe(false);
     expect(isWindowsAuthoringPacket({ ...authoring, authority: { ...authoring.authority, database: 'direct' } })).toBe(false);
     const result = { kind: 'authoring-result', protocolVersion: 1, projectId: 'p', taskId: 't', runId: 'r', jobId: 'j', leaseId: 'l',
@@ -142,6 +143,8 @@ describe('Windows worker shared contracts', () => {
       contentAssessment: { technicalVerification: 'passed', productionReviewRequired: true, rationale: 'Requires visual review.' },
       startedAt: '2026-01-01T00:00:00Z', completedAt: '2026-01-01T00:01:00Z', summary: 'authored' };
     expect(isWindowsAuthoringResult(result)).toBe(true);
+    expect(isWindowsAuthoringResult({ ...result, protocolVersion: 2, resultBundle: { ...result.resultBundle,
+      outputs: [{ path: 'Content/Generated/map.bin', sha256: hash, sizeBytes: 42, blobSha256: hash }] } })).toBe(true);
     expect(isWindowsAuthoringResult({ ...result, contentAssessment: undefined })).toBe(false);
     expect(isWindowsAuthoringResult({ ...result, status: 'failed', contentAssessment: {
       technicalVerification: 'failed', productionReviewRequired: false, rationale: 'Authoring failed before verification.'

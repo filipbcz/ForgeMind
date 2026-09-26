@@ -1,5 +1,6 @@
-import { describe, expect, it } from 'vitest';
-import { assertNativeCodexCliCompatibility, parseCliArgs, requiredProbeFailures, selectLocalCodexModel } from './cli.js';
+import { createHash } from 'node:crypto';
+import { describe, expect, it, vi } from 'vitest';
+import { assertNativeCodexCliCompatibility, parseCliArgs, requiredProbeFailures, selectLocalCodexModel, uploadAuthoringResultBlobs } from './cli.js';
 
 describe('Windows runner CLI parsing', () => {
   it.each([
@@ -43,5 +44,24 @@ describe('Windows runner CLI parsing', () => {
   it('rejects an outdated Codex CLI before it can claim an authoring task', () => {
     expect(() => assertNativeCodexCliCompatibility('--disable --ignore-user-config --ignore-rules --output-schema --permission-profile')).not.toThrow();
     expect(() => assertNativeCodexCliCompatibility('--output-schema')).toThrow(/update @openai\/codex/i);
+  });
+
+  it('uploads binary authoring payloads in bounded chunks and returns a small content-addressed manifest', async () => {
+    const content = Buffer.alloc(4 * 1024 * 1024 + 1, 7); const sha256 = createHash('sha256').update(content).digest('hex');
+    const uploadAuthoringBlobChunk = vi.fn(async (_auth: unknown, _input: { sizeBytes: number }) => ({ accepted: true, duplicate: false }));
+    const completeAuthoringBlob = vi.fn(async (_auth: unknown, _input: unknown) => ({ accepted: true, duplicate: false }));
+    const patch = 'diff --git'; const patchSha = createHash('sha256').update(patch).digest('hex');
+    const result: any = { jobId: 'job', leaseId: 'lease', sessionId: 'session', nonce: 'nonce-value', inputHash: 'a'.repeat(64), patch,
+      resultBundle: { sha256: patchSha, sizeBytes: Buffer.byteLength(patch),
+        lfsObjects: [{ oid: sha256, sha256, sizeBytes: content.length, contentBase64: content.toString('base64') }], outputs: [] } };
+    const manifest = await uploadAuthoringResultBlobs({ uploadAuthoringBlobChunk, completeAuthoringBlob } as any,
+      { deviceId: 'device', credential: 'secret' }, result);
+    const payloadChunks = uploadAuthoringBlobChunk.mock.calls.filter((call) => (call[1] as any).sha256 === sha256);
+    expect(payloadChunks).toHaveLength(2);
+    expect(payloadChunks.map((call) => call[1].sizeBytes)).toEqual([4 * 1024 * 1024, 1]);
+    expect(completeAuthoringBlob).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({ sha256, sizeBytes: content.length, totalChunks: 2 }));
+    expect(manifest.resultBundle.lfsObjects[0]).toEqual({ oid: sha256, sha256, sizeBytes: content.length, blobSha256: sha256 });
+    expect(manifest).toMatchObject({ patch: '', patchBlobSha256: patchSha });
+    expect(JSON.stringify(manifest)).not.toContain(content.toString('base64').slice(0, 100));
   });
 });

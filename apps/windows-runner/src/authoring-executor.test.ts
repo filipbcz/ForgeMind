@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from 'vitest';
-import { assertReadableAuthoringCheckout, buildUnrealPackageVerificationArgs, buildUnrealPackageVerificationScript, canResumeAuthoringCheckpoint, classifyAuthoringFailure, classifyWindowsAuthoringFailure, collectAuthoringToolVersions, collectCheckpointAuthoringProvenance, hasRestorableAuthoringCheckpoint, isProhibitedAuthoringPath, LifecycleNativeImplementationProvider, materializeOutputs, requiresProductionContent, restoreCheckpointAuthoringProvenance, type NativeAuthoringTools, unrealObjectPath, validateRequiredUnrealAssets } from './authoring-executor.js';
+import { assertReadableAuthoringCheckout, authoringSemanticHash, buildUnrealPackageVerificationArgs, buildUnrealPackageVerificationScript, canResumeAuthoringCheckpoint, classifyAuthoringFailure, classifyWindowsAuthoringFailure, collectAuthoringToolVersions, collectCheckpointAuthoringProvenance, compactProcessResults, hasRestorableAuthoringCheckpoint, isProhibitedAuthoringPath, LifecycleNativeImplementationProvider, materializeOutputs, requiresProductionContent, restoreCheckpointAuthoringProvenance, type NativeAuthoringTools, unrealObjectPath, validateRequiredUnrealAssets } from './authoring-executor.js';
 import { mkdtemp, rm } from 'node:fs/promises';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
@@ -40,10 +40,20 @@ describe('native implementation provider lifecycle', () => {
     } finally { await rm(root, { recursive: true, force: true }); }
   });
   it('resumes a durable task checkpoint across a new run identity on the same base commit', () => {
-    const checkpoint = { version: 2 as const, taskId: 'task-1', baseCommitSha: 'a'.repeat(40) };
-    expect(canResumeAuthoringCheckpoint(checkpoint, { taskId: 'task-1', baseCommitSha: 'a'.repeat(40) })).toBe(true);
+    const checkpoint = { version: 2 as const, taskId: 'task-1', baseCommitSha: 'a'.repeat(40), unrealProbeIdentity: 'probe-5.8.2' };
+    expect(canResumeAuthoringCheckpoint(checkpoint, { taskId: 'task-1', baseCommitSha: 'a'.repeat(40) }, 'probe-5.8.2')).toBe(true);
     expect(canResumeAuthoringCheckpoint(checkpoint, { taskId: 'task-2', baseCommitSha: 'a'.repeat(40) })).toBe(false);
     expect(canResumeAuthoringCheckpoint(checkpoint, { taskId: 'task-1', baseCommitSha: 'b'.repeat(40) })).toBe(false);
+    expect(canResumeAuthoringCheckpoint(checkpoint, { taskId: 'task-1', baseCommitSha: 'a'.repeat(40) }, 'probe-5.9.0')).toBe(false);
+  });
+  it('keeps completed-result reuse stable across delivery retries but not product changes', () => {
+    const packet: any = { taskId: 'task', baseCommitSha: 'a'.repeat(40), step: { prompt: 'Build scene', acceptanceCriteria: ['Map exists'],
+      previousValidationError: 'network one' }, operations: [{ id: 'implementation' }], requiredCapabilities: ['unreal'],
+      contentPolicy: { requiresUnrealAssets: true }, artifactExpectations: [], realEngineEvidence: { classification: 'automated-scenario' } };
+    expect(authoringSemanticHash(packet)).toBe(authoringSemanticHash({ ...packet,
+      jobId: 'new-job', step: { ...packet.step, previousValidationError: 'network two' } }));
+    expect(authoringSemanticHash(packet)).not.toBe(authoringSemanticHash({ ...packet,
+      step: { ...packet.step, acceptanceCriteria: ['Different map exists'] } }));
   });
   it('does not restore an empty checkpoint as a Git patch', () => {
     const empty = { patch: '', resultBundle: { lfsObjects: [], outputs: [] } };
@@ -87,6 +97,8 @@ describe('native implementation provider lifecycle', () => {
     expect(mapBranch).toContain('del loaded');
     expect(mapBranch).not.toContain('unreal.load_asset');
     expect(script.slice(script.indexOf('    else:'))).toContain("unreal.load_asset(package['objectPath'])");
+    expect(script).toContain('def inspect_package(package):');
+    expect(script).toContain('observations = list(dict.fromkeys(observations))[:50]');
   });
   it('requires editor-authored packages to be loaded after saving and retains source and exact tool provenance', () => {
     const base = { leaseId: 'lease', sessionId: 'session', shell: 'system' as const, exitCode: 0, stdout: '', stderr: '',
@@ -110,7 +122,18 @@ describe('native implementation provider lifecycle', () => {
     expect(() => validateRequiredUnrealAssets(['Game/Content/Maps/World.umap'], [{ ...authored, authoring: { ...authored.authoring, tool: 'project-script' as const } }, verified]))
       .toThrow('not created or imported through a successful editor');
     expect(requiresProductionContent(['Create usable production scene content'])).toBe(true);
+    expect(requiresProductionContent(['Vytvoř hotovou produkční 3D scénu'])).toBe(true);
     expect(requiresProductionContent(['The package can load'])).toBe(false);
+  });
+  it('bounds final process evidence while preserving authoring and failure diagnostics', () => {
+    const base = { leaseId: 'lease', sessionId: 'session', shell: 'system' as const, exitCode: 0,
+      stdout: 'x'.repeat(100), stderr: '', startedAt: '2026-01-01T00:00:00Z', completedAt: '2026-01-01T00:00:01Z' };
+    const processes = Array.from({ length: 8 }, (_, index) => ({ ...base, checkId: `check-${index}`, command: `command-${index}` }));
+    processes[2] = { ...processes[2]!, exitCode: 1 };
+    const compact = compactProcessResults(processes, 3, 10);
+    expect(compact).toHaveLength(3);
+    expect(compact.some(({ checkId }) => checkId === 'check-2')).toBe(true);
+    expect(compact.every(({ stdout }) => Buffer.byteLength(stdout) <= 10)).toBe(true);
   });
   it('maps packages relative to the selected project Content directory', () => {
     expect(unrealObjectPath('Content/Props/Tree.uasset', 'Game.uproject')).toBe('/Game/Props/Tree');

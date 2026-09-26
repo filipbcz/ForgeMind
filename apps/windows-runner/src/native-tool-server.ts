@@ -91,7 +91,7 @@ async function runProcess(checkId: string, command: string, shell: 'powershell' 
   const controller = new AbortController();
   activeProcesses.add(controller);
   const executed = await runBoundedProcess(sandboxed.executable, sandboxed.args, { cwd: root, timeoutMs: processTimeoutMs,
-    env: sandboxEnvironment(temporaryDirectory, dirname(evidencePath)), signal: controller.signal, maxOutputBytes: 16_000_000 })
+    env: sandboxEnvironment(temporaryDirectory, dirname(evidencePath)), signal: controller.signal, maxOutputBytes: 512_000 })
     .finally(() => activeProcesses.delete(controller));
   const result = { checkId, command, shell, exitCode: executed.exitCode, stdout: redactSecrets(executed.stdout), stderr: redactSecrets(executed.stderr), startedAt, completedAt: new Date().toISOString(),
     ...(executed.terminationReason ? { terminationReason: executed.terminationReason } : {}), ...(authoring ? { authoring } : {}) };

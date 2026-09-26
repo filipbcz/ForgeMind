@@ -523,6 +523,8 @@ export function queueRetryFingerprint(message: string | null | undefined): strin
     .replace(/\b[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\b/g, '<uuid>')
     .replace(/\b\d+(?:\.\d+)?\s*(?:ms|milliseconds?|s|seconds?)\b/g, '<duration>')
     .replace(/\s+/g, ' ').trim();
+  const windowsTree = normalized?.match(/windows authoring .*? at result tree ([a-f0-9]{40}|[a-f0-9]{64})/)?.[1];
+  if (windowsTree) return `windows-authoring-no-tree-progress:${windowsTree}`;
   return normalized || undefined;
 }
 

@@ -5,8 +5,9 @@ export const WINDOWS_WORKER_SCHEMA_VERSION = 1 as const;
 export type WindowsWorkerSchemaVersion = typeof WINDOWS_WORKER_SCHEMA_VERSION;
 export const WINDOWS_EXECUTION_PACKET_VERSION = 2 as const;
 export type WindowsExecutionPacketVersion = typeof WINDOWS_EXECUTION_PACKET_VERSION;
-export const WINDOWS_AUTHORING_PROTOCOL_VERSION = 1 as const;
-export type WindowsAuthoringProtocolVersion = typeof WINDOWS_AUTHORING_PROTOCOL_VERSION;
+export const WINDOWS_AUTHORING_PROTOCOL_VERSION = 2 as const;
+export const WINDOWS_AUTHORING_PROTOCOL_VERSIONS = [1, WINDOWS_AUTHORING_PROTOCOL_VERSION] as const;
+export type WindowsAuthoringProtocolVersion = (typeof WINDOWS_AUTHORING_PROTOCOL_VERSIONS)[number];
 
 export interface WorkerCapability {
   key: string;
@@ -302,11 +303,13 @@ export interface WindowsAuthoringResult {
   resultTreeSha: string;
   /** Authenticates the complete binary Git patch transported to the server. */
   resultBundle: { version: 1; format: 'git-binary-patch'; sha256: string; sizeBytes: number;
-    lfsObjects: Array<{ oid: string; sha256: string; sizeBytes: number; contentBase64: string }>;
-    outputs: Array<{ path: string; sha256: string; sizeBytes: number; contentBase64: string }> };
+    lfsObjects: Array<{ oid: string; sha256: string; sizeBytes: number; contentBase64?: string; blobSha256?: string }>;
+    outputs: Array<{ path: string; sha256: string; sizeBytes: number; contentBase64?: string; blobSha256?: string }> };
   tree: AuthoringTreeEntry[];
   /** Binary-safe Git patch used by the server-side review and delivery lifecycle. */
   patch: string;
+  /** Content-addressed transport reference used when the patch is removed from the result manifest. */
+  patchBlobSha256?: string;
   completedOperationIds: string[];
   checkpointIds: string[];
   artifacts: ExecutionArtifactResult[];
@@ -354,6 +357,8 @@ export const WINDOWS_EVIDENCE_MAX_LOG_BYTES = 256_000;
 export const WINDOWS_EVIDENCE_MAX_ARTIFACT_BYTES = 10_000_000;
 export const WINDOWS_EVIDENCE_MAX_ARTIFACTS = 16;
 export const WINDOWS_AUTHORING_RESULT_MAX_BYTES = 64 * 1024 * 1024;
+export const WINDOWS_AUTHORING_MANIFEST_MAX_BYTES = 8 * 1024 * 1024;
+export const WINDOWS_AUTHORING_BLOB_CHUNK_BYTES = 4 * 1024 * 1024;
 export const WINDOWS_DEVICE_OFFLINE_AFTER_MS = 30_000;
 
 export interface WindowsEvidenceUpload {
@@ -628,7 +633,8 @@ const isAuthoringIntent = (value: unknown): value is AuthoringOperationIntent =>
 };
 
 export function isWindowsAuthoringPacket(value: unknown): value is WindowsAuthoringPacket {
-  if (!isRecord(value) || value.kind !== 'authoring' || value.protocolVersion !== WINDOWS_AUTHORING_PROTOCOL_VERSION) return false;
+  if (!isRecord(value) || value.kind !== 'authoring'
+    || !WINDOWS_AUTHORING_PROTOCOL_VERSIONS.includes(value.protocolVersion as WindowsAuthoringProtocolVersion)) return false;
   const identities = ['projectId', 'taskId', 'runId', 'jobId', 'leaseId', 'repository', 'sourceUrl', 'workspaceRoot', 'artifactRoot', 'nonce'];
   if (!identities.every((key) => isNonEmpty(value[key])) || !isGitCommitSha(value.baseCommitSha) || !isSha256(value.inputHash)
     || !areCapabilityKeys(value.requiredCapabilities) || !Array.isArray(value.managedRoots) || value.managedRoots.length === 0
@@ -669,7 +675,8 @@ export function isWindowsAuthoringPacket(value: unknown): value is WindowsAuthor
 }
 
 export function isWindowsAuthoringResult(value: unknown): value is WindowsAuthoringResult {
-  if (!isRecord(value) || value.kind !== 'authoring-result' || value.protocolVersion !== WINDOWS_AUTHORING_PROTOCOL_VERSION) return false;
+  if (!isRecord(value) || value.kind !== 'authoring-result'
+    || !WINDOWS_AUTHORING_PROTOCOL_VERSIONS.includes(value.protocolVersion as WindowsAuthoringProtocolVersion)) return false;
   const identities = ['projectId', 'taskId', 'runId', 'jobId', 'leaseId', 'deviceId', 'sessionId', 'nonce', 'summary'];
   return identities.every((key) => isNonEmpty(value[key])) && isSha256(value.inputHash) && isGitCommitSha(value.baseCommitSha)
     && isGitCommitSha(value.resultTreeSha) && ['succeeded', 'failed', 'cancelled'].includes(value.status as string)
@@ -701,11 +708,15 @@ export function isWindowsAuthoringResult(value: unknown): value is WindowsAuthor
     && isSha256(value.resultBundle.sha256) && Number.isSafeInteger(value.resultBundle.sizeBytes) && (value.resultBundle.sizeBytes as number) >= 0
     && Array.isArray(value.resultBundle.lfsObjects) && value.resultBundle.lfsObjects.every((object) => isRecord(object)
       && isSha256(object.oid) && object.oid === object.sha256 && Number.isSafeInteger(object.sizeBytes) && (object.sizeBytes as number) >= 0
-      && typeof object.contentBase64 === 'string' && /^[A-Za-z0-9+/]*={0,2}$/.test(object.contentBase64))
+      && ((typeof object.contentBase64 === 'string' && /^[A-Za-z0-9+/]*={0,2}$/.test(object.contentBase64)
+        && object.blobSha256 === undefined) || (object.contentBase64 === undefined && object.blobSha256 === object.sha256)))
     && Array.isArray(value.resultBundle.outputs) && value.resultBundle.outputs.every((output) => isRecord(output)
       && isSafeRelativePath(output.path) && isSha256(output.sha256) && Number.isSafeInteger(output.sizeBytes) && (output.sizeBytes as number) >= 0
-      && typeof output.contentBase64 === 'string' && /^[A-Za-z0-9+/]*={0,2}$/.test(output.contentBase64))
-    && typeof value.patch === 'string' && new TextEncoder().encode(value.patch).byteLength === value.resultBundle.sizeBytes
+      && ((typeof output.contentBase64 === 'string' && /^[A-Za-z0-9+/]*={0,2}$/.test(output.contentBase64)
+        && output.blobSha256 === undefined) || (output.contentBase64 === undefined && output.blobSha256 === output.sha256)))
+    && typeof value.patch === 'string'
+    && ((value.patchBlobSha256 === undefined && new TextEncoder().encode(value.patch).byteLength === value.resultBundle.sizeBytes)
+      || (value.patch === '' && value.patchBlobSha256 === value.resultBundle.sha256))
     && Array.isArray(value.tree) && value.tree.every((entry) => isRecord(entry) && isSafeRelativePath(entry.path)
       && ['file', 'symlink'].includes(entry.kind as string) && isSha256(entry.sha256) && Number.isSafeInteger(entry.sizeBytes)
       && (entry.sizeBytes as number) >= 0 && typeof entry.binary === 'boolean' && /^[0-7]{6}$/.test(String(entry.mode)))

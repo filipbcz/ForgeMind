@@ -1,6 +1,6 @@
 import { createHash, randomUUID } from 'node:crypto';
 import type { Prisma, PrismaClient } from '@prisma/client';
-import { canonicalizeWorkerProbeEvidence, deferLegacyWindowsExecutionPacket, isWindowsAuthoringPacket, isWindowsAuthoringResult, isWindowsExecutionPacket, isWindowsExecutionResult, reconcileRealEngineEvidence, WINDOWS_DEVICE_OFFLINE_AFTER_MS } from '@forgemind/core';
+import { canonicalizeWorkerProbeEvidence, deferLegacyWindowsExecutionPacket, isWindowsAuthoringPacket, isWindowsAuthoringResult, isWindowsExecutionPacket, isWindowsExecutionResult, reconcileRealEngineEvidence, WINDOWS_AUTHORING_BLOB_CHUNK_BYTES, WINDOWS_DEVICE_OFFLINE_AFTER_MS } from '@forgemind/core';
 import type {
   WorkerCapability, WorkerProbeEvidence, WindowsExecutionJob, WindowsExecutionLease,
   WindowsAuthoringPacket, WindowsCapabilityWaitReason, WindowsExecutionPacket, WindowsExecutionResult, WindowsJobPacket, WindowsJobResult, WindowsPendingPhase
@@ -34,10 +34,22 @@ function hasReadableRealArtifacts(packet: any, real: import('@forgemind/core').R
       && content.length === candidate.sizeBytes && createHash('sha256').update(content).digest('hex') === candidate.sha256.toLowerCase();
   }));
   const result = packet.authoringResult;
-  return real.artifacts.every((artifact: { relativePath: string; sha256: string; sizeBytes: number }) =>
-    result?.resultBundle?.outputs?.some((entry: any) => entry.path === artifact.relativePath && entry.sha256 === artifact.sha256
-      && entry.sizeBytes === artifact.sizeBytes && Buffer.from(entry.contentBase64, 'base64').length === entry.sizeBytes
-      && createHash('sha256').update(Buffer.from(entry.contentBase64, 'base64')).digest('hex') === entry.sha256));
+  const readablePayload = (entry: any, sha256: string, sizeBytes: number) => {
+    if (entry?.sha256 !== sha256 || entry?.sizeBytes !== sizeBytes) return false;
+    if (entry.blobSha256 === sha256 && entry.contentBase64 === undefined) return true;
+    if (typeof entry.contentBase64 !== 'string') return false;
+    const content = Buffer.from(entry.contentBase64, 'base64');
+    return content.length === sizeBytes && createHash('sha256').update(content).digest('hex') === sha256.toLowerCase();
+  };
+  return real.artifacts.every((artifact: { relativePath: string; sha256: string; sizeBytes: number }) => {
+    if (result?.resultBundle?.outputs?.some((entry: any) => entry.path === artifact.relativePath
+      && readablePayload(entry, artifact.sha256, artifact.sizeBytes))) return true;
+    const tree = result?.tree?.find((entry: any) => entry.path === artifact.relativePath && entry.sha256 === artifact.sha256
+      && entry.sizeBytes === artifact.sizeBytes);
+    if (!tree) return false;
+    if (!tree.binary) return typeof result.patch === 'string';
+    return result.resultBundle?.lfsObjects?.some((entry: any) => readablePayload(entry, artifact.sha256, artifact.sizeBytes));
+  });
 }
 
 export interface RegisterWorkerDeviceInput {
@@ -78,6 +90,16 @@ export interface WindowsRunnerControlState {
 export interface SubmittedWindowsResult {
   accepted: boolean;
   packet?: WindowsJobPacket;
+}
+
+export interface WindowsAuthoringBlobChunkInput {
+  jobId: string; leaseId: string; sessionId: string; nonce: string; inputHash: string;
+  sha256: string; sizeBytes: number; chunkIndex: number; totalChunks: number; contentBase64: string;
+}
+
+export interface WindowsAuthoringBlobCompleteInput {
+  jobId: string; leaseId: string; sessionId: string; nonce: string; inputHash: string;
+  sha256: string; sizeBytes: number; totalChunks: number;
 }
 
 const asJson = (value: unknown): Prisma.InputJsonValue => value as Prisma.InputJsonValue;
@@ -152,6 +174,7 @@ export class WindowsWorkerRepository {
   async startManualSession(deviceId: string, expiresAt: Date, authorizedProjectIds: string[]): Promise<string> {
     if (expiresAt.getTime() <= Date.now()) throw new Error('Worker session expiry must be in the future.');
     if (authorizedProjectIds.length === 0 || new Set(authorizedProjectIds).size !== authorizedProjectIds.length) throw new Error('At least one unique authorized project is required.');
+    await this.recoverExpired();
     return this.prisma.$transaction(async (tx) => {
       const devices = await tx.$queryRaw<Array<{ id: string }>>`SELECT "id" FROM "worker_devices" WHERE "id" = ${deviceId} AND "status" <> 'revoked' FOR UPDATE`;
       if (devices.length !== 1) throw new Error('Worker device is missing or revoked.');
@@ -206,11 +229,70 @@ export class WindowsWorkerRepository {
       const job = await this.prisma.windowsExecutionJob.findUnique({ where: { id: jobId }, select: { status: true, packet: true } });
       if (!job) throw new Error('Windows authoring job was not found.');
       const packet = job.packet as unknown as WindowsAuthoringPacket & { authoringResult?: import('@forgemind/core').WindowsAuthoringResult };
-      if (packet.authoringResult && isWindowsAuthoringResult(packet.authoringResult)) return packet.authoringResult;
+      if (packet.authoringResult && isWindowsAuthoringResult(packet.authoringResult)) {
+        const blobs = await this.prisma.windowsAuthoringBlob.findMany({ where: { jobId } });
+        const byHash = new Map(blobs.map((blob) => [blob.sha256.toLowerCase(), Buffer.from(blob.content).toString('base64')]));
+        const hydrate = <T extends { sha256: string; contentBase64?: string; blobSha256?: string }>(entry: T): T & { contentBase64: string } => {
+          if (entry.contentBase64 !== undefined) return entry as T & { contentBase64: string };
+          const contentBase64 = byHash.get(entry.blobSha256?.toLowerCase() ?? '');
+          if (!contentBase64) throw new Error(`Windows authoring blob ${entry.blobSha256 ?? entry.sha256} is unavailable.`);
+          const { blobSha256: _blobSha256, ...rest } = entry;
+          return { ...rest, contentBase64 } as T & { contentBase64: string };
+        };
+        const patchBase64 = packet.authoringResult.patchBlobSha256
+          ? byHash.get(packet.authoringResult.patchBlobSha256.toLowerCase()) : undefined;
+        if (packet.authoringResult.patchBlobSha256 && !patchBase64) {
+          throw new Error(`Windows authoring patch blob ${packet.authoringResult.patchBlobSha256} is unavailable.`);
+        }
+        return { ...packet.authoringResult, resultBundle: { ...packet.authoringResult.resultBundle,
+          lfsObjects: packet.authoringResult.resultBundle.lfsObjects.map(hydrate),
+          outputs: packet.authoringResult.resultBundle.outputs.map(hydrate) },
+          patch: patchBase64
+            ? Buffer.from(patchBase64, 'base64').toString('utf8')
+            : packet.authoringResult.patch,
+          patchBlobSha256: undefined };
+      }
       if (['cancelled', 'expired'].includes(job.status)) throw new Error(`Windows authoring job ${job.status}.`);
       await new Promise<void>((resolve) => { const timer = setTimeout(resolve, 1_000); signal?.addEventListener('abort', () => { clearTimeout(timer); resolve(); }, { once: true }); });
     }
     throw new Error('Windows authoring was cancelled.');
+  }
+
+  async uploadAuthoringBlobChunk(deviceId: string, input: WindowsAuthoringBlobChunkInput): Promise<'accepted' | 'duplicate' | 'conflict'> {
+    const content = Buffer.from(input.contentBase64, 'base64');
+    if (content.length > WINDOWS_AUTHORING_BLOB_CHUNK_BYTES || content.length !== input.sizeBytes
+      || input.chunkIndex < 0 || input.chunkIndex >= input.totalChunks || input.totalChunks <= 0) return 'conflict';
+    return this.prisma.$transaction(async (tx) => {
+      const lease = await tx.windowsExecutionLease.findFirst({ where: { id: input.leaseId, jobId: input.jobId, sessionId: input.sessionId,
+        deviceId, nonce: input.nonce, status: 'active' }, include: { job: true } });
+      if (!lease || !isWindowsAuthoringPacket(lease.job.packet) || lease.job.packet.inputHash !== input.inputHash) return 'conflict';
+      const completed = await tx.windowsAuthoringBlob.findUnique({ where: { jobId_sha256: { jobId: input.jobId, sha256: input.sha256 } } });
+      if (completed) return 'duplicate';
+      const existing = await tx.windowsAuthoringBlobChunk.findUnique({ where: { jobId_sha256_chunkIndex: {
+        jobId: input.jobId, sha256: input.sha256, chunkIndex: input.chunkIndex } } });
+      if (existing) return existing.totalChunks === input.totalChunks && existing.sizeBytes === input.sizeBytes
+        && Buffer.from(existing.content).equals(content) ? 'duplicate' : 'conflict';
+      await tx.windowsAuthoringBlobChunk.create({ data: { jobId: input.jobId, sha256: input.sha256, chunkIndex: input.chunkIndex,
+        totalChunks: input.totalChunks, sizeBytes: input.sizeBytes, content } });
+      return 'accepted';
+    });
+  }
+
+  async completeAuthoringBlob(deviceId: string, input: WindowsAuthoringBlobCompleteInput): Promise<'accepted' | 'duplicate' | 'conflict'> {
+    return this.prisma.$transaction(async (tx) => {
+      const lease = await tx.windowsExecutionLease.findFirst({ where: { id: input.leaseId, jobId: input.jobId, sessionId: input.sessionId,
+        deviceId, nonce: input.nonce, status: 'active' }, include: { job: true } });
+      if (!lease || !isWindowsAuthoringPacket(lease.job.packet) || lease.job.packet.inputHash !== input.inputHash) return 'conflict';
+      const existing = await tx.windowsAuthoringBlob.findUnique({ where: { jobId_sha256: { jobId: input.jobId, sha256: input.sha256 } } });
+      if (existing) return Number(existing.sizeBytes) === input.sizeBytes ? 'duplicate' : 'conflict';
+      const chunks = await tx.windowsAuthoringBlobChunk.findMany({ where: { jobId: input.jobId, sha256: input.sha256 }, orderBy: { chunkIndex: 'asc' } });
+      if (chunks.length !== input.totalChunks || chunks.some((chunk, index) => chunk.chunkIndex !== index || chunk.totalChunks !== input.totalChunks)) return 'conflict';
+      const content = Buffer.concat(chunks.map((chunk) => Buffer.from(chunk.content)));
+      if (content.length !== input.sizeBytes || createHash('sha256').update(content).digest('hex') !== input.sha256.toLowerCase()) return 'conflict';
+      await tx.windowsAuthoringBlob.create({ data: { jobId: input.jobId, sha256: input.sha256, sizeBytes: BigInt(input.sizeBytes), content } });
+      await tx.windowsAuthoringBlobChunk.deleteMany({ where: { jobId: input.jobId, sha256: input.sha256 } });
+      return 'accepted';
+    });
   }
 
   async uploadEvidence(deviceId: string, upload: WindowsEvidenceUpload): Promise<'accepted' | 'duplicate' | 'conflict'> {
@@ -361,6 +443,7 @@ export class WindowsWorkerRepository {
         JOIN "worker_devices" d ON d."id" = ${session.device_id}
         WHERE candidate."status" = 'queued'
           AND candidate."project_id" IN (SELECT jsonb_array_elements_text(${JSON.stringify(session.authorized_project_ids)}::jsonb))
+          AND (candidate."packet"->>'kind' IS DISTINCT FROM 'authoring' OR d."runner_version" LIKE '%+authoring-v2%')
           AND (candidate."packet"->>'kind' IS DISTINCT FROM 'authoring'
             OR candidate."packet"->>'protocolVersion' = ANY(${authoringProtocolVersions.map(String)}::text[]))
           AND NOT EXISTS (
@@ -458,16 +541,33 @@ export class WindowsWorkerRepository {
 
   async submitResult(deviceId: string, result: WindowsJobResult): Promise<SubmittedWindowsResult> {
     if ((!isWindowsExecutionResult(result) && !isWindowsAuthoringResult(result)) || result.deviceId !== deviceId) return { accepted: false };
-    if (isWindowsAuthoringResult(result)
+    if (isWindowsAuthoringResult(result) && result.patchBlobSha256 === undefined
       && createHash('sha256').update(Buffer.from(result.patch, 'utf8')).digest('hex') !== result.resultBundle.sha256.toLowerCase()) return { accepted: false };
-    if (isWindowsAuthoringResult(result) && result.resultBundle.lfsObjects.some((object) => {
+    if (isWindowsAuthoringResult(result) && result.resultBundle.lfsObjects.some((object) => object.contentBase64 !== undefined && (() => {
       const content = Buffer.from(object.contentBase64, 'base64');
       return content.length !== object.sizeBytes || createHash('sha256').update(content).digest('hex') !== object.oid.toLowerCase();
-    })) return { accepted: false };
-    if (isWindowsAuthoringResult(result) && result.resultBundle.outputs.some((output) => {
+    })())) return { accepted: false };
+    if (isWindowsAuthoringResult(result) && result.resultBundle.outputs.some((output) => output.contentBase64 !== undefined && (() => {
       const content = Buffer.from(output.contentBase64, 'base64');
       return content.length !== output.sizeBytes || createHash('sha256').update(content).digest('hex') !== output.sha256.toLowerCase();
-    })) return { accepted: false };
+    })())) return { accepted: false };
+    if (isWindowsAuthoringResult(result)) {
+      const references = [...result.resultBundle.lfsObjects, ...result.resultBundle.outputs].filter((entry) => entry.blobSha256 !== undefined);
+      if (result.patchBlobSha256) references.push({ sha256: result.patchBlobSha256, blobSha256: result.patchBlobSha256,
+        sizeBytes: result.resultBundle.sizeBytes } as any);
+      if (references.length > 0) {
+        const blobs = await this.prisma.windowsAuthoringBlob.findMany({ where: { jobId: result.jobId,
+          sha256: { in: [...new Set(references.map((entry) => entry.blobSha256!))] } } });
+        if (references.some((entry) => !blobs.some((blob) => blob.sha256 === entry.blobSha256 && Number(blob.sizeBytes) === entry.sizeBytes))) return { accepted: false };
+      }
+      const jobStore = (this.prisma as any).windowsExecutionJob;
+      const completed = typeof jobStore?.findUnique === 'function'
+        ? await jobStore.findUnique({ where: { id: result.jobId }, select: { status: true, packet: true } }) : undefined;
+      const existing = (completed?.packet as any)?.authoringResult;
+      if (completed?.status === 'succeeded' && existing && JSON.stringify(existing) === JSON.stringify(result)) {
+        return { accepted: true, packet: completed.packet as unknown as WindowsJobPacket };
+      }
+    }
     return this.prisma.$transaction(async (tx) => {
       const leases = await tx.$queryRaw<Array<{ jobId: string; projectId: string; taskId: string; runId: string; packet: Prisma.JsonValue; sessionStatus: string }>>`
         SELECT l."job_id" AS "jobId", j."project_id" AS "projectId", j."task_id" AS "taskId", j."run_id" AS "runId", j."packet", s."status"::text AS "sessionStatus"

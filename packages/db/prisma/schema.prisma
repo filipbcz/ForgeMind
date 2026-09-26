@@ -560,10 +560,41 @@ model WindowsExecutionJob {
   task    Task                    @relation(fields: [taskId], references: [id], onDelete: Cascade)
   run     TaskRun                 @relation(fields: [runId], references: [id], onDelete: Cascade)
   leases  WindowsExecutionLease[]
+  authoringBlobs WindowsAuthoringBlob[]
+  authoringBlobChunks WindowsAuthoringBlobChunk[]
 
   @@index([status, createdAt])
   @@index([taskId, status])
   @@map("windows_execution_jobs")
+}
+
+model WindowsAuthoringBlob {
+  jobId      String   @map("job_id")
+  sha256     String
+  sizeBytes  BigInt   @map("size_bytes")
+  content    Bytes
+  createdAt  DateTime @default(now()) @map("created_at")
+
+  job WindowsExecutionJob @relation(fields: [jobId], references: [id], onDelete: Cascade)
+
+  @@id([jobId, sha256])
+  @@map("windows_authoring_blobs")
+}
+
+model WindowsAuthoringBlobChunk {
+  jobId       String   @map("job_id")
+  sha256      String
+  chunkIndex  Int      @map("chunk_index")
+  totalChunks Int      @map("total_chunks")
+  sizeBytes   Int      @map("size_bytes")
+  content     Bytes
+  createdAt   DateTime @default(now()) @map("created_at")
+
+  job WindowsExecutionJob @relation(fields: [jobId], references: [id], onDelete: Cascade)
+
+  @@id([jobId, sha256, chunkIndex])
+  @@index([jobId, sha256])
+  @@map("windows_authoring_blob_chunks")
 }
 
 model WindowsExecutionLease {

@@ -4,9 +4,9 @@ import { homedir, release as osRelease } from 'node:os';
 import { join } from 'node:path';
 import { stdin, stdout } from 'node:process';
 import { pathToFileURL } from 'node:url';
-import { classifyWindowsExecutionPacket, isWindowsAuthoringPacket, isWindowsExecutionPacket, type WorkerProbeEvidence } from '@forgemind/core';
+import { classifyWindowsExecutionPacket, isWindowsAuthoringPacket, isWindowsExecutionPacket, WINDOWS_AUTHORING_BLOB_CHUNK_BYTES, type WindowsAuthoringResult, type WorkerProbeEvidence } from '@forgemind/core';
 import { createProvider, listCodexModels, resolveCodexBinary, type AIProvider, type ProviderModelOption } from '@forgemind/providers';
-import { WindowsCredentialStore } from './credential-store.js';
+import { WindowsCredentialStore, type RunnerCredential } from './credential-store.js';
 import { cleanupWindowsValidationWorkspace, executeWindowsValidation } from './executor.js';
 import { executeWindowsAuthoring, LifecycleNativeImplementationProvider } from './authoring-executor.js';
 import { runCapabilityProbes, windowsRunnerCapabilityProbes } from './probes.js';
@@ -15,7 +15,8 @@ import { cleanupAcceptedWindowsAuthoring, prepareWindowsManagedRoots } from './m
 import { WindowsRunnerTransport } from './transport.js';
 import { runBoundedProcess } from './process-runner.js';
 
-const RUNNER_VERSION = '0.1.0';
+const RUNNER_BUILD_ID = process.env.FORGEMIND_RUNNER_BUILD_ID?.trim().replace(/[^a-z0-9_.-]/gi, '-');
+const RUNNER_VERSION = `0.2.0+authoring-v2${RUNNER_BUILD_ID ? `.${RUNNER_BUILD_ID}` : ''}`;
 
 export type CliCommand =
   | { command: 'enroll'; apiUrl: string }
@@ -158,8 +159,8 @@ export async function main(args = process.argv.slice(2)): Promise<void> {
             managedRoots, observedCapabilities: probes.capabilities,
             onProgress: (progress) => transport.publishAuthoringProgress(auth, progress).then(() => undefined),
             provider: new LifecycleNativeImplementationProvider(codexRuntime.provider) });
-          const submitted = await transport.submitResult(auth, executed.result);
-          if (!submitted.accepted) throw new Error(`ForgeMind rejected Windows authoring result ${executed.result.jobId}. The durable local checkpoint was preserved.`);
+          const submitted = await submitAuthoringResultDurably(transport, auth, executed.result, context.signal,
+            (message) => stdout.write(`${message}\n`));
           if (submitted.accepted && executed.result.status === 'succeeded') await cleanupAcceptedWindowsAuthoring(managedRoots, executed.result.taskId);
           stdout.write(`${executed.result.summary}\n`);
           return;
@@ -199,6 +200,62 @@ export async function main(args = process.argv.slice(2)): Promise<void> {
       } });
     return;
   }
+}
+
+export async function submitAuthoringResultDurably(transport: WindowsRunnerTransport, auth: RunnerCredential, result: WindowsAuthoringResult,
+  signal?: AbortSignal, report: (message: string) => void = () => undefined): Promise<{ accepted: boolean }> {
+  let delayMs = 1_000;
+  while (!signal?.aborted) {
+    try {
+      const manifest = await uploadAuthoringResultBlobs(transport, auth, result);
+      const submitted = await transport.submitResult(auth, manifest);
+      if (!submitted.accepted) throw new Error(`ForgeMind rejected Windows authoring result ${result.jobId}.`);
+      return submitted;
+    } catch (error) {
+      report(`Authoring result delivery will retry: ${error instanceof Error ? error.message : String(error)}`);
+      await abortableDelay(delayMs, signal);
+      delayMs = Math.min(delayMs * 2, 30_000);
+    }
+  }
+  throw new Error(`Authoring result ${result.jobId} was not delivered before its lease was cancelled. The durable local checkpoint was preserved.`);
+}
+
+export async function uploadAuthoringResultBlobs(transport: WindowsRunnerTransport, auth: RunnerCredential,
+  result: WindowsAuthoringResult): Promise<WindowsAuthoringResult> {
+  const unique = new Map<string, { sha256: string; sizeBytes: number; contentBase64: string }>();
+  const patchBytes = Buffer.from(result.patch, 'utf8');
+  unique.set(result.resultBundle.sha256, { sha256: result.resultBundle.sha256, sizeBytes: patchBytes.length,
+    contentBase64: patchBytes.toString('base64') });
+  for (const entry of [...result.resultBundle.lfsObjects, ...result.resultBundle.outputs]) {
+    if (entry.contentBase64 === undefined) continue;
+    unique.set(entry.sha256, { sha256: entry.sha256, sizeBytes: entry.sizeBytes, contentBase64: entry.contentBase64 });
+  }
+  for (const blob of unique.values()) {
+    const content = Buffer.from(blob.contentBase64, 'base64');
+    if (content.length !== blob.sizeBytes) throw new Error(`Authoring blob ${blob.sha256} has an invalid decoded size.`);
+    const totalChunks = Math.max(1, Math.ceil(content.length / WINDOWS_AUTHORING_BLOB_CHUNK_BYTES));
+    for (let chunkIndex = 0; chunkIndex < totalChunks; chunkIndex += 1) {
+      const chunk = content.subarray(chunkIndex * WINDOWS_AUTHORING_BLOB_CHUNK_BYTES, (chunkIndex + 1) * WINDOWS_AUTHORING_BLOB_CHUNK_BYTES);
+      await transport.uploadAuthoringBlobChunk(auth, { jobId: result.jobId, leaseId: result.leaseId, sessionId: result.sessionId,
+        nonce: result.nonce, inputHash: result.inputHash, sha256: blob.sha256, sizeBytes: chunk.length,
+        chunkIndex, totalChunks, contentBase64: chunk.toString('base64') });
+    }
+    await transport.completeAuthoringBlob(auth, { jobId: result.jobId, leaseId: result.leaseId, sessionId: result.sessionId,
+      nonce: result.nonce, inputHash: result.inputHash, sha256: blob.sha256, sizeBytes: content.length, totalChunks });
+  }
+  const reference = <T extends { sha256: string; contentBase64?: string; blobSha256?: string }>(entry: T): T => {
+    if (entry.contentBase64 === undefined) return entry;
+    const { contentBase64: _contentBase64, ...rest } = entry;
+    return { ...rest, blobSha256: entry.sha256 } as T;
+  };
+  return { ...result, patch: '', patchBlobSha256: result.resultBundle.sha256, resultBundle: { ...result.resultBundle,
+    lfsObjects: result.resultBundle.lfsObjects.map(reference), outputs: result.resultBundle.outputs.map(reference) } };
+}
+
+function abortableDelay(ms: number, signal?: AbortSignal): Promise<void> {
+  if (signal?.aborted) return Promise.resolve();
+  return new Promise((resolveDelay) => { const timer = setTimeout(resolveDelay, ms);
+    signal?.addEventListener('abort', () => { clearTimeout(timer); resolveDelay(); }, { once: true }); });
 }
 
 function assertRequiredProbesPassed(failures: readonly WorkerProbeEvidence[]): void {

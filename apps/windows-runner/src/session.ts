@@ -5,6 +5,7 @@ import type { WindowsRunnerTransport, LeaseClaim } from './transport.js';
 export interface SessionOptions {
   projectIds: string[];
   pollIntervalMs?: number;
+  controlFailureGraceMs?: number;
   signal?: AbortSignal;
   onClaim: (claim: LeaseClaim, context: { sessionId: string; signal: AbortSignal }) => Promise<void>;
 }
@@ -15,16 +16,35 @@ export async function runManualSession(transport: WindowsRunnerTransport, auth: 
   const local = new AbortController();
   const stop = () => local.abort(); options.signal?.addEventListener('abort', stop, { once: true });
   const interval = options.pollIntervalMs ?? 5_000;
+  const controlFailureGraceMs = options.controlFailureGraceMs ?? 45_000;
   let draining = false; let leaseId: string | undefined;
+  let idleControlFailureAt: number | undefined; let claimFailureAt: number | undefined;
   try {
     while (!local.signal.aborted) {
-      const state = await transport.control(auth, sessionId, leaseId);
-      if (['cancelled', 'expired', 'closed'].includes(state.sessionStatus) || state.leaseStatus === 'cancelled' || state.jobStatus === 'cancelled') break;
-      draining ||= state.sessionStatus === 'draining';
-      await transport.heartbeat(auth, sessionId, leaseId);
+      try {
+        const state = await transport.control(auth, sessionId, leaseId);
+        if (['cancelled', 'expired', 'closed'].includes(state.sessionStatus) || state.leaseStatus === 'cancelled' || state.jobStatus === 'cancelled') break;
+        draining ||= state.sessionStatus === 'draining';
+        await transport.heartbeat(auth, sessionId, leaseId);
+        idleControlFailureAt = undefined;
+      } catch {
+        idleControlFailureAt ??= Date.now();
+        if (Date.now() - idleControlFailureAt >= controlFailureGraceMs) break;
+        await delay(Math.max(1, interval), local.signal);
+        continue;
+      }
       if (draining && !leaseId) break;
       if (!leaseId && !draining) {
-        const claim = await transport.claim(auth, sessionId, randomUUID());
+        let claim: LeaseClaim;
+        try {
+          claim = await transport.claim(auth, sessionId, randomUUID());
+          claimFailureAt = undefined;
+        } catch {
+          claimFailureAt ??= Date.now();
+          if (Date.now() - claimFailureAt >= controlFailureGraceMs) break;
+          await delay(Math.max(1, interval), local.signal);
+          continue;
+        }
         leaseId = claim.lease?.id;
         if (claim.lease) {
           const activeLeaseId = claim.lease.id;
@@ -32,6 +52,7 @@ export async function runManualSession(transport: WindowsRunnerTransport, auth: 
           const abortExecution = () => execution.abort();
           local.signal.addEventListener('abort', abortExecution, { once: true });
           let executionFinished = false;
+          let controlFailureAt: number | undefined;
           const monitor = (async () => {
             while (!executionFinished && !execution.signal.aborted) {
               await delay(Math.min(interval, 15_000), execution.signal);
@@ -45,10 +66,14 @@ export async function runManualSession(transport: WindowsRunnerTransport, auth: 
                   break;
                 }
                 await transport.heartbeat(auth, sessionId, activeLeaseId);
+                controlFailureAt = undefined;
               } catch {
-                execution.abort();
-                local.abort();
-                break;
+                controlFailureAt ??= Date.now();
+                if (Date.now() - controlFailureAt >= controlFailureGraceMs) {
+                  execution.abort();
+                  local.abort();
+                  break;
+                }
               }
             }
           })();

@@ -45,4 +45,33 @@ describe('Windows runner manual session', () => {
     expect(observedAbort).toHaveBeenCalledOnce();
     expect(request.mock.calls.filter(([input]) => String(input).includes('/control')).length).toBeGreaterThanOrEqual(2);
   });
+
+  it('keeps a running claim alive across transient control-plane failures', async () => {
+    let controls = 0; let claimed = false;
+    const request = vi.fn(async (input: URL | RequestInfo) => {
+      const url = String(input);
+      if (url.endsWith('/session')) return new Response(JSON.stringify({ sessionId: '11111111-1111-4111-8111-111111111111' }), { status: 200 });
+      if (url.endsWith('/lease')) {
+        if (claimed) return new Response(JSON.stringify({ job: null, lease: null }), { status: 200 });
+        claimed = true; return new Response(JSON.stringify({ job: { id: 'job' }, lease: { id: '22222222-2222-4222-8222-222222222222' } }), { status: 200 });
+      }
+      if (url.includes('/control')) {
+        controls += 1;
+        if (controls === 2) throw new Error('temporary deploy interruption');
+        return new Response(JSON.stringify({ deviceStatus: 'running', sessionStatus: controls >= 4 ? 'cancelled' : 'active' }), { status: 200 });
+      }
+      return new Response(JSON.stringify({ accepted: true }), { status: 200 });
+    });
+    const transport = new WindowsRunnerTransport('https://forgemind.test', request as typeof fetch);
+    let abortedBeforeCompletion = false;
+    await runManualSession(transport, { deviceId: 'device', credential: 'secret' }, {
+      projectIds: ['11111111-1111-4111-8111-111111111111'], pollIntervalMs: 1, controlFailureGraceMs: 100,
+      onClaim: async (_claim, { signal }) => {
+        await new Promise((resolve) => setTimeout(resolve, 5));
+        abortedBeforeCompletion = signal.aborted;
+      }
+    });
+    expect(abortedBeforeCompletion).toBe(false);
+    expect(controls).toBeGreaterThanOrEqual(3);
+  });
 });

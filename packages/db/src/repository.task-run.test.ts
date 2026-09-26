@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from 'vitest';
-import { ForgeMindRepository, mergeProjectArchitecture, sameProjectContractSemantics } from './repository.js';
+import { ForgeMindRepository, mergeProjectArchitecture, queueRetryFingerprint, sameProjectContractSemantics } from './repository.js';
 
 function createMockPrisma() {
   let queuePaused = false;
@@ -1172,6 +1172,14 @@ describe('ForgeMindRepository task runs', () => {
       data: expect.objectContaining({ eventType: 'task_queue_retry_suppressed', taskId: 'task_1',
         payload: expect.objectContaining({ reason: 'same_failure_repeated_without_progress' }) })
     });
+  });
+
+  it('suppresses changing Windows diagnostics when the authored result tree did not progress', () => {
+    const tree = 'a'.repeat(40);
+    expect(queueRetryFingerprint(`Windows authoring failed at result tree ${tree}: Unreal crashed`))
+      .toBe(queueRetryFingerprint(`Windows authoring failed at result tree ${tree}: package could not load`));
+    expect(queueRetryFingerprint(`Windows authoring failed at result tree ${tree}: Unreal crashed`))
+      .not.toBe(queueRetryFingerprint(`Windows authoring failed at result tree ${'b'.repeat(40)}: Unreal crashed`));
   });
 
   it('does not revive a completed or cancelled task while finalizing a retryable failure', async () => {
