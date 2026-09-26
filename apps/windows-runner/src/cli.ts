@@ -14,6 +14,7 @@ import { runManualSession } from './session.js';
 import { cleanupAcceptedWindowsAuthoring, prepareWindowsManagedRoots } from './managed-roots.js';
 import { WindowsRunnerTransport } from './transport.js';
 import { runBoundedProcess } from './process-runner.js';
+import { CoalescedAuthoringProgressPublisher } from './progress-publisher.js';
 
 const RUNNER_BUILD_ID = process.env.FORGEMIND_RUNNER_BUILD_ID?.trim().replace(/[^a-z0-9_.-]/gi, '-');
 const RUNNER_VERSION = `0.2.0+authoring-v2${RUNNER_BUILD_ID ? `.${RUNNER_BUILD_ID}` : ''}`;
@@ -154,11 +155,15 @@ export async function main(args = process.argv.slice(2)): Promise<void> {
         if (!claim.job || !claim.lease) return;
         if (isWindowsAuthoringPacket(claim.job.packet)) {
           stdout.write(`Running native Windows implementation ${claim.job.packet.jobId}.\n`);
+          const progressPublisher = new CoalescedAuthoringProgressPublisher(
+            (progress) => transport.publishAuthoringProgress(auth, progress)
+          );
           const executed = await executeWindowsAuthoring(claim.job.packet, { deviceId: auth.deviceId, sessionId: context.sessionId,
             workspaceRoot: managedRoots.work, artifactRoot: managedRoots.diagnostics, signal: context.signal,
             managedRoots, observedCapabilities: probes.capabilities,
-            onProgress: (progress) => transport.publishAuthoringProgress(auth, progress).then(() => undefined),
+            onProgress: (progress) => progressPublisher.publish(progress),
             provider: new LifecycleNativeImplementationProvider(codexRuntime.provider) });
+          await progressPublisher.flush();
           const submitted = await submitAuthoringResultDurably(transport, auth, executed.result, context.signal,
             (message) => stdout.write(`${message}\n`));
           if (submitted.accepted && executed.result.status === 'succeeded') await cleanupAcceptedWindowsAuthoring(managedRoots, executed.result.taskId);

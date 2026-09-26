@@ -215,4 +215,26 @@ describeDatabase('WindowsWorkerRepository PostgreSQL concurrency', () => {
     expect({ lease: lease.status, job: job.status, session: session.status, device: device.status })
       .toEqual({ lease: 'expired', job: 'queued', session: 'draining', device: 'draining' });
   });
+
+  it('treats a late stop from an expired session as recoverable interruption', async () => {
+    const expiredAt = new Date(Date.now() - 60_000);
+    await first.windowsExecutionLease.deleteMany({ where: { jobId: ids.job } });
+    await first.workerSession.update({ where: { id: ids.session }, data: { status: 'active', expiresAt: expiredAt, endedAt: null } });
+    await first.windowsExecutionJob.update({ where: { id: ids.job }, data: { status: 'running' } });
+    await first.workerDevice.update({ where: { id: ids.device }, data: { status: 'running' } });
+    const lease = await first.windowsExecutionLease.create({ data: {
+      jobId: ids.job, deviceId: ids.device, sessionId: ids.session, status: 'active', expiresAt: expiredAt,
+      nonce: 'expired_session_late_stop'
+    } });
+
+    await new WindowsWorkerRepository(first).cancelSession(ids.session);
+
+    const [session, recoveredLease, job] = await Promise.all([
+      first.workerSession.findUniqueOrThrow({ where: { id: ids.session } }),
+      first.windowsExecutionLease.findUniqueOrThrow({ where: { id: lease.id } }),
+      first.windowsExecutionJob.findUniqueOrThrow({ where: { id: ids.job } })
+    ]);
+    expect({ session: session.status, lease: recoveredLease.status, job: job.status })
+      .toEqual({ session: 'expired', lease: 'expired', job: 'queued' });
+  });
 });

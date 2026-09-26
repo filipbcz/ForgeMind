@@ -20,6 +20,27 @@ describe('Windows runner manual session', () => {
     expect(calls).toEqual(expect.arrayContaining(['/api/windows-runner/device/session', '/api/windows-runner/device/heartbeat', '/api/windows-runner/device/lease', '/api/windows-runner/device/control']));
     expect(onClaim).toHaveBeenCalledOnce();
     expect(request.mock.calls.every((call) => String(call[0]).startsWith('https://'))).toBe(true);
+    expect(calls).not.toContain('/api/windows-runner/device/session/stop');
+    const lifecycleBodies = request.mock.calls
+      .filter(([input]) => /\/(?:heartbeat|lease)$/.test(new URL(String(input)).pathname))
+      .map(([, init]) => JSON.parse(String(init?.body)) as { leaseSeconds?: number });
+    expect(lifecycleBodies.every(({ leaseSeconds }) => leaseSeconds === 300)).toBe(true);
+  });
+
+  it('sends an explicit operator abort to the cancellation endpoint', async () => {
+    const controller = new AbortController(); const calls: string[] = [];
+    const request = vi.fn(async (input: URL | RequestInfo) => {
+      const path = new URL(String(input)).pathname; calls.push(path);
+      const body = path.endsWith('/session') ? { sessionId: '11111111-1111-4111-8111-111111111111' }
+        : path.includes('/control') ? { deviceStatus: 'idle', sessionStatus: 'active' }
+        : path.endsWith('/lease') ? { job: null, lease: null } : { accepted: true };
+      if (path.endsWith('/heartbeat')) controller.abort();
+      return new Response(JSON.stringify(body), { status: 200 });
+    });
+    await runManualSession(new WindowsRunnerTransport('https://forgemind.test', request as typeof fetch),
+      { deviceId: 'device', credential: 'secret' }, { projectIds: ['11111111-1111-4111-8111-111111111111'],
+        pollIntervalMs: 1, signal: controller.signal, onClaim: async () => undefined });
+    expect(calls).toContain('/api/windows-runner/device/session/stop');
   });
 
   it('rejects non-TLS control plane URLs', () => {

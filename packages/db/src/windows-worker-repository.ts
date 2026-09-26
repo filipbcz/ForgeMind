@@ -188,8 +188,7 @@ export class WindowsWorkerRepository {
       const now = new Date();
       await tx.workerSession.updateMany({ where: { id: { in: previousSessionIds } }, data: { status: 'expired', endedAt: now } });
       await tx.windowsExecutionLease.updateMany({ where: { sessionId: { in: previousSessionIds }, status: 'active' }, data: { status: 'expired', releasedAt: now } });
-      await tx.windowsExecutionJob.updateMany({ where: { id: { in: previousJobIds }, status: 'leased' }, data: { status: 'queued' } });
-      await tx.windowsExecutionJob.updateMany({ where: { id: { in: previousJobIds }, status: 'running' }, data: { status: 'expired' } });
+      await tx.windowsExecutionJob.updateMany({ where: { id: { in: previousJobIds }, status: { in: ['leased', 'running'] } }, data: { status: 'queued' } });
       const session = await tx.workerSession.create({ data: { deviceId, expiresAt, authorizedProjectIds: asJson(authorizedProjectIds) } });
       await tx.workerDevice.update({ where: { id: deviceId }, data: { status: 'idle', lastHeartbeatAt: new Date() } });
       return session.id;
@@ -252,7 +251,13 @@ export class WindowsWorkerRepository {
             : packet.authoringResult.patch,
           patchBlobSha256: undefined };
       }
-      if (['cancelled', 'expired'].includes(job.status)) throw new Error(`Windows authoring job ${job.status}.`);
+      if (job.status === 'cancelled') throw new Error('Windows authoring job cancelled.');
+      if (job.status === 'expired') {
+        // Expiry is an infrastructure interruption, not a task result. Legacy
+        // expired rows are made claimable again while their owning task waits.
+        await this.prisma.windowsExecutionJob.updateMany({ where: { id: jobId, status: 'expired' }, data: { status: 'queued' } });
+        continue;
+      }
       await new Promise<void>((resolve) => { const timer = setTimeout(resolve, 1_000); signal?.addEventListener('abort', () => { clearTimeout(timer); resolve(); }, { once: true }); });
     }
     throw new Error('Windows authoring was cancelled.');
@@ -644,7 +649,7 @@ export class WindowsWorkerRepository {
     await this.finishSession(sessionId, 'closed', 'released');
   }
 
-  /** Expires stale sessions/leases and deterministically makes unstarted jobs claimable again. */
+  /** Expires stale sessions/leases and makes interrupted work claimable again. */
   async recoverExpired(now = new Date()): Promise<{ sessions: number; leases: number; jobs: number }> {
     return this.prisma.$transaction(async (tx) => {
       const expiringSessions = await tx.$queryRaw<Array<{ id: string; deviceId: string }>>`
@@ -666,8 +671,7 @@ export class WindowsWorkerRepository {
       const jobIds = [...new Set(stale.map(({ jobId }) => jobId))];
       const deviceIds = [...new Set([...expiringSessions.map(({ deviceId }) => deviceId), ...stale.map(({ deviceId }) => deviceId)])];
       await tx.windowsExecutionLease.updateMany({ where: { id: { in: leaseIds }, status: 'active' }, data: { status: 'expired', releasedAt: now } });
-      const requeuedJobs = await tx.windowsExecutionJob.updateMany({ where: { id: { in: jobIds }, status: 'leased' }, data: { status: 'queued' } });
-      const expiredJobs = await tx.windowsExecutionJob.updateMany({ where: { id: { in: jobIds }, status: 'running' }, data: { status: 'expired' } });
+      const requeuedJobs = await tx.windowsExecutionJob.updateMany({ where: { id: { in: jobIds }, status: { in: ['leased', 'running'] } }, data: { status: 'queued' } });
       await tx.workerDevice.updateMany({
         where: { id: { in: deviceIds }, status: { in: ['reserved', 'running'] }, sessions: { some: { status: 'active', expiresAt: { gt: now } } } },
         data: { status: 'idle' }
@@ -676,21 +680,29 @@ export class WindowsWorkerRepository {
         where: { id: { in: deviceIds }, status: { in: ['idle', 'reserved', 'running', 'draining'] }, sessions: { none: { status: { in: ['active', 'draining'] }, expiresAt: { gt: now } } } },
         data: { status: 'offline' }
       });
-      return { sessions: sessions.count, leases: stale.length, jobs: requeuedJobs.count + expiredJobs.count };
+      return { sessions: sessions.count, leases: stale.length, jobs: requeuedJobs.count };
     });
   }
 
   private async finishSession(sessionId: string, sessionStatus: 'cancelled' | 'closed', leaseStatus: 'cancelled' | 'released'): Promise<void> {
     await this.prisma.$transaction(async (tx) => {
       const now = new Date();
-      const session = await tx.workerSession.update({ where: { id: sessionId }, data: { status: sessionStatus, endedAt: now } });
+      const sessions = await tx.$queryRaw<Array<{ deviceId: string; status: string; expiresAt: Date }>>`
+        SELECT "device_id" AS "deviceId", "status"::text, "expires_at" AS "expiresAt"
+        FROM "worker_sessions" WHERE "id" = ${sessionId} FOR UPDATE
+      `;
+      const session = sessions[0];
+      if (!session) throw new Error('Worker session was not found.');
+      const interruption = session.expiresAt.getTime() <= now.getTime() || ['expired', 'closed'].includes(session.status);
+      const finalSessionStatus = interruption ? 'expired' : sessionStatus;
+      const finalLeaseStatus = interruption ? 'expired' : leaseStatus;
+      await tx.workerSession.update({ where: { id: sessionId }, data: { status: finalSessionStatus, endedAt: now } });
       const leases = await tx.windowsExecutionLease.findMany({ where: { sessionId, status: 'active' }, select: { jobId: true } });
-      await tx.windowsExecutionLease.updateMany({ where: { sessionId, status: 'active' }, data: { status: leaseStatus, releasedAt: now } });
-      if (sessionStatus === 'cancelled') {
+      await tx.windowsExecutionLease.updateMany({ where: { sessionId, status: 'active' }, data: { status: finalLeaseStatus, releasedAt: now } });
+      if (sessionStatus === 'cancelled' && !interruption) {
         await tx.windowsExecutionJob.updateMany({ where: { id: { in: leases.map(({ jobId }) => jobId) }, status: { in: ['leased', 'running'] } }, data: { status: 'cancelled' } });
       } else {
-        await tx.windowsExecutionJob.updateMany({ where: { id: { in: leases.map(({ jobId }) => jobId) }, status: 'leased' }, data: { status: 'queued' } });
-        await tx.windowsExecutionJob.updateMany({ where: { id: { in: leases.map(({ jobId }) => jobId) }, status: 'running' }, data: { status: 'expired' } });
+        await tx.windowsExecutionJob.updateMany({ where: { id: { in: leases.map(({ jobId }) => jobId) }, status: { in: ['leased', 'running'] } }, data: { status: 'queued' } });
       }
       await tx.workerDevice.update({ where: { id: session.deviceId }, data: { status: 'offline' } });
     });

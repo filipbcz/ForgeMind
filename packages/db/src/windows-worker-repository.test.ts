@@ -183,8 +183,8 @@ describe('WindowsWorkerRepository capability leases', () => {
     });
   });
 
-  it('requeues leased work but expires running work during crash recovery', async () => {
-    const updateJobs = vi.fn().mockResolvedValueOnce({ count: 1 }).mockResolvedValueOnce({ count: 1 });
+  it('requeues both leased and running work during crash recovery', async () => {
+    const updateJobs = vi.fn().mockResolvedValueOnce({ count: 2 });
     const tx: any = {
       workerSession: { updateMany: vi.fn(async () => ({ count: 1 })) },
       $queryRaw: vi.fn().mockResolvedValueOnce([{ id: 'session_1', deviceId: 'device_1' }])
@@ -194,8 +194,7 @@ describe('WindowsWorkerRepository capability leases', () => {
     };
     const prisma: any = { $transaction: vi.fn(async (work: (client: unknown) => unknown) => work(tx)) };
     const result = await new WindowsWorkerRepository(prisma).recoverExpired(new Date('2026-08-31T12:00:00Z'));
-    expect(updateJobs).toHaveBeenNthCalledWith(1, expect.objectContaining({ where: expect.objectContaining({ status: 'leased' }), data: { status: 'queued' } }));
-    expect(updateJobs).toHaveBeenNthCalledWith(2, expect.objectContaining({ where: expect.objectContaining({ status: 'running' }), data: { status: 'expired' } }));
+    expect(updateJobs).toHaveBeenCalledWith(expect.objectContaining({ where: expect.objectContaining({ status: { in: ['leased', 'running'] } }), data: { status: 'queued' } }));
     expect(result.jobs).toBe(2);
   });
 
@@ -403,7 +402,8 @@ describe('WindowsWorkerRepository capability leases', () => {
   it('cancels an active lease and reconciles its job when cancellation is requested', async () => {
     const updateJobs = vi.fn(async () => ({ count: 1 }));
     const tx: any = {
-      workerSession: { update: vi.fn(async () => ({ deviceId: 'device_1' })) },
+      $queryRaw: vi.fn(async () => [{ deviceId: 'device_1', status: 'active', expiresAt: new Date('2099-01-01T00:00:00Z') }]),
+      workerSession: { update: vi.fn(async () => undefined) },
       windowsExecutionLease: {
         findMany: vi.fn(async () => [{ jobId: 'job_1' }]), updateMany: vi.fn(async () => ({ count: 1 }))
       },
@@ -424,7 +424,8 @@ describe('WindowsWorkerRepository capability leases', () => {
   it('reconciles leased and running jobs when closeSession terminates a session', async () => {
     const updateJobs = vi.fn(async () => ({ count: 1 }));
     const tx: any = {
-      workerSession: { update: vi.fn(async () => ({ deviceId: 'device_1' })) },
+      $queryRaw: vi.fn(async () => [{ deviceId: 'device_1', status: 'active', expiresAt: new Date('2099-01-01T00:00:00Z') }]),
+      workerSession: { update: vi.fn(async () => undefined) },
       windowsExecutionLease: {
         findMany: vi.fn(async () => [{ jobId: 'job_1' }]), updateMany: vi.fn(async () => ({ count: 1 }))
       },
@@ -434,7 +435,26 @@ describe('WindowsWorkerRepository capability leases', () => {
     await new WindowsWorkerRepository(prisma).closeSession('session_1');
     expect(tx.workerSession.update).toHaveBeenCalledWith(expect.objectContaining({ data: expect.objectContaining({ status: 'closed' }) }));
     expect(tx.windowsExecutionLease.updateMany).toHaveBeenCalledWith(expect.objectContaining({ data: expect.objectContaining({ status: 'released' }) }));
-    expect(updateJobs).toHaveBeenNthCalledWith(1, expect.objectContaining({ where: expect.objectContaining({ status: 'leased' }), data: { status: 'queued' } }));
-    expect(updateJobs).toHaveBeenNthCalledWith(2, expect.objectContaining({ where: expect.objectContaining({ status: 'running' }), data: { status: 'expired' } }));
+    expect(updateJobs).toHaveBeenCalledOnce();
+    expect(updateJobs).toHaveBeenCalledWith(expect.objectContaining({
+      where: expect.objectContaining({ status: { in: ['leased', 'running'] } }), data: { status: 'queued' }
+    }));
+  });
+
+  it('requeues work when a stale runner sends stop after its session expiry', async () => {
+    const updateJobs = vi.fn(async () => ({ count: 1 }));
+    const tx: any = {
+      $queryRaw: vi.fn(async () => [{ deviceId: 'device_1', status: 'active', expiresAt: new Date('2020-01-01T00:00:00Z') }]),
+      workerSession: { update: vi.fn(async () => undefined) },
+      windowsExecutionLease: {
+        findMany: vi.fn(async () => [{ jobId: 'job_1' }]), updateMany: vi.fn(async () => ({ count: 1 }))
+      },
+      windowsExecutionJob: { updateMany: updateJobs }, workerDevice: { update: vi.fn(async () => undefined) }
+    };
+    const prisma: any = { $transaction: vi.fn(async (work: (client: unknown) => unknown) => work(tx)) };
+    await new WindowsWorkerRepository(prisma).cancelSession('session_1');
+    expect(tx.workerSession.update).toHaveBeenCalledWith(expect.objectContaining({ data: expect.objectContaining({ status: 'expired' }) }));
+    expect(tx.windowsExecutionLease.updateMany).toHaveBeenCalledWith(expect.objectContaining({ data: expect.objectContaining({ status: 'expired' }) }));
+    expect(updateJobs).toHaveBeenCalledWith(expect.objectContaining({ data: { status: 'queued' } }));
   });
 });

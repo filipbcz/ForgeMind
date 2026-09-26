@@ -3,6 +3,7 @@ import type { RunnerCredential } from './credential-store.js';
 
 export interface RunnerControlState { deviceStatus: string; sessionStatus: string; leaseStatus?: string; jobStatus?: string }
 export interface LeaseClaim { job: WindowsExecutionJob | null; lease: WindowsExecutionLease | null }
+export const WINDOWS_RUNNER_LEASE_SECONDS = 300;
 
 /** Outbound-only HTTPS control-plane client. It never opens a listening socket. */
 export class WindowsRunnerTransport {
@@ -16,8 +17,8 @@ export class WindowsRunnerTransport {
     return this.call('/api/windows-runner/device', auth, input, 'PUT');
   }
   startSession(auth: RunnerCredential, projectIds: string[]) { return this.call<{ sessionId: string }>('/api/windows-runner/device/session', auth, { projectIds }); }
-  claim(auth: RunnerCredential, sessionId: string, requestId: string) { return this.call<LeaseClaim>('/api/windows-runner/device/lease', auth, { sessionId, requestId, authoringProtocolVersions: [...WINDOWS_AUTHORING_PROTOCOL_VERSIONS] }); }
-  heartbeat(auth: RunnerCredential, sessionId: string, leaseId?: string) { return this.call('/api/windows-runner/device/heartbeat', auth, { sessionId, leaseId }); }
+  claim(auth: RunnerCredential, sessionId: string, requestId: string) { return this.call<LeaseClaim>('/api/windows-runner/device/lease', auth, { sessionId, requestId, leaseSeconds: WINDOWS_RUNNER_LEASE_SECONDS, authoringProtocolVersions: [...WINDOWS_AUTHORING_PROTOCOL_VERSIONS] }); }
+  heartbeat(auth: RunnerCredential, sessionId: string, leaseId?: string) { return this.call('/api/windows-runner/device/heartbeat', auth, { sessionId, leaseId, leaseSeconds: WINDOWS_RUNNER_LEASE_SECONDS }); }
   control(auth: RunnerCredential, sessionId: string, leaseId?: string) {
     const query = new URLSearchParams({ sessionId }); if (leaseId) query.set('leaseId', leaseId);
     return this.call<RunnerControlState>(`/api/windows-runner/device/control?${query}`, auth, undefined, 'GET');

@@ -14,7 +14,8 @@ export interface SessionOptions {
 export async function runManualSession(transport: WindowsRunnerTransport, auth: RunnerCredential, options: SessionOptions): Promise<string> {
   const { sessionId } = await transport.startSession(auth, options.projectIds);
   const local = new AbortController();
-  const stop = () => local.abort(); options.signal?.addEventListener('abort', stop, { once: true });
+  let explicitlyStopped = options.signal?.aborted === true;
+  const stop = () => { explicitlyStopped = true; local.abort(); }; options.signal?.addEventListener('abort', stop, { once: true });
   const interval = options.pollIntervalMs ?? 5_000;
   const controlFailureGraceMs = options.controlFailureGraceMs ?? 45_000;
   let draining = false; let leaseId: string | undefined;
@@ -92,7 +93,12 @@ export async function runManualSession(transport: WindowsRunnerTransport, auth: 
     }
   } finally {
     options.signal?.removeEventListener('abort', stop);
-    try { await transport.stop(auth, sessionId); } catch { /* server may already have cancelled or expired it */ }
+    // Only an operator signal is a cancellation. An expired control session is
+    // recoverable: the server requeues the lease and the next session resumes
+    // the durable authoring checkpoint.
+    if (explicitlyStopped) {
+      try { await transport.stop(auth, sessionId); } catch { /* server may already have cancelled or expired it */ }
+    }
   }
   return sessionId;
 }
