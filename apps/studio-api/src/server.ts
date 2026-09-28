@@ -72,17 +72,33 @@ export async function createApp() {
 
   const prisma = getPrismaClient();
   const repository = createRepository(prisma);
+  const windowsWorkers = new WindowsWorkerRepository(prisma);
   const notificationService = createNotificationService(repository, createWebPushDispatcher());
   const authService = createAuthService(repository);
   const realtime = registerRealtimeGateway(app, repository, authService);
   registerRoutes(app, repository, notificationService, authService, {
     credentials: new WindowsRunnerCredentialAdapter(prisma),
-    workers: new WindowsWorkerRepository(prisma)
+    workers: windowsWorkers
   });
 
   startTaskNotificationBridge(app, repository, notificationService, realtime);
+  startWindowsLeaseRecovery(app, windowsWorkers);
 
   return app;
+}
+
+export function startWindowsLeaseRecovery(app: FastifyInstance, workers: Pick<WindowsWorkerRepository, 'recoverExpired'>): void {
+  const stopPolling = startNonOverlappingPolling(async () => {
+    try {
+      const recovered = await workers.recoverExpired();
+      if (recovered.sessions > 0 || recovered.leases > 0 || recovered.jobs > 0) {
+        app.log.info({ recovered }, 'Recovered expired Windows worker state');
+      }
+    } catch (error) {
+      app.log.warn({ error }, 'Windows worker recovery poll failed');
+    }
+  }, 10_000);
+  app.addHook('onClose', async () => stopPolling());
 }
 
 export function registerErrorRedaction(app: FastifyInstance) {

@@ -19,6 +19,22 @@ describe('bounded native process runner', () => {
     expect(Date.now() - startedAt).toBeLessThan(2_000);
   });
 
+  it('terminates a process that stops producing output', async () => {
+    const result = await runBoundedProcess(process.execPath, ['-e', "process.stdout.write('started');setInterval(() => {}, 1000)"], {
+      timeoutMs: 2_000,
+      idleTimeoutMs: 500
+    });
+    expect(result).toMatchObject({ terminationReason: 'timed-out', stdout: 'started' });
+  });
+
+  it('renews the idle timeout whenever process output arrives', async () => {
+    const result = await runBoundedProcess(process.execPath, ['-e', "let n=0;const timer=setInterval(()=>{process.stdout.write('.');if(++n===4){clearInterval(timer)}},100)"], {
+      timeoutMs: 4_000,
+      idleTimeoutMs: 1_500
+    });
+    expect(result).toMatchObject({ exitCode: 0, stdout: '....' });
+  });
+
   it('returns missing-capability evidence for a nonexistent executable', async () => {
     const result = await runBoundedProcess(`forgemind-missing-${process.pid}`, [], { timeoutMs: 1_000 });
     expect(result).toMatchObject({ terminationReason: 'missing-capability' });

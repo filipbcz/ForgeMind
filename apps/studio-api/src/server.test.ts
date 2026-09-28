@@ -6,6 +6,7 @@ import {
   registerErrorRedaction,
   registerHttpGuardrails,
   startNonOverlappingPolling,
+  startWindowsLeaseRecovery,
   validateProductionHttpSecurityConfig
 } from './server.js';
 
@@ -46,6 +47,15 @@ describe('Studio API server', () => {
         process.env[name] = value;
       }
     }
+  });
+
+  it('recovers expired Windows leases immediately and stops polling when the API closes', async () => {
+    app = Fastify({ logger: false });
+    const recoverExpired = vi.fn(async () => ({ sessions: 1, leases: 1, jobs: 1 }));
+    startWindowsLeaseRecovery(app, { recoverExpired });
+    await vi.waitFor(() => expect(recoverExpired).toHaveBeenCalledOnce());
+    await app.close();
+    app = undefined;
   });
 
   it.each(['PATCH', 'PUT', 'DELETE'])('allows %s requests from the mobile development origin', async (method) => {

@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { assertEvidenceOutsideCheckout, buildSandboxedExecutableInvocation, buildSandboxedProcessInvocation,
-  buildUnrealAuthoringArgs, containsUnrealEditorInvocation } from './native-sandbox.js';
+  buildUnrealAuthoringArgs, containsUnrealEditorInvocation, selectUnrealAutomationExecutable } from './native-sandbox.js';
 
 describe('native process sandbox', () => {
   it('wraps unrestricted PowerShell and cmd text in a checkout-scoped networkless sandbox', () => {
@@ -38,6 +38,14 @@ describe('native process sandbox', () => {
   it('recognizes direct and wrapped UnrealEditor commands that must use the structured tool', () => {
     expect(containsUnrealEditorInvocation("& 'C:\\Program Files\\Epic Games\\UE_5.8\\UnrealEditor-Cmd.exe' Game.uproject")).toBe(true);
     expect(containsUnrealEditorInvocation('npm test')).toBe(false);
+  });
+
+  it('uses the probed commandlet for Python automation and the editor for interactive authoring', () => {
+    const editor = 'C:\\UE\\UnrealEditor.exe';
+    const commandlet = 'C:\\UE\\UnrealEditor-Cmd.exe';
+    expect(selectUnrealAutomationExecutable('unreal-python', [], editor, commandlet)).toBe(commandlet);
+    expect(selectUnrealAutomationExecutable('unreal-editor', ['-ExecutePythonScript=Scripts/create.py'], editor, commandlet)).toBe(commandlet);
+    expect(selectUnrealAutomationExecutable('unreal-editor', [], editor, commandlet)).toBe(editor);
   });
 });
 

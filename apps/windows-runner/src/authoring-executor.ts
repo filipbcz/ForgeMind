@@ -146,6 +146,10 @@ export async function executeWindowsAuthoring(packet: WindowsAuthoringPacket, co
   const selectedUnrealCapability = context.observedCapabilities?.find((capability) => capability.key === 'unreal');
   const selectedUnrealExecutableValue = selectedUnrealCapability?.metadata?.executable;
   const selectedUnrealExecutable = typeof selectedUnrealExecutableValue === 'string' ? selectedUnrealExecutableValue : undefined;
+  const selectedUnrealCommandletValue = selectedUnrealCapability?.metadata?.commandletExecutable;
+  const selectedUnrealCommandletExecutable = typeof selectedUnrealCommandletValue === 'string'
+    ? selectedUnrealCommandletValue
+    : selectedUnrealExecutable;
   const selectedUnrealIdentity = selectedUnrealCapability ? createHash('sha256').update(JSON.stringify(selectedUnrealCapability)).digest('hex') : undefined;
   const checkpointPath = resolve(evidenceDirectory, 'authoring-checkpoint.json');
   const checkout = await prepareCheckout(packet, context.workspaceRoot, checkpointPath, outputDirectory, selectedUnrealIdentity, context.signal);
@@ -178,7 +182,7 @@ export async function executeWindowsAuthoring(packet: WindowsAuthoringPacket, co
   const tools = createTools(workspacePath, resolve(evidenceDirectory, `native-processes-${packet.jobId}.jsonl`), packet.resourcePolicy.timeoutSeconds * 1_000,
     context.signal, processes, packet.leaseId, context.sessionId, { ...suppliedRoots, cache: cacheDirectory, outputs: outputDirectory,
       diagnostics: evidenceDirectory }, async () => publishCheckpoint('in-progress'),
-    selectedUnrealExecutable,
+    selectedUnrealExecutable, selectedUnrealCommandletExecutable,
     async (message) => { liveActivity = `${liveActivity}\n${message}`.slice(-packet.resourcePolicy.maxLogBytes); await emitProgress('author'); });
   await publishCheckpoint('started');
   const startedAt = new Date();
@@ -205,7 +209,7 @@ export async function executeWindowsAuthoring(packet: WindowsAuthoringPacket, co
   if (status === 'succeeded') {
     try {
       productionReviewRequired = await enforceRequiredUnrealAssets(packet, workspacePath, evidenceDirectory, outputDirectory, changedPaths, processes,
-        packet.resourcePolicy.timeoutSeconds * 1_000, selectedUnrealExecutable, context.signal);
+        packet.resourcePolicy.timeoutSeconds * 1_000, selectedUnrealCommandletExecutable, context.signal);
     } catch (error) {
       status = context.signal?.aborted ? 'cancelled' : 'failed';
       summary = `Final native Unreal verification failed: ${redactSecrets(error instanceof Error ? error.message : String(error))}`;
@@ -368,7 +372,7 @@ function managedChild(root: string, name: string): string {
 }
 
 function createTools(root: string, evidencePath: string, timeoutMs: number, signal: AbortSignal | undefined, results: WindowsAuthoringProcessResult[], leaseId: string, sessionId: string,
-  managedRoots: NativeAuthoringTools['managedRoots'], checkpoint: () => Promise<void>, unrealExecutable?: string,
+  managedRoots: NativeAuthoringTools['managedRoots'], checkpoint: () => Promise<void>, unrealExecutable?: string, unrealCommandletExecutable?: string,
   progress?: (message: string) => Promise<void>): NativeAuthoringTools {
   let evidenceOffset = 0; let evidenceRemainder = '';
   const sandboxExecutable = resolveCodexBinary();
@@ -377,7 +381,7 @@ function createTools(root: string, evidencePath: string, timeoutMs: number, sign
     root,
     managedRoots,
     nativeToolChannel: { command: process.execPath, args: [fileURLToPath(new URL('./native-tool-server.js', import.meta.url)), root, evidencePath,
-      sandboxExecutable, unrealExecutable ?? '', String(timeoutMs)] },
+      sandboxExecutable, unrealExecutable ?? '', unrealCommandletExecutable ?? '', String(timeoutMs)] },
     progress,
     async drainNativeProcesses() {
       let content = '';

@@ -4,7 +4,7 @@ import { appendFile, mkdir, readFile, readdir, realpath, rm, stat, writeFile } f
 import { dirname, relative, resolve } from 'node:path';
 import { redactSecrets } from '@forgemind/core';
 import { assertEvidenceOutsideCheckout, buildSandboxedExecutableInvocation, buildSandboxedProcessInvocation,
-  buildUnrealAuthoringArgs, containsUnrealEditorInvocation } from './native-sandbox.js';
+  buildUnrealAuthoringArgs, containsUnrealEditorInvocation, selectUnrealAutomationExecutable } from './native-sandbox.js';
 import { nativeToolDefinitions, nativeToolServerInstructions } from './native-tool-contract.js';
 import { runBoundedProcess } from './process-runner.js';
 
@@ -12,10 +12,12 @@ const root = resolve(process.argv[2] ?? '');
 const evidencePath = resolve(process.argv[3] ?? '');
 const sandboxExecutable = process.argv[4] ?? '';
 const configuredUnrealExecutable = process.argv[5]?.trim() ?? '';
-const configuredProcessTimeoutMs = Number(process.argv[6] ?? 36_000_000);
+const configuredUnrealCommandletExecutable = process.argv[6]?.trim() ?? '';
+const configuredProcessTimeoutMs = Number(process.argv[7] ?? 36_000_000);
 const processTimeoutMs = Number.isFinite(configuredProcessTimeoutMs) && configuredProcessTimeoutMs >= 1_000
   ? configuredProcessTimeoutMs
   : 36_000_000;
+const unrealIdleTimeoutMs = Math.min(processTimeoutMs, 5 * 60_000);
 if (!root || !evidencePath || !sandboxExecutable) throw new Error('Native tool server requires checkout, evidence, and sandbox executable paths.');
 assertEvidenceOutsideCheckout(root, evidencePath);
 const canonicalRoot = await realpath(root);
@@ -60,11 +62,13 @@ async function callTool(name: string, args: any) {
       || !Array.isArray(args.args) || !args.args.every((value: unknown) => typeof value === 'string')
       || !Array.isArray(args.sourceRelativePaths) || !args.sourceRelativePaths.every((value: unknown) => typeof value === 'string')) throw new Error('Invalid Unreal authoring request.');
     const usesEditor = ['unreal-editor', 'unreal-python'].includes(args.tool);
-    const executablePath = usesEditor ? configuredUnrealExecutable : args.executablePath?.trim();
+    const executablePath = usesEditor
+      ? selectUnrealAutomationExecutable(args.tool, args.args, configuredUnrealExecutable, configuredUnrealCommandletExecutable)
+      : args.executablePath?.trim();
     if (!executablePath) throw new Error(usesEditor
       ? 'No runner-probed UnrealEditor executable is available. Run the Windows probe with FORGEMIND_UNREAL_EXECUTABLE configured.'
       : 'This authoring tool requires an executablePath.');
-    if (usesEditor && args.executablePath?.trim() && normalizeExecutable(args.executablePath) !== normalizeExecutable(configuredUnrealExecutable)) {
+    if (usesEditor && args.executablePath?.trim() && normalizeExecutable(args.executablePath) !== normalizeExecutable(executablePath)) {
       throw new Error('The requested UnrealEditor does not match the executable verified by the runner probe.');
     }
     if (usesEditor && !/(?:^|[\\/])UnrealEditor(?:-Cmd)?\.exe$/i.test(executablePath))
@@ -77,21 +81,21 @@ async function callTool(name: string, args: any) {
     const authoring = { tool: args.tool, phase: args.phase, projectRelativePath: args.projectRelativePath,
       executablePath, args: effectiveArgs.slice(1), sourceRelativePaths: args.sourceRelativePaths };
     const invocation = buildSandboxedExecutableInvocation({ sandboxExecutable, checkoutRoot: root, executable: executablePath, args: effectiveArgs });
-    const result = await runProcess(args.checkId, command, 'system', authoring, invocation);
+    const result = await runProcess(args.checkId, command, 'system', authoring, invocation, usesEditor ? unrealIdleTimeoutMs : undefined);
     return { content: [{ type: 'text', text: JSON.stringify(result) }], isError: result.exitCode !== 0 };
   }
   throw new Error(`Unknown native tool: ${name}`);
 }
 
 async function runProcess(checkId: string, command: string, shell: 'powershell' | 'cmd' | 'system', authoring?: Record<string, unknown>,
-  directInvocation?: { executable: string; args: string[] }) {
+  directInvocation?: { executable: string; args: string[] }, idleTimeoutMs?: number) {
   const sandboxed = directInvocation ?? buildSandboxedProcessInvocation({ sandboxExecutable, checkoutRoot: root, command, shell });
   const temporaryDirectory = resolve(root, '.forgemind-tmp'); await mkdir(temporaryDirectory, { recursive: true });
   const startedAt = new Date().toISOString();
   const controller = new AbortController();
   activeProcesses.add(controller);
   const executed = await runBoundedProcess(sandboxed.executable, sandboxed.args, { cwd: root, timeoutMs: processTimeoutMs,
-    env: sandboxEnvironment(temporaryDirectory, dirname(evidencePath)), signal: controller.signal, maxOutputBytes: 512_000 })
+    idleTimeoutMs, env: sandboxEnvironment(temporaryDirectory, dirname(evidencePath)), signal: controller.signal, maxOutputBytes: 512_000 })
     .finally(() => activeProcesses.delete(controller));
   const result = { checkId, command, shell, exitCode: executed.exitCode, stdout: redactSecrets(executed.stdout), stderr: redactSecrets(executed.stderr), startedAt, completedAt: new Date().toISOString(),
     ...(executed.terminationReason ? { terminationReason: executed.terminationReason } : {}), ...(authoring ? { authoring } : {}) };

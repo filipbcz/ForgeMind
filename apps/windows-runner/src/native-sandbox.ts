@@ -55,6 +55,17 @@ export function buildUnrealAuthoringArgs(projectPath: string, args: string[], ph
   return effective;
 }
 
+export function selectUnrealAutomationExecutable(
+  tool: 'unreal-editor' | 'unreal-python',
+  args: readonly string[],
+  editorExecutable: string,
+  commandletExecutable: string
+): string {
+  const requiresPython = tool === 'unreal-python'
+    || args.some((arg) => /^-(?:ExecutePythonScript|run=pythonscript|script=)/i.test(arg.trim()));
+  return requiresPython ? commandletExecutable || editorExecutable : editorExecutable || commandletExecutable;
+}
+
 export function containsUnrealEditorInvocation(command: string): boolean {
   return /\bunrealeditor(?:-cmd)?\.exe\b/i.test(command);
 }

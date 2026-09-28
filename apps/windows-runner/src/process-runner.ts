@@ -12,6 +12,7 @@ export interface BoundedProcessOptions {
   env?: NodeJS.ProcessEnv;
   input?: string | Buffer;
   timeoutMs: number;
+  idleTimeoutMs?: number;
   maxOutputBytes?: number;
   signal?: AbortSignal;
 }
@@ -30,6 +31,9 @@ export async function runBoundedProcess(
   options: BoundedProcessOptions
 ): Promise<BoundedProcessResult> {
   if (options.signal?.aborted) return { stdout: '', stderr: '', terminationReason: 'cancelled' };
+  if (options.idleTimeoutMs !== undefined && (!Number.isFinite(options.idleTimeoutMs) || options.idleTimeoutMs <= 0)) {
+    throw new Error('Idle timeout must be a positive number.');
+  }
   const child = spawn(executable, [...args], {
     ...(options.cwd ? { cwd: options.cwd } : {}),
     ...(options.env ? { env: options.env } : {}),
@@ -40,8 +44,9 @@ export async function runBoundedProcess(
   const maxOutputBytes = options.maxOutputBytes ?? DEFAULT_MAX_OUTPUT_BYTES;
   let stdoutBuffer: Buffer<ArrayBufferLike> = Buffer.alloc(0);
   let stderrBuffer: Buffer<ArrayBufferLike> = Buffer.alloc(0);
-  child.stdout?.on('data', (chunk: Buffer) => { stdoutBuffer = appendBounded(stdoutBuffer, chunk, maxOutputBytes); });
-  child.stderr?.on('data', (chunk: Buffer) => { stderrBuffer = appendBounded(stderrBuffer, chunk, maxOutputBytes); });
+  let resetIdleTimer = () => undefined;
+  child.stdout?.on('data', (chunk: Buffer) => { stdoutBuffer = appendBounded(stdoutBuffer, chunk, maxOutputBytes); resetIdleTimer(); });
+  child.stderr?.on('data', (chunk: Buffer) => { stderrBuffer = appendBounded(stderrBuffer, chunk, maxOutputBytes); resetIdleTimer(); });
   if (options.input === undefined) child.stdin?.end();
   else child.stdin?.end(options.input);
 
@@ -58,6 +63,14 @@ export async function runBoundedProcess(
   let resolveControl!: (reason: 'cancelled' | 'timed-out') => void;
   const control = new Promise<'cancelled' | 'timed-out'>((resolve) => { resolveControl = resolve; });
   const timer = setTimeout(() => resolveControl('timed-out'), options.timeoutMs);
+  let idleTimer: NodeJS.Timeout | undefined;
+  if (options.idleTimeoutMs !== undefined) {
+    resetIdleTimer = () => {
+      if (idleTimer) clearTimeout(idleTimer);
+      idleTimer = setTimeout(() => resolveControl('timed-out'), options.idleTimeoutMs);
+    };
+    resetIdleTimer();
+  }
   const abortListener = () => resolveControl('cancelled');
   options.signal?.addEventListener('abort', abortListener, { once: true });
 
@@ -76,6 +89,7 @@ export async function runBoundedProcess(
     };
   } finally {
     clearTimeout(timer);
+    if (idleTimer) clearTimeout(idleTimer);
     options.signal?.removeEventListener('abort', abortListener);
   }
 }
