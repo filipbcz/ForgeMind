@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 import { createInterface } from 'node:readline/promises';
+import { mkdir } from 'node:fs/promises';
 import { homedir, release as osRelease } from 'node:os';
 import { join } from 'node:path';
 import { stdin, stdout } from 'node:process';
@@ -98,6 +99,7 @@ export async function prepareLocalCodexRuntime(environment: NodeJS.ProcessEnv = 
 }> {
   const codexHome = environment.FORGEMIND_API_CODEX_HOME?.trim()
     || join(environment.LOCALAPPDATA?.trim() || homedir(), 'ForgeMind', 'codex-api');
+  await mkdir(codexHome, { recursive: true });
   const binary = resolveCodexBinary(environment);
   const [execHelp, sandboxHelp] = await Promise.all([
     runCodexCommand(binary, ['exec', '--help'], codexHome),

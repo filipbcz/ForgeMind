@@ -1,7 +1,7 @@
 import { execFile, spawn } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import { existsSync, readdirSync, statSync, watch, type FSWatcher } from 'node:fs';
-import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { homedir, tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { promisify } from 'node:util';
@@ -1088,6 +1088,10 @@ export class CodexProvider implements AIProvider {
     });
 
     try {
+      // CODEX_HOME may live on a mounted volume whose nested API-key directory
+      // is not present on a fresh deployment. Codex CLI requires the directory
+      // to exist before it starts, otherwise it aborts before reading the key.
+      await mkdir(this.commandEnv.CODEX_HOME!, { recursive: true });
       await emitProviderActivityMessage(input.onActivity, {
         kind: 'lifecycle',
         message: `Prompt sent to Codex:\n${input.prompt}`,
