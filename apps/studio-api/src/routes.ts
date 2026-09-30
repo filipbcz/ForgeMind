@@ -4,7 +4,6 @@ import { z } from 'zod';
 import { buildProjectExtensionProposalPrompt, CodexExecutionTimeoutError, createProvider, formatProjectExtensionProposal, GitHubCopilotProvider, listOpenAIModels, resolveModelRoute } from '@forgemind/providers';
 import type { AIProvider, PlanResult, ProviderSessionContext } from '@forgemind/providers';
 import type { ProviderRuntimeConfig } from '@forgemind/providers';
-import { parseAgentConfigYaml } from '@forgemind/config';
 import {
   checkGitHubConnection,
   createGitHubBranch,
@@ -2500,11 +2499,7 @@ function buildProviderRuntimeConfig(connection: AIProviderConnectionSecret, proj
   }
   let modelProfile: NonNullable<ProviderRuntimeConfig['modelProfile']> = 'balanced';
   if (project?.configYaml) {
-    try {
-      modelProfile = parseAgentConfigYaml(project.configYaml).ai.model_profile;
-    } catch {
-      // Project configuration is validated by its own endpoint; provider startup keeps the safe default.
-    }
+    modelProfile = readProjectModelProfile(project.configYaml) ?? modelProfile;
   }
   const environmentProfile = process.env.FORGEMIND_MODEL_PROFILE;
   if (environmentProfile === 'fast' || environmentProfile === 'balanced' || environmentProfile === 'deep') {
@@ -2518,6 +2513,11 @@ function buildProviderRuntimeConfig(connection: AIProviderConnectionSecret, proj
     modelProfile,
     useCli: connection.provider === 'codex' && connection.authMode === 'api_key'
   };
+}
+
+function readProjectModelProfile(configYaml: string): NonNullable<ProviderRuntimeConfig['modelProfile']> | undefined {
+  const match = configYaml.match(/^\s*model_profile\s*:\s*["']?(fast|balanced|deep)["']?\s*(?:#.*)?$/m);
+  return match?.[1] as NonNullable<ProviderRuntimeConfig['modelProfile']> | undefined;
 }
 
 function resolveGlobalModelProfile(): NonNullable<ProviderRuntimeConfig['modelProfile']> {
