@@ -68,7 +68,7 @@ describe('Windows runner manual session', () => {
   });
 
   it('keeps a running claim alive across transient control-plane failures', async () => {
-    let controls = 0; let claimed = false;
+    let controls = 0; let claimed = false; let claimCompleted = false;
     const request = vi.fn(async (input: URL | RequestInfo) => {
       const url = String(input);
       if (url.endsWith('/session')) return new Response(JSON.stringify({ sessionId: '11111111-1111-4111-8111-111111111111' }), { status: 200 });
@@ -79,7 +79,10 @@ describe('Windows runner manual session', () => {
       if (url.includes('/control')) {
         controls += 1;
         if (controls === 2) throw new Error('temporary deploy interruption');
-        return new Response(JSON.stringify({ deviceStatus: 'running', sessionStatus: controls >= 4 ? 'cancelled' : 'active' }), { status: 200 });
+        return new Response(JSON.stringify({
+          deviceStatus: 'running',
+          sessionStatus: claimCompleted && controls >= 4 ? 'cancelled' : 'active'
+        }), { status: 200 });
       }
       return new Response(JSON.stringify({ accepted: true }), { status: 200 });
     });
@@ -90,6 +93,7 @@ describe('Windows runner manual session', () => {
       onClaim: async (_claim, { signal }) => {
         await new Promise((resolve) => setTimeout(resolve, 5));
         abortedBeforeCompletion = signal.aborted;
+        claimCompleted = true;
       }
     });
     expect(abortedBeforeCompletion).toBe(false);
