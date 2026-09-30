@@ -3,12 +3,13 @@ import { mkdir, readFile, writeFile } from 'node:fs/promises';
 import { join, relative, resolve } from 'node:path';
 import { redactSecrets, type ChatMessage, type ProviderKind } from '@forgemind/core';
 import type { AIProviderConnectionSecret, ClaimedChatRun, ForgeMindRepository } from '@forgemind/db';
-import { createProvider, normalizeProviderError, type ChatResult, type ForgeMindApiAction, type ProviderSessionContext, type ProviderUsageMeasurement } from '@forgemind/providers';
+import { createProvider, normalizeProviderError, resolveModelRoute, type ChatResult, type ForgeMindApiAction, type ProviderSessionContext, type ProviderUsageMeasurement } from '@forgemind/providers';
 import { simpleGit, type SimpleGit } from 'simple-git';
 import type { JsonValue } from '@forgemind/shared';
 import { runValidationChecks } from './validation.js';
 import { assertFreeSpaceForWorker, resolveWorkerResourcePolicy } from './resource-policy.js';
 import { resolveWorkerWorkspaceRoot } from './db-worker/lifecycle.js';
+import { parseAgentConfigYaml } from '@forgemind/config';
 
 const MAX_CHAT_PROVIDER_TURNS = 6;
 const UNSAFE_INHERITED_GIT_ENVIRONMENT = new Set([
@@ -58,25 +59,40 @@ export async function runNextChatTurn(repository: ForgeMindRepository, runtime: 
       ? await repository.getAIProviderConnectionSecretById(claimed.thread.providerConnectionId)
       : await repository.getAIProviderConnectionSecret();
     providerKind = resolveChatProviderKind(connection);
+    if (connection?.authMode === 'codex_oauth') {
+      throw new Error(`Provider connection "${connection.id}" uses removed ChatGPT OAuth authentication. Replace it with an OpenAI API key connection.`);
+    }
     const providerModel = resolveChatProviderModel(providerKind, connection);
+    const projectModelProfile = claimed.project?.configYaml
+      ? parseAgentConfigYaml(claimed.project.configYaml).ai.model_profile
+      : 'balanced';
+    const environmentProfile = process.env.FORGEMIND_MODEL_PROFILE;
+    const modelProfile = environmentProfile === 'fast' || environmentProfile === 'balanced' || environmentProfile === 'deep'
+      ? environmentProfile
+      : projectModelProfile;
     const provider = (runtime.createProvider ?? createProvider)(providerKind, connection?.provider === providerKind ? {
       apiKey: connection.apiKey,
       authMode: connection.authMode,
       codexHome: connection.codexHome,
-      model: connection.model
-    } : undefined);
+      model: connection.model,
+      modelProfile,
+      useCli: providerKind === 'codex'
+    } : { modelProfile, useCli: providerKind === 'codex' });
     if (!provider.chat) throw new Error(`Provider "${providerKind}" does not support repository chat.`);
 
     const workspace = await prepareChatWorkspace(repository, claimed, runtime.workspaceRoot);
     const resourcePolicy = resolveWorkerResourcePolicy(claimed.project?.configYaml);
     await assertFreeSpaceForWorker(workspace.path, resourcePolicy);
+    const routedChatModel = providerKind === 'github_copilot'
+      ? providerModel
+      : resolveModelRoute({ profile: modelProfile, workload: 'standard', configuredModel: providerModel }).model;
     const compatibleSession = claimed.thread.providerSessionProvider === providerKind
-      && claimed.thread.providerSessionModel === providerModel
+      && claimed.thread.providerSessionModel === routedChatModel
       && claimed.thread.providerSessionConnectionId === connection?.id;
     const providerSession: ProviderSessionContext = {
       id: compatibleSession ? claimed.thread.providerSessionId : undefined,
       provider: providerKind,
-      model: providerModel,
+      model: routedChatModel,
       onUpdate: (session) => repository.updateChatProviderSession({
         threadId: claimed.thread.id,
         sessionId: session.id,
@@ -562,8 +578,8 @@ function resolveChatProviderKind(connection?: AIProviderConnectionSecret): Provi
 
 function resolveChatProviderModel(provider: ProviderKind, connection?: AIProviderConnectionSecret): string {
   if (connection?.model) return connection.model;
-  if (provider === 'openai') return process.env.OPENAI_MODEL ?? 'gpt-4o-mini';
-  if (provider === 'codex') return process.env.CODEX_MODEL ?? 'gpt-6-astra';
+  if (provider === 'openai') return process.env.OPENAI_MODEL ?? 'gpt-6.1-sol';
+  if (provider === 'codex') return process.env.CODEX_MODEL ?? process.env.FORGEMIND_MODEL_STANDARD ?? 'gpt-6.1-sol';
   return provider;
 }
 

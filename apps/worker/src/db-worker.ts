@@ -6,7 +6,7 @@ import { resolve } from 'node:path';
 import { activeProjectContractRequirements, createBlockedRunState, createFailedRunState, WINDOWS_EVIDENCE_MAX_ARTIFACT_BYTES, WINDOWS_EVIDENCE_MAX_LOG_BYTES, type RealEngineEvidenceIntent, type WindowsAuthoringPacket, type WindowsAuthoringResult } from '@forgemind/core';
 import { advanceRoadmapAfterTaskCompletion, createRepository, getPrismaClient, startNextRoadmapStep, WindowsWorkerRepository, type AIProviderConnectionSecret, type ForgeMindRepository } from '@forgemind/db';
 import { GitHubAppAdapter, createGitHubAdapterFromEnv } from '@forgemind/github';
-import { buildProjectExtensionProposalPrompt, createProvider, formatProjectExtensionProposal, normalizeProviderError, type AIProvider, type CapabilityAuditInput, type ImplementResult, type ProviderSessionContext, type ProviderUsageMeasurement, type ReleaseAuditInput, type ValidationCheck } from '@forgemind/providers';
+import { buildProjectExtensionProposalPrompt, createProvider, formatProjectExtensionProposal, normalizeProviderError, resolveModelRoute, type AIProvider, type CapabilityAuditInput, type ImplementResult, type ProviderSessionContext, type ProviderUsageMeasurement, type ReleaseAuditInput, type ValidationCheck } from '@forgemind/providers';
 import type { NormalizedProviderErrorDetails, ProviderCircuitBreakerSnapshot, ProviderKind } from '@forgemind/core';
 import { toErrorMessage } from '@forgemind/shared';
 import { formatProjectArchitectureContext, runWorkerTask } from './workflow.js';
@@ -504,9 +504,9 @@ export async function runDatabaseWorkerOnce(options: { deferInterruptSignals?: b
     claimed.taskRun.provider = selection.primary.kind;
     claimed.taskRun.model = selectedProviderModel;
   }
-  const primaryRuntimeProvider = buildRuntimeProvider(selection.primary.kind, selection.primary.connection);
+  const primaryRuntimeProvider = buildRuntimeProvider(selection.primary.kind, selection.primary.connection, resolveConfiguredModelProfile(projectConfig?.ai.model_profile));
   const fallbackRuntimeProvider = selection.fallback
-    ? buildRuntimeProvider(selection.fallback.kind, selection.fallback.connection)
+    ? buildRuntimeProvider(selection.fallback.kind, selection.fallback.connection, resolveConfiguredModelProfile(projectConfig?.ai.model_profile))
     : undefined;
   const { provider, getLastProviderKind } = createPolicyAwareProvider({
     primary: primaryRuntimeProvider,
@@ -529,11 +529,10 @@ export async function runDatabaseWorkerOnce(options: { deferInterruptSignals?: b
     fallback: selection.fallback,
     defaultConnection: defaultAIProviderConnection
   });
-  const reviewProvider = buildRuntimeProvider(reviewerSelection.kind, reviewerSelection.connection).provider;
+  const reviewProvider = buildRuntimeProvider(reviewerSelection.kind, reviewerSelection.connection, resolveConfiguredModelProfile(projectConfig?.ai.model_profile)).provider;
   const reviewProviderModel = resolveProviderModel(reviewerSelection.kind, reviewerSelection.connection);
   const primaryConnectionId = selection.primary.connection?.id;
   const hasCompatibleProviderSession = claimed.task.providerSessionProvider === selection.primary.kind
-    && claimed.task.providerSessionModel === selectedProviderModel
     && claimed.task.providerSessionConnectionId === primaryConnectionId;
   const providerSession: ProviderSessionContext = {
     id: hasCompatibleProviderSession ? claimed.task.providerSessionId : undefined,
@@ -770,7 +769,10 @@ export async function runDatabaseWorkerOnce(options: { deferInterruptSignals?: b
               totalTokens: usage.totalTokens,
               usageSource: usage.source,
               estimatedCostUsd: 0,
-              actualCostUsd: usage.actualCostUsd
+              actualCostUsd: usage.actualCostUsd,
+              requestId: usage.requestId,
+              clientRequestId: usage.clientRequestId,
+              pricingVersion: usage.pricingVersion
             });
           }
           const now = Date.now();
@@ -1008,8 +1010,8 @@ async function runNextProjectAudit(input: {
       fallbackProviderConnectionIdOverride: input.fallbackProviderConnectionIdOverride
     });
     const { provider, getLastProviderKind } = createPolicyAwareProvider({
-      primary: buildRuntimeProvider(selection.primary.kind, selection.primary.connection),
-      fallback: selection.fallback ? buildRuntimeProvider(selection.fallback.kind, selection.fallback.connection) : undefined,
+      primary: buildRuntimeProvider(selection.primary.kind, selection.primary.connection, resolveConfiguredModelProfile(projectConfig?.ai.model_profile)),
+      fallback: selection.fallback ? buildRuntimeProvider(selection.fallback.kind, selection.fallback.connection, resolveConfiguredModelProfile(projectConfig?.ai.model_profile)) : undefined,
       audit: (event) => input.repository.writeAudit({
         actorType: 'system',
         eventType: event.eventType,
@@ -1212,7 +1214,14 @@ async function runNextProjectAudit(input: {
       }
     }
 
-    const planningProviderModel = resolveProviderModel(selection.primary.kind, selection.primary.connection);
+    const configuredPlanningModel = resolveProviderModel(selection.primary.kind, selection.primary.connection);
+    const planningProviderModel = selection.primary.kind === 'github_copilot'
+      ? configuredPlanningModel
+      : resolveModelRoute({
+          profile: resolveConfiguredModelProfile(projectConfig?.ai.model_profile),
+          workload: 'standard',
+          configuredModel: configuredPlanningModel
+        }).model;
     const planningConnectionId = selection.primary.connection?.id;
     const hasCompatiblePlanningSession = claimed.project.planningSessionProvider === selection.primary.kind
       && claimed.project.planningSessionModel === planningProviderModel
@@ -1294,7 +1303,16 @@ interface RuntimeProvider {
   provider: AIProvider;
 }
 
-function buildRuntimeProvider(kind: ProviderKind, connection?: AIProviderConnectionSecret): RuntimeProvider {
+function resolveConfiguredModelProfile(projectProfile?: AgentConfig['ai']['model_profile']): AgentConfig['ai']['model_profile'] {
+  const environmentProfile = process.env.FORGEMIND_MODEL_PROFILE;
+  if (environmentProfile === 'fast' || environmentProfile === 'balanced' || environmentProfile === 'deep') return environmentProfile;
+  return projectProfile ?? 'balanced';
+}
+
+function buildRuntimeProvider(kind: ProviderKind, connection?: AIProviderConnectionSecret, modelProfile: AgentConfig['ai']['model_profile'] = 'balanced'): RuntimeProvider {
+  if (connection?.authMode === 'codex_oauth') {
+    throw new Error(`Provider connection "${connection.id}" uses removed ChatGPT OAuth authentication. Replace it with an OpenAI API key connection.`);
+  }
   const contextId = connection?.id ?? `${kind}:env`;
 
   return {
@@ -1302,12 +1320,16 @@ function buildRuntimeProvider(kind: ProviderKind, connection?: AIProviderConnect
     contextId,
     connectionId: connection?.id ?? null,
     model: resolveProviderModel(kind, connection),
-    provider: createProvider(kind, connection?.provider === kind ? {
-      apiKey: connection.apiKey,
-      authMode: connection.authMode,
-      codexHome: connection.codexHome,
-      model: connection.model
-    } : undefined)
+    provider: createProvider(kind, {
+      ...(connection?.provider === kind ? {
+        apiKey: connection.apiKey,
+        authMode: connection.authMode,
+        codexHome: connection.codexHome,
+        model: connection.model
+      } : {}),
+      modelProfile,
+      useCli: kind === 'codex'
+    })
   };
 }
 

@@ -5,7 +5,7 @@ import { join } from 'node:path';
 import { stdin, stdout } from 'node:process';
 import { pathToFileURL } from 'node:url';
 import { classifyWindowsExecutionPacket, isWindowsAuthoringPacket, isWindowsExecutionPacket, WINDOWS_AUTHORING_BLOB_CHUNK_BYTES, type WindowsAuthoringResult, type WorkerProbeEvidence } from '@forgemind/core';
-import { createProvider, listCodexModels, resolveCodexBinary, type AIProvider, type ProviderModelOption } from '@forgemind/providers';
+import { createProvider, listOpenAIModels, resolveCodexBinary, type AIProvider, type ModelProfile, type ProviderModelOption } from '@forgemind/providers';
 import { WindowsCredentialStore, type RunnerCredential } from './credential-store.js';
 import { cleanupWindowsValidationWorkspace, executeWindowsValidation } from './executor.js';
 import { executeWindowsAuthoring, LifecycleNativeImplementationProvider } from './authoring-executor.js';
@@ -54,13 +54,17 @@ export function parseCliArgs(args: string[]): CliCommand {
 
 export function selectLocalCodexModel(models: ProviderModelOption[], requestedModel?: string): string {
   const requested = requestedModel?.trim();
-  if (models.length === 0) throw new Error('Codex reported no models available to the signed-in Windows account.');
+  if (models.length === 0) throw new Error('OpenAI API reported no models available to the configured project key.');
   if (requested) {
     const selected = models.find((model) => model.id === requested);
-    if (!selected) throw new Error(`Configured CODEX_MODEL "${requested}" is not available to the signed-in Windows account. Available models: ${models.map(({ id }) => id).join(', ')}.`);
+    if (!selected) throw new Error(`Configured model "${requested}" is not available to the OpenAI project key. Available models: ${models.map(({ id }) => id).join(', ')}.`);
     return selected.id;
   }
-  return (models.find((model) => model.isDefault) ?? models[0])!.id;
+  return (models.find((model) => model.isDefault)
+    ?? models.find((model) => model.id === 'gpt-6.1-sol')
+    ?? models.find((model) => model.id === 'gpt-6-sol')
+    ?? models.find((model) => model.id === 'gpt-5.6-sol')
+    ?? models[0])!.id;
 }
 
 export function assertNativeCodexCliCompatibility(help: string): void {
@@ -92,7 +96,8 @@ async function runCodexCommand(binary: string, args: string[], codexHome: string
 export async function prepareLocalCodexRuntime(environment: NodeJS.ProcessEnv = process.env): Promise<{
   provider: AIProvider; model: string; codexHome: string; availableModels: string[];
 }> {
-  const codexHome = environment.CODEX_HOME?.trim() || join(homedir(), '.codex');
+  const codexHome = environment.FORGEMIND_API_CODEX_HOME?.trim()
+    || join(environment.LOCALAPPDATA?.trim() || homedir(), 'ForgeMind', 'codex-api');
   const binary = resolveCodexBinary(environment);
   const [execHelp, sandboxHelp] = await Promise.all([
     runCodexCommand(binary, ['exec', '--help'], codexHome),
@@ -102,12 +107,19 @@ export async function prepareLocalCodexRuntime(environment: NodeJS.ProcessEnv = 
   const sandboxProbe = await runCodexCommand(binary, ['sandbox', '--permission-profile', ':workspace', '-C', process.cwd(), '--',
     'cmd.exe', '/d', '/c', 'echo FORGEMIND_SANDBOX_OK'], codexHome);
   if (!sandboxProbe.includes('FORGEMIND_SANDBOX_OK')) throw new Error('Codex Windows sandbox preflight did not execute the expected checkout-confined command.');
-  const models = await listCodexModels({ codexHome, binary });
-  const model = selectLocalCodexModel(models, environment.CODEX_MODEL);
-  const provider = createProvider('codex', { authMode: 'codex_oauth', codexHome, model });
+  const apiKey = environment.OPENAI_API_KEY?.trim() || environment.CODEX_API_KEY?.trim();
+  if (!apiKey) throw new Error('OPENAI_API_KEY is required. ForgeMind Windows authoring no longer supports ChatGPT OAuth.');
+  const models = await listOpenAIModels(apiKey);
+  const model = selectLocalCodexModel(models, environment.FORGEMIND_MODEL_STANDARD ?? environment.CODEX_MODEL);
+  const modelProfile = readModelProfile(environment.FORGEMIND_MODEL_PROFILE);
+  const provider = createProvider('codex', { apiKey, authMode: 'api_key', useCli: true, codexHome, model, modelProfile });
   const preflight = await provider.preflight();
-  if (!preflight.ok) throw new Error(`Codex OAuth preflight failed before starting a Windows session: ${preflight.error?.auditSafeMessage ?? 'unknown error'}`);
+  if (!preflight.ok) throw new Error(`OpenAI API preflight failed before starting a Windows session: ${preflight.error?.auditSafeMessage ?? 'unknown error'}`);
   return { provider, model, codexHome, availableModels: models.map(({ id }) => id) };
+}
+
+function readModelProfile(value: string | undefined): ModelProfile {
+  return value === 'fast' || value === 'deep' ? value : 'balanced';
 }
 
 export async function main(args = process.argv.slice(2)): Promise<void> {
@@ -123,7 +135,7 @@ export async function main(args = process.argv.slice(2)): Promise<void> {
   const auth = await store.load(); if (!auth) throw new Error('Runner is not enrolled.');
   if (parsed.command === 'session-drain') { await transport.drain(auth, parsed.sessionId); return; }
   if (parsed.command === 'session-stop') { await transport.stop(auth, parsed.sessionId); return; }
-  stdout.write('[preflight] Checking Codex CLI, sandbox and OAuth...\n');
+  stdout.write('[preflight] Checking Codex CLI sandbox and OpenAI API key...\n');
   const codexRuntime = await prepareLocalCodexRuntime();
   stdout.write(`[preflight] Codex passed; selected model ${codexRuntime.model}.\n`);
   stdout.write('[preflight] Checking local Windows capabilities...\n');
@@ -135,7 +147,7 @@ export async function main(args = process.argv.slice(2)): Promise<void> {
   if (!process.env.FORGEMIND_UNREAL_EXECUTABLE) {
     stdout.write('[preflight] unreal: not configured; set FORGEMIND_UNREAL_EXECUTABLE in this process before testing Unreal authoring.\n');
   }
-  stdout.write(`Codex preflight passed. Selected model: ${codexRuntime.model}. Available models: ${codexRuntime.availableModels.join(', ')}.\n`);
+  stdout.write(`OpenAI API preflight passed. Standard model: ${codexRuntime.model}. Available models: ${codexRuntime.availableModels.join(', ')}.\n`);
   const failedRequiredProbes = requiredProbeFailures(probes.evidence);
   if (parsed.command === 'probe') {
     if (parsed.json) stdout.write(`${JSON.stringify(probes.evidence, null, 2)}\n`);

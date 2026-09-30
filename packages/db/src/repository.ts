@@ -851,8 +851,8 @@ export class ForgeMindRepository {
             model: input.model,
             apiKeyCiphertext,
             apiKeyFingerprint,
-            codexHome: input.codexHome ?? existingConnection?.codexHome,
-            accountSummary: input.accountSummary ?? existingConnection?.accountSummary,
+            codexHome: authMode === 'api_key' ? null : input.codexHome ?? existingConnection?.codexHome,
+            accountSummary: authMode === 'api_key' ? null : input.accountSummary ?? existingConnection?.accountSummary,
             lastCheckedAt: now
           }
         });
@@ -5050,6 +5050,9 @@ export class ForgeMindRepository {
         usageSource: usage.usageSource,
         estimatedCostUsd: Number(usage.estimatedCostUsd),
         actualCostUsd: usage.actualCostUsd === null ? undefined : Number(usage.actualCostUsd),
+        requestId: usage.requestId ?? undefined,
+        clientRequestId: usage.clientRequestId ?? undefined,
+        pricingVersion: usage.pricingVersion ?? undefined,
         createdAt: usage.createdAt.toISOString()
       })),
       auditEvents: auditEvents.map((event) => {
@@ -5113,6 +5116,9 @@ export class ForgeMindRepository {
     credits?: number;
     estimatedCostUsd: number;
     actualCostUsd?: number;
+    requestId?: string;
+    clientRequestId?: string;
+    pricingVersion?: string;
   }): Promise<void> {
     await this.prisma.providerUsage.create({
       data: {
@@ -5129,7 +5135,10 @@ export class ForgeMindRepository {
         usageSource: input.usageSource ?? 'estimated',
         credits: input.credits ?? 0,
         estimatedCostUsd: input.estimatedCostUsd,
-        actualCostUsd: input.actualCostUsd
+        actualCostUsd: input.actualCostUsd,
+        requestId: input.requestId,
+        clientRequestId: input.clientRequestId,
+        pricingVersion: input.pricingVersion
       }
     });
   }

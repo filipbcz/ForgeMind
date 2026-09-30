@@ -127,8 +127,8 @@ describe('capability audit providers', () => {
     await expect(provider.auditCapability(input)).resolves.toMatchObject({ verdict: 'satisfied' });
   });
 
-  it('runs Codex OAuth audits with read-only access to the complete repository', async () => {
-    const provider = new CodexProvider({ authMode: 'codex_oauth', codexHome: '/codex-home' });
+  it('runs API-key-authenticated Codex CLI audits with read-only access to the complete repository', async () => {
+    const provider = new CodexProvider({ apiKey: 'sk-test', authMode: 'api_key', useCli: true, codexHome: '/codex-home' });
     const runCodexExec = vi.spyOn(provider as unknown as {
       runCodexExec: (input: Record<string, unknown>) => Promise<string>;
     }, 'runCodexExec').mockResolvedValue(JSON.stringify(auditResponse));

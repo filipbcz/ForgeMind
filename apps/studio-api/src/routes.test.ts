@@ -2009,6 +2009,19 @@ describe('Studio API routes', () => {
       consumeRiskApproval: vi.fn(async () => true),
       resolveApproval: vi.fn(),
       getAIProviderConnection: vi.fn(async () => undefined),
+      getAIProviderConnectionSecretById: vi.fn(async (id: string) => id === 'legacy_oauth' ? ({
+        id,
+        userId: 'user_1',
+        name: 'Legacy Codex',
+        isDefault: true,
+        credentialSource: 'codex_oauth',
+        provider: 'codex',
+        authMode: 'codex_oauth',
+        model: 'gpt-5.5',
+        codexHome: '/data/codex/legacy',
+        connectedAt: new Date().toISOString(),
+        updatedAt: new Date().toISOString()
+      }) : undefined),
       upsertAIProviderConnection: vi.fn(async (input: { provider: 'openai' | 'codex'; authMode?: 'api_key' | 'codex_oauth'; model: string }) => ({
         userId: 'user_1',
         credentialSource: input.authMode === 'codex_oauth' ? 'codex_oauth' : 'api_key',
@@ -2028,6 +2041,10 @@ describe('Studio API routes', () => {
     const previousOpenAIKey = process.env.OPENAI_API_KEY;
     const previousOpenAIModel = process.env.OPENAI_MODEL;
     const app = Fastify();
+    const providerFetchSpy = vi.spyOn(globalThis, 'fetch').mockResolvedValue({
+      ok: true,
+      json: async () => ({ data: [{ id: 'gpt-6-luna' }, { id: 'gpt-4o-mini' }, { id: 'gpt-6-astra' }] })
+    } as Response);
 
     try {
       const auth = createAuthService();
@@ -2061,6 +2078,20 @@ describe('Studio API routes', () => {
       expect(statusResponse.statusCode).toBe(200);
       expect(statusResponse.json().availableProviders).toContain('openai');
       expect(statusResponse.json().availableProviders).not.toContain('github_copilot');
+      expect(statusResponse.json().modelPolicy).toEqual(expect.objectContaining({
+        profile: 'balanced',
+        economy: 'gpt-6-luna',
+        standard: 'gpt-6.1-sol',
+        critical: 'gpt-6-astra'
+      }));
+
+      const removedOAuthResponse = await app.inject({
+        method: 'GET',
+        url: '/api/providers/codex/oauth/status',
+        headers: sessionHeaders
+      });
+      expect(removedOAuthResponse.statusCode).toBe(410);
+      expect(removedOAuthResponse.json().error).toContain('API key');
 
       const frozenCopilotResponse = await app.inject({
         method: 'POST',
@@ -2103,11 +2134,34 @@ describe('Studio API routes', () => {
           actorId: 'user_1'
         })
       );
+
+      const migrateOAuthResponse = await app.inject({
+        method: 'POST',
+        url: '/api/providers/connect',
+        headers: sessionHeaders,
+        payload: {
+          connectionId: 'legacy_oauth',
+          provider: 'codex',
+          authMode: 'api_key',
+          apiKey: 'sk-project-test',
+          model: 'gpt-4o-mini'
+        }
+      });
+      expect(migrateOAuthResponse.statusCode).toBe(200);
+      expect(repository.upsertAIProviderConnection).toHaveBeenLastCalledWith(expect.objectContaining({
+        connectionId: 'legacy_oauth',
+        provider: 'codex',
+        authMode: 'api_key',
+        apiKey: 'sk-project-test',
+        codexHome: undefined,
+        accountSummary: undefined
+      }));
     } finally {
       restoreEnv('FORGEMIND_PROVIDER', previousProvider);
       restoreEnv('FORGEMIND_FALLBACK_PROVIDER', previousFallback);
       restoreEnv('OPENAI_API_KEY', previousOpenAIKey);
       restoreEnv('OPENAI_MODEL', previousOpenAIModel);
+      providerFetchSpy.mockRestore();
       await app.close();
     }
   });

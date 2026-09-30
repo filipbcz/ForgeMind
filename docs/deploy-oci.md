@@ -10,7 +10,7 @@ GitHub Actions builds immutable ForgeMind container images, publishes them to Gi
 - `postgres`: application database
 - `migrate`: one-shot Prisma migration runner used during deployment
 
-Persistent Docker volumes keep PostgreSQL data, Codex login data and worker workspaces across releases. The Compose project is explicitly named `forgemind`, so its containers, network and volumes cannot collide with `Running`.
+Persistent Docker volumes keep PostgreSQL data, API-key-authenticated Codex tool-runtime state, and worker workspaces across releases. The Compose project is explicitly named `forgemind`, so its containers, network and volumes cannot collide with `Running`.
 
 The `web` service does not publish host ports. It is reachable only as `forgemind-web` on the external `shared-edge` Docker network. The existing Caddy container from `Running` remains the only process bound to host ports `80` and `443`.
 
@@ -134,17 +134,9 @@ Each deployment prints `docker system df` before and after cleanup. The runtime 
 
 ## Provider configuration
 
-Configure GitHub and the AI provider in the deployed ForgeMind UI. Encrypted credentials use `FORGEMIND_CREDENTIAL_KEY` and are stored in PostgreSQL.
+Configure GitHub and an OpenAI project service-account API key in the deployed ForgeMind UI. Encrypted credentials use `FORGEMIND_CREDENTIAL_KEY` and are stored in PostgreSQL. ChatGPT OAuth and its callback relay are not part of the production stack.
 
-Codex browser OAuth is started by the API container and stores its state in the persistent `codex_home` volume. The production stack exposes its callback relay only on the server loopback interface (`127.0.0.1:1455`); it is not publicly reachable and port `1455` must not be opened in UFW or the OCI security list.
-
-When the browser runs on another computer, start this tunnel before opening the Codex OAuth authorization URL, then keep it running until the browser reports success:
-
-```powershell
-ssh -N -o ExitOnForwardFailure=yes -L 1455:127.0.0.1:1455 ubuntu@myrunning.duckdns.org
-```
-
-The browser's fixed `http://localhost:1455/auth/callback` redirect is forwarded through SSH to the loopback-only relay, which forwards it to the Codex CLI listener inside the API container.
+For environment-managed credentials set `OPENAI_API_KEY` (and optionally `CODEX_API_KEY` for a separate local tool-runtime key) in the protected server env file. Model policy aliases are `FORGEMIND_MODEL_ECONOMY`, `FORGEMIND_MODEL_STANDARD`, and `FORGEMIND_MODEL_CRITICAL`.
 
 ## Operations
 

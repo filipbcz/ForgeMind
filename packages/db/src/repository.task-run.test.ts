@@ -498,6 +498,9 @@ describe('ForgeMindRepository task runs', () => {
       credits: 0,
       estimatedCostUsd: 0.01,
       actualCostUsd: null,
+      requestId: 'req_openai_1',
+      clientRequestId: 'client_1',
+      pricingVersion: 'openai-2026-09-29',
       createdAt
     }]);
     prisma.auditLog.findMany.mockResolvedValueOnce([{
@@ -549,6 +552,11 @@ describe('ForgeMindRepository task runs', () => {
       task: 'task:task_1',
       run: 'task:task_1:run:run_1',
       provider: 'task:task_1:run:run_1:provider:usage_1'
+    }));
+    expect(diagnostics?.providerUsage[0]).toEqual(expect.objectContaining({
+      requestId: 'req_openai_1',
+      clientRequestId: 'client_1',
+      pricingVersion: 'openai-2026-09-29'
     }));
     const serialized = JSON.stringify(diagnostics);
     expect(serialized).toContain('[secret-redacted]');

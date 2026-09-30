@@ -673,6 +673,9 @@ export interface TaskRun {
   usageSource: string;
   estimatedCostUsd: number;
   actualCostUsd?: number;
+  requestId?: string;
+  clientRequestId?: string;
+  pricingVersion?: string;
   startedAt?: IsoDateString;
   finishedAt?: IsoDateString;
   summary?: string;

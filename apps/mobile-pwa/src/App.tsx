@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
+import { useEffect, useMemo, useState, type ReactNode } from 'react';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { ROADMAP_GENERATION_CONFIRMATION, getRunStateDetail, getRunStateLabel, type WindowsWorkerOperationsReadModel } from '@forgemind/core';
 import {
@@ -36,8 +36,6 @@ import {
   completeTask as completeTaskRequest,
   connectGitHubAdapter,
   connectProvider,
-  codexOAuthAuthorizeUrl,
-  completeCodexOAuth,
   decideProjectRoadmapExtension as decideProjectRoadmapExtensionRequest,
   createProject as createProjectRequest,
   createTask as createTaskRequest,
@@ -53,7 +51,6 @@ import {
   fetchProjectContracts,
   fetchProjectRoadmap,
   fetchProjectSpecifications,
-  fetchCodexOAuthStatus,
   fetchProviderModels,
   fetchProviderStatus,
   fetchNotificationVapidPublicKey,
@@ -92,7 +89,6 @@ import type {
   AssignProjectRepositoryRequest,
   AuthSessionResponse,
   AuditEventApi,
-  CodexOAuthStartResponse,
   CreateProjectRequest,
   CreateTaskRequest,
   DecideProjectRoadmapExtensionRequest,
@@ -781,15 +777,6 @@ function AuthenticatedApp({ auth }: { auth: AuthSessionResponse }) {
     mutationFn: (input: ProviderModelsRequest) => fetchProviderModels(input)
   });
 
-  const codexOAuthCompleteMutation = useMutation({
-    mutationFn: (input: { loginId: string; connectionId?: string; model: string; name?: string; isDefault?: boolean }) => completeCodexOAuth(input),
-    onSuccess: (result) => {
-      if (result.completed) {
-        queryClient.invalidateQueries({ queryKey: ['provider-status'] });
-      }
-    }
-  });
-
   const githubAdapterConnectMutation = useMutation({
     mutationFn: (input: GitHubAdapterConnectRequest) => connectGitHubAdapter(input),
     onSuccess: () => {
@@ -1127,7 +1114,6 @@ function AuthenticatedApp({ auth }: { auth: AuthSessionResponse }) {
             providerLoading={providerStatusQuery.isLoading}
             providerBusy={
               providerConnectMutation.isPending
-              || codexOAuthCompleteMutation.isPending
               || providerDeleteMutation.isPending
             }
             providerModels={providerModelsMutation.data}
@@ -1135,9 +1121,7 @@ function AuthenticatedApp({ auth }: { auth: AuthSessionResponse }) {
             providerError={
               providerConnectMutation.error
                 ? formatUiError(providerConnectMutation.error)
-                : codexOAuthCompleteMutation.error
-                  ? formatUiError(codexOAuthCompleteMutation.error)
-                  : providerDeleteMutation.error
+                : providerDeleteMutation.error
                     ? formatUiError(providerDeleteMutation.error)
                     : providerModelsMutation.error
                       ? formatUiError(providerModelsMutation.error)
@@ -1146,14 +1130,6 @@ function AuthenticatedApp({ auth }: { auth: AuthSessionResponse }) {
             onProviderConnect={(input) => providerConnectMutation.mutate(input)}
             onProviderDelete={(connectionId) => providerDeleteMutation.mutate(connectionId)}
             onProviderModelsLoad={(input) => providerModelsMutation.mutateAsync(input)}
-            onCodexOAuthStart={(name) => {
-              providerConnectMutation.reset();
-              codexOAuthCompleteMutation.reset();
-              const loginId = crypto.randomUUID();
-              window.open(codexOAuthAuthorizeUrl(loginId, name), '_blank', 'noopener');
-              return { loginId, authFlow: 'browser', startedAt: new Date().toISOString(), codexHome: '' };
-            }}
-            onCodexOAuthComplete={(loginId, connectionId, model, name, isDefault) => codexOAuthCompleteMutation.mutateAsync({ loginId, connectionId, model, name, isDefault })}
             notificationSettings={notificationSettings}
             notificationsLoading={notificationSettingsQuery.isLoading}
             notificationsBusy={
@@ -3634,8 +3610,6 @@ function SettingsPanel({
   onProviderConnect,
   onProviderDelete,
   onProviderModelsLoad,
-  onCodexOAuthStart,
-  onCodexOAuthComplete,
   notificationSettings,
   notificationsLoading,
   notificationsBusy,
@@ -3671,8 +3645,6 @@ function SettingsPanel({
   onProviderConnect: (input: ProviderConnectRequest) => void;
   onProviderDelete: (connectionId: string) => void;
   onProviderModelsLoad: (input: ProviderModelsRequest) => Promise<ProviderModelsResponse>;
-  onCodexOAuthStart: (name?: string) => CodexOAuthStartResponse;
-  onCodexOAuthComplete: (loginId: string, connectionId: string | undefined, model: string, name?: string, isDefault?: boolean) => Promise<unknown>;
   notificationSettings?: NotificationSettingsApi;
   notificationsLoading: boolean;
   notificationsBusy: boolean;
@@ -3695,15 +3667,12 @@ function SettingsPanel({
   const [providerForm, setProviderForm] = useState<ProviderConnectRequest>({
     connectionId: undefined,
     name: '',
-    provider: 'openai',
+    provider: 'codex',
     authMode: 'api_key',
     apiKey: '',
     model: '',
     isDefault: false
   });
-  const [codexOAuthLogin, setCodexOAuthLogin] = useState<CodexOAuthStartResponse | undefined>();
-  const [codexOAuthError, setCodexOAuthError] = useState<string | undefined>();
-  const oauthCompletionStarted = useRef(false);
   const [githubAdapterForm, setGitHubAdapterForm] = useState<GitHubAdapterConnectRequest>({
     token: '',
     apiBaseUrl: ''
@@ -3711,62 +3680,9 @@ function SettingsPanel({
   const [windowsRunnerName, setWindowsRunnerName] = useState('Windows runner');
   const currentProviderModelOptions = providerModels?.provider === providerForm.provider
     && providerModels.connectionId === providerForm.connectionId
-    && !providerModels.loginId
     ? providerModels.models
     : [];
   const providerConnections = providerStatus?.connections ?? [];
-  const isNewCodexOAuth = providerForm.provider === 'codex'
-    && providerForm.authMode === 'codex_oauth'
-    && !providerForm.connectionId;
-  const oauthTunnelCommand = typeof window !== 'undefined' && window.location.hostname !== 'localhost'
-    ? `ssh -N -o ExitOnForwardFailure=yes -L 1455:127.0.0.1:1455 ubuntu@${window.location.hostname}`
-    : undefined;
-
-  useEffect(() => {
-    if (!codexOAuthLogin) {
-      oauthCompletionStarted.current = false;
-      return;
-    }
-
-    const pollId = window.setInterval(() => {
-      if (oauthCompletionStarted.current) {
-        return;
-      }
-      void fetchCodexOAuthStatus(codexOAuthLogin.loginId)
-        .then(async (status) => {
-          if (status.completed && !status.success) {
-            oauthCompletionStarted.current = true;
-            setCodexOAuthError(status.errorOutput || status.status.rawOutput || 'Codex OAuth login selhal.');
-            return;
-          }
-          if (!status.success || oauthCompletionStarted.current) {
-            return;
-          }
-          oauthCompletionStarted.current = true;
-          const result = await onProviderModelsLoad({ provider: 'codex', loginId: codexOAuthLogin.loginId });
-          const selectedModel = result.models.find((model) => model.isDefault)?.id ?? result.models[0]?.id;
-          if (!selectedModel) {
-            throw new Error('Prihlaseny Codex ucet nevratil zadny dostupny model.');
-          }
-          setProviderForm((previous) => ({ ...previous, model: selectedModel }));
-          await onCodexOAuthComplete(
-            codexOAuthLogin.loginId,
-            providerForm.connectionId,
-            selectedModel,
-            providerForm.name?.trim() || undefined,
-            providerForm.isDefault
-          );
-          setCodexOAuthLogin(undefined);
-        })
-        .catch((error) => {
-          oauthCompletionStarted.current = false;
-          setCodexOAuthError(formatUiError(error));
-        });
-    }, 2_000);
-
-    return () => window.clearInterval(pollId);
-  }, [codexOAuthLogin, onCodexOAuthComplete, onProviderModelsLoad, providerForm.connectionId, providerForm.isDefault, providerForm.name]);
-
   useEffect(() => {
     if (!providerForm.connectionId) {
       if (providerConnections.length === 0 && !providerForm.isDefault) {
@@ -3779,7 +3695,7 @@ function SettingsPanel({
       setProviderForm({
         connectionId: undefined,
         name: '',
-        provider: 'openai',
+        provider: 'codex',
         authMode: 'api_key',
         apiKey: '',
         model: '',
@@ -3792,14 +3708,12 @@ function SettingsPanel({
     setProviderForm({
       connectionId: undefined,
       name: '',
-      provider: 'openai',
+      provider: 'codex',
       authMode: 'api_key',
       apiKey: '',
       model: '',
       isDefault: providerConnections.length === 0
     });
-    setCodexOAuthLogin(undefined);
-    setCodexOAuthError(undefined);
   }
 
   function editProviderConnection(connection: ProviderConnectionApi) {
@@ -3807,14 +3721,16 @@ function SettingsPanel({
       connectionId: connection.id,
       name: connection.name,
       provider: connection.provider,
-      authMode: connection.authMode,
+      authMode: 'api_key',
       apiKey: '',
       model: connection.model,
       isDefault: connection.isDefault
     });
-    setCodexOAuthLogin(undefined);
-    setCodexOAuthError(undefined);
   }
+
+  const editingLegacyOAuth = providerConnections.some((connection) => (
+    connection.id === providerForm.connectionId && connection.authMode === 'codex_oauth'
+  ));
 
   return (
     <section className="settings-grid">
@@ -3963,9 +3879,15 @@ function SettingsPanel({
             <MetricBlock label="Persistent" value={providerStatus.persistent ? 'Ano' : 'Ne'} />
             <MetricBlock label="Circuit" value={providerStatus.currentRuntimeStatus?.circuitBreaker.state ?? 'closed'} />
             <MetricBlock label="Last success" value={formatProviderRuntimeTimestamp(providerStatus.currentRuntimeStatus?.lastSuccessfulRequestAt)} />
+            {providerStatus.modelPolicy ? (
+              <>
+                <MetricBlock label="Model policy" value={providerStatus.modelPolicy.profile} />
+                <MetricBlock label="Economy / standard / critical" value={`${providerStatus.modelPolicy.economy} · ${providerStatus.modelPolicy.standard} · ${providerStatus.modelPolicy.critical}`} wide />
+              </>
+            ) : null}
           </>
         ) : null}
-        {providerError || codexOAuthError ? <div className="error-banner">{providerError ?? codexOAuthError}</div> : null}
+        {providerError ? <div className="error-banner">{providerError}</div> : null}
         <div className="provider-connection-list wide">
           {providerConnections.length ? (
             providerConnections.map((connection) => (
@@ -3983,10 +3905,7 @@ function SettingsPanel({
                     {connection.isDefault ? ' · default' : ''}
                     {connection.credentialSource ? ` · ${connection.credentialSource}` : ''}
                   </small>
-                  {connection.available === false ? <small>OAuth session vyzaduje znovu prihlasit.</small> : null}
-                  {connection.availability === 'status_unavailable' ? (
-                    <small>Stav OAuth nelze docasne overit. Ulozene pripojeni zustava zachovane.</small>
-                  ) : null}
+                  {connection.available === false ? <small>Toto staré OAuth připojení je neaktivní; nahraďte je API key připojením.</small> : null}
                   <small>
                     Circuit {connection.runtimeStatus?.circuitBreaker.state ?? 'closed'}
                     {' · '}
@@ -4022,38 +3941,17 @@ function SettingsPanel({
               setProviderForm((previous) => ({
                 ...previous,
                 provider,
-                authMode: provider === 'codex' ? previous.authMode ?? 'api_key' : 'api_key',
+                authMode: 'api_key',
                 model: ''
               }));
-              if (provider !== 'codex') {
-                setCodexOAuthLogin(undefined);
-              }
             }}
           >
-            <option value="openai">openai</option>
-            <option value="codex">codex</option>
+            <option value="codex">OpenAI API · Codex tools</option>
+            <option value="openai">OpenAI API · response only</option>
             {providerForm.provider === 'github_copilot' ? <option value="github_copilot">github_copilot (frozen)</option> : null}
           </select>
         </label>
-        {providerForm.provider === 'codex' ? (
-          <label>
-            Auth
-            <select
-              value={providerForm.authMode ?? 'api_key'}
-              disabled={Boolean(providerForm.connectionId)}
-              onChange={(event) => {
-                const authMode = event.target.value as NonNullable<ProviderConnectRequest['authMode']>;
-                setProviderForm((previous) => ({ ...previous, authMode }));
-                if (authMode !== 'codex_oauth') {
-                  setCodexOAuthLogin(undefined);
-                }
-              }}
-            >
-              <option value="api_key">API key</option>
-              <option value="codex_oauth">OAuth</option>
-            </select>
-          </label>
-        ) : null}
+        <MetricBlock label="Autentizace" value="OpenAI API key" />
         <label>
           Nazev connectionu
           <input
@@ -4062,20 +3960,16 @@ function SettingsPanel({
             onChange={(event) => setProviderForm((previous) => ({ ...previous, name: event.target.value }))}
           />
         </label>
-        {providerForm.authMode !== 'codex_oauth' ? (
-          <label>
-            {providerForm.provider === 'github_copilot' ? 'GitHub token (optional)' : 'API key'}
-            <input
-              type="password"
-              placeholder={providerForm.provider === 'github_copilot' ? 'gho_... nebo github_pat_...' : 'paste provider api key'}
-              value={providerForm.apiKey ?? ''}
-              onChange={(event) => setProviderForm((previous) => ({ ...previous, apiKey: event.target.value }))}
-            />
-          </label>
-        ) : null}
-        {isNewCodexOAuth ? (
-          <small className="wide">Po prihlaseni nacteme modely dostupne pro tento Codex ucet a ulozime jeho vychozi model.</small>
-        ) : currentProviderModelOptions.length > 0 ? (
+        <label>
+          {providerForm.provider === 'github_copilot' ? 'GitHub token (optional)' : 'OpenAI project API key'}
+          <input
+            type="password"
+            placeholder={providerForm.provider === 'github_copilot' ? 'gho_... nebo github_pat_...' : 'sk-proj-...'}
+            value={providerForm.apiKey ?? ''}
+            onChange={(event) => setProviderForm((previous) => ({ ...previous, apiKey: event.target.value }))}
+          />
+        </label>
+        {currentProviderModelOptions.length > 0 ? (
           <label>
             Model
             <select
@@ -4100,14 +3994,15 @@ function SettingsPanel({
             />
           </label>
         )}
-        {!isNewCodexOAuth ? <div className="actions wide">
+        <div className="actions wide">
           <button
             className="secondary-action"
             type="button"
             disabled={
               providerModelsLoading
-              || (providerForm.authMode === 'codex_oauth' && !providerForm.connectionId)
-              || (providerForm.provider === 'openai' && !providerForm.apiKey?.trim() && !providerForm.connectionId)
+              || (providerForm.provider !== 'github_copilot'
+                && !providerForm.apiKey?.trim()
+                && (!providerForm.connectionId || editingLegacyOAuth))
             }
             onClick={() => onProviderModelsLoad({
               provider: providerForm.provider,
@@ -4117,7 +4012,7 @@ function SettingsPanel({
           >
             {providerModelsLoading ? 'Nacitam modely...' : 'Nacist dostupne modely'}
           </button>
-        </div> : null}
+        </div>
         <label className="toggle-row wide">
           <input
             type="checkbox"
@@ -4129,67 +4024,25 @@ function SettingsPanel({
             <small>Tento connection se pouzije jako vychozi provider pro projekty bez vlastni volby.</small>
           </span>
         </label>
-        {isNewCodexOAuth && oauthTunnelCommand && !codexOAuthLogin ? (
-          <div className="oauth-panel wide">
-            <span>Vzdaleny Codex OAuth</span>
-            <strong>Nejprve spustte SSH tunel.</strong>
-            <code>{oauthTunnelCommand}</code>
-            <small>Tunel nechte bezet do dokonceni prihlaseni, potom otevřete OAuth.</small>
-          </div>
-        ) : null}
-        {codexOAuthLogin ? (
-          <div className="oauth-panel wide">
-            <span>Codex OAuth</span>
-            <strong>Dokoncete prihlaseni v otevrenem okne.</strong>
-            {oauthTunnelCommand ? (
-              <>
-                <small>Pred potvrzenim OAuth spustte na pocitaci s prohlizecem tento SSH tunel:</small>
-                <code>{oauthTunnelCommand}</code>
-              </>
-            ) : null}
-            {codexOAuthLogin.loginUrl ? (
-              <a href={codexOAuthLogin.loginUrl} target="_blank" rel="noreferrer">
-                Otevrit autorizaci Codex
-              </a>
-            ) : null}
-            <small>Po potvrzeni se connection overi a ulozi automaticky.</small>
-          </div>
-        ) : null}
         <div className="actions">
-          {providerForm.authMode === 'codex_oauth' ? (
-            <>
-              <button
-                className="primary-action"
-                type="button"
-                disabled={providerBusy}
-                onClick={() => {
-                  oauthCompletionStarted.current = false;
-                  setCodexOAuthError(undefined);
-                  setCodexOAuthLogin(onCodexOAuthStart(providerForm.name?.trim() || undefined));
-                }}
-              >
-                Prihlasit Codex pres OAuth
-              </button>
-            </>
-          ) : null}
-          {providerForm.authMode !== 'codex_oauth' || providerForm.connectionId ? <button
+          <button
             className="primary-action"
             type="button"
-            disabled={providerBusy || !providerForm.model.trim()}
+            disabled={providerBusy || !providerForm.model.trim() || (editingLegacyOAuth && !providerForm.apiKey?.trim())}
             onClick={() =>
               onProviderConnect({
                 connectionId: providerForm.connectionId,
                 name: providerForm.name?.trim() || undefined,
                 isDefault: providerForm.isDefault,
                 provider: providerForm.provider,
-                authMode: providerForm.authMode ?? 'api_key',
+                authMode: 'api_key',
                 apiKey: providerForm.apiKey?.trim() || undefined,
                 model: providerForm.model.trim()
               })
             }
           >
             {providerForm.connectionId ? 'Ulozit zmeny' : 'Pripojit provider'}
-          </button> : null}
+          </button>
           {providerForm.connectionId ? (
             <button className="secondary-action" type="button" disabled={providerBusy} onClick={resetProviderForm}>
               Zrusit editaci

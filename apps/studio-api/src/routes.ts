@@ -1,8 +1,10 @@
 import type { FastifyInstance, FastifyReply, FastifyRequest } from 'fastify';
 import { createHash } from 'node:crypto';
 import { z } from 'zod';
-import { buildProjectExtensionProposalPrompt, CodexExecutionTimeoutError, createProvider, formatProjectExtensionProposal, GitHubCopilotProvider, listCodexModels, listOpenAIModels } from '@forgemind/providers';
+import { buildProjectExtensionProposalPrompt, CodexExecutionTimeoutError, createProvider, formatProjectExtensionProposal, GitHubCopilotProvider, listOpenAIModels, resolveModelRoute } from '@forgemind/providers';
 import type { AIProvider, PlanResult, ProviderSessionContext } from '@forgemind/providers';
+import type { ProviderRuntimeConfig } from '@forgemind/providers';
+import { parseAgentConfigYaml } from '@forgemind/config';
 import {
   checkGitHubConnection,
   createGitHubBranch,
@@ -18,7 +20,6 @@ import {
   prepareReadOnlyRepositoryBaseline
 } from '@forgemind/github';
 import type { AuthService } from './auth.js';
-import { completeCodexOAuthBrowserLogin, readCodexOAuthBrowserLoginStatus, readCodexOAuthStatus, resolveCodexHome, startCodexOAuthBrowserLogin } from './codex-oauth.js';
 import { createTaskDispatchService } from './dispatch.js';
 import { sendBadRequest, sendNotFound } from './http.js';
 import { buildReviewedImplementationStepBlueprints } from './roadmap-generation.js';
@@ -223,50 +224,24 @@ const providerConnectSchema = z
     name: z.string().trim().min(1).max(80).optional(),
     isDefault: z.boolean().optional(),
     provider: z.enum(['openai', 'codex', 'github_copilot']),
-    authMode: z.enum(['api_key', 'codex_oauth']).optional().default('api_key'),
+    authMode: z.literal('api_key').optional().default('api_key'),
     apiKey: z.string().min(1).optional(),
     model: z.string().min(1)
   })
   .superRefine((input, context) => {
-    if (input.authMode === 'api_key' && input.provider !== 'github_copilot' && !input.apiKey && !input.connectionId) {
+    if (input.provider !== 'github_copilot' && !input.apiKey && !input.connectionId) {
       context.addIssue({
         code: z.ZodIssueCode.custom,
         path: ['apiKey'],
         message: 'API key is required for API key provider auth.'
       });
     }
-
-    if (input.authMode === 'codex_oauth' && input.provider !== 'codex') {
-      context.addIssue({
-        code: z.ZodIssueCode.custom,
-        path: ['authMode'],
-        message: 'Codex OAuth can only be used with the codex provider.'
-      });
-    }
   });
-
-const codexOAuthCompleteSchema = z.object({
-  loginId: z.string().min(1),
-  connectionId: z.string().uuid().optional(),
-  name: z.string().trim().min(1).max(80).optional(),
-  isDefault: z.boolean().optional(),
-  model: z.string().min(1)
-});
-
-const codexOAuthStartSchema = z.object({
-  loginId: z.string().uuid().optional(),
-  name: z.string().trim().min(1).max(80).optional()
-});
-
-const codexOAuthStatusParamsSchema = z.object({
-  loginId: z.string().uuid()
-});
 
 const providerModelsSchema = z.object({
   provider: z.enum(['openai', 'codex', 'github_copilot']),
   apiKey: z.string().min(1).optional(),
   connectionId: z.string().uuid().optional(),
-  loginId: z.string().uuid().optional()
 });
 
 const githubConnectSchema = z.object({
@@ -335,28 +310,15 @@ export function registerRoutes(
     const providerConnection = await readAIProviderConnection(repository);
     const runtimeStatuses = await listProviderConnectionRuntimeStatuses(repository);
     const runtimeStatusByConnection = new Map(runtimeStatuses.map((status) => [providerRuntimeStatusKey(status.provider, status.connectionId), status]));
-    const connections = await Promise.all(providerConnections.map(async (connection) => {
+    const connections = providerConnections.map((connection) => {
       const runtimeStatus = runtimeStatusByConnection.get(providerRuntimeStatusKey(connection.provider, connection.id)) ?? null;
-      if (connection.provider !== 'codex' || connection.authMode !== 'codex_oauth') {
-        return { ...connection, available: true, runtimeStatus };
-      }
-      if (!connection.codexHome) {
-        return { ...connection, available: false, runtimeStatus };
-      }
-
-      const status = await readCodexOAuthStatus(connection.codexHome);
       return {
         ...connection,
         runtimeStatus,
-        available: status.verificationStatus === 'unavailable' ? null : status.loggedIn,
-        availability: status.verificationStatus === 'verified'
-          ? 'available'
-          : status.verificationStatus === 'logged_out'
-            ? 'reauthentication_required'
-            : 'status_unavailable',
-        accountSummary: status.accountSummary ?? connection.accountSummary
+        available: connection.authMode === 'api_key',
+        availability: connection.authMode === 'api_key' ? 'available' : 'api_key_migration_required'
       };
-    }));
+    });
     const envProvider = process.env.FORGEMIND_PROVIDER === 'openai'
       || process.env.FORGEMIND_PROVIDER === 'codex'
       || process.env.FORGEMIND_PROVIDER === 'github_copilot'
@@ -367,11 +329,18 @@ export function registerRoutes(
     const currentRuntimeStatus = currentProvider
       ? runtimeStatusByConnection.get(providerRuntimeStatusKey(currentProvider, providerConnection?.id ?? null)) ?? null
       : null;
+    const modelProfile = resolveGlobalModelProfile();
     return {
       currentProvider,
       currentModel,
       currentConnectionId: providerConnection?.id ?? null,
       currentRuntimeStatus,
+      modelPolicy: {
+        profile: modelProfile,
+        economy: resolveModelRoute({ profile: modelProfile, workload: 'economy', configuredModel: currentModel ?? undefined }).model,
+        standard: resolveModelRoute({ profile: modelProfile, workload: 'standard', configuredModel: currentModel ?? undefined }).model,
+        critical: resolveModelRoute({ profile: modelProfile, workload: 'critical', configuredModel: currentModel ?? undefined }).model
+      },
       connections,
       fallbackProvider: process.env.FORGEMIND_FALLBACK_PROVIDER ?? null,
       githubAdapter: githubConnection ? 'app' : getGitHubAdapterEnvStatus().adapter,
@@ -380,16 +349,15 @@ export function registerRoutes(
       credentialSource: providerConnection?.credentialSource ?? (currentProvider ? 'env' : 'none'),
       authMode: providerConnection?.authMode ?? null,
       apiKeyFingerprint: providerConnection?.apiKeyFingerprint ?? null,
-      codexHome: providerConnection?.codexHome ?? (currentProvider === 'codex' ? resolveCodexHome() : null),
+      codexHome: null,
       accountSummary: providerConnection?.accountSummary ?? null,
       connectedAt: providerConnection?.connectedAt ?? null,
       lastCheckedAt: providerConnection?.lastCheckedAt ?? null,
       configured: {
         openai: providerConnection?.provider === 'openai' || Boolean(process.env.OPENAI_API_KEY),
-        codex:
-          providerConnection?.provider === 'codex'
-            ? providerConnection.authMode !== 'codex_oauth' || Boolean(providerConnection.codexHome)
-            : Boolean(process.env.CODEX_API_KEY),
+        codex: providerConnection?.provider === 'codex'
+          ? providerConnection.authMode === 'api_key'
+          : Boolean(process.env.CODEX_API_KEY || process.env.OPENAI_API_KEY),
         github_copilot:
           providerConnection?.provider === 'github_copilot'
           || Boolean(process.env.COPILOT_GITHUB_TOKEN)
@@ -443,25 +411,9 @@ export function registerRoutes(
         return { provider: input.provider, connectionId: input.connectionId, models: await provider.listModels() };
       }
 
-      if (input.loginId) {
-        const login = await readCodexOAuthBrowserLoginStatus(input.loginId);
-        if (!login.success || !login.status.loggedIn) {
-          throw new Error('Finish the Codex OAuth login before loading models.');
-        }
-        return { provider: input.provider, loginId: input.loginId, models: await listCodexModels({ codexHome: login.codexHome }) };
-      }
-
-      if (connection?.authMode === 'codex_oauth' && connection.codexHome) {
-        const status = await readCodexOAuthStatus(connection.codexHome);
-        if (!status.loggedIn) {
-          throw new Error('This Codex OAuth connection has expired. Sign in again.');
-        }
-        return { provider: input.provider, connectionId: input.connectionId, models: await listCodexModels({ codexHome: connection.codexHome }) };
-      }
-
       const apiKey = input.apiKey ?? connection?.apiKey;
       if (!apiKey) {
-        throw new Error('Enter a Codex API key or select a connected Codex OAuth account before loading models.');
+        throw new Error('Enter an OpenAI API key before loading Codex models.');
       }
       return {
         provider: input.provider,
@@ -495,54 +447,13 @@ export function registerRoutes(
     };
   });
 
-  app.get('/api/providers/codex/oauth/status', async () => {
-    const status = await readCodexOAuthStatus();
-    return {
-      ...status,
-      configured: status.loggedIn
-    };
+  const oauthRemoved = async (_request: FastifyRequest, reply: FastifyReply) => reply.code(410).send({
+    error: 'ChatGPT OAuth support was removed. Connect an OpenAI project API key instead.'
   });
-
-  app.post('/api/providers/codex/oauth/start', async (request, reply) => {
-    try {
-      const input = codexOAuthStartSchema.parse(request.body ?? {});
-      const login = await startCodexOAuthBrowserLogin({ name: input.name });
-      return reply.code(202).send({
-        loginId: login.loginId,
-        authFlow: login.authFlow,
-        startedAt: login.startedAt,
-        loginUrl: login.loginUrl,
-        codexHome: login.codexHome
-      });
-    } catch (error) {
-      return sendBadRequest(reply, error);
-    }
-  });
-
-  app.get('/api/providers/codex/oauth/authorize', async (request, reply) => {
-    try {
-      const input = codexOAuthStartSchema.parse(request.query ?? {});
-      if (!input.loginId) {
-        throw new Error('OAuth login ID is required.');
-      }
-      const login = await startCodexOAuthBrowserLogin(input);
-      if (!login.loginUrl) {
-        throw new Error('Codex did not provide an OAuth authorization URL.');
-      }
-      return reply.redirect(login.loginUrl);
-    } catch (error) {
-      return sendBadRequest(reply, error);
-    }
-  });
-
-  app.get('/api/providers/codex/oauth/:loginId/status', async (request, reply) => {
-    try {
-      const { loginId } = codexOAuthStatusParamsSchema.parse(request.params);
-      return reply.send(await readCodexOAuthBrowserLoginStatus(loginId));
-    } catch (error) {
-      return sendBadRequest(reply, error);
-    }
-  });
+  app.get('/api/providers/codex/oauth/status', oauthRemoved);
+  app.post('/api/providers/codex/oauth/start', oauthRemoved);
+  app.get('/api/providers/codex/oauth/authorize', oauthRemoved);
+  app.get('/api/providers/codex/oauth/:loginId/status', oauthRemoved);
 
   app.get('/api/github/repositories', async (request, reply) => {
     try {
@@ -674,93 +585,7 @@ export function registerRoutes(
     }
   });
 
-  app.post('/api/providers/codex/oauth/complete', async (request, reply) => {
-    try {
-      const input = codexOAuthCompleteSchema.parse(request.body ?? {});
-      const existingConnection = input.connectionId
-        ? await readAIProviderConnectionSecretById(repository, input.connectionId)
-        : undefined;
-      if (input.connectionId && !existingConnection) {
-        throw new Error('AI provider connection was not found.');
-      }
-      if (
-        existingConnection
-        && (existingConnection.provider !== 'codex' || existingConnection.authMode !== 'codex_oauth')
-      ) {
-        throw new Error('Only an existing Codex OAuth connection can be signed in again.');
-      }
-
-      const completed = await completeCodexOAuthBrowserLogin(input.loginId);
-      if (!completed.completed) {
-        return reply.code(202).send({
-          ok: false,
-          completed: false,
-          loginId: input.loginId,
-          authFlow: completed.authFlow,
-          startedAt: completed.startedAt,
-          loginUrl: completed.loginUrl,
-          codexHome: completed.codexHome
-        });
-      }
-
-      if (!completed.success || !completed.status.loggedIn) {
-        throw new Error(completed.errorOutput || completed.status.rawOutput || 'Codex OAuth login did not complete successfully.');
-      }
-
-      const provider = createProvider('codex', {
-        authMode: 'codex_oauth',
-        model: input.model,
-        codexHome: completed.status.codexHome
-      });
-      const estimate = await provider.estimateCost({
-        prompt: 'Provider connection check prompt.',
-        repositorySizeHint: 'small'
-      });
-
-      const currentUser = await repository.getCurrentUser();
-      const connection = await saveAIProviderConnection(repository, {
-        connectionId: input.connectionId,
-        name: input.name,
-        isDefault: input.isDefault,
-        provider: 'codex',
-        authMode: 'codex_oauth',
-        model: input.model,
-        codexHome: completed.status.codexHome,
-        accountSummary: completed.status.accountSummary ?? undefined
-      });
-      await repository.writeAudit({
-        actorType: 'user',
-        actorId: currentUser.id,
-        eventType: 'provider_connected',
-        payload: {
-          provider: 'codex',
-          connectionId: connection.id,
-          name: connection.name,
-          isDefault: connection.isDefault,
-          credentialSource: connection.credentialSource,
-          authMode: connection.authMode,
-          model: connection.model,
-          codexHome: connection.codexHome ?? null,
-          accountSummary: connection.accountSummary ?? null,
-          persistent: true
-        }
-      });
-
-      return reply.send({
-        ok: true,
-        completed: true,
-        connectionId: connection.id,
-        name: connection.name,
-        provider: 'codex',
-        model: connection.model,
-        persistent: true,
-        authMode: connection.authMode,
-        estimate
-      });
-    } catch (error) {
-      return sendBadRequest(reply, error);
-    }
-  });
+  app.post('/api/providers/codex/oauth/complete', oauthRemoved);
 
   app.post('/api/providers/connect', async (request, reply) => {
     try {
@@ -776,28 +601,26 @@ export function registerRoutes(
       }
       if (
         existingConnection
-        && (existingConnection.provider !== input.provider || existingConnection.authMode !== input.authMode)
+        && existingConnection.provider !== input.provider
       ) {
-        throw new Error('Provider and authentication type cannot be changed on an existing connection. Add a new connection instead.');
+        throw new Error('Provider cannot be changed on an existing connection. Add a new connection instead.');
       }
-
-      let codexOAuthStatus: Awaited<ReturnType<typeof readCodexOAuthStatus>> | undefined;
-      if (input.authMode === 'codex_oauth') {
-        if (!existingConnection?.codexHome) {
-          throw new Error('Start and complete a new Codex OAuth login before creating this connection.');
-        }
-        codexOAuthStatus = await readCodexOAuthStatus(existingConnection.codexHome);
-        if (!codexOAuthStatus.loggedIn) {
-          throw new Error('This Codex OAuth connection has expired. Sign in again.');
-        }
+      if (
+        existingConnection
+        && existingConnection.authMode !== input.authMode
+        && !(existingConnection.authMode === 'codex_oauth' && input.authMode === 'api_key')
+      ) {
+        throw new Error('Only migration from a legacy ChatGPT OAuth connection to an API key is supported.');
       }
 
       const provider = createProvider(input.provider, {
         apiKey: input.apiKey ?? existingConnection?.apiKey,
         authMode: input.authMode,
         model: input.model,
-        codexHome: codexOAuthStatus?.codexHome
+        modelProfile: input.provider === 'github_copilot' ? undefined : resolveGlobalModelProfile()
       });
+      const preflight = await provider.preflight();
+      if (!preflight.ok) throw new Error(preflight.error?.auditSafeMessage ?? 'OpenAI API key validation failed.');
       const estimate = await provider.estimateCost({
         prompt: 'Provider connection check prompt.',
         repositorySizeHint: 'small'
@@ -812,8 +635,8 @@ export function registerRoutes(
         authMode: input.authMode,
         apiKey: input.apiKey,
         model: input.model,
-        codexHome: codexOAuthStatus?.codexHome,
-        accountSummary: codexOAuthStatus?.accountSummary ?? undefined
+        codexHome: undefined,
+        accountSummary: undefined
       });
       await repository.writeAudit({
         actorType: 'user',
@@ -1208,7 +1031,7 @@ export function registerRoutes(
         : await readAIProviderConnectionSecret(repository);
       if (!connection) throw new Error('Connect an AI provider before reviewing audit gaps.');
       if (!project.githubOwner || !project.githubRepo) throw new Error('A connected repository is required for audit gap review.');
-      const provider = createProvider(connection.provider, { apiKey: connection.apiKey, authMode: connection.authMode, model: connection.model, codexHome: connection.codexHome });
+      const provider = createProvider(connection.provider, buildProviderRuntimeConfig(connection, project));
       if (!provider.reviewRoadmap) throw new Error(`AI provider "${provider.kind}" does not support independent roadmap quality review.`);
       const githubConnection = await readGitHubConnectionSecret(repository);
       if (!githubConnection) throw new Error('Connect GitHub before reviewing audit gaps.');
@@ -2000,12 +1823,7 @@ export async function generateRoadmapPlan(
     throw new Error('Connect an AI provider before generating implementation steps.');
   }
 
-  const provider = createProvider(connection.provider, {
-    apiKey: connection.apiKey,
-    authMode: connection.authMode,
-    model: connection.model,
-    codexHome: connection.codexHome
-  });
+  const provider = createProvider(connection.provider, buildProviderRuntimeConfig(connection, project));
   const discoverBaseline = async () => {
     if (!project.githubOwner || !project.githubRepo) {
       throw new Error('A connected repository is required for commit-bound roadmap planning.');
@@ -2115,14 +1933,18 @@ export function createProjectPlanningSession(
   connection: AIProviderConnectionSecret,
   forceFresh = false
 ): ProviderSessionContext {
+  const modelProfile = buildProviderRuntimeConfig(connection, project).modelProfile ?? 'balanced';
+  const planningModel = connection.provider === 'github_copilot'
+    ? connection.model
+    : resolveModelRoute({ profile: modelProfile, workload: 'standard', configuredModel: connection.model }).model;
   const canResume = !forceFresh
     && project.planningSessionProvider === connection.provider
-    && project.planningSessionModel === connection.model
+    && project.planningSessionModel === planningModel
     && project.planningSessionConnectionId === connection.id;
   return {
     id: canResume ? project.planningSessionId : undefined,
     provider: connection.provider,
-    model: connection.model,
+    model: planningModel,
     onUpdate: async (update) => {
       await repository.updateProjectPlanningSession({
         projectId: project.id,
@@ -2507,12 +2329,7 @@ async function generateExtensionProposal(
     throw new Error('Connect an AI provider before generating a project extension proposal.');
   }
 
-  const provider = createProvider(connection.provider, {
-    apiKey: connection.apiKey,
-    authMode: connection.authMode,
-    model: connection.model,
-    codexHome: connection.codexHome
-  });
+  const provider = createProvider(connection.provider, buildProviderRuntimeConfig(connection, project));
   const session = createProjectPlanningSession(repository, project, connection);
   const contract = project.projectContract;
   const specifications = await repository.getProjectSpecifications(project.id);
@@ -2675,6 +2492,37 @@ async function readAIProviderConnection(repository: ForgeMindRepository) {
     getAIProviderConnection?: ForgeMindRepository['getAIProviderConnection'];
   };
   return maybeRepository.getAIProviderConnection ? maybeRepository.getAIProviderConnection() : undefined;
+}
+
+function buildProviderRuntimeConfig(connection: AIProviderConnectionSecret, project?: Pick<Project, 'configYaml'>): ProviderRuntimeConfig {
+  if (connection.authMode === 'codex_oauth') {
+    throw new Error(`Provider connection "${connection.id}" uses removed ChatGPT OAuth authentication. Replace it with an OpenAI API key connection.`);
+  }
+  let modelProfile: NonNullable<ProviderRuntimeConfig['modelProfile']> = 'balanced';
+  if (project?.configYaml) {
+    try {
+      modelProfile = parseAgentConfigYaml(project.configYaml).ai.model_profile;
+    } catch {
+      // Project configuration is validated by its own endpoint; provider startup keeps the safe default.
+    }
+  }
+  const environmentProfile = process.env.FORGEMIND_MODEL_PROFILE;
+  if (environmentProfile === 'fast' || environmentProfile === 'balanced' || environmentProfile === 'deep') {
+    modelProfile = environmentProfile;
+  }
+  return {
+    apiKey: connection.apiKey,
+    authMode: connection.authMode,
+    model: connection.model,
+    codexHome: connection.codexHome,
+    modelProfile,
+    useCli: connection.provider === 'codex' && connection.authMode === 'api_key'
+  };
+}
+
+function resolveGlobalModelProfile(): NonNullable<ProviderRuntimeConfig['modelProfile']> {
+  const profile = process.env.FORGEMIND_MODEL_PROFILE;
+  return profile === 'fast' || profile === 'balanced' || profile === 'deep' ? profile : 'balanced';
 }
 
 async function listAIProviderConnections(repository: ForgeMindRepository) {

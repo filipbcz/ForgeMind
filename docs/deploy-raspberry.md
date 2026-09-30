@@ -1,6 +1,6 @@
 # Raspberry Pi Production Migration
 
-This runbook moves the existing ForgeMind production stack from OCI to the ARM64 Raspberry Pi host. It preserves the PostgreSQL database, encrypted integration credentials, Codex login state, and worker workspaces. Do not generate a new `FORGEMIND_CREDENTIAL_KEY`; the existing value is required to decrypt provider and GitHub credentials after restore.
+This runbook moves the existing ForgeMind production stack from OCI to the ARM64 Raspberry Pi host. It preserves the PostgreSQL database, encrypted integration credentials, API-key-authenticated Codex tool-runtime state, and worker workspaces. Do not generate a new `FORGEMIND_CREDENTIAL_KEY`; the existing value is required to decrypt provider and GitHub credentials after restore.
 
 ## Target
 
@@ -92,7 +92,7 @@ Pause the ForgeMind queue and wait for the active task to finish. Then stop all 
 ```bash
 cd /opt/forgemind/app
 compose=(docker compose -p forgemind --env-file /opt/forgemind/shared/server.env -f infra/docker-compose.prod.yml)
-"${compose[@]}" stop worker api codex-oauth-relay web
+"${compose[@]}" stop worker api web
 ```
 
 Create the database and volume archives:
@@ -121,7 +121,7 @@ Transfer all artifacts through the trusted workstation to `/home/filip/forgemind
 If export or transfer fails, restart the unchanged OCI stack immediately:
 
 ```bash
-"${compose[@]}" up -d api codex-oauth-relay worker web
+"${compose[@]}" up -d api worker web
 ```
 
 ## 5. Restore On Raspberry Pi
@@ -135,7 +135,7 @@ compose=(docker compose -p forgemind \
   --env-file /home/filip/forgemind/shared/server.env \
   -f infra/docker-compose.prod.yml \
   -f infra/docker-compose.raspberry.yml)
-"${compose[@]}" stop worker api codex-oauth-relay web
+"${compose[@]}" stop worker api web
 "${compose[@]}" up -d postgres
 ```
 
@@ -164,7 +164,7 @@ docker run --rm \
   alpine sh -c 'find /data -mindepth 1 -maxdepth 1 -exec rm -rf {} + && tar -C /data -xzf /backup/worker-workspaces.tar.gz'
 ```
 
-Run `infra/deploy/remote-deploy.sh` through the Raspberry workflow again. Before downloading a release it removes Docker build cache, images not referenced by containers, and workspaces belonging to tasks that have been completed for at least one hour. Active, failed, and otherwise retriable task workspaces are preserved. The script requires at least 6144 MB of free space before pulling release images; `FORGEMIND_DEPLOY_MIN_FREE_MB` can override that threshold when the host storage layout changes. It then applies newer Prisma migrations before starting API, worker, OAuth relay, and web. After a successful deployment, or when deployment fails, it removes newly unused images so the previous and next multi-gigabyte runtime layers do not remain on disk together.
+Run `infra/deploy/remote-deploy.sh` through the Raspberry workflow again. Before downloading a release it removes Docker build cache, images not referenced by containers, and workspaces belonging to tasks that have been completed for at least one hour. Active, failed, and otherwise retriable task workspaces are preserved. The script requires at least 6144 MB of free space before pulling release images; `FORGEMIND_DEPLOY_MIN_FREE_MB` can override that threshold when the host storage layout changes. It then applies newer Prisma migrations before starting API, worker, and web. After a successful deployment, or when deployment fails, it removes newly unused images so the previous and next multi-gigabyte runtime layers do not remain on disk together.
 
 ## 6. Acceptance And Cutover
 
@@ -173,7 +173,7 @@ Do not resume the queue until all checks pass:
 1. `curl http://127.0.0.1:8080/health` succeeds on Raspberry Pi.
 2. `https://forgemind.tail50677a.ts.net/health` succeeds from a tailnet client.
 3. Projects, tasks, approvals, provider connections, and GitHub settings match OCI.
-4. Codex login status is connected; reauthenticate only if the copied login is rejected.
+4. The OpenAI project API key connection passes preflight and all policy models are available.
 5. A read-only GitHub connection check succeeds.
 6. One small test task completes through implementation, validation, review, and delivery.
 7. Database and volume backups remain available until the new host is stable.

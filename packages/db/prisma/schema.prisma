@@ -361,7 +361,7 @@ model ChatRun {
   outputTokens    Int           @default(0) @map("output_tokens")
   totalTokens     Int           @default(0) @map("total_tokens")
   cachedTokens    Int           @default(0) @map("cached_tokens")
-  actualCostUsd   Decimal?      @map("actual_cost_usd") @db.Decimal(10, 4)
+  actualCostUsd   Decimal?      @map("actual_cost_usd") @db.Decimal(14, 8)
   errorMessage    String?       @map("error_message")
   responseSummary String?       @map("response_summary")
   resultJson      Json?         @map("result_json")
@@ -853,8 +853,8 @@ model TaskRun {
   outputTokens     Int          @default(0) @map("output_tokens")
   totalTokens      Int          @default(0) @map("total_tokens")
   usageSource      String       @default("estimated") @map("usage_source")
-  estimatedCostUsd Decimal      @default(0.00) @map("estimated_cost_usd") @db.Decimal(10, 4)
-  actualCostUsd    Decimal?     @map("actual_cost_usd") @db.Decimal(10, 4)
+  estimatedCostUsd Decimal      @default(0.00) @map("estimated_cost_usd") @db.Decimal(14, 8)
+  actualCostUsd    Decimal?     @map("actual_cost_usd") @db.Decimal(14, 8)
   startedAt        DateTime?    @map("started_at")
   finishedAt       DateTime?    @map("finished_at")
   summary          String?
@@ -933,14 +933,18 @@ model ProviderUsage {
   totalTokens      Int          @default(0) @map("total_tokens")
   usageSource      String       @default("estimated") @map("usage_source")
   credits          Decimal      @default(0.00) @db.Decimal(12, 4)
-  estimatedCostUsd Decimal      @default(0.00) @map("estimated_cost_usd") @db.Decimal(10, 4)
-  actualCostUsd    Decimal?     @map("actual_cost_usd") @db.Decimal(10, 4)
+  estimatedCostUsd Decimal      @default(0.00) @map("estimated_cost_usd") @db.Decimal(14, 8)
+  actualCostUsd    Decimal?     @map("actual_cost_usd") @db.Decimal(14, 8)
+  requestId        String?      @map("request_id")
+  clientRequestId  String?      @map("client_request_id")
+  pricingVersion   String?      @map("pricing_version")
   createdAt        DateTime     @default(now()) @map("created_at")
 
   task    Task    @relation(fields: [taskId], references: [id])
   taskRun TaskRun @relation(fields: [taskRunId], references: [id])
 
   @@index([provider, createdAt])
+  @@index([requestId])
   @@map("provider_usage")
 }
 

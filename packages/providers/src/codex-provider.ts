@@ -1,9 +1,9 @@
 import { execFile, spawn } from 'node:child_process';
+import { randomUUID } from 'node:crypto';
 import { existsSync, readdirSync, statSync, watch, type FSWatcher } from 'node:fs';
 import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
-import { tmpdir } from 'node:os';
+import { homedir, tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
-import { createInterface } from 'node:readline';
 import { promisify } from 'node:util';
 import type { ProviderKind } from '@forgemind/core';
 import { createWorkspaceEnvironment } from '@forgemind/shared';
@@ -35,12 +35,12 @@ import type {
 } from './provider.js';
 import { ProviderContractError, normalizeProviderError, normalizeProviderPreflight, normalizeValidationChecks, parseChatResult, parseImplementResult, parsePlanResult, parseProviderJsonObject, parseReviewResult, parseValidationImpactResult } from './provider.js';
 import { emitCapturedUsage, normalizeTokenBreakdown } from './provider-usage.js';
+import { calculateModelCostUsd } from './model-pricing.js';
 import { buildReviewPrompt } from './review-prompt.js';
 import { buildRoadmapQualityReviewPrompt, compactRoadmapContract } from './roadmap-review-prompt.js';
 import { buildCapabilityAuditPrompt, buildReleaseAuditPrompt, normalizeAuditContentWithSingleRepair, normalizeCapabilityAuditResult, normalizeReleaseAuditResult } from './audit-prompt.js';
 import type { ProviderRuntimeConfig } from './index.js';
 import { buildRepositoryChatPrompt } from './chat-prompt.js';
-import type { ProviderModelOption } from './openai-provider.js';
 
 const DEFAULT_CODEX_API_URL = 'https://api.openai.com/v1/responses';
 const DEFAULT_CODEX_MODEL = 'gpt-6-astra';
@@ -69,103 +69,6 @@ export function buildCodexReviewSchema(): Record<string, unknown> {
       }
     }
   };
-}
-
-interface CodexAppServerModel {
-  id?: string;
-  model?: string;
-  displayName?: string;
-  hidden?: boolean;
-  isDefault?: boolean;
-}
-
-export async function listCodexModels(input: {
-  codexHome: string;
-  binary?: string;
-  timeoutMs?: number;
-}): Promise<ProviderModelOption[]> {
-  const child = spawn(input.binary ?? resolveCodexBinary(), ['app-server'], {
-    cwd: input.codexHome,
-    env: { ...createWorkspaceEnvironment(), CODEX_HOME: input.codexHome },
-    stdio: ['pipe', 'pipe', 'pipe'],
-    windowsHide: true
-  });
-  const lines = createInterface({ input: child.stdout! });
-  let stderr = '';
-  let settled = false;
-
-  return await new Promise<ProviderModelOption[]>((resolve, reject) => {
-    const timeout = setTimeout(() => finish(new Error('Codex model listing timed out.')), input.timeoutMs ?? 20_000);
-
-    const finish = (error?: Error, models?: ProviderModelOption[]) => {
-      if (settled) return;
-      settled = true;
-      clearTimeout(timeout);
-      lines.close();
-      child.kill();
-      if (error) reject(error);
-      else resolve(models ?? []);
-    };
-
-    const send = (message: unknown) => child.stdin?.write(`${JSON.stringify(message)}\n`);
-
-    child.stderr?.on('data', (chunk: Buffer) => {
-      stderr = appendCappedOutput(stderr, chunk.toString('utf8'), 8_000);
-    });
-    child.on('error', (error) => finish(error));
-    child.on('close', (code) => {
-      if (!settled) {
-        finish(new Error(stripAnsi(stderr).trim() || `Codex app-server exited with code ${code}.`));
-      }
-    });
-    lines.on('line', (line) => {
-      let message: { id?: number; result?: unknown; error?: { message?: string } };
-      try {
-        message = JSON.parse(line) as typeof message;
-      } catch {
-        return;
-      }
-
-      if (message.id === 1) {
-        if (message.error) {
-          finish(new Error(message.error.message ?? 'Codex app-server initialization failed.'));
-          return;
-        }
-        send({ method: 'initialized', params: {} });
-        send({ method: 'model/list', id: 2, params: { limit: 100, includeHidden: false } });
-        return;
-      }
-
-      if (message.id === 2) {
-        if (message.error) {
-          finish(new Error(message.error.message ?? 'Codex model listing failed.'));
-          return;
-        }
-        const result = message.result as { data?: CodexAppServerModel[] } | undefined;
-        finish(undefined, normalizeCodexModels(result?.data ?? []));
-      }
-    });
-
-    send({
-      method: 'initialize',
-      id: 1,
-      params: {
-        clientInfo: { name: 'forgemind', title: 'ForgeMind', version: '0.1.0' }
-      }
-    });
-  });
-}
-
-export function normalizeCodexModels(models: CodexAppServerModel[]): ProviderModelOption[] {
-  return models
-    .filter((model) => !model.hidden && Boolean(model.model ?? model.id))
-    .map((model) => ({
-      id: (model.model ?? model.id)!,
-      name: model.displayName?.trim() || (model.model ?? model.id)!,
-      isDefault: model.isDefault === true
-    }))
-    .filter((model, index, all) => all.findIndex((candidate) => candidate.id === model.id) === index)
-    .sort((left, right) => Number(right.isDefault) - Number(left.isDefault) || left.name.localeCompare(right.name));
 }
 
 function validationChecksJsonSchema(): Record<string, unknown> {
@@ -531,34 +434,35 @@ export class CodexProvider implements AIProvider {
 
   private readonly apiKey?: string;
   private readonly apiBaseUrl: string;
-  private readonly authMode: 'api_key' | 'oauth';
+  private readonly useCli: boolean;
   private readonly commandEnv: NodeJS.ProcessEnv;
   private readonly model: string;
-  private oauthSessionVerified = false;
+  private readonly reasoningEffort: NonNullable<ProviderRuntimeConfig['reasoningEffort']>;
 
   constructor(config?: ProviderRuntimeConfig) {
-    this.authMode = config?.authMode === 'codex_oauth' || (!config?.authMode && process.env.CODEX_AUTH_MODE === 'oauth')
-      ? 'oauth'
-      : 'api_key';
-    const key = config?.apiKey ?? process.env.CODEX_API_KEY;
-    if (this.authMode === 'api_key' && !key) {
-      throw new Error('CODEX_API_KEY is required for Codex provider.');
+    if ((config as { authMode?: string } | undefined)?.authMode === 'codex_oauth') {
+      throw new Error('ChatGPT OAuth support was removed. Configure an OpenAI project API key instead.');
+    }
+    const key = config?.apiKey ?? process.env.CODEX_API_KEY ?? process.env.OPENAI_API_KEY;
+    if (!key) {
+      throw new Error('OPENAI_API_KEY or CODEX_API_KEY is required for the Codex API provider.');
     }
     this.apiKey = key;
+    this.useCli = config?.useCli ?? false;
     this.apiBaseUrl = process.env.CODEX_API_BASE_URL ?? DEFAULT_CODEX_API_URL;
+    const apiKeyCodexHome = config?.codexHome ?? process.env.FORGEMIND_API_CODEX_HOME
+      ?? (process.env.CODEX_HOME ? join(process.env.CODEX_HOME, 'api-key') : join(homedir(), '.forgemind-codex-api'));
     this.commandEnv = {
       ...createWorkspaceEnvironment(),
-      ...(config?.codexHome ? { CODEX_HOME: config.codexHome } : {})
+      OPENAI_API_KEY: key,
+      CODEX_HOME: apiKeyCodexHome
     };
     this.model = config?.model?.trim() || (process.env.CODEX_MODEL ?? DEFAULT_CODEX_MODEL);
+    this.reasoningEffort = config?.reasoningEffort ?? 'medium';
   }
 
   async preflight(signal?: AbortSignal): Promise<ProviderPreflightResult> {
     return normalizeProviderPreflight(this.kind, async () => {
-      if (this.authMode === 'oauth') {
-        await this.verifyOAuthSession();
-        return;
-      }
       const response = await fetch(buildCodexModelsUrl(this.apiBaseUrl), {
         headers: { Authorization: `Bearer ${this.apiKey}` },
         signal
@@ -566,7 +470,11 @@ export class CodexProvider implements AIProvider {
       if (!response.ok) {
         throw normalizeCodexHttpError(response, 'Codex preflight failed.');
       }
-      await readProviderJson(response, 'Codex preflight');
+      const payload = await readProviderJson<{ data?: Array<{ id?: string }> }>(response, 'Codex preflight');
+      const ids = (payload.data ?? []).flatMap((item) => typeof item.id === 'string' ? [item.id] : []);
+      if (!ids.some((id) => id === this.model || id.startsWith(`${this.model}-`))) {
+        throw new ProviderContractError(`Codex model "${this.model}" is not available to this API project.`);
+      }
     });
   }
 
@@ -579,7 +487,7 @@ export class CodexProvider implements AIProvider {
   }
 
   async plan(input: PlanInput): Promise<PlanResult> {
-    if (this.authMode === 'oauth') {
+    if (this.useCli) {
       return this.planWithCli(input);
     }
 
@@ -636,7 +544,7 @@ export class CodexProvider implements AIProvider {
       `Invalid roadmap JSON:\n${JSON.stringify(input.implementationSteps)}`
     ].join('\n\n');
     let content: string;
-    if (this.authMode === 'oauth') {
+    if (this.useCli) {
       content = await this.runCodexExec({
         repositoryPath: input.repositoryPath,
         sandbox: 'read-only',
@@ -674,10 +582,10 @@ export class CodexProvider implements AIProvider {
   }
 
   async reviewRoadmap(input: RoadmapQualityReviewInput): Promise<ReviewResult> {
-    const nativeRepositoryAccess = this.authMode === 'oauth';
+    const nativeRepositoryAccess = this.useCli;
     const providerPrompt = buildRoadmapQualityReviewPrompt({ ...input, nativeRepositoryAccess });
     let content: string;
-    if (this.authMode === 'oauth') {
+    if (this.useCli) {
       content = await this.runCodexExec({
         repositoryPath: input.repositoryPath,
         sandbox: 'read-only',
@@ -709,7 +617,7 @@ export class CodexProvider implements AIProvider {
   }
 
   async implement(input: ImplementInput): Promise<ImplementResult> {
-    if (this.authMode === 'oauth') {
+    if (this.useCli) {
       return this.implementWithCli(input);
     }
 
@@ -764,7 +672,7 @@ export class CodexProvider implements AIProvider {
     const continueSession = Boolean(resolveCompatibleSessionId(input.session, 'codex', this.model));
     const providerPrompt = buildRepositoryChatPrompt(input, continueSession);
     let content: string;
-    if (this.authMode === 'oauth') {
+    if (this.useCli) {
       content = await this.runCodexExec({
         repositoryPath: input.repositoryPath,
         packetOnly: !input.repositoryAttached,
@@ -800,7 +708,7 @@ export class CodexProvider implements AIProvider {
 
   async review(input: ReviewInput): Promise<ReviewResult> {
     const reviewPrompt = buildReviewPrompt(input);
-    if (this.authMode === 'oauth') {
+    if (this.useCli) {
       return this.reviewWithCli(input, reviewPrompt);
     }
 
@@ -832,10 +740,10 @@ export class CodexProvider implements AIProvider {
   async auditCapability(input: CapabilityAuditInput): Promise<CapabilityAuditResult> {
     const auditInput: CapabilityAuditInput = {
       ...input,
-      repositoryAccess: this.authMode === 'oauth' ? 'read_only_checkout' : 'complete_snapshot'
+      repositoryAccess: this.useCli ? 'read_only_checkout' : 'complete_snapshot'
     };
     const providerPrompt = buildCapabilityAuditPrompt(auditInput);
-    if (this.authMode === 'oauth') {
+    if (this.useCli) {
       return this.auditCapabilityWithCli(auditInput, providerPrompt);
     }
     if (!auditInput.repositoryContext?.trim()) {
@@ -877,10 +785,10 @@ export class CodexProvider implements AIProvider {
   async auditRelease(input: ReleaseAuditInput): Promise<ReleaseAuditResult> {
     const auditInput: ReleaseAuditInput = {
       ...input,
-      repositoryAccess: this.authMode === 'oauth' ? 'read_only_checkout' : 'complete_snapshot'
+      repositoryAccess: this.useCli ? 'read_only_checkout' : 'complete_snapshot'
     };
     const providerPrompt = buildReleaseAuditPrompt(auditInput);
-    if (this.authMode === 'oauth') {
+    if (this.useCli) {
       const schema = releaseAuditJsonSchema([...auditInput.contract.invariants, ...auditInput.contract.releaseCriteria]);
       const content = await this.runCodexExec({
         repositoryPath: input.repositoryPath,
@@ -949,7 +857,7 @@ export class CodexProvider implements AIProvider {
     return {
       inputTokens,
       outputTokens,
-      estimatedCostUsd: parseFloat((((inputTokens + outputTokens) / 1000) * 0.003 * multiplier).toFixed(4))
+      estimatedCostUsd: calculateModelCostUsd({ model: this.model, inputTokens, outputTokens }) ?? 0
     };
   }
 
@@ -962,11 +870,11 @@ export class CodexProvider implements AIProvider {
   }
 
   supportsNativeRepositoryReview(): boolean {
-    return this.authMode === 'oauth';
+    return this.useCli;
   }
 
   supportsNativeRepositoryAudit(): boolean {
-    return this.authMode === 'oauth';
+    return this.useCli;
   }
 
   private async planWithCli(input: PlanInput): Promise<PlanResult> {
@@ -1161,8 +1069,6 @@ export class CodexProvider implements AIProvider {
     signal?: AbortSignal;
     nativeToolChannel?: { command: string; args: string[] };
   }): Promise<string> {
-    await this.verifyOAuthSession();
-
     const tempDir = await mkdtemp(join(tmpdir(), 'forgemind-codex-'));
     const schemaPath = join(tempDir, 'schema.json');
     const outputPath = join(tempDir, 'last-message.json');
@@ -1173,6 +1079,7 @@ export class CodexProvider implements AIProvider {
       sandbox: input.sandbox,
       bypassSandbox: resolveCodexSandboxBypass(input.sandbox, Boolean(input.nativeToolChannel), process.env),
       model: this.model,
+      reasoningEffort: this.reasoningEffort,
       schemaPath,
       outputPath,
       repositoryPath: executionDirectory,
@@ -1200,14 +1107,15 @@ export class CodexProvider implements AIProvider {
           await input.session?.onUpdate?.({ id, provider: 'codex', model: this.model });
         }
       });
-      if (execution.totalTokens !== undefined) {
-        await emitCapturedUsage(input.onActivity, {
-          provider: 'codex',
-          model: this.model,
-          totalTokens: execution.totalTokens,
-          source: 'actual_total'
-        });
-      }
+      const capturedUsage = normalizeTokenBreakdown({
+        provider: 'codex',
+        model: this.model,
+        inputTokens: execution.inputTokens,
+        outputTokens: execution.outputTokens,
+        cachedTokens: execution.cachedTokens,
+        totalTokens: execution.totalTokens
+      });
+      await emitCapturedUsage(input.onActivity, capturedUsage ? { ...capturedUsage, source: 'actual_total' } : undefined);
       return await readFile(outputPath, 'utf8');
     } catch (error) {
       if (error instanceof CodexExecutionTimeoutError) {
@@ -1219,26 +1127,6 @@ export class CodexProvider implements AIProvider {
     }
   }
 
-  private async verifyOAuthSession(): Promise<void> {
-    if (this.authMode !== 'oauth' || this.oauthSessionVerified) {
-      return;
-    }
-
-    try {
-      const { stdout, stderr } = await execFileAsync(resolveCodexBinary(), ['login', 'status'], {
-        env: this.commandEnv,
-        timeout: 15_000,
-        windowsHide: true
-      });
-      if (!/Logged in using ChatGPT/i.test(`${stdout}\n${stderr}`)) {
-        throw new Error('Codex CLI reported no active ChatGPT login.');
-      }
-      this.oauthSessionVerified = true;
-    } catch {
-      throw normalizeProviderError('codex', 'Codex OAuth session is not active. Reconnect Codex in Settings before retrying this task.');
-    }
-  }
-
   private async requestResponses(
     messages: Array<{ role: 'system' | 'user' | 'assistant'; content: string }>,
     session?: ProviderSessionContext,
@@ -1246,14 +1134,16 @@ export class CodexProvider implements AIProvider {
   ): Promise<{ content: string; usage?: ProviderUsageMeasurement }> {
     try {
       if (!this.apiKey) {
-        throw normalizeProviderError('codex', 'CODEX_API_KEY is required for Codex API key provider mode.');
+        throw normalizeProviderError('codex', 'OPENAI_API_KEY or CODEX_API_KEY is required for Codex API key provider mode.');
       }
 
+      const clientRequestId = randomUUID();
       const response = await fetch(this.apiBaseUrl, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
-          Authorization: `Bearer ${this.apiKey}`
+          Authorization: `Bearer ${this.apiKey}`,
+          'X-Client-Request-Id': clientRequestId
         },
         signal,
         body: JSON.stringify({
@@ -1263,8 +1153,9 @@ export class CodexProvider implements AIProvider {
             role: message.role,
             content: [{ type: 'input_text', text: message.content }]
           })),
-          temperature: 0.2,
-          max_output_tokens: 1000
+          reasoning: { effort: this.reasoningEffort },
+          max_output_tokens: 8_000,
+          store: false
         })
       });
 
@@ -1313,7 +1204,9 @@ export class CodexProvider implements AIProvider {
           inputTokens: data.usage?.input_tokens,
           outputTokens: data.usage?.output_tokens,
           cachedTokens: data.usage?.input_tokens_details?.cached_tokens,
-          totalTokens: data.usage?.total_tokens
+          totalTokens: data.usage?.total_tokens,
+          requestId: response.headers?.get?.('x-request-id') ?? undefined,
+          clientRequestId
         })
       };
     } catch (error) {
@@ -1366,6 +1259,7 @@ export function buildCodexExecArgs(input: {
   sandbox: 'read-only' | 'workspace-write';
   bypassSandbox?: boolean;
   model: string;
+  reasoningEffort?: NonNullable<ProviderRuntimeConfig['reasoningEffort']>;
   schemaPath: string;
   outputPath: string;
   repositoryPath?: string;
@@ -1383,6 +1277,9 @@ export function buildCodexExecArgs(input: {
   }
 
   args.push('--model', input.model);
+  if (input.reasoningEffort) {
+    args.push('-c', `model_reasoning_effort=${JSON.stringify(input.reasoningEffort)}`);
+  }
   if (input.nativeToolChannel) {
     args.push('--ignore-user-config', '--ignore-rules', '--disable', 'shell_tool', '--disable', 'multi_agent',
       '-c', `mcp_servers.forgemind_native.command=${JSON.stringify(input.nativeToolChannel.command)}`,
@@ -1432,6 +1329,9 @@ export interface CodexProcessOptions {
 }
 
 export interface CodexProcessResult {
+  inputTokens?: number;
+  outputTokens?: number;
+  cachedTokens?: number;
   totalTokens?: number;
   sessionId?: string;
 }
@@ -1447,8 +1347,8 @@ export class CodexExecutionTimeoutError extends Error {
   ) {
     super(
       reason === 'inactivity'
-        ? `Codex OAuth provider execution stopped after ${elapsedMs} ms without activity.`
-        : `Codex OAuth provider execution exceeded the maximum runtime of ${elapsedMs} ms.`
+        ? `Codex CLI execution stopped after ${elapsedMs} ms without activity.`
+        : `Codex CLI execution exceeded the maximum runtime of ${elapsedMs} ms.`
     );
     this.name = 'CodexExecutionTimeoutError';
   }
@@ -1485,6 +1385,9 @@ export async function runCodexProcess(
     let workspaceWatcher: FSWatcher | undefined;
     let sessionId: string | undefined;
     let jsonLineBuffer = '';
+    let jsonInputTokens: number | undefined;
+    let jsonOutputTokens: number | undefined;
+    let jsonCachedTokens: number | undefined;
     let jsonTotalTokens: number | undefined;
     let jsonFailureMessage = '';
     const expectsJsonEvents = args.includes('--json');
@@ -1588,6 +1491,9 @@ export async function runCodexProcess(
           }
           const usage = event.usage;
           if (usage && typeof usage.input_tokens === 'number' && typeof usage.output_tokens === 'number') {
+            jsonInputTokens = usage.input_tokens;
+            jsonOutputTokens = usage.output_tokens;
+            jsonCachedTokens = usage.cached_input_tokens ?? usage.input_tokens_details?.cached_tokens;
             jsonTotalTokens = usage.input_tokens + usage.output_tokens;
           }
           const message = formatCodexJsonEvent(event);
@@ -1651,12 +1557,18 @@ export async function runCodexProcess(
       }
       if (code === 0) {
         emitActivity('lifecycle', 'Codex process completed.');
-        finish(undefined, { totalTokens: jsonTotalTokens ?? parseCodexCliTotalTokens(stderr), sessionId });
+        finish(undefined, {
+          inputTokens: jsonInputTokens,
+          outputTokens: jsonOutputTokens,
+          cachedTokens: jsonCachedTokens,
+          totalTokens: jsonTotalTokens ?? parseCodexCliTotalTokens(stderr),
+          sessionId
+        });
         return;
       }
 
       const diagnostic = stripAnsi(stderr).trim() || jsonFailureMessage.trim() || stripAnsi(stdout).trim().slice(-16_000);
-      finish(new Error(`Codex OAuth provider execution failed with ${code}: ${diagnostic || 'no diagnostic output'}`));
+      finish(new Error(`Codex CLI execution failed with ${code}: ${diagnostic || 'no diagnostic output'}`));
     });
     child.stdin?.end(stdin);
   });
@@ -1667,7 +1579,12 @@ interface CodexJsonEvent {
   thread_id?: string;
   message?: string;
   error?: { message?: string } | string;
-  usage?: { input_tokens?: number; output_tokens?: number };
+  usage?: {
+    input_tokens?: number;
+    output_tokens?: number;
+    cached_input_tokens?: number;
+    input_tokens_details?: { cached_tokens?: number };
+  };
   item?: {
     id?: string;
     type?: string;

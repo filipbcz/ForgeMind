@@ -1,4 +1,5 @@
 import type { ProviderKind } from '@forgemind/core';
+import { randomUUID } from 'node:crypto';
 import type {
   AIProvider,
   ChatInput,
@@ -25,14 +26,15 @@ import type {
 } from './provider.js';
 import { ProviderContractError, normalizeProviderError, normalizeProviderPreflight, normalizeValidationChecks, parseChatResult, parseImplementResult, parsePlanResult, parseProviderJsonObject, parseReviewResult, parseValidationImpactResult } from './provider.js';
 import { emitCapturedUsage, normalizeTokenBreakdown } from './provider-usage.js';
+import { calculateModelCostUsd } from './model-pricing.js';
 import { buildReviewPrompt } from './review-prompt.js';
 import { buildRoadmapQualityReviewPrompt, compactRoadmapContract } from './roadmap-review-prompt.js';
 import { buildCapabilityAuditPrompt, buildReleaseAuditPrompt, normalizeAuditContentWithSingleRepair, normalizeCapabilityAuditResult, normalizeReleaseAuditResult } from './audit-prompt.js';
 import type { ProviderRuntimeConfig } from './index.js';
 import { buildRepositoryChatPrompt } from './chat-prompt.js';
 
-const DEFAULT_OPENAI_API_URL = 'https://api.openai.com/v1/chat/completions';
-const DEFAULT_OPENAI_MODEL = 'gpt-4o-mini';
+const DEFAULT_OPENAI_API_URL = 'https://api.openai.com/v1/responses';
+const DEFAULT_OPENAI_MODEL = 'gpt-6.1-sol';
 
 export interface ProviderModelOption {
   id: string;
@@ -70,6 +72,7 @@ export class OpenAIProvider implements AIProvider {
   protected readonly apiKey: string;
   private readonly apiBaseUrl: string;
   private readonly model: string;
+  private readonly reasoningEffort: NonNullable<ProviderRuntimeConfig['reasoningEffort']>;
 
   constructor(config?: ProviderRuntimeConfig) {
     const key = config?.apiKey ?? process.env.OPENAI_API_KEY;
@@ -79,6 +82,7 @@ export class OpenAIProvider implements AIProvider {
     this.apiKey = key;
     this.apiBaseUrl = process.env.OPENAI_API_BASE_URL ?? DEFAULT_OPENAI_API_URL;
     this.model = config?.model?.trim() || (process.env.OPENAI_MODEL ?? DEFAULT_OPENAI_MODEL);
+    this.reasoningEffort = config?.reasoningEffort ?? 'medium';
   }
 
   async preflight(signal?: AbortSignal): Promise<ProviderPreflightResult> {
@@ -90,7 +94,8 @@ export class OpenAIProvider implements AIProvider {
       if (!response.ok) {
         throw normalizeOpenAIHttpError(response, 'OpenAI preflight failed.');
       }
-      await readProviderJson(response, 'OpenAI preflight');
+      const payload = await readProviderJson<{ data?: Array<{ id?: string }> }>(response, 'OpenAI preflight');
+      assertModelAvailable(payload.data, this.model, 'OpenAI');
     });
   }
 
@@ -373,7 +378,7 @@ export class OpenAIProvider implements AIProvider {
     return {
       inputTokens,
       outputTokens,
-      estimatedCostUsd: parseFloat(((inputTokens + outputTokens) / 1000 * 0.002 * multiplier).toFixed(4))
+      estimatedCostUsd: calculateModelCostUsd({ model: this.model, inputTokens, outputTokens }) ?? 0
     };
   }
 
@@ -398,18 +403,29 @@ export class OpenAIProvider implements AIProvider {
     signal?: AbortSignal
   ): Promise<{ content: string; usage?: import('./provider.js').ProviderUsageMeasurement }> {
     try {
+      const clientRequestId = randomUUID();
       const response = await fetch(this.apiBaseUrl, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
-          Authorization: `Bearer ${this.apiKey}`
+          Authorization: `Bearer ${this.apiKey}`,
+          'X-Client-Request-Id': clientRequestId
         },
         signal,
         body: JSON.stringify({
           model: this.model,
-          messages,
-          temperature: 0.2,
-          max_tokens: 800
+          instructions: messages.filter((message) => message.role === 'system').map((message) => typeof message.content === 'string' ? message.content : JSON.stringify(message.content)).join('\n\n'),
+          input: messages.filter((message) => message.role !== 'system').map((message) => ({
+            role: message.role,
+            content: typeof message.content === 'string'
+              ? [{ type: 'input_text', text: message.content }]
+              : message.content.map((part) => part.type === 'text'
+                ? { type: 'input_text', text: part.text }
+                : { type: 'input_image', image_url: part.image_url.url, detail: part.image_url.detail })
+          })),
+          reasoning: { effort: this.reasoningEffort },
+          max_output_tokens: 8_000,
+          store: false
         })
       });
 
@@ -418,15 +434,24 @@ export class OpenAIProvider implements AIProvider {
       }
 
       const data = await readProviderJson<{
+        output_text?: string;
+        output?: Array<{ content?: Array<{ text?: string }> }>;
         choices?: Array<{ message?: { content?: string } }>;
         usage?: {
+          input_tokens?: number;
+          output_tokens?: number;
+          total_tokens?: number;
+          input_tokens_details?: { cached_tokens?: number };
           prompt_tokens?: number;
           completion_tokens?: number;
-          total_tokens?: number;
           prompt_tokens_details?: { cached_tokens?: number };
         };
       }>(response, 'OpenAI request');
-      const content = data.choices?.[0]?.message?.content?.trim() ?? '';
+      const content = typeof data.output_text === 'string' && data.output_text.trim()
+        ? data.output_text.trim()
+        : data.output?.flatMap((item) => item.content ?? []).map((item) => item.text ?? '').join('\n').trim()
+          || data.choices?.[0]?.message?.content?.trim()
+          || '';
       if (!content) {
         throw new ProviderContractError('OpenAI request returned an empty response.');
       }
@@ -435,15 +460,24 @@ export class OpenAIProvider implements AIProvider {
         usage: normalizeTokenBreakdown({
           provider: 'openai',
           model: this.model,
-          inputTokens: data.usage?.prompt_tokens,
-          outputTokens: data.usage?.completion_tokens,
-          cachedTokens: data.usage?.prompt_tokens_details?.cached_tokens,
-          totalTokens: data.usage?.total_tokens
+          inputTokens: data.usage?.input_tokens ?? data.usage?.prompt_tokens,
+          outputTokens: data.usage?.output_tokens ?? data.usage?.completion_tokens,
+          cachedTokens: data.usage?.input_tokens_details?.cached_tokens ?? data.usage?.prompt_tokens_details?.cached_tokens,
+          totalTokens: data.usage?.total_tokens,
+          requestId: response.headers?.get?.('x-request-id') ?? undefined,
+          clientRequestId
         })
       };
     } catch (error) {
       throw normalizeProviderError(this.kind, error);
     }
+  }
+}
+
+function assertModelAvailable(models: Array<{ id?: string }> | undefined, model: string, provider: string): void {
+  const ids = (models ?? []).flatMap((item) => typeof item.id === 'string' ? [item.id] : []);
+  if (!ids.some((id) => id === model || id.startsWith(`${model}-`))) {
+    throw new ProviderContractError(`${provider} model "${model}" is not available to this API project.`);
   }
 }
 

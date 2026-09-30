@@ -57,7 +57,7 @@ function fixture() {
     getCurrentUser: vi.fn(async () => owner), getProject: vi.fn(async () => project),
     getProjectRoadmap: vi.fn(async () => roadmap),
     getProjectSpecifications: vi.fn(async () => ({ current: { fullSpecification: project.brief } })),
-    getAIProviderConnectionSecretById: vi.fn(async () => ({ provider: 'codex', authMode: 'codex_oauth', model: 'test-model' })),
+    getAIProviderConnectionSecretById: vi.fn(async () => ({ provider: 'codex', authMode: 'api_key', apiKey: 'sk-test', model: 'test-model' })),
     getGitHubConnectionSecret: vi.fn(async () => ({ token: 'test-token', apiBaseUrl: 'https://api.github.test' })),
     saveProjectAuditGapReview: vi.fn(async (input: { review: ReviewResult }) => { job.gapProposalReview = input.review; }),
     reviseProjectAuditGapProposal: vi.fn(async (input: { proposal: AuditGapProposal }) => {

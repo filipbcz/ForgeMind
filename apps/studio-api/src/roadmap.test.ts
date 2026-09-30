@@ -65,19 +65,19 @@ describe('project roadmap generation', () => {
       { updateProjectPlanningSession } as never,
       {
         id: 'project_1', name: 'Demo', slug: 'demo', defaultBranch: 'main', isActive: true,
-        planningSessionId: 'thread_1', planningSessionProvider: 'codex', planningSessionModel: 'gpt-5.5',
+        planningSessionId: 'thread_1', planningSessionProvider: 'codex', planningSessionModel: 'gpt-6.1-sol',
         planningSessionConnectionId: 'connection_1', createdAt: '', updatedAt: ''
       },
       {
-        id: 'connection_1', userId: 'user_1', name: 'Codex', isDefault: true, credentialSource: 'codex_oauth',
-        provider: 'codex', authMode: 'codex_oauth', model: 'gpt-5.5', connectedAt: '', updatedAt: ''
+        id: 'connection_1', userId: 'user_1', name: 'Codex API', isDefault: true, credentialSource: 'api_key',
+        provider: 'codex', authMode: 'api_key', apiKey: 'sk-test', model: 'gpt-6.1-sol', connectedAt: '', updatedAt: ''
       }
     );
 
     expect(session.id).toBe('thread_1');
-    await session.onUpdate?.({ id: 'thread_2', provider: 'codex', model: 'gpt-5.5' });
+    await session.onUpdate?.({ id: 'thread_2', provider: 'codex', model: 'gpt-6.1-sol' });
     expect(updateProjectPlanningSession).toHaveBeenCalledWith({
-      projectId: 'project_1', sessionId: 'thread_2', provider: 'codex', model: 'gpt-5.5', connectionId: 'connection_1'
+      projectId: 'project_1', sessionId: 'thread_2', provider: 'codex', model: 'gpt-6.1-sol', connectionId: 'connection_1'
     });
 
     const incompatible = createProjectPlanningSession(
@@ -88,8 +88,8 @@ describe('project roadmap generation', () => {
         planningSessionConnectionId: 'connection_1', createdAt: '', updatedAt: ''
       },
       {
-        id: 'connection_1', userId: 'user_1', name: 'Codex', isDefault: true, credentialSource: 'codex_oauth',
-        provider: 'codex', authMode: 'codex_oauth', model: 'gpt-5.5', connectedAt: '', updatedAt: ''
+        id: 'connection_1', userId: 'user_1', name: 'Codex API', isDefault: true, credentialSource: 'api_key',
+        provider: 'codex', authMode: 'api_key', apiKey: 'sk-test', model: 'gpt-6.1-sol', connectedAt: '', updatedAt: ''
       }
     );
     expect(incompatible.id).toBeUndefined();
@@ -98,12 +98,12 @@ describe('project roadmap generation', () => {
       { updateProjectPlanningSession } as never,
       {
         id: 'project_1', name: 'Demo', slug: 'demo', defaultBranch: 'main', isActive: true,
-        planningSessionId: 'thread_1', planningSessionProvider: 'codex', planningSessionModel: 'gpt-5.5',
+        planningSessionId: 'thread_1', planningSessionProvider: 'codex', planningSessionModel: 'gpt-6.1-sol',
         planningSessionConnectionId: 'connection_1', createdAt: '', updatedAt: ''
       },
       {
-        id: 'connection_1', userId: 'user_1', name: 'Codex', isDefault: true, credentialSource: 'codex_oauth',
-        provider: 'codex', authMode: 'codex_oauth', model: 'gpt-5.5', connectedAt: '', updatedAt: ''
+        id: 'connection_1', userId: 'user_1', name: 'Codex API', isDefault: true, credentialSource: 'api_key',
+        provider: 'codex', authMode: 'api_key', apiKey: 'sk-test', model: 'gpt-6.1-sol', connectedAt: '', updatedAt: ''
       },
       true
     );

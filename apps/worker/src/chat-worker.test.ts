@@ -35,7 +35,7 @@ function createRepository(claimed = createClaimedRun()) {
   return {
     claimNextChatRun: vi.fn(async () => claimed),
     getAIProviderConnectionSecret: vi.fn(async () => ({
-      id: 'connection_1', provider: 'codex', authMode: 'codex_oauth', model: 'gpt-5.5'
+      id: 'connection_1', provider: 'codex', authMode: 'api_key', apiKey: 'sk-test', model: 'gpt-6.1-sol'
     })),
     getAIProviderConnectionSecretById: vi.fn(),
     getGitHubConnectionSecret: vi.fn(),

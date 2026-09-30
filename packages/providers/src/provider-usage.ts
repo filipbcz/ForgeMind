@@ -1,5 +1,7 @@
 import type { ProviderKind } from '@forgemind/core';
 import type { ProviderActivityHandler, ProviderUsageMeasurement } from './provider.js';
+import { calculateModelCostUsd } from './model-pricing.js';
+import { resolveModelTokenPricing } from './model-pricing.js';
 
 export function normalizeTokenBreakdown(input: {
   provider: ProviderKind;
@@ -8,6 +10,8 @@ export function normalizeTokenBreakdown(input: {
   outputTokens?: number;
   cachedTokens?: number;
   totalTokens?: number;
+  requestId?: string;
+  clientRequestId?: string;
 }): ProviderUsageMeasurement | undefined {
   const inputTokens = normalizeTokenCount(input.inputTokens);
   const outputTokens = normalizeTokenCount(input.outputTokens);
@@ -23,6 +27,7 @@ export function normalizeTokenBreakdown(input: {
     return undefined;
   }
 
+  const pricing = resolveModelTokenPricing(input.model);
   return {
     provider: input.provider,
     model: input.model,
@@ -30,7 +35,16 @@ export function normalizeTokenBreakdown(input: {
     inputTokens,
     outputTokens,
     cachedTokens,
-    source: inputTokens !== undefined && outputTokens !== undefined ? 'actual_breakdown' : 'actual_total'
+    source: inputTokens !== undefined && outputTokens !== undefined ? 'actual_breakdown' : 'actual_total',
+    actualCostUsd: calculateModelCostUsd({
+      model: input.model,
+      inputTokens,
+      outputTokens,
+      cachedTokens
+    }),
+    requestId: input.requestId,
+    clientRequestId: input.clientRequestId,
+    pricingVersion: pricing?.sourceVersion
   };
 }
 

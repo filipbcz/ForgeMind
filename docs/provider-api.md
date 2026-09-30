@@ -14,8 +14,11 @@ Minimalni kontrakt:
 Aktualni implementace:
 
 - `MockProvider` slouzi pro lokalni testy, deterministicke E2E scenare a vyvoj bez externich kredencialu.
-- `OpenAIProvider` vola OpenAI chat completions API pres `OPENAI_API_KEY`, `OPENAI_API_BASE_URL` a `OPENAI_MODEL`.
-- `CodexProvider` je samostatny provider adapter pro primarni Codex flow pres `CODEX_API_KEY`, `CODEX_API_BASE_URL` a `CODEX_MODEL`.
+- `OpenAIProvider` vola OpenAI Responses API pres projektovy `OPENAI_API_KEY`, `OPENAI_API_BASE_URL` a `OPENAI_MODEL`.
+- `CodexProvider` pouziva stejny OpenAI API key; v lokalnim tool-runtime rezimu spousti Codex CLI s `OPENAI_API_KEY`, nikdy s ChatGPT OAuth session.
+- `model_profile` je vykonna routing policy: `balanced` smeruje scoped praci na Luna, bezny vyvoj na GPT-6.1 Sol a kriticke audity na Astra; `fast` posouva praci o uroven nize a `deep` o uroven vyse.
+- `FORGEMIND_MODEL_ECONOMY`, `FORGEMIND_MODEL_STANDARD` a `FORGEMIND_MODEL_CRITICAL` mohou modelove aliasy centralne zmenit bez zasahu do orchestrace.
+- Provider usage uklada skutecne input/output/cached tokeny, cenu podle verzovaneho ceniku a OpenAI/client request ID.
 - `GitHubCopilotProvider` je kompatibilitni placeholder pro historicky ulozene connectiony; runtime SDK se nedistribuuje a provider nelze pouzit pro nove ani existujici tasky.
 - Worker umi vybrat primarni provider z konfigurace nebo `FORGEMIND_PROVIDER` a pouzit fallback z konfigurace nebo `FORGEMIND_FALLBACK_PROVIDER`.
 - Worker umi primarni i fallback provider navazat na konkretni ulozene provider connection pres `FORGEMIND_PROVIDER_CONNECTION_ID` a `FORGEMIND_FALLBACK_PROVIDER_CONNECTION_ID` nebo pres `ai.primary_connection_id` a `ai.fallback_connection_id` v `agent.config.yaml`.

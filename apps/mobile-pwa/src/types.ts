@@ -692,6 +692,12 @@ export interface ProviderStatusApi {
   currentModel: string | null;
   currentConnectionId: string | null;
   currentRuntimeStatus: ProviderConnectionRuntimeStatus | null;
+  modelPolicy?: {
+    profile: 'fast' | 'balanced' | 'deep';
+    economy: string;
+    standard: string;
+    critical: string;
+  };
   connections: ProviderConnectionApi[];
   fallbackProvider: 'openai' | 'codex' | 'github_copilot' | string | null;
   githubAdapter: string;
@@ -734,7 +740,7 @@ export interface ProviderConnectionApi {
   codexHome?: string;
   accountSummary?: string;
   available?: boolean | null;
-  availability?: 'available' | 'reauthentication_required' | 'status_unavailable';
+  availability?: 'available' | 'api_key_migration_required';
   runtimeStatus?: ProviderConnectionRuntimeStatus | null;
   connectedAt: string;
   lastCheckedAt?: string;
@@ -746,7 +752,7 @@ export interface ProviderConnectRequest {
   name?: string;
   isDefault?: boolean;
   provider: 'openai' | 'codex' | 'github_copilot';
-  authMode?: 'api_key' | 'codex_oauth';
+  authMode?: 'api_key';
   apiKey?: string;
   model: string;
 }
@@ -757,7 +763,7 @@ export interface ProviderConnectResponse {
   name: string;
   provider: string;
   model: string;
-  authMode: 'api_key' | 'codex_oauth';
+  authMode: 'api_key';
   persistent: boolean;
   estimate: {
     inputTokens: number;
@@ -776,48 +782,12 @@ export interface ProviderModelsRequest {
   provider: ProviderConnectRequest['provider'];
   apiKey?: string;
   connectionId?: string;
-  loginId?: string;
 }
 
 export interface ProviderModelsResponse {
   provider: ProviderConnectRequest['provider'];
   connectionId?: string;
-  loginId?: string;
   models: ProviderModelOption[];
-}
-
-export interface CodexOAuthStartResponse {
-  loginId: string;
-  authFlow: 'browser';
-  startedAt: string;
-  loginUrl?: string;
-  codexHome: string;
-}
-
-export interface CodexOAuthCompleteResponse {
-  ok: boolean;
-  completed: boolean;
-  connectionId?: string;
-  name?: string;
-  provider?: string;
-  model?: string;
-  authMode?: 'codex_oauth';
-  persistent?: boolean;
-  loginId?: string;
-  authFlow?: 'browser';
-  startedAt?: string;
-  loginUrl?: string;
-  codexHome?: string;
-}
-
-export interface CodexOAuthStatusResponse {
-  completed: boolean;
-  success: boolean;
-  errorOutput?: string;
-  status: {
-    loggedIn: boolean;
-    rawOutput?: string;
-  };
 }
 
 export interface CreateTaskRequest {

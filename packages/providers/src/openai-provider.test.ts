@@ -3,7 +3,7 @@ import { mkdirSync, mkdtempSync, rmSync, utimesSync, writeFileSync } from 'node:
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { listOpenAIModels, OpenAIProvider } from './openai-provider.js';
-import { CodexProvider, buildCodexExecArgs, buildCodexNativeImplementationPrompt, normalizeCodexModels, resolveCodexBinary, resolveCodexSandboxBypass } from './codex-provider.js';
+import { CodexProvider, buildCodexExecArgs, buildCodexNativeImplementationPrompt, resolveCodexBinary, resolveCodexSandboxBypass } from './codex-provider.js';
 import { ProviderContractError, normalizeProviderError } from './provider.js';
 
 function successfulResponse(body: unknown): Response {
@@ -41,7 +41,7 @@ describe('OpenAI provider', () => {
   });
 
   it('appends the models path to an OpenAI-compatible API base URL', async () => {
-    vi.mocked(fetch).mockResolvedValueOnce(successfulResponse({ data: [] }));
+    vi.mocked(fetch).mockResolvedValueOnce(successfulResponse({ data: [{ id: 'gpt-6.1-sol' }] }));
 
     await listOpenAIModels('sk-test', 'https://provider.example/v1');
 
@@ -58,7 +58,7 @@ describe('OpenAI provider', () => {
 
   it('exposes a preflight check through the adapter contract', async () => {
     process.env.OPENAI_API_KEY = 'test-key';
-    vi.mocked(fetch).mockResolvedValueOnce(successfulResponse({ data: [] }));
+    vi.mocked(fetch).mockResolvedValueOnce(successfulResponse({ data: [{ id: 'gpt-6.1-sol' }] }));
 
     const result = await new OpenAIProvider().preflight();
 
@@ -163,8 +163,8 @@ describe('OpenAI provider', () => {
     await new OpenAIProvider().plan({ taskId: 'plan', title: 'Plan work', prompt: 'Create the roadmap.' });
 
     const request = vi.mocked(fetch).mock.calls.at(-1)?.[1];
-    const body = JSON.parse(String(request?.body)) as { messages: Array<{ content: string }> };
-    const prompt = body.messages.map((message) => message.content).join('\n');
+    const body = JSON.parse(String(request?.body)) as { instructions: string; input: Array<{ content: Array<{ text: string }> }> };
+    const prompt = [body.instructions, ...body.input.flatMap((message) => message.content.map((item) => item.text))].join('\n');
     expect(prompt).toContain('Do not propose executable validation commands during planning');
     expect(prompt).not.toContain('validationRecovery');
   });
@@ -290,17 +290,6 @@ describe('OpenAI provider', () => {
 });
 
 describe('Codex provider', () => {
-  it('normalizes visible Codex app-server models and keeps the default first', () => {
-    expect(normalizeCodexModels([
-      { id: 'hidden', displayName: 'Hidden', hidden: true },
-      { id: 'gpt-fast', displayName: 'GPT Fast' },
-      { id: 'gpt-default', model: 'gpt-default', displayName: 'GPT Default', isDefault: true }
-    ])).toEqual([
-      { id: 'gpt-default', name: 'GPT Default', isDefault: true },
-      { id: 'gpt-fast', name: 'GPT Fast', isDefault: false }
-    ]);
-  });
-
   it('should construct codex provider instance', () => {
     process.env.CODEX_API_KEY = 'test-key';
     const codex = new CodexProvider();
@@ -309,7 +298,7 @@ describe('Codex provider', () => {
 
   it('exposes Codex API-key preflight through the adapter contract', async () => {
     process.env.CODEX_API_KEY = 'test-key';
-    vi.mocked(fetch).mockResolvedValueOnce(successfulResponse({ data: [] }));
+    vi.mocked(fetch).mockResolvedValueOnce(successfulResponse({ data: [{ id: 'gpt-6-astra' }] }));
 
     const result = await new CodexProvider({ authMode: 'api_key' }).preflight();
 

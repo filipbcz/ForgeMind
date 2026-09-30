@@ -10,9 +10,6 @@ import type {
   CreateChatThreadRequest,
   CreateProjectRequest,
   CreateTaskRequest,
-  CodexOAuthCompleteResponse,
-  CodexOAuthStatusResponse,
-  CodexOAuthStartResponse,
   DecideProjectRoadmapExtensionRequest,
   DeleteProjectRequest,
   DeleteProjectResponse,
@@ -383,39 +380,6 @@ export async function deleteProviderConnection(connectionId: string): Promise<{ 
   return request<{ ok: boolean; connectionId: string }>(`/api/providers/connections/${connectionId}`, {
     method: 'DELETE'
   });
-}
-
-export async function startCodexOAuth(input: { name?: string } = {}): Promise<CodexOAuthStartResponse> {
-  return request<CodexOAuthStartResponse>('/api/providers/codex/oauth/start', {
-    method: 'POST',
-    body: JSON.stringify(input)
-  });
-}
-
-export async function completeCodexOAuth(input: {
-  loginId: string;
-  connectionId?: string;
-  model: string;
-  name?: string;
-  isDefault?: boolean;
-}): Promise<CodexOAuthCompleteResponse> {
-  return request<CodexOAuthCompleteResponse>('/api/providers/codex/oauth/complete', {
-    method: 'POST',
-    body: JSON.stringify(input)
-  });
-}
-
-export async function fetchCodexOAuthStatus(loginId: string): Promise<CodexOAuthStatusResponse> {
-  return request<CodexOAuthStatusResponse>(`/api/providers/codex/oauth/${loginId}/status`);
-}
-
-export function codexOAuthAuthorizeUrl(loginId: string, name?: string): string {
-  const url = new URL(`${API_URL}/api/providers/codex/oauth/authorize`);
-  url.searchParams.set('loginId', loginId);
-  if (name) {
-    url.searchParams.set('name', name);
-  }
-  return url.toString();
 }
 
 export async function fetchNotificationSettings(): Promise<NotificationSettingsApi> {

@@ -9,7 +9,7 @@ describe('Codex structured output schemas', () => {
   });
 
   it.each(['implementation', 'chat'] as const)('serializes typed Windows adapters in the actual %s request schema', async (operation) => {
-    const provider = new CodexProvider({ authMode: 'codex_oauth' });
+    const provider = new CodexProvider({ apiKey: 'sk-test', authMode: 'api_key', useCli: true });
     const intercepted = new Error('Stop before invoking Codex.');
     const execute = vi.spyOn(provider as unknown as {
       runCodexExec: (input: { schema: JsonSchema }) => Promise<string>;
@@ -48,7 +48,7 @@ describe('Codex structured output schemas', () => {
   });
 
   it('reviews a large repository through the native read-only checkout without embedding it in the prompt', async () => {
-    const provider = new CodexProvider({ authMode: 'codex_oauth' });
+    const provider = new CodexProvider({ apiKey: 'sk-test', authMode: 'api_key', useCli: true });
     const intercepted = new Error('Stop before invoking Codex.');
     const execute = vi.spyOn(provider as unknown as {
       runCodexExec: (input: { repositoryPath?: string; prompt: string }) => Promise<string>;
@@ -182,30 +182,9 @@ describe('Codex process activity timeouts', () => {
     expect(prompt).not.toContain('A very long implementation plan');
   });
 
-  it('fails before execution when the configured OAuth session is not active', async () => {
-    const previousAuthMode = process.env.CODEX_AUTH_MODE;
-    const previousBinary = process.env.FORGEMIND_CODEX_CLI_PATH;
-    process.env.CODEX_AUTH_MODE = 'oauth';
-    process.env.FORGEMIND_CODEX_CLI_PATH = process.execPath;
-
-    const provider = new CodexProvider();
-    await expect(provider.plan({
-      taskId: 'task_1',
-      title: 'Task',
-      prompt: 'Prompt',
-      repositoryPath: process.cwd()
-    })).rejects.toThrow('Codex OAuth session is not active. Reconnect Codex in Settings before retrying this task.');
-
-    if (previousAuthMode === undefined) {
-      delete process.env.CODEX_AUTH_MODE;
-    } else {
-      process.env.CODEX_AUTH_MODE = previousAuthMode;
-    }
-    if (previousBinary === undefined) {
-      delete process.env.FORGEMIND_CODEX_CLI_PATH;
-    } else {
-      process.env.FORGEMIND_CODEX_CLI_PATH = previousBinary;
-    }
+  it('rejects removed ChatGPT OAuth configuration', () => {
+    expect(() => new CodexProvider({ authMode: 'codex_oauth' } as never))
+      .toThrow('ChatGPT OAuth support was removed');
   });
 
   it('keeps an active process alive past the inactivity timeout', async () => {
@@ -256,7 +235,7 @@ describe('Codex process activity timeouts', () => {
   it('captures a persisted Codex session from JSONL events', async () => {
     const onSessionId = vi.fn();
     const result = await runCodexProcess(
-      ['-e', "process.stdout.write(JSON.stringify({type:'thread.started',thread_id:'session-123'})+'\\n');process.stdout.write(JSON.stringify({type:'turn.completed',usage:{input_tokens:12,output_tokens:3}})+'\\n')", '--', '--json'],
+      ['-e', "process.stdout.write(JSON.stringify({type:'thread.started',thread_id:'session-123'})+'\\n');process.stdout.write(JSON.stringify({type:'turn.completed',usage:{input_tokens:12,output_tokens:3,cached_input_tokens:4}})+'\\n')", '--', '--json'],
       '',
       {
         binary: process.execPath,
@@ -267,7 +246,7 @@ describe('Codex process activity timeouts', () => {
     );
 
     expect(onSessionId).toHaveBeenCalledWith('session-123');
-    expect(result).toMatchObject({ sessionId: 'session-123', totalTokens: 15 });
+    expect(result).toMatchObject({ sessionId: 'session-123', inputTokens: 12, outputTokens: 3, cachedTokens: 4, totalTokens: 15 });
   });
 
   it('stops a process after sustained inactivity', async () => {

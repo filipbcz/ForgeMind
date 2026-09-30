@@ -37,6 +37,9 @@ export interface ProviderUsageMeasurement {
   cachedTokens?: number;
   source: 'actual_total' | 'actual_breakdown';
   actualCostUsd?: number;
+  requestId?: string;
+  clientRequestId?: string;
+  pricingVersion?: string;
 }
 
 export interface PlanInput {

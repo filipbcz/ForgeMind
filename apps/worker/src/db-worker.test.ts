@@ -1438,8 +1438,8 @@ github:
       taskId: 'task_1',
       result: expect.objectContaining({ status: 'ready_for_user_review' })
     }));
-    expect(createProviderMock).toHaveBeenCalledWith('openai', undefined);
-    expect(createProviderMock).toHaveBeenCalledWith('codex', undefined);
+    expect(createProviderMock).toHaveBeenCalledWith('openai', expect.objectContaining({ modelProfile: 'balanced', useCli: false }));
+    expect(createProviderMock).toHaveBeenCalledWith('codex', expect.objectContaining({ modelProfile: 'balanced', useCli: true }));
     expect(fallbackEstimate).not.toHaveBeenCalled();
     expect(repositoryMock.writeAudit).toHaveBeenCalledWith(expect.objectContaining({
       eventType: 'task_cost_estimate_unavailable'
@@ -1711,6 +1711,9 @@ github:
           provider: 'codex',
           model: 'gpt-5.5',
           totalTokens: 124947,
+          requestId: 'req_openai_1',
+          clientRequestId: 'client_1',
+          pricingVersion: 'openai-2026-09-29',
           source: 'actual_total'
         }
       });
@@ -1756,7 +1759,10 @@ github:
       attempt: 2,
       totalTokens: 124947,
       usageSource: 'actual_total',
-      estimatedCostUsd: 0
+      estimatedCostUsd: 0,
+      requestId: 'req_openai_1',
+      clientRequestId: 'client_1',
+      pricingVersion: 'openai-2026-09-29'
     }));
     expect(repositoryMock.recordProviderUsage).toHaveBeenNthCalledWith(3, expect.objectContaining({
       phase: 'implementation',
