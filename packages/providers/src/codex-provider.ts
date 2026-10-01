@@ -454,7 +454,11 @@ export class CodexProvider implements AIProvider {
       ?? (process.env.CODEX_HOME ? join(process.env.CODEX_HOME, 'api-key') : join(homedir(), '.forgemind-codex-api'));
     this.commandEnv = {
       ...createWorkspaceEnvironment(),
+      // `codex exec` supports the dedicated CODEX_API_KEY environment
+      // variable for non-interactive API-key authentication. Keep
+      // OPENAI_API_KEY as well for compatible CLI versions and tools.
       OPENAI_API_KEY: key,
+      CODEX_API_KEY: key,
       CODEX_HOME: apiKeyCodexHome
     };
     this.model = config?.model?.trim() || (process.env.CODEX_MODEL ?? DEFAULT_CODEX_MODEL);

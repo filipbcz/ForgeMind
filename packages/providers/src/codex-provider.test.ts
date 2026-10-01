@@ -187,6 +187,14 @@ describe('Codex process activity timeouts', () => {
       .toThrow('ChatGPT OAuth support was removed');
   });
 
+  it('passes the configured API key to both Codex CLI authentication variables', () => {
+    const provider = new CodexProvider({ apiKey: 'sk-test', authMode: 'api_key', useCli: true });
+    const commandEnv = (provider as unknown as { commandEnv: NodeJS.ProcessEnv }).commandEnv;
+
+    expect(commandEnv.OPENAI_API_KEY).toBe('sk-test');
+    expect(commandEnv.CODEX_API_KEY).toBe('sk-test');
+  });
+
   it('keeps an active process alive past the inactivity timeout', async () => {
     const onActivity = vi.fn();
 
