@@ -136,7 +136,7 @@ Each deployment prints `docker system df` before and after cleanup. The runtime 
 
 Configure GitHub and an OpenAI project service-account API key in the deployed ForgeMind UI. Encrypted credentials use `FORGEMIND_CREDENTIAL_KEY` and are stored in PostgreSQL. ChatGPT OAuth and its callback relay are not part of the production stack.
 
-For environment-managed credentials set `OPENAI_API_KEY` (and optionally `CODEX_API_KEY` for a separate local tool-runtime key) in the protected server env file. Model policy aliases are `FORGEMIND_MODEL_ECONOMY`, `FORGEMIND_MODEL_STANDARD`, and `FORGEMIND_MODEL_CRITICAL`.
+For environment-managed credentials set `OPENAI_API_KEY` (and optionally `CODEX_API_KEY` for a separate local tool-runtime key) in the protected server env file. Task routing uses `FORGEMIND_MODEL_ROUTER` and the cheapest-to-strongest comma-separated `FORGEMIND_MODEL_POOL`; static planning and audit aliases remain available as `FORGEMIND_MODEL_ECONOMY`, `FORGEMIND_MODEL_STANDARD`, and `FORGEMIND_MODEL_CRITICAL`.
 
 ## Operations
 

@@ -131,6 +131,8 @@ describe('Windows worker shared contracts', () => {
       authority: { database: 'none', productionHosts: 'none', globalGitHubCredentials: 'none' }
     };
     expect(isWindowsAuthoringPacket(authoring)).toBe(true);
+    expect(isWindowsAuthoringPacket({ ...authoring, modelRoute: { model: 'gpt-6-luna', reasoningEffort: 'medium' } })).toBe(true);
+    expect(isWindowsAuthoringPacket({ ...authoring, modelRoute: { model: 'gpt-6-luna', reasoningEffort: 'extreme' } })).toBe(false);
     expect(isWindowsAuthoringPacket({ ...authoring, protocolVersion: 2 })).toBe(true);
     expect(isWindowsAuthoringPacket({ ...authoring, protocolVersion: 3 })).toBe(false);
     expect(isWindowsAuthoringPacket({ ...authoring, baseCommitSha: 'main' })).toBe(false);

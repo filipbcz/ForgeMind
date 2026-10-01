@@ -17,7 +17,8 @@ import type {
   ProjectRoadmapCycle as CoreProjectRoadmapCycle,
   ProjectSpecificationVersion as CoreProjectSpecificationVersion,
   Project as CoreProject,
-  TaskRun as CoreTaskRun
+  TaskRun as CoreTaskRun,
+  TaskModelRoutingDecision
 } from '@forgemind/core';
 import { normalizeRunState, parseTaskRunState } from '@forgemind/core';
 import type { JsonValue } from '@forgemind/shared';
@@ -427,11 +428,31 @@ export function toTask(task: Task): ForgeTask {
     providerSessionModel: task.providerSessionModel ?? undefined,
     providerSessionConnectionId: task.providerSessionConnectionId ?? undefined,
     providerSessionUpdatedAt: task.providerSessionUpdatedAt?.toISOString(),
+    modelRoutingDecision: parseTaskModelRoutingDecision(task.modelRoutingDecision),
     createdAt: task.createdAt.toISOString(),
     updatedAt: task.updatedAt.toISOString(),
     startedAt: task.startedAt?.toISOString(),
     finishedAt: task.finishedAt?.toISOString()
   };
+}
+
+function parseTaskModelRoutingDecision(value: Prisma.JsonValue | null): TaskModelRoutingDecision | undefined {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return undefined;
+  const record = value as Record<string, Prisma.JsonValue>;
+  const parseSelection = (candidate: Prisma.JsonValue | undefined) => {
+    if (!candidate || typeof candidate !== 'object' || Array.isArray(candidate)) return undefined;
+    const selection = candidate as Record<string, Prisma.JsonValue>;
+    const effort = selection.reasoningEffort;
+    if (typeof selection.model !== 'string' || !['low', 'medium', 'high', 'xhigh', 'max'].includes(String(effort))) return undefined;
+    return { model: selection.model, reasoningEffort: effort as TaskModelRoutingDecision['implementation']['reasoningEffort'] };
+  };
+  const implementation = parseSelection(record.implementation);
+  const review = parseSelection(record.review);
+  const escalation = parseSelection(record.escalation);
+  if (record.version !== 1 || typeof record.routerModel !== 'string' || !implementation || !review || !escalation
+    || typeof record.rationale !== 'string' || typeof record.confidence !== 'number' || typeof record.decidedAt !== 'string') return undefined;
+  return { version: 1, routerModel: record.routerModel, implementation, review, escalation,
+    rationale: record.rationale, confidence: record.confidence, decidedAt: record.decidedAt };
 }
 
 export function toTaskRun(run: TaskRun): CoreTaskRun {

@@ -1,5 +1,5 @@
 import type { IsoDateString, JsonValue } from '@forgemind/shared';
-import type { ValidationCheckCategory } from './model.js';
+import type { TaskModelSelection, ValidationCheckCategory } from './model.js';
 
 export const WINDOWS_WORKER_SCHEMA_VERSION = 1 as const;
 export type WindowsWorkerSchemaVersion = typeof WINDOWS_WORKER_SCHEMA_VERSION;
@@ -257,6 +257,8 @@ export interface WindowsAuthoringPacket {
   baseCommitSha: string;
   workspaceRoot: string;
   artifactRoot: string;
+  /** Server-selected task route. The runner must use this model for native authoring. */
+  modelRoute?: TaskModelSelection;
   /** The complete, current implementation step. No roadmap or prior task context is
    * available to the native implementation provider. */
   step: { prompt: string; acceptanceCriteria: string[]; previousValidationError?: string; previousReviewBlockers?: string[]; priorPatch?: string;
@@ -643,6 +645,8 @@ export function isWindowsAuthoringPacket(value: unknown): value is WindowsAuthor
     || !areCapabilityKeys(value.contentPolicy.prohibitedDatasetExtensions)
     || !value.contentPolicy.prohibitedDatasetExtensions.every((extension) => /^\.[a-z0-9]+$/i.test(extension))
     || !Number.isSafeInteger(value.contentPolicy.maxUnclassifiedFileBytes) || (value.contentPolicy.maxUnclassifiedFileBytes as number) <= 0
+    || (value.modelRoute !== undefined && (!isRecord(value.modelRoute) || !isNonEmpty(value.modelRoute.model)
+      || !['low', 'medium', 'high', 'xhigh', 'max'].includes(value.modelRoute.reasoningEffort as string)))
     || !isRecord(value.step) || !isNonEmpty(value.step.prompt) || !Array.isArray(value.step.acceptanceCriteria)
     || !value.step.acceptanceCriteria.every(isNonEmpty)
     || (value.step.previousValidationError !== undefined && typeof value.step.previousValidationError !== 'string')

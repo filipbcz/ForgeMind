@@ -9,7 +9,15 @@ import type { ForgeTask, Project } from '@forgemind/core';
 vi.stubGlobal('fetch', vi.fn(async (_url: string, init?: RequestInit) => {
   const body = typeof init?.body === 'string' ? init.body : '';
   let content = '{}';
-  if (body.includes('Create a plan')) {
+  if (body.includes('You route one software task')) {
+    content = JSON.stringify({
+      implementation: { model: 'gpt-6.1-sol', reasoningEffort: 'medium' },
+      review: { model: 'gpt-6.1-sol', reasoningEffort: 'low' },
+      escalation: { model: 'gpt-6.1-sol', reasoningEffort: 'high' },
+      rationale: 'The task is small but requires repository tools.',
+      confidence: 0.9
+    });
+  } else if (body.includes('Create a plan')) {
     content = JSON.stringify({ summary: 'Plan summary', steps: ['step1'], acceptanceCriteria: ['ac1'] });
   } else if (body.includes('Implement the following task') || body.includes('Implement the following')) {
     content = JSON.stringify({

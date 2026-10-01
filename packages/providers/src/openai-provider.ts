@@ -21,10 +21,11 @@ import type {
   RoadmapRepairResult,
   ReviewInput,
   ReviewResult,
+  TaskRoutingInput,
   ValidationImpactInput,
   ValidationImpactResult
 } from './provider.js';
-import { ProviderContractError, normalizeProviderError, normalizeProviderPreflight, normalizeValidationChecks, parseChatResult, parseImplementResult, parsePlanResult, parseProviderJsonObject, parseReviewResult, parseValidationImpactResult } from './provider.js';
+import { ProviderContractError, buildTaskRoutingMessages, normalizeProviderError, normalizeProviderPreflight, normalizeValidationChecks, parseChatResult, parseImplementResult, parsePlanResult, parseProviderJsonObject, parseReviewResult, parseTaskModelRoutingDecision, parseValidationImpactResult } from './provider.js';
 import { emitCapturedUsage, normalizeTokenBreakdown } from './provider-usage.js';
 import { calculateModelCostUsd } from './model-pricing.js';
 import { buildReviewPrompt } from './review-prompt.js';
@@ -72,6 +73,7 @@ export class OpenAIProvider implements AIProvider {
   protected readonly apiKey: string;
   private readonly apiBaseUrl: string;
   private readonly model: string;
+  private readonly allowedModels: string[];
   private readonly reasoningEffort: NonNullable<ProviderRuntimeConfig['reasoningEffort']>;
 
   constructor(config?: ProviderRuntimeConfig) {
@@ -82,6 +84,8 @@ export class OpenAIProvider implements AIProvider {
     this.apiKey = key;
     this.apiBaseUrl = process.env.OPENAI_API_BASE_URL ?? DEFAULT_OPENAI_API_URL;
     this.model = config?.model?.trim() || (process.env.OPENAI_MODEL ?? DEFAULT_OPENAI_MODEL);
+    const configuredModels = config?.allowedModels?.map((model) => model.trim()).filter(Boolean) ?? [];
+    this.allowedModels = configuredModels.length > 0 ? configuredModels : [this.model];
     this.reasoningEffort = config?.reasoningEffort ?? 'medium';
   }
 
@@ -97,6 +101,18 @@ export class OpenAIProvider implements AIProvider {
       const payload = await readProviderJson<{ data?: Array<{ id?: string }> }>(response, 'OpenAI preflight');
       assertModelAvailable(payload.data, this.model, 'OpenAI');
     });
+  }
+
+  async routeTask(input: TaskRoutingInput) {
+    const routingInput = {
+      ...input,
+      availableModels: input.availableModels.length > 0 ? input.availableModels : this.allowedModels,
+      routerModel: input.routerModel || this.model
+    };
+    const messages: OpenAIMessage[] = buildTaskRoutingMessages(routingInput);
+    const response = await this.requestChat(messages, input.signal);
+    await emitCapturedUsage(input.onActivity, response.usage);
+    return parseTaskModelRoutingDecision(response.content, routingInput);
   }
 
   async assessValidationImpact(input: ValidationImpactInput): Promise<ValidationImpactResult> {

@@ -13,10 +13,10 @@ import type { AIProvider } from './provider.js';
 import { OpenAIProvider } from './openai-provider.js';
 import { CodexProvider } from './codex-provider.js';
 import { GitHubCopilotProvider } from './github-copilot-provider.js';
-import { ModelRoutedProvider, type ModelProfile, type ReasoningEffort } from './model-router.js';
+import { ModelRoutedProvider, type ModelProfile, type ModelRoutingState, type ReasoningEffort } from './model-router.js';
 
-export type { ModelProfile, ModelRoute, ModelWorkload, ReasoningEffort } from './model-router.js';
-export { resolveModelRoute } from './model-router.js';
+export type { ModelProfile, ModelRoute, ModelRoutingState, ModelWorkload, ReasoningEffort } from './model-router.js';
+export { DEFAULT_MODEL_POOL, resolveModelRoute } from './model-router.js';
 
 export interface ProviderRuntimeConfig {
   apiKey?: string;
@@ -27,6 +27,10 @@ export interface ProviderRuntimeConfig {
   useCli?: boolean;
   /** Optional workload-aware model policy. Omit to preserve a single explicit model. */
   modelProfile?: ModelProfile;
+  /** Candidate execution/review models available to the one-time task router. */
+  allowedModels?: string[];
+  /** Shared per-task state lets independently constructed implement/review wrappers reuse one decision. */
+  routingState?: ModelRoutingState;
   reasoningEffort?: ReasoningEffort;
 }
 

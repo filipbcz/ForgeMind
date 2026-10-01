@@ -1,7 +1,7 @@
 import { redactError } from '@forgemind/core';
 import type { ImplementationStepPlan, RoadmapCandidate, RoadmapQualityReview } from '@forgemind/core';
 export type { ImplementationStepPlan } from '@forgemind/core';
-import type { AcceptanceEvidenceSource, AcceptanceEvidenceStatus, NormalizedProviderErrorDetails, NormalizedProviderErrorKind, ProjectArchitectureUpdate, ProjectContract, ProjectContractDelta, ProjectContractRequirement, ProviderKind, ProviderPreflightResult, RealEngineEvidenceIntent, TaskMode, ValidationCheckCategory } from '@forgemind/core';
+import type { AcceptanceEvidenceSource, AcceptanceEvidenceStatus, ModelReasoningEffort, NormalizedProviderErrorDetails, NormalizedProviderErrorKind, ProjectArchitectureUpdate, ProjectContract, ProjectContractDelta, ProjectContractRequirement, ProviderKind, ProviderPreflightResult, RealEngineEvidenceIntent, TaskMode, TaskModelRoutingDecision, ValidationCheckCategory } from '@forgemind/core';
 
 export type { NormalizedProviderErrorDetails, NormalizedProviderErrorKind, ProviderPreflightResult } from '@forgemind/core';
 
@@ -10,7 +10,97 @@ export interface ProviderActivity {
   message: string;
   elapsedMs: number;
   usage?: ProviderUsageMeasurement;
+  routingDecision?: TaskModelRoutingDecision;
   process?: { event: 'started' | 'completed'; id?: string; command: string; exitCode?: number; stdout?: string; stderr?: string };
+}
+
+export interface TaskRoutingInput {
+  taskId: string;
+  title: string;
+  prompt: string;
+  acceptanceCriteria: string[];
+  availableModels: string[];
+  routerModel: string;
+  previousFailure?: string;
+  onActivity?: ProviderActivityHandler;
+  signal?: AbortSignal;
+}
+
+export function buildTaskRoutingMessages(input: TaskRoutingInput): Array<{ role: 'system' | 'user'; content: string }> {
+  return [
+    {
+      role: 'system',
+      content: 'You route one software task to the cheapest model and reasoning effort likely to complete it reliably. ' +
+        'GPT-6 Luna is for focused, well-scoped and repeatable work; GPT-6.1 Sol is for complex coding and coordinated deliverables; GPT-6 Astra is for ambiguous, demanding or critical work. ' +
+        'Choose implementation and independent review separately. Escalation is used only after a substantive implementation or review failure and must be at least as capable as the initial implementation route. ' +
+        'Return JSON only with implementation, review, escalation (each containing model and reasoningEffort), rationale, and confidence from 0 to 1.'
+    },
+    {
+      role: 'user',
+      content: JSON.stringify({
+        title: input.title,
+        prompt: input.prompt,
+        acceptanceCriteria: input.acceptanceCriteria,
+        availableModels: input.availableModels,
+        previousFailure: input.previousFailure ?? null
+      })
+    }
+  ];
+}
+
+export function parseTaskModelRoutingDecision(
+  content: string,
+  input: Pick<TaskRoutingInput, 'availableModels' | 'routerModel'>
+): TaskModelRoutingDecision {
+  const value = parseProviderJsonObject(content, 'task model routing');
+  const allowedModels = new Set(input.availableModels);
+  const parseSelection = (key: 'implementation' | 'review' | 'escalation') => {
+    const candidate = value[key];
+    if (!candidate || typeof candidate !== 'object' || Array.isArray(candidate)) {
+      throw new ProviderContractError(`Task model routing must contain ${key}.`);
+    }
+    const record = candidate as Record<string, unknown>;
+    const effort = record.reasoningEffort;
+    if (typeof record.model !== 'string' || !allowedModels.has(record.model)) {
+      throw new ProviderContractError(`Task model routing selected unavailable ${key} model.`);
+    }
+    if (!isModelReasoningEffort(effort)) {
+      throw new ProviderContractError(`Task model routing selected invalid ${key} reasoning effort.`);
+    }
+    return { model: record.model, reasoningEffort: effort };
+  };
+  if (typeof value.rationale !== 'string' || !value.rationale.trim()) {
+    throw new ProviderContractError('Task model routing must contain a rationale.');
+  }
+  if (typeof value.confidence !== 'number' || !Number.isFinite(value.confidence) || value.confidence < 0 || value.confidence > 1) {
+    throw new ProviderContractError('Task model routing confidence must be between 0 and 1.');
+  }
+  const implementation = parseSelection('implementation');
+  const review = parseSelection('review');
+  const escalation = parseSelection('escalation');
+  const modelRank = (selection: { model: string }) => input.availableModels.indexOf(selection.model);
+  const effortRank = (selection: { reasoningEffort: ModelReasoningEffort }) =>
+    ['low', 'medium', 'high', 'xhigh', 'max'].indexOf(selection.reasoningEffort);
+  if (
+    modelRank(escalation) < modelRank(implementation)
+    || (modelRank(escalation) === modelRank(implementation) && effortRank(escalation) < effortRank(implementation))
+  ) {
+    throw new ProviderContractError('Task model routing escalation must be at least as capable as the implementation route.');
+  }
+  return {
+    version: 1,
+    routerModel: input.routerModel,
+    implementation,
+    review,
+    escalation,
+    rationale: value.rationale.trim(),
+    confidence: value.confidence,
+    decidedAt: new Date().toISOString()
+  };
+}
+
+function isModelReasoningEffort(value: unknown): value is ModelReasoningEffort {
+  return value === 'low' || value === 'medium' || value === 'high' || value === 'xhigh' || value === 'max';
 }
 
 export type ProviderActivityHandler = (activity: ProviderActivity) => void | Promise<void>;
@@ -687,6 +777,7 @@ export interface CostEstimateResult {
 export interface AIProvider {
   kind: ProviderKind;
   preflight(signal?: AbortSignal): Promise<ProviderPreflightResult>;
+  routeTask?(input: TaskRoutingInput): Promise<TaskModelRoutingDecision>;
   plan(input: PlanInput): Promise<PlanResult>;
   repairRoadmap?(input: RoadmapRepairInput): Promise<RoadmapRepairResult>;
   reviewRoadmap?(input: RoadmapQualityReviewInput): Promise<ReviewResult>;

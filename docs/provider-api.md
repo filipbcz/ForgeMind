@@ -4,6 +4,7 @@ Provider adapter je v `packages/providers`.
 
 Minimalni kontrakt:
 
+- `routeTask()` jednou klasifikuje task a vrati model i reasoning effort pro implementaci, nezavisly review a pripadnou eskalaci.
 - `plan()` pripravi kroky a akceptacni kriteria.
 - `implement()` provede nebo simuluje zmenu ve workspace.
 - `review()` vrati blokery, bezpecna vylepseni a rizikove zmeny.
@@ -16,8 +17,9 @@ Aktualni implementace:
 - `MockProvider` slouzi pro lokalni testy, deterministicke E2E scenare a vyvoj bez externich kredencialu.
 - `OpenAIProvider` vola OpenAI Responses API pres projektovy `OPENAI_API_KEY`, `OPENAI_API_BASE_URL` a `OPENAI_MODEL`.
 - `CodexProvider` pouziva stejny OpenAI API key; v lokalnim tool-runtime rezimu spousti Codex CLI s `OPENAI_API_KEY`, nikdy s ChatGPT OAuth session.
-- `model_profile` je vykonna routing policy: `balanced` smeruje scoped praci na Luna, bezny vyvoj na GPT-6.1 Sol a kriticke audity na Astra; `fast` posouva praci o uroven nize a `deep` o uroven vyse.
-- `FORGEMIND_MODEL_ECONOMY`, `FORGEMIND_MODEL_STANDARD` a `FORGEMIND_MODEL_CRITICAL` mohou modelove aliasy centralne zmenit bez zasahu do orchestrace.
+- Implementacni task nema tri pevne urovne. Nizkonakladovy router (vychozi GPT-6.1 Sol s low reasoning) zvoli presny model a reasoning effort z usporadaneho poolu, rozhodnuti se ulozi k tasku a implementace i review je znovu pouziji. Nova volba se nedela pri kazdem turnu; po vecnem selhani se pouzije predem zvolena eskalace.
+- Connection muze ulozit vlastni serazeny pool modelu. Pro environment-managed connection jej urcuji `FORGEMIND_MODEL_ROUTER` a carkami oddeleny `FORGEMIND_MODEL_POOL`.
+- `model_profile` a `FORGEMIND_MODEL_ECONOMY`, `FORGEMIND_MODEL_STANDARD`, `FORGEMIND_MODEL_CRITICAL` zustavaji pro netaskove operace, napr. roadmapu a audity.
 - Provider usage uklada skutecne input/output/cached tokeny, cenu podle verzovaneho ceniku a OpenAI/client request ID.
 - `GitHubCopilotProvider` je kompatibilitni placeholder pro historicky ulozene connectiony; runtime SDK se nedistribuuje a provider nelze pouzit pro nove ani existujici tasky.
 - Worker umi vybrat primarni provider z konfigurace nebo `FORGEMIND_PROVIDER` a pouzit fallback z konfigurace nebo `FORGEMIND_FALLBACK_PROVIDER`.

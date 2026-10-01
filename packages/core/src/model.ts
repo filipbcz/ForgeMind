@@ -653,10 +653,31 @@ export interface ForgeTask {
   providerSessionModel?: string;
   providerSessionConnectionId?: string;
   providerSessionUpdatedAt?: IsoDateString;
+  modelRoutingDecision?: TaskModelRoutingDecision;
   createdAt: IsoDateString;
   updatedAt: IsoDateString;
   startedAt?: IsoDateString;
   finishedAt?: IsoDateString;
+}
+
+export type ModelReasoningEffort = 'low' | 'medium' | 'high' | 'xhigh' | 'max';
+
+export interface TaskModelSelection {
+  model: string;
+  reasoningEffort: ModelReasoningEffort;
+}
+
+/** One persisted model assignment for a task. The escalation route is used only
+ * after a substantive implementation or review failure. */
+export interface TaskModelRoutingDecision {
+  version: 1;
+  routerModel: string;
+  implementation: TaskModelSelection;
+  review: TaskModelSelection;
+  escalation: TaskModelSelection;
+  rationale: string;
+  confidence: number;
+  decidedAt: IsoDateString;
 }
 
 export interface TaskRun {

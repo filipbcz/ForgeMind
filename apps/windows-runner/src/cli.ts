@@ -5,8 +5,8 @@ import { homedir, release as osRelease } from 'node:os';
 import { join } from 'node:path';
 import { stdin, stdout } from 'node:process';
 import { pathToFileURL } from 'node:url';
-import { classifyWindowsExecutionPacket, isWindowsAuthoringPacket, isWindowsExecutionPacket, WINDOWS_AUTHORING_BLOB_CHUNK_BYTES, type WindowsAuthoringResult, type WorkerProbeEvidence } from '@forgemind/core';
-import { createProvider, listOpenAIModels, resolveCodexBinary, type AIProvider, type ModelProfile, type ProviderModelOption } from '@forgemind/providers';
+import { classifyWindowsExecutionPacket, isWindowsAuthoringPacket, isWindowsExecutionPacket, WINDOWS_AUTHORING_BLOB_CHUNK_BYTES, type TaskModelSelection, type WindowsAuthoringResult, type WorkerProbeEvidence } from '@forgemind/core';
+import { createProvider, listOpenAIModels, resolveCodexBinary, type AIProvider, type ProviderModelOption } from '@forgemind/providers';
 import { WindowsCredentialStore, type RunnerCredential } from './credential-store.js';
 import { cleanupWindowsValidationWorkspace, executeWindowsValidation } from './executor.js';
 import { executeWindowsAuthoring, LifecycleNativeImplementationProvider } from './authoring-executor.js';
@@ -96,6 +96,7 @@ async function runCodexCommand(binary: string, args: string[], codexHome: string
 
 export async function prepareLocalCodexRuntime(environment: NodeJS.ProcessEnv = process.env): Promise<{
   provider: AIProvider; model: string; codexHome: string; availableModels: string[];
+  providerForRoute: (route: TaskModelSelection) => AIProvider;
 }> {
   const codexHome = environment.FORGEMIND_API_CODEX_HOME?.trim()
     || join(environment.LOCALAPPDATA?.trim() || homedir(), 'ForgeMind', 'codex-api');
@@ -113,15 +114,23 @@ export async function prepareLocalCodexRuntime(environment: NodeJS.ProcessEnv = 
   if (!apiKey) throw new Error('OPENAI_API_KEY is required. ForgeMind Windows authoring no longer supports ChatGPT OAuth.');
   const models = await listOpenAIModels(apiKey);
   const model = selectLocalCodexModel(models, environment.FORGEMIND_MODEL_STANDARD ?? environment.CODEX_MODEL);
-  const modelProfile = readModelProfile(environment.FORGEMIND_MODEL_PROFILE);
-  const provider = createProvider('codex', { apiKey, authMode: 'api_key', useCli: true, codexHome, model, modelProfile });
+  const providerConfig = { apiKey, authMode: 'api_key' as const, useCli: true, codexHome };
+  const provider = createProvider('codex', { ...providerConfig, model, reasoningEffort: 'medium' });
   const preflight = await provider.preflight();
   if (!preflight.ok) throw new Error(`OpenAI API preflight failed before starting a Windows session: ${preflight.error?.auditSafeMessage ?? 'unknown error'}`);
-  return { provider, model, codexHome, availableModels: models.map(({ id }) => id) };
-}
-
-function readModelProfile(value: string | undefined): ModelProfile {
-  return value === 'fast' || value === 'deep' ? value : 'balanced';
+  const availableModels = models.map(({ id }) => id);
+  return {
+    provider,
+    model,
+    codexHome,
+    availableModels,
+    providerForRoute: (route) => {
+      if (!availableModels.includes(route.model)) {
+        throw new Error(`Server-selected model "${route.model}" is not available to this Windows runner API key.`);
+      }
+      return createProvider('codex', { ...providerConfig, model: route.model, reasoningEffort: route.reasoningEffort });
+    }
+  };
 }
 
 export async function main(args = process.argv.slice(2)): Promise<void> {
@@ -169,6 +178,12 @@ export async function main(args = process.argv.slice(2)): Promise<void> {
         if (!claim.job || !claim.lease) return;
         if (isWindowsAuthoringPacket(claim.job.packet)) {
           stdout.write(`Running native Windows implementation ${claim.job.packet.jobId}.\n`);
+          const authoringProvider = claim.job.packet.modelRoute
+            ? codexRuntime.providerForRoute(claim.job.packet.modelRoute)
+            : codexRuntime.provider;
+          if (claim.job.packet.modelRoute) {
+            stdout.write(`Using routed model ${claim.job.packet.modelRoute.model} (${claim.job.packet.modelRoute.reasoningEffort}).\n`);
+          }
           const progressPublisher = new CoalescedAuthoringProgressPublisher(
             (progress) => transport.publishAuthoringProgress(auth, progress)
           );
@@ -176,7 +191,7 @@ export async function main(args = process.argv.slice(2)): Promise<void> {
             workspaceRoot: managedRoots.work, artifactRoot: managedRoots.diagnostics, signal: context.signal,
             managedRoots, observedCapabilities: probes.capabilities,
             onProgress: (progress) => progressPublisher.publish(progress),
-            provider: new LifecycleNativeImplementationProvider(codexRuntime.provider) });
+            provider: new LifecycleNativeImplementationProvider(authoringProvider) });
           await progressPublisher.flush();
           const submitted = await submitAuthoringResultDurably(transport, auth, executed.result, context.signal,
             (message) => stdout.write(`${message}\n`));

@@ -1,7 +1,7 @@
 import type { FastifyInstance, FastifyReply, FastifyRequest } from 'fastify';
 import { createHash } from 'node:crypto';
 import { z } from 'zod';
-import { buildProjectExtensionProposalPrompt, CodexExecutionTimeoutError, createProvider, formatProjectExtensionProposal, GitHubCopilotProvider, listOpenAIModels, resolveModelRoute } from '@forgemind/providers';
+import { buildProjectExtensionProposalPrompt, CodexExecutionTimeoutError, createProvider, DEFAULT_MODEL_POOL, formatProjectExtensionProposal, GitHubCopilotProvider, listOpenAIModels, resolveModelRoute } from '@forgemind/providers';
 import type { AIProvider, PlanResult, ProviderSessionContext } from '@forgemind/providers';
 import type { ProviderRuntimeConfig } from '@forgemind/providers';
 import {
@@ -225,7 +225,8 @@ const providerConnectSchema = z
     provider: z.enum(['openai', 'codex', 'github_copilot']),
     authMode: z.literal('api_key').optional().default('api_key'),
     apiKey: z.string().min(1).optional(),
-    model: z.string().min(1)
+    model: z.string().trim().min(1).optional(),
+    allowedModels: z.array(z.string().trim().min(1)).max(16).optional()
   })
   .superRefine((input, context) => {
     if (input.provider !== 'github_copilot' && !input.apiKey && !input.connectionId) {
@@ -329,12 +330,18 @@ export function registerRoutes(
       ? runtimeStatusByConnection.get(providerRuntimeStatusKey(currentProvider, providerConnection?.id ?? null)) ?? null
       : null;
     const modelProfile = resolveGlobalModelProfile();
+    const allowedModels = providerConnection?.allowedModels?.length
+      ? providerConnection.allowedModels
+      : [...DEFAULT_MODEL_POOL];
     return {
       currentProvider,
       currentModel,
       currentConnectionId: providerConnection?.id ?? null,
       currentRuntimeStatus,
       modelPolicy: {
+        mode: 'automatic',
+        router: currentModel ?? DEFAULT_MODEL_POOL[1],
+        allowedModels,
         profile: modelProfile,
         economy: resolveModelRoute({ profile: modelProfile, workload: 'economy', configuredModel: currentModel ?? undefined }).model,
         standard: resolveModelRoute({ profile: modelProfile, workload: 'standard', configuredModel: currentModel ?? undefined }).model,
@@ -612,14 +619,43 @@ export function registerRoutes(
         throw new Error('Only migration from a legacy ChatGPT OAuth connection to an API key is supported.');
       }
 
+      const routerModel = input.model?.trim()
+        || existingConnection?.model
+        || (input.provider === 'github_copilot' ? '' : DEFAULT_MODEL_POOL[1]);
+      if (!routerModel) throw new Error('A router model is required for this provider.');
+      const allowedModels = Array.from(new Set(
+        input.allowedModels?.length
+          ? input.allowedModels
+          : existingConnection?.allowedModels?.length
+            ? existingConnection.allowedModels
+            : input.provider === 'github_copilot' ? [routerModel] : [...DEFAULT_MODEL_POOL]
+      ));
+
       const provider = createProvider(input.provider, {
         apiKey: input.apiKey ?? existingConnection?.apiKey,
         authMode: input.authMode,
-        model: input.model,
-        modelProfile: input.provider === 'github_copilot' ? undefined : resolveGlobalModelProfile()
+        model: routerModel,
+        reasoningEffort: 'low'
       });
-      const preflight = await provider.preflight();
-      if (!preflight.ok) throw new Error(preflight.error?.auditSafeMessage ?? 'OpenAI API key validation failed.');
+      if (input.provider === 'openai' || input.provider === 'codex') {
+        const apiKey = input.apiKey ?? existingConnection?.apiKey;
+        if (!apiKey) throw new Error('An OpenAI API key is required.');
+        const availableModels = await listOpenAIModels(
+          apiKey,
+          input.provider === 'codex'
+            ? process.env.CODEX_API_BASE_URL ?? 'https://api.openai.com/v1/responses'
+            : process.env.OPENAI_API_BASE_URL
+        );
+        const availableIds = availableModels.map(({ id }) => id);
+        const unavailableModels = Array.from(new Set([routerModel, ...allowedModels]))
+          .filter((model) => !availableIds.some((id) => id === model || id.startsWith(`${model}-`)));
+        if (unavailableModels.length > 0) {
+          throw new Error(`Models are not available to this API project: ${unavailableModels.join(', ')}.`);
+        }
+      } else {
+        const preflight = await provider.preflight();
+        if (!preflight.ok) throw new Error(preflight.error?.auditSafeMessage ?? 'Provider validation failed.');
+      }
       const estimate = await provider.estimateCost({
         prompt: 'Provider connection check prompt.',
         repositorySizeHint: 'small'
@@ -633,7 +669,8 @@ export function registerRoutes(
         provider: input.provider,
         authMode: input.authMode,
         apiKey: input.apiKey,
-        model: input.model,
+        model: routerModel,
+        allowedModels,
         codexHome: undefined,
         accountSummary: undefined
       });
@@ -650,6 +687,7 @@ export function registerRoutes(
           authMode: connection.authMode,
           apiKeyFingerprint: connection.apiKeyFingerprint ?? null,
           model: connection.model,
+          allowedModels: connection.allowedModels ?? [],
           codexHome: connection.codexHome ?? null,
           accountSummary: connection.accountSummary ?? null,
           persistent: true
@@ -662,6 +700,7 @@ export function registerRoutes(
         name: connection.name,
         provider: input.provider,
         model: connection.model,
+        allowedModels: connection.allowedModels ?? [],
         authMode: connection.authMode,
         persistent: true,
         estimate
@@ -2509,6 +2548,7 @@ function buildProviderRuntimeConfig(connection: AIProviderConnectionSecret, proj
     apiKey: connection.apiKey,
     authMode: connection.authMode,
     model: connection.model,
+    allowedModels: connection.allowedModels,
     codexHome: connection.codexHome,
     modelProfile,
     useCli: connection.provider === 'codex' && connection.authMode === 'api_key'
@@ -2595,6 +2635,7 @@ async function saveAIProviderConnection(
     authMode?: 'api_key' | 'codex_oauth';
     apiKey?: string;
     model: string;
+    allowedModels?: string[];
     codexHome?: string;
     accountSummary?: string;
   }

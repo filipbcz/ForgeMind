@@ -93,6 +93,7 @@ const repositoryMock = {
   updateProjectRoadmapCycleStatus: vi.fn(async () => undefined),
   setProjectRoadmapCycleExtensionProposal: vi.fn(async () => undefined),
   updateTaskRunProvider: vi.fn(async () => undefined),
+  updateTaskModelRoutingDecision: vi.fn(async () => undefined),
   updateTaskProviderSession: vi.fn(async () => undefined),
   updateProjectPlanningSession: vi.fn(async () => undefined),
   recordCompletedTaskProjectMemory: vi.fn(async () => undefined),

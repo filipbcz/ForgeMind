@@ -43,6 +43,7 @@ import {
   type TaskDiagnosticExport,
   type TaskStatus,
   type TaskCheckpoint,
+  type TaskModelRoutingDecision,
   type TaskRunState
 } from '@forgemind/core';
 import { createHash, randomUUID } from 'node:crypto';
@@ -321,6 +322,7 @@ export interface AIProviderConnectionSnapshot {
   provider: AIProviderConnectionKind;
   authMode: AIProviderAuthMode;
   model: string;
+  allowedModels?: string[];
   apiKeyFingerprint?: string;
   codexHome?: string;
   accountSummary?: string;
@@ -807,6 +809,7 @@ export class ForgeMindRepository {
     provider: AIProviderConnectionKind;
     authMode?: AIProviderAuthMode;
     model: string;
+    allowedModels?: string[];
     apiKey?: string;
     codexHome?: string;
     accountSummary?: string;
@@ -849,6 +852,7 @@ export class ForgeMindRepository {
             provider: input.provider,
             authMode,
             model: input.model,
+            allowedModels: toPrismaJson(input.allowedModels ?? jsonStringArray(existingConnection?.allowedModels ?? [])),
             apiKeyCiphertext,
             apiKeyFingerprint,
             codexHome: authMode === 'api_key' ? null : input.codexHome ?? existingConnection?.codexHome,
@@ -866,6 +870,7 @@ export class ForgeMindRepository {
           provider: input.provider,
           authMode,
           model: input.model,
+          allowedModels: toPrismaJson(input.allowedModels ?? []),
           apiKeyCiphertext,
           apiKeyFingerprint,
           codexHome: input.codexHome,
@@ -887,6 +892,7 @@ export class ForgeMindRepository {
         provider: connection.provider,
         authMode: connection.authMode,
         model: connection.model,
+        allowedModels: jsonStringArray(connection.allowedModels),
         apiKeyFingerprint: connection.apiKeyFingerprint ?? null,
         codexHome: connection.codexHome ?? null,
         accountSummary: connection.accountSummary ?? null
@@ -2559,6 +2565,13 @@ export class ForgeMindRepository {
         }
       });
     }
+  }
+
+  async updateTaskModelRoutingDecision(taskId: string, decision: TaskModelRoutingDecision): Promise<void> {
+    await this.prisma.task.update({
+      where: { id: taskId },
+      data: { modelRoutingDecision: toPrismaJson(decision as unknown as JsonValue) }
+    });
   }
 
   async updateProjectPlanningSession(input: {
@@ -5281,6 +5294,7 @@ function toAIProviderConnectionSnapshot(connection: AiProviderConnection): AIPro
     provider: connection.provider as AIProviderConnectionKind,
     authMode,
     model: connection.model,
+    allowedModels: jsonStringArray(connection.allowedModels),
     apiKeyFingerprint: connection.apiKeyFingerprint ?? undefined,
     codexHome: connection.codexHome ?? undefined,
     accountSummary: connection.accountSummary ?? undefined,

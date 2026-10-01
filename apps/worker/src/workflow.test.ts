@@ -298,6 +298,14 @@ describe('simple autonomous worker workflow', () => {
   it('arbitrates implementation ownership to Windows before Linux validation and independent review', async () => {
     const project = createProject(); const task = createTask(project.id);
     const linuxImplement = vi.fn(async () => { throw new Error('Linux must not implement a Windows-owned step.'); });
+    const routeTask = vi.fn(async () => ({
+      version: 1 as const, routerModel: 'gpt-6.1-sol',
+      implementation: { model: 'gpt-6-luna', reasoningEffort: 'medium' as const },
+      review: { model: 'gpt-6.1-sol', reasoningEffort: 'low' as const },
+      escalation: { model: 'gpt-6-astra', reasoningEffort: 'high' as const },
+      rationale: 'Use the least expensive capable route and escalate only after a blocker.', confidence: 0.9,
+      decidedAt: new Date().toISOString()
+    }));
     let reviewAttempt = 0;
     const reviewer = createProvider({ review: vi.fn(async () => ++reviewAttempt === 1 ? review('not_satisfied', ['Fix native output.']) : review('satisfied')) });
     const implementOnWindows = vi.fn(async (_input: ImplementInput & { baseCommitSha: string }) => implementation('pass\n'));
@@ -305,11 +313,14 @@ describe('simple autonomous worker workflow', () => {
     await mkdir(checkout, { recursive: true }); const git = simpleGit(checkout); await git.init();
     await git.addConfig('user.name', 'ForgeMind Test'); await git.addConfig('user.email', 'test@forgemind.local');
     await writeFile(join(checkout, 'README.md'), 'base\n'); await git.add('README.md'); await git.commit('base');
-    const result = await runWorkerTask({ project, task, provider: createProvider({ implement: linuxImplement }), reviewProvider: reviewer,
+    const result = await runWorkerTask({ project, task, provider: createProvider({ implement: linuxImplement, routeTask }), reviewProvider: reviewer,
       implementationOwner: 'windows', implementOnWindows, workspaceRoot });
     expect(result.status).toBe('ready_for_user_review');
     expect(implementOnWindows).toHaveBeenCalledWith(expect.objectContaining({ baseCommitSha: expect.stringMatching(/^[a-f0-9]{40}$/) }));
     expect(implementOnWindows).toHaveBeenCalledTimes(2);
+    expect(routeTask).toHaveBeenCalledTimes(1);
+    expect(implementOnWindows.mock.calls[0]?.[0]).toMatchObject({ modelRoute: { model: 'gpt-6-luna', reasoningEffort: 'medium' } });
+    expect(implementOnWindows.mock.calls[1]?.[0]).toMatchObject({ modelRoute: { model: 'gpt-6-astra', reasoningEffort: 'high' } });
     expect(implementOnWindows.mock.calls[1]?.[0]).toMatchObject({ previousReviewBlockers: ['Fix native output.'] });
     expect(linuxImplement).not.toHaveBeenCalled();
     expect(reviewer.review).toHaveBeenCalledWith(expect.objectContaining({ repositoryPath: result.workspacePath }));

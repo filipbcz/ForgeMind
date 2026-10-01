@@ -693,6 +693,9 @@ export interface ProviderStatusApi {
   currentConnectionId: string | null;
   currentRuntimeStatus: ProviderConnectionRuntimeStatus | null;
   modelPolicy?: {
+    mode?: 'automatic';
+    router?: string;
+    allowedModels?: string[];
     profile: 'fast' | 'balanced' | 'deep';
     economy: string;
     standard: string;
@@ -736,6 +739,7 @@ export interface ProviderConnectionApi {
   provider: 'openai' | 'codex' | 'github_copilot';
   authMode: 'api_key' | 'codex_oauth';
   model: string;
+  allowedModels?: string[];
   apiKeyFingerprint?: string;
   codexHome?: string;
   accountSummary?: string;
@@ -754,7 +758,8 @@ export interface ProviderConnectRequest {
   provider: 'openai' | 'codex' | 'github_copilot';
   authMode?: 'api_key';
   apiKey?: string;
-  model: string;
+  model?: string;
+  allowedModels?: string[];
 }
 
 export interface ProviderConnectResponse {
@@ -763,6 +768,7 @@ export interface ProviderConnectResponse {
   name: string;
   provider: string;
   model: string;
+  allowedModels?: string[];
   authMode: 'api_key';
   persistent: boolean;
   estimate: {

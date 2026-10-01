@@ -276,7 +276,7 @@ export async function executeWindowsAuthoring(packet: WindowsAuthoringPacket, co
 export function authoringSemanticHash(packet: WindowsAuthoringPacket): string {
   return createHash('sha256').update(JSON.stringify({ taskId: packet.taskId, baseCommitSha: packet.baseCommitSha,
     prompt: packet.step.prompt, acceptanceCriteria: packet.step.acceptanceCriteria, priorPatch: packet.step.priorPatch,
-    previousReviewBlockers: packet.step.previousReviewBlockers, operations: packet.operations,
+    previousReviewBlockers: packet.step.previousReviewBlockers, modelRoute: packet.modelRoute, operations: packet.operations,
     requiredCapabilities: packet.requiredCapabilities, contentPolicy: packet.contentPolicy, artifactExpectations: packet.artifactExpectations,
     realEngineEvidence: packet.realEngineEvidence })).digest('hex');
 }

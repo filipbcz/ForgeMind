@@ -3671,6 +3671,7 @@ function SettingsPanel({
     authMode: 'api_key',
     apiKey: '',
     model: '',
+    allowedModels: [],
     isDefault: false
   });
   const [githubAdapterForm, setGitHubAdapterForm] = useState<GitHubAdapterConnectRequest>({
@@ -3699,6 +3700,7 @@ function SettingsPanel({
         authMode: 'api_key',
         apiKey: '',
         model: '',
+        allowedModels: [],
         isDefault: false
       });
     }
@@ -3712,6 +3714,7 @@ function SettingsPanel({
       authMode: 'api_key',
       apiKey: '',
       model: '',
+      allowedModels: [],
       isDefault: providerConnections.length === 0
     });
   }
@@ -3724,6 +3727,7 @@ function SettingsPanel({
       authMode: 'api_key',
       apiKey: '',
       model: connection.model,
+      allowedModels: connection.allowedModels,
       isDefault: connection.isDefault
     });
   }
@@ -3874,15 +3878,15 @@ function SettingsPanel({
         {providerStatus ? (
           <>
             <MetricBlock label="Provider" value={providerStatus.currentProvider ?? 'Nenastaveno'} />
-            <MetricBlock label="Model" value={providerStatus.currentModel ?? 'Nenastaveno'} />
+            <MetricBlock label="Router model" value={providerStatus.modelPolicy?.router ?? providerStatus.currentModel ?? 'Automaticky'} />
             <MetricBlock label="Auth" value={providerStatus.authMode ?? providerStatus.credentialSource} />
             <MetricBlock label="Persistent" value={providerStatus.persistent ? 'Ano' : 'Ne'} />
             <MetricBlock label="Circuit" value={providerStatus.currentRuntimeStatus?.circuitBreaker.state ?? 'closed'} />
             <MetricBlock label="Last success" value={formatProviderRuntimeTimestamp(providerStatus.currentRuntimeStatus?.lastSuccessfulRequestAt)} />
             {providerStatus.modelPolicy ? (
               <>
-                <MetricBlock label="Model policy" value={providerStatus.modelPolicy.profile} />
-                <MetricBlock label="Economy / standard / critical" value={`${providerStatus.modelPolicy.economy} · ${providerStatus.modelPolicy.standard} · ${providerStatus.modelPolicy.critical}`} wide />
+                <MetricBlock label="Výběr modelu" value={providerStatus.modelPolicy.mode === 'automatic' ? 'Automatický pro každý task' : providerStatus.modelPolicy.profile} />
+                <MetricBlock label="Povolené modely" value={providerStatus.modelPolicy.allowedModels?.join(' · ') || `${providerStatus.modelPolicy.economy} · ${providerStatus.modelPolicy.standard} · ${providerStatus.modelPolicy.critical}`} wide />
               </>
             ) : null}
           </>
@@ -3898,7 +3902,7 @@ function SettingsPanel({
                 <div className="provider-connection-summary">
                   <strong>{connection.name}</strong>
                   <small>
-                    {connection.provider} · {connection.model}
+                    {connection.provider} · router {connection.model} · pool {connection.allowedModels?.join(', ') || 'automatic'}
                   </small>
                   <small>
                     {connection.authMode}
@@ -3942,7 +3946,8 @@ function SettingsPanel({
                 ...previous,
                 provider,
                 authMode: 'api_key',
-                model: ''
+                model: '',
+                allowedModels: []
               }));
             }}
           >
@@ -3971,12 +3976,12 @@ function SettingsPanel({
         </label>
         {currentProviderModelOptions.length > 0 ? (
           <label>
-            Model
+            Router model (volitelné)
             <select
-              value={providerForm.model}
+              value={providerForm.model ?? ''}
               onChange={(event) => setProviderForm((previous) => ({ ...previous, model: event.target.value }))}
             >
-              <option value="">Vyberte model</option>
+              <option value="">Automaticky · GPT-6.1 Sol</option>
               {currentProviderModelOptions.map((model) => (
                 <option key={model.id} value={model.id}>
                   {model.name}
@@ -3986,14 +3991,26 @@ function SettingsPanel({
           </label>
         ) : (
           <label>
-            {providerForm.provider === 'codex' ? 'Codex model ID' : 'Model ID'}
+            Router model ID (volitelné)
             <input
-              placeholder={providerForm.provider === 'codex' ? 'Model configured for this Codex account' : 'Load models or enter model ID'}
-              value={providerForm.model}
+              placeholder="Automaticky: gpt-6.1-sol"
+              value={providerForm.model ?? ''}
               onChange={(event) => setProviderForm((previous) => ({ ...previous, model: event.target.value }))}
             />
           </label>
         )}
+        <label className="wide">
+          Povolené modely pro automatický výběr (volitelné)
+          <input
+            placeholder="Automaticky: gpt-6-luna, gpt-6.1-sol, gpt-6-astra"
+            value={(providerForm.allowedModels ?? []).join(', ')}
+            onChange={(event) => setProviderForm((previous) => ({
+              ...previous,
+              allowedModels: Array.from(new Set(event.target.value.split(',').map((model) => model.trim()).filter(Boolean)))
+            }))}
+          />
+          <small>Modely řaďte od nejlevnějšího po nejsilnější. Prázdné pole použije doporučený fond; Sol vybere model a reasoning jednou při zahájení tasku.</small>
+        </label>
         <div className="actions wide">
           <button
             className="secondary-action"
@@ -4028,7 +4045,7 @@ function SettingsPanel({
           <button
             className="primary-action"
             type="button"
-            disabled={providerBusy || !providerForm.model.trim() || (editingLegacyOAuth && !providerForm.apiKey?.trim())}
+            disabled={providerBusy || (editingLegacyOAuth && !providerForm.apiKey?.trim())}
             onClick={() =>
               onProviderConnect({
                 connectionId: providerForm.connectionId,
@@ -4037,7 +4054,8 @@ function SettingsPanel({
                 provider: providerForm.provider,
                 authMode: 'api_key',
                 apiKey: providerForm.apiKey?.trim() || undefined,
-                model: providerForm.model.trim()
+                model: providerForm.model?.trim() || undefined,
+                allowedModels: providerForm.allowedModels?.length ? providerForm.allowedModels : undefined
               })
             }
           >

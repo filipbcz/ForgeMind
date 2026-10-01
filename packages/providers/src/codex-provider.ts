@@ -30,10 +30,11 @@ import type {
   ProviderUsageMeasurement,
   ReviewInput,
   ReviewResult,
+  TaskRoutingInput,
   ValidationImpactInput,
   ValidationImpactResult
 } from './provider.js';
-import { ProviderContractError, normalizeProviderError, normalizeProviderPreflight, normalizeValidationChecks, parseChatResult, parseImplementResult, parsePlanResult, parseProviderJsonObject, parseReviewResult, parseValidationImpactResult } from './provider.js';
+import { ProviderContractError, buildTaskRoutingMessages, normalizeProviderError, normalizeProviderPreflight, normalizeValidationChecks, parseChatResult, parseImplementResult, parsePlanResult, parseProviderJsonObject, parseReviewResult, parseTaskModelRoutingDecision, parseValidationImpactResult } from './provider.js';
 import { emitCapturedUsage, normalizeTokenBreakdown } from './provider-usage.js';
 import { calculateModelCostUsd } from './model-pricing.js';
 import { buildReviewPrompt } from './review-prompt.js';
@@ -437,6 +438,7 @@ export class CodexProvider implements AIProvider {
   private readonly useCli: boolean;
   private readonly commandEnv: NodeJS.ProcessEnv;
   private readonly model: string;
+  private readonly allowedModels: string[];
   private readonly reasoningEffort: NonNullable<ProviderRuntimeConfig['reasoningEffort']>;
 
   constructor(config?: ProviderRuntimeConfig) {
@@ -462,6 +464,8 @@ export class CodexProvider implements AIProvider {
       CODEX_HOME: apiKeyCodexHome
     };
     this.model = config?.model?.trim() || (process.env.CODEX_MODEL ?? DEFAULT_CODEX_MODEL);
+    const configuredModels = config?.allowedModels?.map((model) => model.trim()).filter(Boolean) ?? [];
+    this.allowedModels = configuredModels.length > 0 ? configuredModels : [this.model];
     this.reasoningEffort = config?.reasoningEffort ?? 'medium';
   }
 
@@ -480,6 +484,18 @@ export class CodexProvider implements AIProvider {
         throw new ProviderContractError(`Codex model "${this.model}" is not available to this API project.`);
       }
     });
+  }
+
+  async routeTask(input: TaskRoutingInput) {
+    const routingInput = {
+      ...input,
+      availableModels: input.availableModels.length > 0 ? input.availableModels : this.allowedModels,
+      routerModel: input.routerModel || this.model
+    };
+    const messages = buildTaskRoutingMessages(routingInput);
+    const response = await this.requestResponses(messages, undefined, input.signal);
+    await emitCapturedUsage(input.onActivity, response.usage);
+    return parseTaskModelRoutingDecision(response.content, routingInput);
   }
 
   async assessValidationImpact(input: ValidationImpactInput): Promise<ValidationImpactResult> {

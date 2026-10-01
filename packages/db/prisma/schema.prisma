@@ -296,6 +296,7 @@ model AiProviderConnection {
   provider          ProviderKind
   authMode          AiProviderAuthMode @default(api_key) @map("auth_mode")
   model             String
+  allowedModels     Json               @default("[]") @map("allowed_models")
   apiKeyCiphertext  String?            @map("api_key_ciphertext")
   apiKeyFingerprint String?            @map("api_key_fingerprint")
   codexHome         String?            @map("codex_home")
@@ -452,6 +453,7 @@ model Task {
   providerSessionModel           String?       @map("provider_session_model")
   providerSessionConnectionId    String?       @map("provider_session_connection_id")
   providerSessionUpdatedAt       DateTime?     @map("provider_session_updated_at")
+  modelRoutingDecision           Json?         @map("model_routing_decision")
   createdAt                      DateTime      @default(now()) @map("created_at")
   updatedAt                      DateTime      @updatedAt @map("updated_at")
   startedAt                      DateTime?     @map("started_at")

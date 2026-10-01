@@ -10,6 +10,8 @@ import type {
   ProjectArchitectureUpdate,
   ProviderKind,
   TaskActivity,
+  TaskModelRoutingDecision,
+  TaskModelSelection,
   TaskStatus
 } from '@forgemind/core';
 import {
@@ -53,7 +55,7 @@ export interface WorkerTaskInput {
   signal?: AbortSignal;
   resourcePolicy?: WorkerResourcePolicy;
   implementationOwner?: 'linux' | 'windows';
-  implementOnWindows?: (input: Parameters<AIProvider['implement']>[0] & { baseCommitSha: string }) => Promise<ImplementResult>;
+  implementOnWindows?: (input: Parameters<AIProvider['implement']>[0] & { baseCommitSha: string; modelRoute?: TaskModelSelection }) => Promise<ImplementResult>;
   visualEvidence?: Parameters<AIProvider['implement']>[0]['visualEvidence'];
 }
 
@@ -124,6 +126,7 @@ export interface WorkerTaskHooks {
     message: string;
     elapsedMs: number;
     usage?: import('@forgemind/providers').ProviderUsageMeasurement;
+    routingDecision?: import('@forgemind/core').TaskModelRoutingDecision;
   }) => Promise<void>;
   onIterationStarted?: (iteration: {
     phase: IterationPhase;
@@ -325,6 +328,21 @@ export async function runWorkerTask(input: WorkerTaskInput): Promise<WorkerTaskR
       elapsedMs: 0
     });
   }
+
+  let taskModelRoutingDecision: TaskModelRoutingDecision | undefined = input.task.modelRoutingDecision;
+  if (input.resume?.resumeFrom !== 'delivery' && provider.routeTask) {
+    taskModelRoutingDecision = await provider.routeTask({
+      taskId: input.task.id,
+      title: input.task.title,
+      prompt: executionPrompt,
+      acceptanceCriteria: plan.acceptanceCriteria,
+      availableModels: [],
+      routerModel: '',
+      previousFailure: input.resume?.previousValidationError ?? input.resume?.previousReviewBlockers?.join(' | '),
+      signal: input.signal,
+      onActivity: (activity) => input.hooks?.onProviderActivity?.({ phase: 'planning', attempt: 0, ...activity })
+    });
+  }
   let validationChecks = normalizeValidationChecks(input.resume?.validationChecks);
   let externalValidationChecks = validationChecks.filter((check) => check.target === 'windows');
   if (!input.resume || rerunPlanning) {
@@ -427,7 +445,13 @@ export async function runWorkerTask(input: WorkerTaskInput): Promise<WorkerTaskR
     if (input.implementationOwner === 'windows' && !windowsBaseCommitSha) throw new Error('Windows authoring requires an exact base commit.');
     implementation = resumedImplementation
       ?? (input.implementationOwner === 'windows'
-        ? await input.implementOnWindows!({ ...implementationInput, baseCommitSha: windowsBaseCommitSha! })
+        ? await input.implementOnWindows!({
+            ...implementationInput,
+            baseCommitSha: windowsBaseCommitSha!,
+            modelRoute: (attempt > 1 || implementationInput.previousReviewBlockers?.length || implementationInput.previousValidationError)
+              ? taskModelRoutingDecision?.escalation
+              : taskModelRoutingDecision?.implementation
+          })
         : await provider.implement(implementationInput));
     resumedImplementation = undefined;
 

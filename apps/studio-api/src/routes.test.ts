@@ -2022,12 +2022,13 @@ describe('Studio API routes', () => {
         connectedAt: new Date().toISOString(),
         updatedAt: new Date().toISOString()
       }) : undefined),
-      upsertAIProviderConnection: vi.fn(async (input: { provider: 'openai' | 'codex'; authMode?: 'api_key' | 'codex_oauth'; model: string }) => ({
+      upsertAIProviderConnection: vi.fn(async (input: { provider: 'openai' | 'codex'; authMode?: 'api_key' | 'codex_oauth'; model: string; allowedModels?: string[] }) => ({
         userId: 'user_1',
         credentialSource: input.authMode === 'codex_oauth' ? 'codex_oauth' : 'api_key',
         provider: input.provider,
         authMode: input.authMode ?? 'api_key',
         model: input.model,
+        allowedModels: input.allowedModels,
         apiKeyFingerprint: 'fp_test',
         connectedAt: new Date().toISOString(),
         lastCheckedAt: new Date().toISOString(),
@@ -2043,7 +2044,7 @@ describe('Studio API routes', () => {
     const app = Fastify();
     const providerFetchSpy = vi.spyOn(globalThis, 'fetch').mockResolvedValue({
       ok: true,
-      json: async () => ({ data: [{ id: 'gpt-6-luna' }, { id: 'gpt-4o-mini' }, { id: 'gpt-6-astra' }] })
+      json: async () => ({ data: [{ id: 'gpt-6-luna' }, { id: 'gpt-6.1-sol' }, { id: 'gpt-4o-mini' }, { id: 'gpt-6-astra' }] })
     } as Response);
 
     try {
@@ -2120,14 +2121,16 @@ describe('Studio API routes', () => {
       expect(connectResponse.json().ok).toBe(true);
       expect(connectResponse.json().provider).toBe('openai');
       expect(connectResponse.json().model).toBe('gpt-4o-mini');
-      expect(repository.upsertAIProviderConnection).toHaveBeenCalledWith({
+      expect(connectResponse.json().allowedModels).toEqual(['gpt-6-luna', 'gpt-6.1-sol', 'gpt-6-astra']);
+      expect(repository.upsertAIProviderConnection).toHaveBeenCalledWith(expect.objectContaining({
         provider: 'openai',
         authMode: 'api_key',
         apiKey: 'sk-test',
         model: 'gpt-4o-mini',
+        allowedModels: ['gpt-6-luna', 'gpt-6.1-sol', 'gpt-6-astra'],
         accountSummary: undefined,
         codexHome: undefined
-      });
+      }));
       expect(repository.writeAudit).toHaveBeenCalledWith(
         expect.objectContaining({
           eventType: 'provider_connected',

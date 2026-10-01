@@ -1,4 +1,4 @@
-import type { ProviderKind } from '@forgemind/core';
+import type { ModelReasoningEffort, ProviderKind, TaskModelRoutingDecision, TaskModelSelection } from '@forgemind/core';
 import type {
   AIProvider,
   CapabilityAuditInput,
@@ -10,13 +10,18 @@ import type {
   ReviewInput,
   RoadmapQualityReviewInput,
   RoadmapRepairInput,
+  TaskRoutingInput,
   ValidationImpactInput
 } from './provider.js';
 import type { ProviderRuntimeConfig } from './index.js';
 
 export type ModelProfile = 'fast' | 'balanced' | 'deep';
 export type ModelWorkload = 'economy' | 'standard' | 'critical';
-export type ReasoningEffort = 'low' | 'medium' | 'high' | 'xhigh';
+export type ReasoningEffort = ModelReasoningEffort;
+
+export interface ModelRoutingState {
+  decision?: TaskModelRoutingDecision;
+}
 
 export interface ModelRoute {
   workload: ModelWorkload;
@@ -30,6 +35,8 @@ const DEFAULT_MODELS = {
   standard: 'gpt-6.1-sol',
   critical: 'gpt-6-astra'
 } as const;
+
+export const DEFAULT_MODEL_POOL = [DEFAULT_MODELS.economy, DEFAULT_MODELS.standard, DEFAULT_MODELS.critical] as const;
 
 /** Resolve the effective model without embedding provider policy in orchestration. */
 export function resolveModelRoute(input: {
@@ -85,24 +92,73 @@ export class ModelRoutedProvider implements AIProvider {
     this.kind = kind;
   }
 
+  private get routingState(): ModelRoutingState {
+    return this.config.routingState ?? (this.config.routingState = {});
+  }
+
+  private availableModels(): string[] {
+    const configured = this.config.allowedModels?.map((model) => model.trim()).filter(Boolean) ?? [];
+    const environment = process.env.FORGEMIND_MODEL_POOL?.split(',').map((model) => model.trim()).filter(Boolean) ?? [];
+    return Array.from(new Set(configured.length > 0 ? configured : environment.length > 0 ? environment : DEFAULT_MODEL_POOL));
+  }
+
+  private routerModel(): string {
+    return this.config.model?.trim() || process.env.FORGEMIND_MODEL_ROUTER?.trim() || DEFAULT_MODELS.standard;
+  }
+
+  private providerForSelection(selection: TaskModelSelection): AIProvider {
+    const key = `${selection.model}:${selection.reasoningEffort}`;
+    let provider = this.providers.get(key);
+    if (!provider) {
+      provider = this.factory(this.kind, {
+        ...this.config,
+        modelProfile: undefined,
+        allowedModels: undefined,
+        routingState: undefined,
+        model: selection.model,
+        reasoningEffort: selection.reasoningEffort
+      });
+      this.providers.set(key, provider);
+    }
+    return provider;
+  }
+
   private provider(workload: ModelWorkload): { provider: AIProvider; route: ModelRoute } {
     const route = resolveModelRoute({
       profile: this.config.modelProfile,
       workload,
       configuredModel: this.config.model
     });
-    const key = `${route.model}:${route.reasoningEffort}`;
-    let provider = this.providers.get(key);
-    if (!provider) {
-      provider = this.factory(this.kind, {
-        ...this.config,
-        modelProfile: undefined,
-        model: route.model,
-        reasoningEffort: route.reasoningEffort
-      });
-      this.providers.set(key, provider);
+    return { provider: this.providerForSelection(route), route };
+  }
+
+  async routeTask(input: TaskRoutingInput): Promise<TaskModelRoutingDecision> {
+    if (this.routingState.decision) return this.routingState.decision;
+    const availableModels = this.availableModels();
+    const routerModel = this.routerModel();
+    const router = this.providerForSelection({ model: routerModel, reasoningEffort: 'low' });
+    let decision: TaskModelRoutingDecision;
+    if (router.routeTask) {
+      try {
+        decision = await router.routeTask({ ...input, availableModels, routerModel });
+      } catch (error) {
+        const kind = error && typeof error === 'object' && 'kind' in error
+          ? (error as { kind?: unknown }).kind
+          : undefined;
+        if (typeof kind === 'string' && kind !== 'invalid_response') throw error;
+        decision = fallbackTaskRoutingDecision(availableModels, routerModel, `Router fallback: ${error instanceof Error ? error.message : String(error)}`);
+      }
+    } else {
+      decision = fallbackTaskRoutingDecision(availableModels, routerModel, `${this.kind} does not expose task routing; using the balanced fallback.`);
     }
-    return { provider, route };
+    this.routingState.decision = decision;
+    await input.onActivity?.({
+      kind: 'lifecycle',
+      message: `Task model route selected once: implementation ${decision.implementation.model} (${decision.implementation.reasoningEffort}), review ${decision.review.model} (${decision.review.reasoningEffort}), escalation ${decision.escalation.model} (${decision.escalation.reasoningEffort}). ${decision.rationale}`,
+      elapsedMs: 0,
+      routingDecision: decision
+    });
+    return decision;
   }
 
   private async announce(input: unknown, operation: string, route: ModelRoute) {
@@ -115,8 +171,8 @@ export class ModelRoutedProvider implements AIProvider {
   }
 
   async preflight(signal?: AbortSignal) {
-    const routes = (['economy', 'standard', 'critical'] as const).map((workload) => this.provider(workload));
-    const unique = Array.from(new Map(routes.map((entry) => [entry.route.model, entry.provider])).values());
+    const models = Array.from(new Set([this.routerModel(), ...this.availableModels()]));
+    const unique = models.map((model) => this.providerForSelection({ model, reasoningEffort: model === this.routerModel() ? 'low' : 'medium' }));
     for (const provider of unique) {
       const result = await provider.preflight(signal);
       if (!result.ok) return result;
@@ -152,8 +208,22 @@ export class ModelRoutedProvider implements AIProvider {
   }
 
   async implement(input: ImplementInput) {
-    const requested: ModelWorkload = (input.attemptNumber ?? 1) > 1 || Boolean(input.previousReviewBlockers?.length) ? 'critical' : 'standard';
-    const { provider, route } = this.provider(requested);
+    const decision = await this.routeTask({
+      taskId: input.taskId,
+      title: input.plan.summary || input.taskId,
+      prompt: input.prompt,
+      acceptanceCriteria: input.plan.acceptanceCriteria,
+      availableModels: this.availableModels(),
+      routerModel: this.routerModel(),
+      previousFailure: input.previousValidationError ?? input.previousReviewBlockers?.join(' | '),
+      onActivity: input.onActivity,
+      signal: input.signal
+    });
+    const escalated = (input.attemptNumber ?? 1) > 1 || Boolean(input.previousReviewBlockers?.length) || Boolean(input.previousValidationError);
+    const selection = escalated ? decision.escalation : decision.implementation;
+    const provider = this.providerForSelection(selection);
+    const route: ModelRoute = { workload: escalated ? 'critical' : 'standard', ...selection,
+      rationale: escalated ? `persisted task route escalation: ${decision.rationale}` : `persisted task route: ${decision.rationale}` };
     await this.announce(input, 'implementation', route);
     return provider.implement(input);
   }
@@ -166,7 +236,22 @@ export class ModelRoutedProvider implements AIProvider {
   }
 
   async review(input: ReviewInput) {
-    const { provider, route } = this.provider(input.previousReviewBlockers?.length ? 'critical' : 'standard');
+    const decision = await this.routeTask({
+      taskId: input.taskId,
+      title: input.taskTitle,
+      prompt: input.taskPrompt,
+      acceptanceCriteria: input.acceptanceCriteria,
+      availableModels: this.availableModels(),
+      routerModel: this.routerModel(),
+      previousFailure: input.previousReviewBlockers?.join(' | '),
+      onActivity: input.onActivity,
+      signal: input.signal
+    });
+    const escalated = Boolean(input.previousReviewBlockers?.length);
+    const selection = escalated ? decision.escalation : decision.review;
+    const provider = this.providerForSelection(selection);
+    const route: ModelRoute = { workload: escalated ? 'critical' : 'standard', ...selection,
+      rationale: escalated ? `persisted task route escalation: ${decision.rationale}` : `persisted task route: ${decision.rationale}` };
     await this.announce(input, 'implementation-review', route);
     return provider.review(input);
   }
@@ -190,4 +275,20 @@ export class ModelRoutedProvider implements AIProvider {
   supportsGitHubNativeFlow() { return this.provider('standard').provider.supportsGitHubNativeFlow(); }
   supportsNativeRepositoryReview() { return this.provider('critical').provider.supportsNativeRepositoryReview?.() ?? false; }
   supportsNativeRepositoryAudit() { return this.provider('critical').provider.supportsNativeRepositoryAudit?.() ?? false; }
+}
+
+function fallbackTaskRoutingDecision(availableModels: string[], routerModel: string, rationale: string): TaskModelRoutingDecision {
+  const ranked = [...availableModels];
+  const standard = ranked.find((model) => /sol/i.test(model)) ?? ranked[Math.min(1, ranked.length - 1)] ?? routerModel;
+  const critical = ranked.at(-1) ?? standard;
+  return {
+    version: 1,
+    routerModel,
+    implementation: { model: standard, reasoningEffort: 'medium' },
+    review: { model: standard, reasoningEffort: 'medium' },
+    escalation: { model: critical, reasoningEffort: /astra/i.test(critical) ? 'high' : 'medium' },
+    rationale,
+    confidence: 0,
+    decidedAt: new Date().toISOString()
+  };
 }

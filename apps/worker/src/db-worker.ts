@@ -3,12 +3,12 @@ import { createHash, randomUUID } from 'node:crypto';
 import { spawn } from 'node:child_process';
 import { mkdir, readFile, writeFile } from 'node:fs/promises';
 import { resolve } from 'node:path';
-import { activeProjectContractRequirements, createBlockedRunState, createFailedRunState, WINDOWS_EVIDENCE_MAX_ARTIFACT_BYTES, WINDOWS_EVIDENCE_MAX_LOG_BYTES, type RealEngineEvidenceIntent, type WindowsAuthoringPacket, type WindowsAuthoringResult } from '@forgemind/core';
+import { activeProjectContractRequirements, createBlockedRunState, createFailedRunState, WINDOWS_EVIDENCE_MAX_ARTIFACT_BYTES, WINDOWS_EVIDENCE_MAX_LOG_BYTES, type RealEngineEvidenceIntent, type TaskModelSelection, type WindowsAuthoringPacket, type WindowsAuthoringResult } from '@forgemind/core';
 import { advanceRoadmapAfterTaskCompletion, createRepository, getPrismaClient, startNextRoadmapStep, WindowsWorkerRepository, type AIProviderConnectionSecret, type ForgeMindRepository } from '@forgemind/db';
 import { GitHubAppAdapter, createGitHubAdapterFromEnv } from '@forgemind/github';
-import { buildProjectExtensionProposalPrompt, createProvider, formatProjectExtensionProposal, normalizeProviderError, resolveModelRoute, type AIProvider, type CapabilityAuditInput, type ImplementResult, type ProviderSessionContext, type ProviderUsageMeasurement, type ReleaseAuditInput, type ValidationCheck } from '@forgemind/providers';
+import { buildProjectExtensionProposalPrompt, createProvider, formatProjectExtensionProposal, normalizeProviderError, resolveModelRoute, type AIProvider, type CapabilityAuditInput, type ImplementResult, type ModelRoutingState, type ProviderSessionContext, type ProviderUsageMeasurement, type ReleaseAuditInput, type ValidationCheck } from '@forgemind/providers';
 import type { NormalizedProviderErrorDetails, ProviderCircuitBreakerSnapshot, ProviderKind } from '@forgemind/core';
-import { toErrorMessage } from '@forgemind/shared';
+import { toErrorMessage, type JsonValue } from '@forgemind/shared';
 import { formatProjectArchitectureContext, runWorkerTask } from './workflow.js';
 import { buildCompleteRepositoryContext, prepareCapabilityAuditWorkspace, runCapabilityAudit, runReleaseAudit } from './capability-audit.js';
 import { runNextChatTurn } from './chat-worker.js';
@@ -149,7 +149,7 @@ async function enqueueExternalWindowsValidations(
 async function implementThroughWindowsLease(windowsWorkers: WindowsWorkerRepository, input: {
   project: import('@forgemind/core').Project; taskId: string; taskRunId: string; workspacePath: string;
   prompt: string; acceptanceCriteria: string[]; previousValidationError?: string; previousReviewBlockers?: string[];
-  baseCommitSha: string; requiredCapabilities: string[]; requiresUnrealAssets: boolean; signal?: AbortSignal;
+  baseCommitSha: string; requiredCapabilities: string[]; requiresUnrealAssets: boolean; modelRoute?: TaskModelSelection; signal?: AbortSignal;
 }): Promise<ImplementResult> {
   if (!input.project.githubOwner || !input.project.githubRepo) throw new Error('Windows authoring requires a GitHub repository.');
   const jobId = randomUUID();
@@ -174,9 +174,11 @@ async function implementThroughWindowsLease(windowsWorkers: WindowsWorkerReposit
       prohibitedDatasetExtensions: ['.tif', '.tiff', '.geotiff', '.shp', '.dbf', '.shx', '.prj', '.gpkg', '.geojson', '.kml', '.kmz', '.gdb', '.fgb', '.las', '.laz', '.copc', '.dem', '.dt0', '.dt1', '.dt2', '.asc', '.img', '.jp2', '.ecw', '.mrf', '.mbtiles', '.pmtiles', '.osm', '.pbf', '.grib', '.nc', '.hdf'],
       maxUnclassifiedFileBytes: 50 * 1024 * 1024 },
     resourcePolicy: { timeoutSeconds: 36_000, maxLogBytes: WINDOWS_EVIDENCE_MAX_LOG_BYTES, maxArtifactBytes: WINDOWS_EVIDENCE_MAX_ARTIFACT_BYTES },
+    ...(input.modelRoute ? { modelRoute: input.modelRoute } : {}),
     nonce: 'pending', inputHash: createWindowsAuthoringInputHash({ taskId: input.taskId, baseCommitSha: input.baseCommitSha,
       prompt: input.prompt, acceptanceCriteria: input.acceptanceCriteria, previousValidationError: input.previousValidationError,
-      previousReviewBlockers: input.previousReviewBlockers, priorPatch, requiresUnrealAssets: input.requiresUnrealAssets }),
+      previousReviewBlockers: input.previousReviewBlockers, priorPatch, requiresUnrealAssets: input.requiresUnrealAssets,
+      modelRoute: input.modelRoute }),
     ...(realEngineEvidence ? { realEngineEvidence } : {}),
     authority: { database: 'none', productionHosts: 'none', globalGitHubCredentials: 'none' }
   };
@@ -236,6 +238,7 @@ async function implementThroughWindowsLease(windowsWorkers: WindowsWorkerReposit
 export function createWindowsAuthoringInputHash(input: {
   taskId: string; baseCommitSha: string; prompt: string; acceptanceCriteria: string[];
   previousValidationError?: string; previousReviewBlockers?: string[]; priorPatch: string; requiresUnrealAssets: boolean;
+  modelRoute?: TaskModelSelection;
 }): string {
   return createHash('sha256').update(JSON.stringify(input)).digest('hex');
 }
@@ -504,9 +507,10 @@ export async function runDatabaseWorkerOnce(options: { deferInterruptSignals?: b
     claimed.taskRun.provider = selection.primary.kind;
     claimed.taskRun.model = selectedProviderModel;
   }
-  const primaryRuntimeProvider = buildRuntimeProvider(selection.primary.kind, selection.primary.connection, resolveConfiguredModelProfile(projectConfig?.ai.model_profile));
+  const routingState: ModelRoutingState = { decision: claimed.task.modelRoutingDecision };
+  const primaryRuntimeProvider = buildRuntimeProvider(selection.primary.kind, selection.primary.connection, resolveConfiguredModelProfile(projectConfig?.ai.model_profile), routingState);
   const fallbackRuntimeProvider = selection.fallback
-    ? buildRuntimeProvider(selection.fallback.kind, selection.fallback.connection, resolveConfiguredModelProfile(projectConfig?.ai.model_profile))
+    ? buildRuntimeProvider(selection.fallback.kind, selection.fallback.connection, resolveConfiguredModelProfile(projectConfig?.ai.model_profile), routingState)
     : undefined;
   const { provider, getLastProviderKind } = createPolicyAwareProvider({
     primary: primaryRuntimeProvider,
@@ -529,7 +533,7 @@ export async function runDatabaseWorkerOnce(options: { deferInterruptSignals?: b
     fallback: selection.fallback,
     defaultConnection: defaultAIProviderConnection
   });
-  const reviewProvider = buildRuntimeProvider(reviewerSelection.kind, reviewerSelection.connection, resolveConfiguredModelProfile(projectConfig?.ai.model_profile)).provider;
+  const reviewProvider = buildRuntimeProvider(reviewerSelection.kind, reviewerSelection.connection, resolveConfiguredModelProfile(projectConfig?.ai.model_profile), routingState).provider;
   const reviewProviderModel = resolveProviderModel(reviewerSelection.kind, reviewerSelection.connection);
   const primaryConnectionId = selection.primary.connection?.id;
   const hasCompatibleProviderSession = claimed.task.providerSessionProvider === selection.primary.kind
@@ -644,7 +648,9 @@ export async function runDatabaseWorkerOnce(options: { deferInterruptSignals?: b
             acceptanceCriteria: implementationInput.plan.acceptanceCriteria, baseCommitSha: implementationInput.baseCommitSha,
             previousValidationError: implementationInput.previousValidationError, previousReviewBlockers: implementationInput.previousReviewBlockers,
             requiredCapabilities: projectConfig.workflow.windows_authoring_capabilities,
-            requiresUnrealAssets: projectConfig.workflow.windows_authoring_requires_unreal_assets, signal: implementationInput.signal
+            requiresUnrealAssets: projectConfig.workflow.windows_authoring_requires_unreal_assets,
+            modelRoute: implementationInput.modelRoute,
+            signal: implementationInput.signal
           })
         : undefined,
       resourcePolicy,
@@ -737,6 +743,26 @@ export async function runDatabaseWorkerOnce(options: { deferInterruptSignals?: b
           });
         },
         onProviderActivity: async (activity) => {
+          if (activity.routingDecision) {
+            routingState.decision = activity.routingDecision;
+            claimed.task.modelRoutingDecision = activity.routingDecision;
+            await repository.updateTaskModelRoutingDecision(claimed.task.id, activity.routingDecision);
+            await repository.updateTaskRunProvider({
+              taskRunId: claimed.taskRun.id,
+              provider: selection.primary.kind,
+              model: activity.routingDecision.implementation.model
+            });
+            claimed.taskRun.model = activity.routingDecision.implementation.model;
+            await repository.writeAudit({
+              actorType: 'agent',
+              eventType: 'task_model_route_selected',
+              taskId: claimed.task.id,
+              payload: {
+                taskRunId: claimed.taskRun.id,
+                decision: activity.routingDecision as unknown as JsonValue
+              }
+            });
+          }
           let normalizedUsage: ProviderUsageMeasurement | undefined;
           if (activity.usage) {
             const usage = normalizeProviderUsageMeasurement(activity.phase, activity.usage, cumulativeProviderTotals);
@@ -1309,7 +1335,12 @@ function resolveConfiguredModelProfile(projectProfile?: AgentConfig['ai']['model
   return projectProfile ?? 'balanced';
 }
 
-function buildRuntimeProvider(kind: ProviderKind, connection?: AIProviderConnectionSecret, modelProfile: AgentConfig['ai']['model_profile'] = 'balanced'): RuntimeProvider {
+function buildRuntimeProvider(
+  kind: ProviderKind,
+  connection?: AIProviderConnectionSecret,
+  modelProfile: AgentConfig['ai']['model_profile'] = 'balanced',
+  routingState?: ModelRoutingState
+): RuntimeProvider {
   if (connection?.authMode === 'codex_oauth') {
     throw new Error(`Provider connection "${connection.id}" uses removed ChatGPT OAuth authentication. Replace it with an OpenAI API key connection.`);
   }
@@ -1325,9 +1356,11 @@ function buildRuntimeProvider(kind: ProviderKind, connection?: AIProviderConnect
         apiKey: connection.apiKey,
         authMode: connection.authMode,
         codexHome: connection.codexHome,
-        model: connection.model
+        model: connection.model,
+        allowedModels: connection.allowedModels
       } : {}),
       modelProfile,
+      routingState,
       useCli: kind === 'codex'
     })
   };
@@ -1440,6 +1473,12 @@ function createPolicyAwareProvider(input: PolicyAwareProviderInput): { provider:
     kind: input.primary.kind,
     async preflight(signal) {
       return callWithFallback('preflight', (provider) => provider.preflight(signal), signal);
+    },
+    async routeTask(routeInput) {
+      return callWithFallback('route_task', (provider) => {
+        if (!provider.routeTask) throw new Error('Configured provider does not support task model routing.');
+        return provider.routeTask(routeInput);
+      }, routeInput.signal);
     },
     supportsLocalRepo: () => input.primary.provider.supportsLocalRepo(),
     supportsGitHubNativeFlow: () => input.primary.provider.supportsGitHubNativeFlow(),
