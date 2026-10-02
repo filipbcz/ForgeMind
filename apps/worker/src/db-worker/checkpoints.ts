@@ -350,6 +350,7 @@ function buildPhaseRetryResume(
 
 function actionableImplementationFailure(message: string | undefined): string | undefined {
   if (!message?.trim()) return undefined;
+  if (/waiting_for_capability/i.test(message)) return undefined;
   return /(?:validation failed|verification failed|required (?:unreal )?(?:authoring|content|packages?)|did not produce (?:a |any )?\.uasset|failed again without progress|acceptance cannot pass)/i.test(message)
     ? message
     : undefined;

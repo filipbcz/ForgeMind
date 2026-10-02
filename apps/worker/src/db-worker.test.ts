@@ -985,6 +985,31 @@ github:
     expect(runWorkerTaskMock.mock.calls[0]?.[0].resume.previousValidationError).toBeUndefined();
   });
 
+  it('does not escalate a retry from a stale waiting-for-capability marker after probes passed', async () => {
+    repositoryMock.claimNextSubmittedTask.mockResolvedValueOnce(createClaimedTask('phase_retry'));
+    repositoryMock.getTaskDiff.mockResolvedValueOnce({
+      taskId: 'task_1', filesChanged: 0, insertions: 0, deletions: 0,
+      iterations: [{ phase: 'planning', prompt: 'Plan', resultSummary: 'Plan ready', validationResult: {
+        steps: ['Author scene'], acceptanceCriteria: ['Scene is saved']
+      }, createdAt: '2026-08-02T10:00:10.000Z' }]
+    });
+    repositoryMock.listTaskAudit.mockResolvedValueOnce([
+      { eventType: 'task_iteration_started', payload: { taskRunId: 'run_old', phase: 'implementation', attempt: 2 }, createdAt: '2026-08-02T10:00:20.000Z' },
+      { eventType: 'task_failed', payload: { taskRunId: 'run_old', status: 'failed',
+        errorMessage: 'The same Windows validation failed again: Editor baseline is waiting_for_capability; acceptance cannot pass' }, createdAt: '2026-08-02T10:00:30.000Z' }
+    ]);
+    runWorkerTaskMock.mockResolvedValueOnce({
+      taskId: 'task_1', status: 'ready_for_user_review', issueUrl: '', branchName: 'ai/1-task', workspacePath: 'C:/tmp/worker',
+      validation: { command: 'native verifier', exitCode: 0, stdout: 'ok', stderr: '', passed: true },
+      summary: 'Corrected.', approvals: [], completedAt: new Date().toISOString()
+    });
+
+    const { runDatabaseWorkerOnce } = await import('./db-worker.js');
+    await runDatabaseWorkerOnce();
+
+    expect(runWorkerTaskMock.mock.calls[0]?.[0].resume.previousValidationError).toBeUndefined();
+  });
+
   it('restores full validation evidence only from a versioned workspace checkpoint', async () => {
     repositoryMock.claimNextSubmittedTask.mockResolvedValueOnce(createClaimedTask('phase_retry'));
     repositoryMock.getTaskDiff.mockResolvedValueOnce({
