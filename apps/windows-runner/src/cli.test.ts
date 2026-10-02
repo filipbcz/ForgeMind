@@ -1,6 +1,6 @@
 import { createHash } from 'node:crypto';
 import { describe, expect, it, vi } from 'vitest';
-import { assertNativeCodexCliCompatibility, parseCliArgs, requiredProbeFailures, selectLocalCodexModel, uploadAuthoringResultBlobs } from './cli.js';
+import { assertNativeCodexCliCompatibility, parseCliArgs, requiredProbeFailures, resolveCodexPreflightTimeouts, selectLocalCodexModel, uploadAuthoringResultBlobs } from './cli.js';
 
 describe('Windows runner CLI parsing', () => {
   it.each([
@@ -44,6 +44,19 @@ describe('Windows runner CLI parsing', () => {
   it('rejects an outdated Codex CLI before it can claim an authoring task', () => {
     expect(() => assertNativeCodexCliCompatibility('--disable --ignore-user-config --ignore-rules --output-schema --permission-profile')).not.toThrow();
     expect(() => assertNativeCodexCliCompatibility('--output-schema')).toThrow(/update @openai\/codex/i);
+  });
+
+  it('allows a slow valid Windows sandbox probe without weakening bounded execution', () => {
+    expect(resolveCodexPreflightTimeouts({})).toEqual({ inspectionMs: 60_000, sandboxProbeMs: 300_000 });
+    expect(resolveCodexPreflightTimeouts({
+      FORGEMIND_CODEX_CLI_INSPECTION_TIMEOUT_MS: '90000',
+      FORGEMIND_CODEX_SANDBOX_PROBE_TIMEOUT_MS: '420000'
+    })).toEqual({ inspectionMs: 90_000, sandboxProbeMs: 420_000 });
+  });
+
+  it('rejects invalid or unbounded Codex preflight timeouts', () => {
+    expect(() => resolveCodexPreflightTimeouts({ FORGEMIND_CODEX_CLI_INSPECTION_TIMEOUT_MS: 'not-a-number' })).toThrow(/integer from 1000/i);
+    expect(() => resolveCodexPreflightTimeouts({ FORGEMIND_CODEX_SANDBOX_PROBE_TIMEOUT_MS: '1800001' })).toThrow(/integer from 1000/i);
   });
 
   it('uploads binary authoring payloads in bounded chunks and returns a small content-addressed manifest', async () => {

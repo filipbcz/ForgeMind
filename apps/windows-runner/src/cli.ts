@@ -19,6 +19,9 @@ import { CoalescedAuthoringProgressPublisher } from './progress-publisher.js';
 
 const RUNNER_BUILD_ID = process.env.FORGEMIND_RUNNER_BUILD_ID?.trim().replace(/[^a-z0-9_.-]/gi, '-');
 const RUNNER_VERSION = `0.2.0+authoring-v2${RUNNER_BUILD_ID ? `.${RUNNER_BUILD_ID}` : ''}`;
+const DEFAULT_CODEX_CLI_INSPECTION_TIMEOUT_MS = 60_000;
+const DEFAULT_CODEX_SANDBOX_PROBE_TIMEOUT_MS = 300_000;
+const MAX_CODEX_PREFLIGHT_TIMEOUT_MS = 1_800_000;
 
 export type CliCommand =
   | { command: 'enroll'; apiUrl: string }
@@ -85,16 +88,36 @@ export function requiredProbeFailures(
   return evidence.filter(({ capability, status }) => status !== 'supported' && required.has(capability.key));
 }
 
-async function runCodexCommand(binary: string, args: string[], codexHome: string): Promise<string> {
-  const result = await runBoundedProcess(binary, args, { timeoutMs: 20_000, maxOutputBytes: 1_000_000,
-    env: { ...process.env, CODEX_HOME: codexHome } });
+export function resolveCodexPreflightTimeouts(environment: NodeJS.ProcessEnv = process.env): {
+  inspectionMs: number; sandboxProbeMs: number;
+} {
+  return {
+    inspectionMs: readTimeout(environment, 'FORGEMIND_CODEX_CLI_INSPECTION_TIMEOUT_MS', DEFAULT_CODEX_CLI_INSPECTION_TIMEOUT_MS),
+    sandboxProbeMs: readTimeout(environment, 'FORGEMIND_CODEX_SANDBOX_PROBE_TIMEOUT_MS', DEFAULT_CODEX_SANDBOX_PROBE_TIMEOUT_MS)
+  };
+}
+
+interface CodexCommandOptions {
+  step: string;
+  timeoutMs: number;
+  timeoutSetting: string;
+  environment: NodeJS.ProcessEnv;
+}
+
+async function runCodexCommand(binary: string, args: string[], codexHome: string, options: CodexCommandOptions): Promise<string> {
+  const result = await runBoundedProcess(binary, args, { timeoutMs: options.timeoutMs, maxOutputBytes: 1_000_000,
+    env: { ...options.environment, CODEX_HOME: codexHome } });
   if (result.exitCode !== 0 || result.terminationReason) {
-    throw new Error(`Could not inspect the installed Codex CLI: ${result.stderr || result.stdout || result.terminationReason || `exit ${result.exitCode}`}`);
+    if (result.terminationReason === 'timed-out') {
+      throw new Error(`Codex CLI ${options.step} timed out after ${formatSeconds(options.timeoutMs)}. The process tree was stopped. Increase ${options.timeoutSetting} only if this valid local operation needs more time.`);
+    }
+    throw new Error(`Codex CLI ${options.step} failed: ${result.stderr || result.stdout || result.terminationReason || `exit ${result.exitCode}`}`);
   }
   return `${result.stdout}\n${result.stderr}`;
 }
 
-export async function prepareLocalCodexRuntime(environment: NodeJS.ProcessEnv = process.env): Promise<{
+export async function prepareLocalCodexRuntime(environment: NodeJS.ProcessEnv = process.env,
+  report: (message: string) => void = () => undefined): Promise<{
   provider: AIProvider; model: string; codexHome: string; availableModels: string[];
   providerForRoute: (route: TaskModelSelection) => AIProvider;
 }> {
@@ -102,20 +125,27 @@ export async function prepareLocalCodexRuntime(environment: NodeJS.ProcessEnv = 
     || join(environment.LOCALAPPDATA?.trim() || homedir(), 'ForgeMind', 'codex-api');
   await mkdir(codexHome, { recursive: true });
   const binary = resolveCodexBinary(environment);
-  const [execHelp, sandboxHelp] = await Promise.all([
-    runCodexCommand(binary, ['exec', '--help'], codexHome),
-    runCodexCommand(binary, ['sandbox', '--help'], codexHome)
-  ]);
+  const timeouts = resolveCodexPreflightTimeouts(environment);
+  const inspectionOptions = (step: string): CodexCommandOptions => ({ step, timeoutMs: timeouts.inspectionMs,
+    timeoutSetting: 'FORGEMIND_CODEX_CLI_INSPECTION_TIMEOUT_MS', environment });
+  report(`Inspecting Codex exec support (timeout ${formatSeconds(timeouts.inspectionMs)})...`);
+  const execHelp = await runCodexCommand(binary, ['exec', '--help'], codexHome, inspectionOptions('exec help inspection'));
+  report(`Inspecting Codex sandbox support (timeout ${formatSeconds(timeouts.inspectionMs)})...`);
+  const sandboxHelp = await runCodexCommand(binary, ['sandbox', '--help'], codexHome, inspectionOptions('sandbox help inspection'));
   assertNativeCodexCliCompatibility(`${execHelp}\n${sandboxHelp}`);
+  report(`Running the checkout-confined Codex sandbox probe (timeout ${formatSeconds(timeouts.sandboxProbeMs)})...`);
   const sandboxProbe = await runCodexCommand(binary, ['sandbox', '--permission-profile', ':workspace', '-C', process.cwd(), '--',
-    'cmd.exe', '/d', '/c', 'echo FORGEMIND_SANDBOX_OK'], codexHome);
+    'cmd.exe', '/d', '/c', 'echo FORGEMIND_SANDBOX_OK'], codexHome, { step: 'Windows sandbox probe',
+    timeoutMs: timeouts.sandboxProbeMs, timeoutSetting: 'FORGEMIND_CODEX_SANDBOX_PROBE_TIMEOUT_MS', environment });
   if (!sandboxProbe.includes('FORGEMIND_SANDBOX_OK')) throw new Error('Codex Windows sandbox preflight did not execute the expected checkout-confined command.');
   const apiKey = environment.OPENAI_API_KEY?.trim() || environment.CODEX_API_KEY?.trim();
   if (!apiKey) throw new Error('OPENAI_API_KEY is required. ForgeMind Windows authoring no longer supports ChatGPT OAuth.');
+  report('Loading models available to the OpenAI API project...');
   const models = await listOpenAIModels(apiKey);
   const model = selectLocalCodexModel(models, environment.FORGEMIND_MODEL_STANDARD ?? environment.CODEX_MODEL);
   const providerConfig = { apiKey, authMode: 'api_key' as const, useCli: true, codexHome };
   const provider = createProvider('codex', { ...providerConfig, model, reasoningEffort: 'medium' });
+  report(`Verifying OpenAI API access with ${model}...`);
   const preflight = await provider.preflight();
   if (!preflight.ok) throw new Error(`OpenAI API preflight failed before starting a Windows session: ${preflight.error?.auditSafeMessage ?? 'unknown error'}`);
   const availableModels = models.map(({ id }) => id);
@@ -147,7 +177,7 @@ export async function main(args = process.argv.slice(2)): Promise<void> {
   if (parsed.command === 'session-drain') { await transport.drain(auth, parsed.sessionId); return; }
   if (parsed.command === 'session-stop') { await transport.stop(auth, parsed.sessionId); return; }
   stdout.write('[preflight] Checking Codex CLI sandbox and OpenAI API key...\n');
-  const codexRuntime = await prepareLocalCodexRuntime();
+  const codexRuntime = await prepareLocalCodexRuntime(process.env, (message) => stdout.write(`[preflight] ${message}\n`));
   stdout.write(`[preflight] Codex passed; selected model ${codexRuntime.model}.\n`);
   stdout.write('[preflight] Checking local Windows capabilities...\n');
   const probes = await runCapabilityProbes(windowsRunnerCapabilityProbes(osRelease()), new Date(), (progress) => {
@@ -290,6 +320,20 @@ function abortableDelay(ms: number, signal?: AbortSignal): Promise<void> {
   if (signal?.aborted) return Promise.resolve();
   return new Promise((resolveDelay) => { const timer = setTimeout(resolveDelay, ms);
     signal?.addEventListener('abort', () => { clearTimeout(timer); resolveDelay(); }, { once: true }); });
+}
+
+function readTimeout(environment: NodeJS.ProcessEnv, name: string, fallbackMs: number): number {
+  const raw = environment[name]?.trim();
+  if (!raw) return fallbackMs;
+  const timeoutMs = Number(raw);
+  if (!Number.isSafeInteger(timeoutMs) || timeoutMs < 1_000 || timeoutMs > MAX_CODEX_PREFLIGHT_TIMEOUT_MS) {
+    throw new Error(`${name} must be an integer from 1000 to ${MAX_CODEX_PREFLIGHT_TIMEOUT_MS} milliseconds.`);
+  }
+  return timeoutMs;
+}
+
+function formatSeconds(timeoutMs: number): string {
+  return `${Number((timeoutMs / 1_000).toFixed(1))}s`;
 }
 
 function assertRequiredProbesPassed(failures: readonly WorkerProbeEvidence[]): void {
