@@ -228,7 +228,7 @@ export class OpenAIProvider implements AIProvider {
           `Attempt: ${input.attemptNumber ?? 1}`,
           `Prompt: ${input.prompt}`,
           `Plan: ${input.plan.steps.join(' | ')}`,
-          input.attemptNumber && input.attemptNumber > 1 ? 'Preserve completed work and apply only the supplied correction.' : '',
+          input.previousValidationError || input.previousReviewBlockers?.length ? 'Preserve completed work and apply only the supplied correction.' : '',
           input.previousValidationError ? `Previous validation error: ${input.previousValidationError}` : '',
           input.previousReviewBlockers?.length ? `Previous review blockers: ${input.previousReviewBlockers.join(' | ')}` : '',
           input.visualEvidence?.length ? `Runtime capture files (with verified hashes and provenance): ${input.visualEvidence.map((item) => `${item.localPath} sha256=${item.artifactHash} tree=${item.resultTreeSha} build=${item.buildId} scene=${item.scene}`).join(' | ')}` : '',

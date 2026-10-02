@@ -333,7 +333,8 @@ function buildPhaseRetryResume(
     previousValidationError: resumeFrom === 'implementation'
       ? validation && !validation.passed
         ? formatValidationFailure(validation)
-        : queueErrorMessage ?? (typeof latestTechnicalFailureMessage === 'string' ? latestTechnicalFailureMessage : undefined)
+        : actionableImplementationFailure(queueErrorMessage)
+          ?? actionableImplementationFailure(typeof latestTechnicalFailureMessage === 'string' ? latestTechnicalFailureMessage : undefined)
       : undefined,
     previousReviewBlockers: resumeFrom === 'implementation' ? reviewBlockers : undefined,
     validation,
@@ -345,6 +346,13 @@ function buildPhaseRetryResume(
     completedSatisfactionReview,
     completedReview
   };
+}
+
+function actionableImplementationFailure(message: string | undefined): string | undefined {
+  if (!message?.trim()) return undefined;
+  return /(?:validation failed|verification failed|required (?:unreal )?(?:authoring|content|packages?)|did not produce (?:a |any )?\.uasset|failed again without progress|acceptance cannot pass)/i.test(message)
+    ? message
+    : undefined;
 }
 
 function extractCriterionResults(value: unknown): ReviewResult['criterionResults'] | undefined {

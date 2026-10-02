@@ -5,6 +5,8 @@ describe('Codex structured output schemas', () => {
   it('keeps native Unreal validation on the structured runner path', () => {
     const prompt = buildCodexNativeImplementationPrompt('Implement the scene.');
     expect(prompt).toContain('Invoke UnrealEditor only through run_unreal_authoring');
+    expect(prompt).toContain('tool=unreal-build');
+    expect(prompt).toContain('Do not convert a concrete build or tool failure into waiting_for_capability');
     expect(prompt).toContain('Do not return a validationChecks command that invokes UnrealEditor');
   });
 
@@ -180,6 +182,16 @@ describe('Codex process activity timeouts', () => {
     expect(prompt).toContain('Expected exit code 0, received 1.');
     expect(prompt).not.toContain('A very long task scope');
     expect(prompt).not.toContain('A very long implementation plan');
+  });
+
+  it('does not call a technical resume a correction without substantive feedback', () => {
+    const prompt = buildCodexImplementationPrompt({
+      taskId: 'task-1', prompt: 'Continue the task.', repositoryPath: '/workspace', attemptNumber: 2,
+      plan: { summary: 'Continue.', steps: ['Finish it.'], acceptanceCriteria: ['It works.'] }
+    });
+
+    expect(prompt).toContain('Attempt: 2');
+    expect(prompt).not.toContain('This is a correction pass');
   });
 
   it('rejects removed ChatGPT OAuth configuration', () => {

@@ -228,6 +228,19 @@ describe('native implementation provider lifecycle', () => {
     expect(provider.implement.mock.calls[1][0].session).toBe(provider.implement.mock.calls[0][0].session);
   });
 
+  it('tells a repair pass that probed capability cannot be replaced by a waiting marker', async () => {
+    const failing = { ...implementation, validationChecks: [implementation.validationChecks[0]] };
+    const provider: any = { implement: vi.fn(async () => failing) };
+    const tools = { root: 'C:/exact/job', nativeToolChannel: { command: 'node', args: ['server'] }, drainNativeProcesses: vi.fn(),
+      read: vi.fn(), write: vi.fn(), remove: vi.fn(), record: vi.fn(), run: vi.fn(async ({ checkId, command, shell }) => ({
+        leaseId: 'lease', sessionId: 'session', checkId, command, shell, exitCode: 1, stdout: 'Editor baseline is waiting_for_capability', stderr: '',
+        startedAt: new Date().toISOString(), completedAt: new Date().toISOString()
+      })) } as unknown as NativeAuthoringTools;
+    await expect(new LifecycleNativeImplementationProvider(provider).implement({ prompt: 'repair', acceptanceCriteria: ['works'], operations: [], tools }))
+      .rejects.toThrow(/required capabilities passed local probes/i);
+    expect(provider.implement.mock.calls[1][0].previousValidationError).toContain('Do not preserve waiting_for_capability');
+  });
+
   it('blocks an aggregated-only provider command instead of fabricating empty stderr', async () => {
     const provider: any = { implement: vi.fn(async (input: any) => {
       await input.onActivity({ kind: 'stdout', message: 'combined', elapsedMs: 1,

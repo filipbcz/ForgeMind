@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import { assertEvidenceOutsideCheckout, buildSandboxedExecutableInvocation, buildSandboxedProcessInvocation,
-  buildUnrealAuthoringArgs, containsUnrealEditorInvocation, selectUnrealAutomationExecutable } from './native-sandbox.js';
+  buildUnrealAuthoringArgs, buildUnrealBuildToolArgs, containsUnrealBuildInvocation, containsUnrealEditorInvocation,
+  selectUnrealAutomationExecutable } from './native-sandbox.js';
 
 describe('native process sandbox', () => {
   it('wraps unrestricted PowerShell and cmd text in a checkout-scoped networkless sandbox', () => {
@@ -38,6 +39,19 @@ describe('native process sandbox', () => {
   it('recognizes direct and wrapped UnrealEditor commands that must use the structured tool', () => {
     expect(containsUnrealEditorInvocation("& 'C:\\Program Files\\Epic Games\\UE_5.8\\UnrealEditor-Cmd.exe' Game.uproject")).toBe(true);
     expect(containsUnrealEditorInvocation('npm test')).toBe(false);
+  });
+
+  it('recognizes raw UBT commands and constructs one constrained Editor build', () => {
+    expect(containsUnrealBuildInvocation('& "C:\\UE\\Engine\\Build\\BatchFiles\\Build.bat" FlyingEditor Win64 Development')).toBe(true);
+    expect(containsUnrealBuildInvocation('dotnet UnrealBuildTool.dll FlyingEditor')).toBe(true);
+    expect(containsUnrealBuildInvocation('npm run build')).toBe(false);
+    expect(buildUnrealBuildToolArgs({ unrealBuildToolDll: 'C:\\UE\\UnrealBuildTool.dll', projectPath: 'C:\\work\\Flying.uproject',
+      target: 'FlyingEditor', platform: 'Win64', configuration: 'Development' })).toEqual([
+      'C:\\UE\\UnrealBuildTool.dll', 'FlyingEditor', 'Win64', 'Development', '-Project=C:\\work\\Flying.uproject',
+      '-WaitMutex', '-NoHotReloadFromIDE', '-NoUBA'
+    ]);
+    expect(() => buildUnrealBuildToolArgs({ unrealBuildToolDll: 'ubt.dll', projectPath: 'Flying.uproject',
+      target: 'OtherEditor', platform: 'Win64', configuration: 'Development' })).toThrow('FlyingEditor');
   });
 
   it('uses the probed commandlet for Python automation and the editor for interactive authoring', () => {

@@ -1,10 +1,11 @@
 #!/usr/bin/env node
 import { createInterface } from 'node:readline';
-import { appendFile, mkdir, readFile, readdir, realpath, rm, stat, writeFile } from 'node:fs/promises';
+import { access, appendFile, mkdir, readFile, readdir, realpath, rm, stat, writeFile } from 'node:fs/promises';
 import { dirname, relative, resolve } from 'node:path';
 import { redactSecrets } from '@forgemind/core';
 import { assertEvidenceOutsideCheckout, buildSandboxedExecutableInvocation, buildSandboxedProcessInvocation,
-  buildUnrealAuthoringArgs, containsUnrealEditorInvocation, selectUnrealAutomationExecutable } from './native-sandbox.js';
+  buildUnrealAuthoringArgs, buildUnrealBuildToolArgs, containsUnrealBuildInvocation, containsUnrealEditorInvocation,
+  selectUnrealAutomationExecutable } from './native-sandbox.js';
 import { nativeToolDefinitions, nativeToolServerInstructions } from './native-tool-contract.js';
 import { runBoundedProcess } from './process-runner.js';
 
@@ -51,21 +52,24 @@ async function callTool(name: string, args: any) {
   if (name === 'run_process') {
     if (!['powershell', 'cmd', 'system'].includes(args.shell) || typeof args.command !== 'string' || typeof args.checkId !== 'string') throw new Error('Invalid process request.');
     if (containsUnrealEditorInvocation(args.command)) throw new Error('UnrealEditor cannot run through run_process. Use run_unreal_authoring so the runner-probed executable and required automation flags are applied.');
+    if (containsUnrealBuildInvocation(args.command)) throw new Error('UnrealBuildTool cannot run through run_process. Use run_unreal_authoring with tool=unreal-build so the runner-probed toolchain and writable build environment are applied.');
     const result = await runProcess(args.checkId, args.command, args.shell);
     return { content: [{ type: 'text', text: JSON.stringify(result) }], isError: result.exitCode !== 0 };
   }
   if (name === 'run_unreal_authoring') {
-    if (!['unreal-editor', 'unreal-python', 'project-script', 'cpp-tool'].includes(args.tool)
+    if (!['unreal-editor', 'unreal-python', 'unreal-build', 'project-script', 'cpp-tool'].includes(args.tool)
       || !['author', 'verify', 'build', 'cook', 'package'].includes(args.phase)
       || (args.executablePath !== undefined && typeof args.executablePath !== 'string')
       || typeof args.projectRelativePath !== 'string' || args.projectRelativePath.length === 0
       || !Array.isArray(args.args) || !args.args.every((value: unknown) => typeof value === 'string')
       || !Array.isArray(args.sourceRelativePaths) || !args.sourceRelativePaths.every((value: unknown) => typeof value === 'string')) throw new Error('Invalid Unreal authoring request.');
     const usesEditor = ['unreal-editor', 'unreal-python'].includes(args.tool);
+    const usesBuildTool = args.tool === 'unreal-build';
+    const buildRuntime = usesBuildTool ? await resolveUnrealBuildRuntime(configuredUnrealExecutable || configuredUnrealCommandletExecutable) : undefined;
     const executablePath = usesEditor
       ? selectUnrealAutomationExecutable(args.tool, args.args, configuredUnrealExecutable, configuredUnrealCommandletExecutable)
-      : args.executablePath?.trim();
-    if (!executablePath) throw new Error(usesEditor
+      : buildRuntime?.dotnetExecutable ?? args.executablePath?.trim();
+    if (!executablePath) throw new Error(usesEditor || usesBuildTool
       ? 'No runner-probed UnrealEditor executable is available. Run the Windows probe with FORGEMIND_UNREAL_EXECUTABLE configured.'
       : 'This authoring tool requires an executablePath.');
     if (usesEditor && args.executablePath?.trim() && normalizeExecutable(args.executablePath) !== normalizeExecutable(executablePath)) {
@@ -76,11 +80,24 @@ async function callTool(name: string, args: any) {
     const project = await existingContained(args.projectRelativePath);
     if (!String(project).toLowerCase().endsWith('.uproject') || !(await stat(project)).isFile()) throw new Error('The selected project must be an existing .uproject in the leased checkout.');
     for (const source of args.sourceRelativePaths) await existingContained(source);
-    const effectiveArgs = usesEditor ? buildUnrealAuthoringArgs(project, args.args, args.phase) : [project, ...args.args];
+    if (usesBuildTool && (args.phase !== 'build' || args.args.length > 0 || typeof args.target !== 'string'
+      || args.platform !== 'Win64' || !['Development', 'DebugGame'].includes(args.configuration))) {
+      throw new Error('unreal-build requires phase=build, an empty args array, target=<Project>Editor, platform=Win64, and configuration=Development or DebugGame.');
+    }
+    const effectiveArgs = usesEditor
+      ? buildUnrealAuthoringArgs(project, args.args, args.phase)
+      : usesBuildTool
+        ? buildUnrealBuildToolArgs({ unrealBuildToolDll: buildRuntime!.unrealBuildToolDll, projectPath: project,
+            target: args.target, platform: args.platform, configuration: args.configuration })
+        : [project, ...args.args];
     const command = [executablePath, ...effectiveArgs].map(quoteWindowsArgument).join(' ');
     const authoring = { tool: args.tool, phase: args.phase, projectRelativePath: args.projectRelativePath,
       executablePath, args: effectiveArgs.slice(1), sourceRelativePaths: args.sourceRelativePaths };
-    const invocation = buildSandboxedExecutableInvocation({ sandboxExecutable, checkoutRoot: root, executable: executablePath, args: effectiveArgs });
+    // UBT is a runner-resolved executable with a strictly validated target and argument vector. Running this exact invocation
+    // directly avoids denying its unavoidable per-user .NET/UBT state while arbitrary AI commands remain checkout-sandboxed.
+    const invocation = usesBuildTool
+      ? { executable: executablePath, args: effectiveArgs }
+      : buildSandboxedExecutableInvocation({ sandboxExecutable, checkoutRoot: root, executable: executablePath, args: effectiveArgs });
     const result = await runProcess(args.checkId, command, 'system', authoring, invocation, usesEditor ? unrealIdleTimeoutMs : undefined);
     return { content: [{ type: 'text', text: JSON.stringify(result) }], isError: result.exitCode !== 0 };
   }
@@ -90,7 +107,15 @@ async function callTool(name: string, args: any) {
 async function runProcess(checkId: string, command: string, shell: 'powershell' | 'cmd' | 'system', authoring?: Record<string, unknown>,
   directInvocation?: { executable: string; args: string[] }, idleTimeoutMs?: number) {
   const sandboxed = directInvocation ?? buildSandboxedProcessInvocation({ sandboxExecutable, checkoutRoot: root, command, shell });
-  const temporaryDirectory = resolve(root, '.forgemind-tmp'); await mkdir(temporaryDirectory, { recursive: true });
+  const temporaryDirectory = resolve(root, '.forgemind-tmp');
+  await Promise.all([
+    mkdir(temporaryDirectory, { recursive: true }),
+    mkdir(resolve(temporaryDirectory, 'profile'), { recursive: true }),
+    mkdir(resolve(temporaryDirectory, 'local-app-data'), { recursive: true }),
+    mkdir(resolve(temporaryDirectory, 'roaming-app-data'), { recursive: true }),
+    mkdir(resolve(temporaryDirectory, 'dotnet-home'), { recursive: true }),
+    mkdir(resolve(temporaryDirectory, 'nuget-packages'), { recursive: true })
+  ]);
   const startedAt = new Date().toISOString();
   const controller = new AbortController();
   activeProcesses.add(controller);
@@ -123,7 +148,32 @@ function sandboxEnvironment(temporaryDirectory: string, isolatedCodexHome: strin
     safe[key] = value;
   }
   safe.CODEX_HOME = isolatedCodexHome; safe.TEMP = temporaryDirectory; safe.TMP = temporaryDirectory;
+  safe.USERPROFILE = resolve(temporaryDirectory, 'profile');
+  safe.LOCALAPPDATA = resolve(temporaryDirectory, 'local-app-data');
+  safe.APPDATA = resolve(temporaryDirectory, 'roaming-app-data');
+  safe.DOTNET_CLI_HOME = resolve(temporaryDirectory, 'dotnet-home');
+  safe.NUGET_PACKAGES = resolve(temporaryDirectory, 'nuget-packages');
+  safe.DOTNET_CLI_TELEMETRY_OPTOUT = '1';
   return safe;
+}
+
+async function resolveUnrealBuildRuntime(editorExecutable: string): Promise<{ dotnetExecutable: string; unrealBuildToolDll: string }> {
+  if (!editorExecutable || !/(?:^|[\\/])UnrealEditor(?:-Cmd)?\.exe$/i.test(editorExecutable)) {
+    throw new Error('Unreal build requires the runner-probed UnrealEditor executable.');
+  }
+  const engineRoot = resolve(dirname(editorExecutable), '..', '..');
+  const unrealBuildToolDll = resolve(engineRoot, 'Binaries', 'DotNET', 'UnrealBuildTool', 'UnrealBuildTool.dll');
+  await access(unrealBuildToolDll);
+  const dotnetRoot = resolve(engineRoot, 'Binaries', 'ThirdParty', 'DotNet');
+  const versions = (await readdir(dotnetRoot, { withFileTypes: true }))
+    .filter((entry) => entry.isDirectory())
+    .map((entry) => entry.name)
+    .sort((left, right) => right.localeCompare(left, undefined, { numeric: true }));
+  for (const version of versions) {
+    const candidate = resolve(dotnetRoot, version, 'win-x64', 'dotnet.exe');
+    try { await access(candidate); return { dotnetExecutable: candidate, unrealBuildToolDll }; } catch { /* continue */ }
+  }
+  throw new Error(`The runner-probed Unreal installation has no bundled win-x64 dotnet runtime under ${dotnetRoot}.`);
 }
 
 function contained(path: string) { const target = resolve(root, String(path)); const rel = relative(root, target); if (rel === '..' || rel.startsWith(`..${process.platform === 'win32' ? '\\' : '/'}`)) throw new Error('Path escapes leased checkout.'); return target; }

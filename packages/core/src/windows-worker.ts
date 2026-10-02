@@ -339,7 +339,7 @@ export interface WindowsAuthoringProcessResult {
   terminationReason?: 'timed-out' | 'cancelled' | 'missing-capability';
   /** Present for structured Unreal authoring calls. Unlike legacy validation,
    * these calls deliberately carry the AI-selected argument vector. */
-  authoring?: { tool: 'unreal-editor' | 'unreal-python' | 'project-script' | 'cpp-tool'; phase: 'author' | 'verify' | 'build' | 'cook' | 'package';
+  authoring?: { tool: 'unreal-editor' | 'unreal-python' | 'unreal-build' | 'project-script' | 'cpp-tool'; phase: 'author' | 'verify' | 'build' | 'cook' | 'package';
     projectRelativePath: string; executablePath: string; args: string[]; sourceRelativePaths: string[]; loadedPackages?: string[];
     inspections?: Array<{ path: string; className: string; technicalObservations: string[] }> };
 }
@@ -698,7 +698,7 @@ export function isWindowsAuthoringResult(value: unknown): value is WindowsAuthor
       && typeof process.stderr === 'string' && isIsoDate(process.startedAt) && isIsoDate(process.completedAt)
       && (process.terminationReason === undefined || ['timed-out', 'cancelled', 'missing-capability'].includes(process.terminationReason as string))
       && (process.authoring === undefined || (isRecord(process.authoring)
-        && ['unreal-editor', 'unreal-python', 'project-script', 'cpp-tool'].includes(process.authoring.tool as string)
+        && ['unreal-editor', 'unreal-python', 'unreal-build', 'project-script', 'cpp-tool'].includes(process.authoring.tool as string)
         && ['author', 'verify', 'build', 'cook', 'package'].includes(process.authoring.phase as string)
         && isSafeRelativePath(process.authoring.projectRelativePath) && isNonEmpty(process.authoring.executablePath)
         && Array.isArray(process.authoring.args) && process.authoring.args.every((arg) => typeof arg === 'string')

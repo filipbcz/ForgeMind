@@ -1,9 +1,14 @@
 import { describe, expect, it, vi } from 'vitest';
 import type { AIProvider } from './provider.js';
 import { parseTaskModelRoutingDecision } from './provider.js';
-import { ModelRoutedProvider, resolveModelRoute, type ModelRoutingState } from './model-router.js';
+import { hasSubstantiveImplementationFeedback, ModelRoutedProvider, resolveModelRoute, type ModelRoutingState } from './model-router.js';
 
 describe('model routing', () => {
+  it('does not escalate merely because orchestration resumed at a later attempt', () => {
+    expect(hasSubstantiveImplementationFeedback({})).toBe(false);
+    expect(hasSubstantiveImplementationFeedback({ previousValidationError: 'Acceptance validation failed.' })).toBe(true);
+    expect(hasSubstantiveImplementationFeedback({ previousReviewBlockers: ['Missing evidence.'] })).toBe(true);
+  });
   it('uses Luna, Sol and Astra for balanced economy, standard and critical work', () => {
     expect(resolveModelRoute({ profile: 'balanced', workload: 'economy', environment: {} }).model).toBe('gpt-6-luna');
     expect(resolveModelRoute({ profile: 'balanced', workload: 'standard', environment: {} }).model).toBe('gpt-6.1-sol');

@@ -21,7 +21,7 @@ import {
   slugifyBranchSegment,
   type GitHubAdapter
 } from '@forgemind/github';
-import { createProvider, type AIProvider, type ImplementResult, type PlanResult, type ProviderSessionContext, type ReviewResult, type ValidationCheck } from '@forgemind/providers';
+import { createProvider, hasSubstantiveImplementationFeedback, type AIProvider, type ImplementResult, type PlanResult, type ProviderSessionContext, type ReviewResult, type ValidationCheck } from '@forgemind/providers';
 import { parseAgentConfigYaml } from '@forgemind/config';
 import { nowIso, toErrorMessage, type JsonValue } from '@forgemind/shared';
 import {
@@ -448,7 +448,7 @@ export async function runWorkerTask(input: WorkerTaskInput): Promise<WorkerTaskR
         ? await input.implementOnWindows!({
             ...implementationInput,
             baseCommitSha: windowsBaseCommitSha!,
-            modelRoute: (attempt > 1 || implementationInput.previousReviewBlockers?.length || implementationInput.previousValidationError)
+            modelRoute: hasSubstantiveImplementationFeedback(implementationInput)
               ? taskModelRoutingDecision?.escalation
               : taskModelRoutingDecision?.implementation
           })

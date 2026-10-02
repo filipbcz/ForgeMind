@@ -6,7 +6,7 @@ import { fileURLToPath } from 'node:url';
 import type { AuthoringTreeEntry, WindowsAuthoringPacket, WindowsAuthoringProcessResult, WindowsAuthoringResult } from '@forgemind/core';
 import { isWindowsAuthoringResult, redactSecrets } from '@forgemind/core';
 import { resolveCodexBinary, type AIProvider, type ProviderSessionContext } from '@forgemind/providers';
-import { buildSandboxedProcessInvocation, buildUnrealAuthoringArgs, containsUnrealEditorInvocation } from './native-sandbox.js';
+import { buildSandboxedProcessInvocation, buildUnrealAuthoringArgs, containsUnrealBuildInvocation, containsUnrealEditorInvocation } from './native-sandbox.js';
 import { runBoundedProcess } from './process-runner.js';
 
 export interface NativeAuthoringTools {
@@ -51,7 +51,7 @@ export class LifecycleNativeImplementationProvider implements NativeImplementati
           taskId: 'native-windows-authoring', prompt: input.prompt,
           plan: { summary: input.prompt, steps: input.operations.map((operation) => operation.rationale), acceptanceCriteria: input.acceptanceCriteria },
           repositoryPath: input.tools.root, signal: input.signal, attemptNumber: attempt, session: providerSession,
-          previousValidationError: failure ? `${failure.checkId}: ${failure.command}\n${failure.stderr || failure.stdout}` : input.previousValidationError,
+          previousValidationError: failure ? formatNativeValidationFailure(failure) : input.previousValidationError,
           previousReviewBlockers: input.previousReviewBlockers,
           nativeToolChannel: input.tools.nativeToolChannel,
           onActivity: async (activity) => {
@@ -101,6 +101,9 @@ export class LifecycleNativeImplementationProvider implements NativeImplementati
           });
           continue;
         }
+        if (containsUnrealBuildInvocation(check.command)) {
+          throw new Error('Unreal build validation must use run_unreal_authoring with tool=unreal-build so the runner-probed toolchain and writable build environment are applied.');
+        }
         const process = await input.tools.run({ command: check.command, shell, checkId: `provider-check-${index + 1}` });
         if (process.exitCode === 0) passed.set(identity, process); else { failure = process; break; }
       }
@@ -108,13 +111,20 @@ export class LifecycleNativeImplementationProvider implements NativeImplementati
       const fingerprint = createHash('sha256').update(JSON.stringify({ command: failure.command, shell: failure.shell,
         exitCode: failure.exitCode, stdout: failure.stdout, stderr: failure.stderr })).digest('hex');
       if (failedFingerprints.has(fingerprint)) {
-        throw new Error(`The same Windows validation failed again without progress: ${failure.checkId}: ${failure.command}\n${failure.stderr || failure.stdout}`);
+        throw new Error(`The same Windows validation failed again without progress: ${formatNativeValidationFailure(failure)}`);
       }
       failedFingerprints.add(fingerprint);
     }
     if (!result) throw new Error('Implementation provider returned no result.');
     return { summary: result.summary, completedOperationIds: input.operations.map(({ id }) => id), checkpointIds: [] };
   }
+}
+
+function formatNativeValidationFailure(failure: WindowsAuthoringProcessResult): string {
+  const detail = `${failure.checkId}: ${failure.command}\n${failure.stderr || failure.stdout}`;
+  return /waiting_for_capability/i.test(detail)
+    ? `${detail}\nThe runner leased this job only after its required capabilities passed local probes. Do not preserve waiting_for_capability after a concrete tool failure; repair the failure using the structured native tools and rerun the check.`
+    : detail;
 }
 
 function inferWindowsShell(command: string): 'powershell' | 'cmd' | 'system' {

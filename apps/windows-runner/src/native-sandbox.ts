@@ -70,6 +70,33 @@ export function containsUnrealEditorInvocation(command: string): boolean {
   return /\bunrealeditor(?:-cmd)?\.exe\b/i.test(command);
 }
 
+export function containsUnrealBuildInvocation(command: string): boolean {
+  return /(?:\bunrealbuildtool(?:\.exe|\.dll)?\b|(?:^|[\\/\s"'])build\.bat\b)/i.test(command);
+}
+
+export function buildUnrealBuildToolArgs(input: {
+  unrealBuildToolDll: string;
+  projectPath: string;
+  target: string;
+  platform: 'Win64';
+  configuration: 'Development' | 'DebugGame';
+}): string[] {
+  const projectName = input.projectPath.replaceAll('\\', '/').split('/').at(-1)?.replace(/\.uproject$/i, '');
+  if (!projectName || input.target !== `${projectName}Editor`) {
+    throw new Error(`Unreal build target must be ${projectName || '<Project>'}Editor for the selected project.`);
+  }
+  return [
+    input.unrealBuildToolDll,
+    input.target,
+    input.platform,
+    input.configuration,
+    `-Project=${input.projectPath}`,
+    '-WaitMutex',
+    '-NoHotReloadFromIDE',
+    '-NoUBA'
+  ];
+}
+
 function hasCommandLineFlag(args: string[], expected: string): boolean {
   const name = expected.slice(1).toLowerCase();
   return args.some((arg) => {

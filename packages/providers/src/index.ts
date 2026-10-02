@@ -16,7 +16,7 @@ import { GitHubCopilotProvider } from './github-copilot-provider.js';
 import { ModelRoutedProvider, type ModelProfile, type ModelRoutingState, type ReasoningEffort } from './model-router.js';
 
 export type { ModelProfile, ModelRoute, ModelRoutingState, ModelWorkload, ReasoningEffort } from './model-router.js';
-export { DEFAULT_MODEL_POOL, resolveModelRoute } from './model-router.js';
+export { DEFAULT_MODEL_POOL, hasSubstantiveImplementationFeedback, resolveModelRoute } from './model-router.js';
 
 export interface ProviderRuntimeConfig {
   apiKey?: string;

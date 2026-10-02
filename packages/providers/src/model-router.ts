@@ -38,6 +38,14 @@ const DEFAULT_MODELS = {
 
 export const DEFAULT_MODEL_POOL = [DEFAULT_MODELS.economy, DEFAULT_MODELS.standard, DEFAULT_MODELS.critical] as const;
 
+/** A retry number is lifecycle bookkeeping, not evidence that a stronger model is needed. */
+export function hasSubstantiveImplementationFeedback(input: {
+  previousValidationError?: string;
+  previousReviewBlockers?: string[];
+}): boolean {
+  return Boolean(input.previousValidationError?.trim() || input.previousReviewBlockers?.some((blocker) => blocker.trim()));
+}
+
 /** Resolve the effective model without embedding provider policy in orchestration. */
 export function resolveModelRoute(input: {
   profile: ModelProfile;
@@ -219,7 +227,7 @@ export class ModelRoutedProvider implements AIProvider {
       onActivity: input.onActivity,
       signal: input.signal
     });
-    const escalated = (input.attemptNumber ?? 1) > 1 || Boolean(input.previousReviewBlockers?.length) || Boolean(input.previousValidationError);
+    const escalated = hasSubstantiveImplementationFeedback(input);
     const selection = escalated ? decision.escalation : decision.implementation;
     const provider = this.providerForSelection(selection);
     const route: ModelRoute = { workload: escalated ? 'critical' : 'standard', ...selection,
