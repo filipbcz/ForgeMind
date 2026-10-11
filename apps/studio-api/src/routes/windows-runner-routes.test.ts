@@ -56,6 +56,30 @@ describe('Windows runner enrollment API', () => {
     expect(response.json()).toEqual({ error: 'Invalid execution result.' });
   });
 
+  it('accepts and byte-bounds progress logs produced by older runners with multibyte output', async () => {
+    const app = Fastify(); const deviceId = '11111111-1111-4111-8111-111111111111';
+    const credentials: any = { authenticate: vi.fn(async () => ({ deviceId })) };
+    const workers: any = { recordAuthoringProgress: vi.fn(async () => true) };
+    registerWindowsRunnerRoutes(app, {} as any, credentials, workers);
+    const text = `${'Příliš žluťoučký kůň '.repeat(14_000)}latest`;
+    const payload = { schemaVersion: 1, jobId: '22222222-2222-4222-8222-222222222222',
+      leaseId: '33333333-3333-4333-8333-333333333333', sessionId: '44444444-4444-4444-8444-444444444444', phase: 'author',
+      checkpoint: { resultTreeSha: 'a'.repeat(40), updatedAt: '2026-10-11T15:07:18.349Z', resumedFromCheckpoint: false },
+      log: { text, sizeBytes: Buffer.byteLength(text), sha256: createHash('sha256').update(text).digest('hex') } };
+    expect(Buffer.byteLength(text)).toBeGreaterThan(256_000);
+
+    const response = await app.inject({ method: 'POST', url: '/api/windows-runner/device/authoring-progress',
+      headers: { authorization: 'Bearer device-token' }, payload });
+
+    expect(response.statusCode).toBe(200);
+    const stored = workers.recordAuthoringProgress.mock.calls[0][1];
+    expect(Buffer.byteLength(stored.log.text)).toBeLessThanOrEqual(256_000);
+    expect(stored.log.text).toMatch(/latest$/);
+    expect(stored.log.text).not.toContain('\ufffd');
+    expect(stored.log.sizeBytes).toBe(Buffer.byteLength(stored.log.text));
+    expect(stored.log.sha256).toBe(createHash('sha256').update(stored.log.text).digest('hex'));
+  });
+
   it('accepts bounded authoring blob chunks and binds them to the authenticated device', async () => {
     const app = Fastify(); const deviceId = '11111111-1111-4111-8111-111111111111';
     const credentials: any = { authenticate: vi.fn(async () => ({ deviceId })) };

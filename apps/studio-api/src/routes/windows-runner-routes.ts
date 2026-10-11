@@ -39,6 +39,16 @@ const sessionControl = z.object({ sessionId: z.string().uuid() });
 const controlQuery = z.object({ sessionId: z.string().uuid(), leaseId: z.string().uuid().optional() });
 const sha = z.string().regex(/^[a-f0-9]{64}$/i);
 const gitCommitSha = z.string().regex(/^(?:[a-f0-9]{40}|[a-f0-9]{64})$/i);
+const LEGACY_AUTHORING_LOG_MAX_BYTES = WINDOWS_EVIDENCE_MAX_LOG_BYTES * 4;
+
+function truncateUtf8Tail(value: string, maxBytes: number): string {
+  const bytes = Buffer.from(value, 'utf8');
+  if (bytes.length <= maxBytes) return value;
+  let start = bytes.length - maxBytes;
+  while (start < bytes.length && (bytes[start]! & 0xc0) === 0x80) start += 1;
+  return bytes.subarray(start).toString('utf8');
+}
+
 const authoringProgress = z.object({ schemaVersion: z.literal(1), jobId: z.string().uuid(), leaseId: z.string().uuid(), sessionId: z.string().uuid(),
   phase: z.enum(['checkout', 'author', 'verify', 'build', 'cook', 'package']), checkpoint: z.object({ resultTreeSha: gitCommitSha,
     updatedAt: z.string().datetime(), resumedFromCheckpoint: z.boolean() }), log: z.object({ text: z.string(), sizeBytes: z.number().int().nonnegative(), sha256: sha }) });
@@ -200,12 +210,15 @@ export function registerWindowsRunnerRoutes(app: FastifyInstance, repository: Fo
     await repository.writeAudit({ actorType: 'system', actorId: principal.deviceId, eventType: 'windows_runner_result_submitted', taskId: request.body.taskId, projectId: request.body.projectId, payload: { deviceId: principal.deviceId, jobId: request.body.jobId, leaseId: request.body.leaseId, status: request.body.status, commitSha: request.body.commitSha } });
     return { accepted: true, evidenceRecorded };
   });
-  app.post('/api/windows-runner/device/authoring-progress', { preHandler: runnerAuth(credentials) }, async (request, reply) => {
+  app.post('/api/windows-runner/device/authoring-progress', { preHandler: runnerAuth(credentials),
+    bodyLimit: LEGACY_AUTHORING_LOG_MAX_BYTES + 100_000 }, async (request, reply) => {
     const principal = runnerPrincipal(request); const parsed = authoringProgress.safeParse(request.body);
     if (!parsed.success) return reply.code(400).send({ error: 'Invalid authoring progress.' });
-    const progress = parsed.data; const text = redactSecrets(progress.log.text); const sizeBytes = Buffer.byteLength(text);
-    if (text !== progress.log.text || sizeBytes !== progress.log.sizeBytes || sizeBytes > WINDOWS_EVIDENCE_MAX_LOG_BYTES
-      || createHash('sha256').update(text).digest('hex') !== progress.log.sha256.toLowerCase()) return reply.code(400).send({ error: 'Authoring progress log is invalid.' });
+    const input = parsed.data; const rawText = redactSecrets(input.log.text); const rawSizeBytes = Buffer.byteLength(rawText);
+    if (rawText !== input.log.text || rawSizeBytes !== input.log.sizeBytes || rawSizeBytes > LEGACY_AUTHORING_LOG_MAX_BYTES
+      || createHash('sha256').update(rawText).digest('hex') !== input.log.sha256.toLowerCase()) return reply.code(400).send({ error: 'Authoring progress log is invalid.' });
+    const text = truncateUtf8Tail(rawText, WINDOWS_EVIDENCE_MAX_LOG_BYTES);
+    const progress = { ...input, log: { text, sizeBytes: Buffer.byteLength(text), sha256: createHash('sha256').update(text).digest('hex') } };
     const accepted = await workers.recordAuthoringProgress(principal.deviceId, progress);
     return accepted ? { accepted } : reply.code(409).send({ error: 'Execution lease is not active for this device.' });
   });
