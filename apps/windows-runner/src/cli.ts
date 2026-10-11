@@ -215,7 +215,10 @@ export async function main(args = process.argv.slice(2)): Promise<void> {
             stdout.write(`Using routed model ${claim.job.packet.modelRoute.model} (${claim.job.packet.modelRoute.reasoningEffort}).\n`);
           }
           const progressPublisher = new CoalescedAuthoringProgressPublisher(
-            (progress) => transport.publishAuthoringProgress(auth, progress)
+            async (progress) => {
+              await transport.publishAuthoringProgress(auth, progress);
+              stdout.write(`[authoring] phase=${progress.phase} checkpoint=${progress.checkpoint.resultTreeSha.slice(0, 12)} log=${progress.log.sizeBytes} bytes\n`);
+            }
           );
           const executed = await executeWindowsAuthoring(claim.job.packet, { deviceId: auth.deviceId, sessionId: context.sessionId,
             workspaceRoot: managedRoots.work, artifactRoot: managedRoots.diagnostics, signal: context.signal,

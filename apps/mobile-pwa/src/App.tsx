@@ -311,8 +311,8 @@ function AuthenticatedApp({ auth }: { auth: AuthSessionResponse }) {
   const windowsOperationsQuery = useQuery({
     queryKey: ['windows-worker-operations'],
     queryFn: () => fetchWindowsWorkerOperations(),
-    enabled: view === 'settings',
-    refetchInterval: view === 'settings' ? globalPollInterval : false,
+    enabled: view === 'settings' || view === 'tasks',
+    refetchInterval: view === 'settings' || view === 'tasks' ? globalPollInterval : false,
     retry: 1
   });
 
@@ -978,6 +978,7 @@ function AuthenticatedApp({ auth }: { auth: AuthSessionResponse }) {
                 usage={usageQuery.data}
                 queue={queueQuery.data}
                 workerStatus={workerStatusQuery.data}
+                windowsAuthoring={windowsOperationsQuery.data?.activeAuthoring.find((item) => item.taskId === selectedTask.id)}
                 realtimeState={taskRealtimeState}
                 realtimeMeta={taskRealtimeMeta}
                 busy={
@@ -1546,6 +1547,7 @@ function TaskActivityPanel(props: {
   currentRunId?: string;
   logs: AuditEventApi[];
   realtimeState: RealtimeUiState;
+  windowsAuthoring?: WindowsWorkerOperationsReadModel['activeAuthoring'][number];
 }) {
   const entries = useMemo(() => collectTaskActivityEntries(props.logs, props.taskId), [props.logs, props.taskId]);
   const taskIsActive = activeStatuses.has(props.task.status);
@@ -1605,8 +1607,19 @@ function TaskActivityPanel(props: {
           <ArrowDown size={17} />
         </summary>
         <div className="provider-activity-output">
+          {props.windowsAuthoring ? (
+            <div className="provider-activity-entry stdout progress">
+              <div className="provider-activity-meta">
+                <span>Windows worker</span>
+                <span>{formatPhase(props.windowsAuthoring.phase)}</span>
+                <span>živě</span>
+              </div>
+              <strong>Unreal authoring · checkpoint {props.windowsAuthoring.lastCheckpoint ?? 'dosud žádný'}</strong>
+              {props.windowsAuthoring.logs.map((log) => <pre key={log.sha256}>{log.text}</pre>)}
+            </div>
+          ) : null}
           {technicalEntries.length === 0 ? (
-            <div className="provider-activity-empty">Zatím bez průběžné aktivity.</div>
+            props.windowsAuthoring ? null : <div className="provider-activity-empty">Zatím bez průběžné aktivity.</div>
           ) : null}
           {technicalEntries.map((entry) => (
             <div className={`provider-activity-entry ${entry.kind} ${entry.state}`} key={entry.id}>
@@ -1637,6 +1650,7 @@ function TaskDetail(props: {
   usage?: TaskUsageApi;
   queue?: TaskQueueApi;
   workerStatus?: WorkerStatusApi;
+  windowsAuthoring?: WindowsWorkerOperationsReadModel['activeAuthoring'][number];
   realtimeState: RealtimeUiState;
   realtimeMeta: RealtimeConnectionMeta;
   busy: boolean;
@@ -1769,6 +1783,7 @@ function TaskDetail(props: {
           currentRunId={latestRun?.id}
           logs={props.logs}
           realtimeState={props.realtimeState}
+          windowsAuthoring={props.windowsAuthoring}
         />
         <ol className="workflow-steps">
           {workflowItems.map((item) => {
