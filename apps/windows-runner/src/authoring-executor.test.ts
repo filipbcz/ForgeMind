@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from 'vitest';
-import { assertReadableAuthoringCheckout, authoringSemanticHash, buildUnrealPackageVerificationArgs, buildUnrealPackageVerificationScript, canResumeAuthoringCheckpoint, classifyAuthoringFailure, classifyWindowsAuthoringFailure, collectAuthoringToolVersions, collectCheckpointAuthoringProvenance, compactProcessResults, hasRestorableAuthoringCheckpoint, isProhibitedAuthoringPath, LifecycleNativeImplementationProvider, materializeOutputs, requiresProductionContent, restoreCheckpointAuthoringProvenance, type NativeAuthoringTools, unrealObjectPath, validateRequiredUnrealAssets } from './authoring-executor.js';
+import { assertReadableAuthoringCheckout, authoringSemanticHash, buildUnrealPackageVerificationArgs, buildUnrealPackageVerificationScript, canResumeAuthoringCheckpoint, checkpointRecoveryScore, classifyAuthoringFailure, classifyWindowsAuthoringFailure, collectAuthoringToolVersions, collectCheckpointAuthoringProvenance, compactProcessResults, hasRestorableAuthoringCheckpoint, isProhibitedAuthoringPath, LifecycleNativeImplementationProvider, materializeOutputs, requiresProductionContent, restoreCheckpointAuthoringProvenance, selectRecoveryCheckpoint, type NativeAuthoringTools, unrealObjectPath, validateRequiredUnrealAssets } from './authoring-executor.js';
 import { mkdtemp, rm } from 'node:fs/promises';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
@@ -45,6 +45,16 @@ describe('native implementation provider lifecycle', () => {
     expect(canResumeAuthoringCheckpoint(checkpoint, { taskId: 'task-2', baseCommitSha: 'a'.repeat(40) })).toBe(false);
     expect(canResumeAuthoringCheckpoint(checkpoint, { taskId: 'task-1', baseCommitSha: 'b'.repeat(40) })).toBe(false);
     expect(canResumeAuthoringCheckpoint(checkpoint, { taskId: 'task-1', baseCommitSha: 'a'.repeat(40) }, 'probe-5.9.0')).toBe(false);
+    expect(canResumeAuthoringCheckpoint(checkpoint, { taskId: 'task-1', baseCommitSha: 'a'.repeat(40) }, 'probe-5.9.0', true)).toBe(true);
+  });
+  it('prefers a materially richer preserved checkpoint over a fresh partial retry', () => {
+    const bundle = { version: 1 as const, format: 'git-binary-patch' as const, sha256: 'a', sizeBytes: 1, lfsObjects: [], outputs: [] };
+    const partial: any = { version: 2, taskId: 'task-1', baseCommitSha: 'a'.repeat(40), resultTreeSha: '1'.repeat(40),
+      updatedAt: '2026-10-11T19:33:08Z', unrealProbeIdentity: 'new-probe', patch: 'small', tree: [{ path: 'one' }], resultBundle: bundle };
+    const preserved: any = { ...partial, resultTreeSha: '2'.repeat(40), updatedAt: '2026-10-11T16:33:59Z', unrealProbeIdentity: 'old-probe',
+      patch: 'x'.repeat(20_000), tree: Array.from({ length: 49 }, (_, index) => ({ path: String(index) })) };
+    expect(checkpointRecoveryScore(preserved)).toBeGreaterThan(checkpointRecoveryScore(partial));
+    expect(selectRecoveryCheckpoint([partial, preserved], 'new-probe')).toBe(preserved);
   });
   it('keeps completed-result reuse stable across delivery retries but not product changes', () => {
     const packet: any = { taskId: 'task', baseCommitSha: 'a'.repeat(40), step: { prompt: 'Build scene', acceptanceCriteria: ['Map exists'],

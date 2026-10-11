@@ -429,30 +429,63 @@ function createTools(root: string, evidencePath: string, timeoutMs: number, sign
 async function prepareCheckout(packet: WindowsAuthoringPacket, root: string, checkpointPath: string, outputRoot: string,
   selectedUnrealIdentity?: string, signal?: AbortSignal): Promise<{ path: string; resumed: boolean; checkpoint?: AuthoringDiskCheckpoint }> {
   await mkdir(root, { recursive: true }); const path = resolve(root, packet.taskId);
-  let checkpoint: AuthoringDiskCheckpoint | undefined;
   let generations: string[] = [];
   try { generations = (await readdir(dirname(checkpointPath))).filter((name) => name.startsWith(`${basename(checkpointPath)}.generation-`) && name.endsWith('.json')).sort().reverse().map((name) => resolve(dirname(checkpointPath), name)); } catch { /* no generations */ }
+  const checkpoints: AuthoringDiskCheckpoint[] = [];
   for (const candidate of [...generations, checkpointPath, `${checkpointPath}.previous`]) {
-    try { checkpoint = JSON.parse(await readFile(candidate, 'utf8')) as AuthoringDiskCheckpoint; if (checkpoint.version === 2) break; } catch { /* try last complete generation */ }
+    try {
+      const checkpoint = JSON.parse(await readFile(candidate, 'utf8')) as AuthoringDiskCheckpoint;
+      if (canResumeAuthoringCheckpoint(checkpoint, packet, selectedUnrealIdentity, true) && hasRestorableAuthoringCheckpoint(checkpoint)
+        && !checkpoints.some((item) => item.resultTreeSha === checkpoint.resultTreeSha)) checkpoints.push(checkpoint);
+    } catch { /* try the other complete generations */ }
   }
-  const checkpointMatches = canResumeAuthoringCheckpoint(checkpoint, packet, selectedUnrealIdentity)
-    && hasRestorableAuthoringCheckpoint(checkpoint);
-  try {
-    const actual = await spawnComplete('git.exe', ['rev-parse', 'HEAD'], path, 30_000, signal);
-    if (checkpointMatches
-      && actual.exitCode === 0 && actual.stdout.trim().toLowerCase() === packet.baseCommitSha.toLowerCase()) {
-      const status = await spawnComplete('git.exe', ['status', '--porcelain=v1'], path, 30_000, signal);
-      if (status.exitCode === 0 && status.stdout.trim().length > 0) {
-        const retainedTree = await gitTree(path, signal);
-        if (retainedTree.toLowerCase() === checkpoint!.resultTreeSha.toLowerCase()) return { path: await realpath(path), resumed: true, checkpoint };
-      }
+  const compatible = selectRecoveryCheckpoint(checkpoints, selectedUnrealIdentity);
+  let preservedPaths: string[] = [];
+  try { preservedPaths = (await readdir(root)).filter((name) => name.startsWith(`${packet.taskId}.preserved-`)).sort().reverse().map((name) => resolve(root, name)); } catch { /* no preserved workspaces */ }
+  const retained: Array<{ path: string; checkpoint: AuthoringDiskCheckpoint }> = [];
+  for (const retainedPath of [path, ...preservedPaths]) {
+    try {
+      const actual = await spawnComplete('git.exe', ['rev-parse', 'HEAD'], retainedPath, 30_000, signal);
+      if (actual.exitCode !== 0 || actual.stdout.trim().toLowerCase() !== packet.baseCommitSha.toLowerCase()) continue;
+      const status = await spawnComplete('git.exe', ['status', '--porcelain=v1'], retainedPath, 30_000, signal);
+      if (status.exitCode !== 0 || status.stdout.trim().length === 0) continue;
+      const retainedTree = await gitTree(retainedPath, signal);
+      const checkpoint = checkpoints.find((item) => item.resultTreeSha.toLowerCase() === retainedTree.toLowerCase());
+      if (checkpoint) retained.push({ path: retainedPath, checkpoint });
+    } catch { /* inspect the other retained workspaces */ }
+  }
+  const bestRetained = retained.sort((left, right) => checkpointRecoveryScore(right.checkpoint) - checkpointRecoveryScore(left.checkpoint))[0];
+  if (bestRetained) {
+    if (bestRetained.path !== path) {
+      try { await rename(path, resolve(root, `${packet.taskId}.preserved-rejected-${Date.now()}`)); } catch { /* active checkout may not exist */ }
+      await rename(bestRetained.path, path);
     }
-  } catch { /* missing or invalid retained checkout */ }
+    return { path: await realpath(path), resumed: true, checkpoint: bestRetained.checkpoint };
+  }
   try { await rename(path, resolve(root, `${packet.taskId}.preserved-${Date.now()}`)); } catch (error) {
-    try { await lstat(path); } catch { /* checkout did not exist */ return cloneCheckout(packet, root, path, outputRoot, signal, checkpointMatches ? checkpoint : undefined); }
+    try { await lstat(path); } catch { /* checkout did not exist */ return cloneCheckout(packet, root, path, outputRoot, signal, compatible); }
     throw error;
   }
-  return cloneCheckout(packet, root, path, outputRoot, signal, checkpointMatches ? checkpoint : undefined);
+  return cloneCheckout(packet, root, path, outputRoot, signal, compatible);
+}
+
+export function checkpointRecoveryScore(checkpoint: Pick<AuthoringDiskCheckpoint, 'patch' | 'tree' | 'resultBundle' | 'authoringProvenance'>): number {
+  return Buffer.byteLength(checkpoint.patch, 'utf8')
+    + checkpoint.tree.length * 1_024
+    + checkpoint.resultBundle.lfsObjects.reduce((sum, item) => sum + item.sizeBytes, 0)
+    + checkpoint.resultBundle.outputs.reduce((sum, item) => sum + item.sizeBytes, 0)
+    + (checkpoint.authoringProvenance?.length ?? 0) * 4_096;
+}
+
+export function selectRecoveryCheckpoint(checkpoints: AuthoringDiskCheckpoint[], selectedUnrealIdentity?: string): AuthoringDiskCheckpoint | undefined {
+  return [...checkpoints].sort((left, right) => {
+    const leftExact = left.unrealProbeIdentity === selectedUnrealIdentity ? 1 : 0;
+    const rightExact = right.unrealProbeIdentity === selectedUnrealIdentity ? 1 : 0;
+    const scoreDifference = checkpointRecoveryScore(right) - checkpointRecoveryScore(left);
+    if (Math.abs(scoreDifference) >= 4_096) return scoreDifference;
+    if (leftExact !== rightExact) return rightExact - leftExact;
+    return Date.parse(right.updatedAt) - Date.parse(left.updatedAt);
+  })[0];
 }
 
 async function cloneCheckout(packet: WindowsAuthoringPacket, root: string, path: string, outputRoot: string, signal?: AbortSignal, checkpoint?: AuthoringDiskCheckpoint): Promise<{ path: string; resumed: boolean; checkpoint?: AuthoringDiskCheckpoint }> {
@@ -552,11 +585,12 @@ export function restoreCheckpointAuthoringProvenance(
 export function canResumeAuthoringCheckpoint(
   checkpoint: Pick<AuthoringDiskCheckpoint, 'version' | 'taskId' | 'baseCommitSha' | 'unrealProbeIdentity'> | undefined,
   packet: Pick<WindowsAuthoringPacket, 'taskId' | 'baseCommitSha'>,
-  selectedUnrealIdentity?: string
+  selectedUnrealIdentity?: string,
+  allowUnrealProbeMismatch = false
 ): boolean {
   return checkpoint?.version === 2 && checkpoint.taskId === packet.taskId
     && checkpoint.baseCommitSha.toLowerCase() === packet.baseCommitSha.toLowerCase()
-    && checkpoint.unrealProbeIdentity === selectedUnrealIdentity;
+    && (allowUnrealProbeMismatch || checkpoint.unrealProbeIdentity === selectedUnrealIdentity);
 }
 
 export function hasRestorableAuthoringCheckpoint(
