@@ -14,6 +14,7 @@ import { redactSecrets } from '@forgemind/core';
 import { SafeFixtureExecutor } from './fixture-executor.js';
 import { PinnedUnrealCommandAdapter, type ApprovedUnrealProfile, type PinnedUnrealTool } from './unreal-adapter.js';
 import { runBoundedProcess } from './process-runner.js';
+import { truncateUtf8Tail } from './utf8.js';
 
 interface ProcessResult {
   status: 'succeeded' | 'failed' | 'cancelled' | 'timed_out' | 'deferred';
@@ -99,7 +100,7 @@ export async function executeWindowsValidation(
       stderr: [execution.stderr, error instanceof Error ? error.message : String(error)].filter(Boolean).join('\n')
     };
   }
-  const logText = truncateUtf8(redactSecrets([
+  const logText = truncateUtf8Tail(redactSecrets([
     `[intent] ${packet.check.command}`,
     `[adapter] ${packet.dispatch.kind}`,
     execution.stdout ? `[stdout]\n${execution.stdout}` : '',
@@ -431,11 +432,6 @@ function resolveContained(root: string, relativePath: string): string {
   const childPath = relative(resolve(root), candidate);
   if (!childPath || childPath.startsWith('..') || isAbsolute(childPath)) throw new Error('Artifact path escapes the validation workspace.');
   return candidate;
-}
-
-function truncateUtf8(value: string, maxBytes: number): string {
-  const bytes = Buffer.from(value);
-  return bytes.length <= maxBytes ? value : bytes.subarray(bytes.length - maxBytes).toString('utf8');
 }
 
 function sha256(value: Buffer): string {

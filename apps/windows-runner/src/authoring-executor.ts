@@ -8,6 +8,7 @@ import { isWindowsAuthoringResult, redactSecrets } from '@forgemind/core';
 import { resolveCodexBinary, type AIProvider, type ProviderSessionContext } from '@forgemind/providers';
 import { buildSandboxedProcessInvocation, buildUnrealAuthoringArgs, containsUnrealBuildInvocation, containsUnrealEditorInvocation } from './native-sandbox.js';
 import { runBoundedProcess } from './process-runner.js';
+import { truncateUtf8Tail } from './utf8.js';
 
 export interface NativeAuthoringTools {
   root: string;
@@ -177,7 +178,7 @@ export async function executeWindowsAuthoring(packet: WindowsAuthoringPacket, co
   const emitProgress = async (phase: import('@forgemind/core').WindowsAuthoringProgress['phase']) => {
     if (!context.onProgress || !latestCheckpoint) return;
     const processLog = processes.map((process) => `${process.command}\n${process.stdout}\n${process.stderr}`).join('\n');
-    const text = redactSecrets(`${liveActivity}\n${processLog}`).slice(-packet.resourcePolicy.maxLogBytes);
+    const text = truncateUtf8Tail(redactSecrets(`${liveActivity}\n${processLog}`), packet.resourcePolicy.maxLogBytes);
     const progress = { schemaVersion: 1 as const, jobId: packet.jobId, leaseId: packet.leaseId, sessionId: context.sessionId, phase,
       checkpoint: { resultTreeSha: latestCheckpoint.resultTreeSha, updatedAt: latestCheckpoint.updatedAt, resumedFromCheckpoint: checkout.resumed },
       log: { text, sizeBytes: Buffer.byteLength(text), sha256: createHash('sha256').update(text).digest('hex') } };
@@ -193,7 +194,7 @@ export async function executeWindowsAuthoring(packet: WindowsAuthoringPacket, co
     context.signal, processes, packet.leaseId, context.sessionId, { ...suppliedRoots, cache: cacheDirectory, outputs: outputDirectory,
       diagnostics: evidenceDirectory }, async () => publishCheckpoint('in-progress'),
     selectedUnrealExecutable, selectedUnrealCommandletExecutable,
-    async (message) => { liveActivity = `${liveActivity}\n${message}`.slice(-packet.resourcePolicy.maxLogBytes); await emitProgress('author'); });
+    async (message) => { liveActivity = truncateUtf8Tail(`${liveActivity}\n${message}`, packet.resourcePolicy.maxLogBytes); await emitProgress('author'); });
   await publishCheckpoint('started');
   const startedAt = new Date();
   let status: WindowsAuthoringResult['status'] = 'succeeded';
@@ -314,8 +315,7 @@ export function compactProcessResults(processes: WindowsAuthoringProcessResult[]
   const selected = important.length >= maximumEntries ? important.slice(-maximumEntries)
     : [...processes.filter((process) => !important.includes(process)).slice(-(maximumEntries - important.length)), ...important]
       .sort((left, right) => left.startedAt.localeCompare(right.startedAt));
-  const bound = (value: string) => Buffer.byteLength(value) <= maximumStreamBytes ? value
-    : Buffer.from(value).subarray(-maximumStreamBytes).toString('utf8');
+  const bound = (value: string) => truncateUtf8Tail(value, maximumStreamBytes);
   return selected.map((process) => ({ ...process, stdout: bound(process.stdout), stderr: bound(process.stderr) }));
 }
 
