@@ -3,7 +3,7 @@ import { access, lstat, mkdir, readFile, readdir, realpath, rename, rm, writeFil
 import { constants as fsConstants } from 'node:fs';
 import { basename, dirname, posix, relative, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import type { AuthoringTreeEntry, WindowsAuthoringPacket, WindowsAuthoringProcessResult, WindowsAuthoringResult } from '@forgemind/core';
+import type { AuthoringTreeEntry, WindowsAuthoringPacket, WindowsAuthoringProcessResult, WindowsAuthoringResult, WindowsProviderUsage } from '@forgemind/core';
 import { isWindowsAuthoringResult, redactSecrets } from '@forgemind/core';
 import { resolveCodexBinary, type AIProvider, type ProviderSessionContext } from '@forgemind/providers';
 import { buildSandboxedProcessInvocation, buildUnrealAuthoringArgs, containsUnrealBuildInvocation, containsUnrealEditorInvocation } from './native-sandbox.js';
@@ -25,7 +25,7 @@ export interface NativeAuthoringTools {
 
 export interface NativeImplementationProvider {
   implement(input: { prompt: string; acceptanceCriteria: string[]; previousValidationError?: string; previousReviewBlockers?: string[];
-    operations: WindowsAuthoringPacket['operations']; tools: NativeAuthoringTools; signal?: AbortSignal }): Promise<{ summary: string; completedOperationIds: string[]; checkpointIds: string[] }>;
+    operations: WindowsAuthoringPacket['operations']; tools: NativeAuthoringTools; signal?: AbortSignal }): Promise<{ summary: string; completedOperationIds: string[]; checkpointIds: string[]; providerUsage?: WindowsProviderUsage[] }>;
 }
 
 /** Bridges the runner lease to the ordinary implementation provider lifecycle.
@@ -39,6 +39,7 @@ export class LifecycleNativeImplementationProvider implements NativeImplementati
     const providerSession: ProviderSessionContext = {};
     let failure: WindowsAuthoringProcessResult | undefined;
     let result;
+    const providerUsage: WindowsProviderUsage[] = [];
     for (let attempt = 1; ; attempt += 1) {
       if (input.signal?.aborted) throw new Error('Native implementation was cancelled.');
       const providerStarted = new Date();
@@ -56,6 +57,7 @@ export class LifecycleNativeImplementationProvider implements NativeImplementati
           previousReviewBlockers: input.previousReviewBlockers,
           nativeToolChannel: input.tools.nativeToolChannel,
           onActivity: async (activity) => {
+            if (activity.usage) providerUsage.push({ ...activity.usage, attempt });
             if (activity.kind === 'stdout') providerStdout += `${activity.message}\n`; else if (activity.kind === 'stderr') providerStderr += `${activity.message}\n`;
             await input.tools.progress?.(activity.message);
             await input.tools.drainNativeProcesses();
@@ -81,6 +83,7 @@ export class LifecycleNativeImplementationProvider implements NativeImplementati
         await input.tools.drainNativeProcesses();
         await input.tools.record({ checkId: `implementation-provider-${attempt}`, command: 'provider.implement', shell: 'system', exitCode: 1,
           stdout: providerStdout, stderr: [providerStderr, error instanceof Error ? error.message : String(error)].filter(Boolean).join('\n'), startedAt: providerStarted.toISOString(), completedAt: new Date().toISOString() });
+        if (error && typeof error === 'object') Object.assign(error, { providerUsage });
         throw error;
       }
       failure = undefined;
@@ -117,7 +120,7 @@ export class LifecycleNativeImplementationProvider implements NativeImplementati
       failedFingerprints.add(fingerprint);
     }
     if (!result) throw new Error('Implementation provider returned no result.');
-    return { summary: result.summary, completedOperationIds: input.operations.map(({ id }) => id), checkpointIds: [] };
+    return { summary: result.summary, completedOperationIds: input.operations.map(({ id }) => id), checkpointIds: [], providerUsage };
   }
 }
 
@@ -202,12 +205,16 @@ export async function executeWindowsAuthoring(packet: WindowsAuthoringPacket, co
   let summary = 'Native implementation completed.';
   let completedOperationIds: string[] = [];
   let checkpointIds: string[] = [];
+  let providerUsage: WindowsProviderUsage[] = [];
   try {
     const output = await context.provider.implement({ prompt: packet.step.prompt, acceptanceCriteria: packet.step.acceptanceCriteria,
       previousValidationError: packet.step.previousValidationError, previousReviewBlockers: packet.step.previousReviewBlockers,
       operations: packet.operations, tools, signal: context.signal });
     summary = output.summary; completedOperationIds = output.completedOperationIds; checkpointIds = output.checkpointIds;
+    providerUsage = output.providerUsage ?? [];
   } catch (error) {
+    providerUsage = error && typeof error === 'object' && 'providerUsage' in error && Array.isArray(error.providerUsage)
+      ? error.providerUsage as WindowsProviderUsage[] : [];
     status = context.signal?.aborted ? 'cancelled' : 'failed';
     summary = redactSecrets(error instanceof Error ? error.message : String(error));
     authoringFailureState = classifyAuthoringFailure(summary, context.signal?.aborted === true, processes);
@@ -269,7 +276,7 @@ export async function executeWindowsAuthoring(packet: WindowsAuthoringPacket, co
     runId: packet.runId, jobId: packet.jobId, leaseId: packet.leaseId, deviceId: context.deviceId, sessionId: context.sessionId,
     nonce: packet.nonce, inputHash: packet.inputHash, baseCommitSha: packet.baseCommitSha, resultTreeSha: treeSha, resultBundle,
     tree, patch: patchResult.stdout, completedOperationIds, checkpointIds,
-    artifacts, ...(classified ? { realEngineEvidence: classified } : {}),
+    artifacts, ...(providerUsage.length ? { providerUsage } : {}), ...(classified ? { realEngineEvidence: classified } : {}),
     processes: compactProcessResults(processes), status, ...(failure ? { failure } : {}), contentAssessment: { technicalVerification: status !== 'succeeded' ? 'failed'
       : packet.contentPolicy.requiresUnrealAssets ? 'passed' : 'not-required',
       productionReviewRequired, rationale: status !== 'succeeded'

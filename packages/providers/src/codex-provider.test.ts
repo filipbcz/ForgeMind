@@ -8,6 +8,8 @@ describe('Codex structured output schemas', () => {
     expect(prompt).toContain('tool=unreal-build');
     expect(prompt).toContain('Do not convert a concrete build or tool failure into waiting_for_capability');
     expect(prompt).toContain('Do not return a validationChecks command that invokes UnrealEditor');
+    expect(prompt).toContain('return the structured result promptly');
+    expect(prompt).toContain('outside this turn');
   });
 
   it.each(['implementation', 'chat'] as const)('serializes typed Windows adapters in the actual %s request schema', async (operation) => {
@@ -250,6 +252,15 @@ describe('Codex process activity timeouts', () => {
     await expect(runCodexProcess(['-e', `process.stdout.write(${JSON.stringify(`${history}\n${failure}\n`)});process.exit(1)`, '--', '--json'], '', {
       binary: process.execPath, inactivityTimeoutMs: 1_500, maxRuntimeMs: 3_000
     })).rejects.toThrow('Selected model is unavailable.');
+  });
+
+  it('preserves the latest token usage when a Codex turn fails', async () => {
+    const event = JSON.stringify({ type: 'turn.failed', error: { message: 'Stopped.' },
+      usage: { input_tokens: 120, output_tokens: 30, cached_input_tokens: 40 } });
+    const error = await runCodexProcess(['-e', `process.stdout.write(${JSON.stringify(`${event}\n`)});process.exit(1)`, '--', '--json'], '', {
+      binary: process.execPath, inactivityTimeoutMs: 1_500, maxRuntimeMs: 3_000
+    }).catch((caught) => caught);
+    expect(error).toMatchObject({ codexUsage: { inputTokens: 120, outputTokens: 30, cachedTokens: 40, totalTokens: 150 } });
   });
 
   it('captures a persisted Codex session from JSONL events', async () => {

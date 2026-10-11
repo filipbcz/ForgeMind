@@ -602,6 +602,26 @@ export class WindowsWorkerRepository {
         const updated = await tx.windowsExecutionJob.updateMany({ where: { id: result.jobId, status: { in: ['leased', 'running'] } }, data: { status,
           packet: asJson({ ...packet, authoringResult: result }) } });
         if (updated.count !== 1) throw new Error('Execution job changed while its result was being reconciled.');
+        if (result.providerUsage?.length) {
+          await tx.providerUsage.createMany({ data: result.providerUsage.map((usage) => ({
+            taskId: result.taskId,
+            taskRunId: result.runId,
+            provider: usage.provider,
+            model: usage.model,
+            phase: 'windows-authoring',
+            attempt: usage.attempt,
+            inputTokens: usage.inputTokens ?? 0,
+            outputTokens: usage.outputTokens ?? 0,
+            cachedTokens: usage.cachedTokens ?? 0,
+            totalTokens: usage.totalTokens,
+            usageSource: usage.source,
+            estimatedCostUsd: 0,
+            actualCostUsd: usage.actualCostUsd,
+            requestId: usage.requestId,
+            clientRequestId: usage.clientRequestId,
+            pricingVersion: usage.pricingVersion
+          })) });
+        }
         await tx.windowsExecutionLease.update({ where: { id: result.leaseId }, data: { status: result.status === 'cancelled' ? 'cancelled' : 'released', releasedAt: new Date() } });
         await tx.workerDevice.update({ where: { id: deviceId }, data: { status: persisted.sessionStatus === 'active' ? 'idle' : 'offline' } });
         return { accepted: true, packet };

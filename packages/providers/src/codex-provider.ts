@@ -953,7 +953,8 @@ export class CodexProvider implements AIProvider {
       : baseProviderPrompt;
     const beforeSnapshot = await collectChangedFileSnapshot(input.repositoryPath);
     let content: string;
-    let recoveredFromTimeout = false;
+    let recoveredFromInterruption = false;
+    let recoverySummary = '';
     try {
       content = await this.runCodexExec({
         repositoryPath: input.repositoryPath,
@@ -988,7 +989,9 @@ export class CodexProvider implements AIProvider {
         prompt: providerPrompt
       });
     } catch (error) {
-      if (!(error instanceof CodexExecutionTimeoutError)) {
+      const recoverableInterruption = error instanceof CodexExecutionTimeoutError
+        || /stream disconnected|connection (?:closed|reset|lost)|websocket.*(?:closed|disconnect)|unexpected eof/i.test(error instanceof Error ? error.message : String(error));
+      if (!recoverableInterruption || input.signal?.aborted) {
         throw error;
       }
 
@@ -997,20 +1000,23 @@ export class CodexProvider implements AIProvider {
         throw error;
       }
 
-      recoveredFromTimeout = true;
-      content = error.lastMessage || error.stderr || error.stdout;
+      recoveredFromInterruption = true;
+      recoverySummary = error instanceof CodexExecutionTimeoutError
+        ? 'Codex stopped after its execution timeout'
+        : 'The Codex response stream disconnected';
+      content = error instanceof CodexExecutionTimeoutError ? error.lastMessage || error.stderr || error.stdout : '';
       await emitProviderActivity(input.onActivity, {
         kind: 'lifecycle',
-        message: 'Codex timed out after inactivity, but workspace changes were preserved for validation.',
-        elapsedMs: error.elapsedMs
+        message: `${recoverySummary}, but workspace changes were preserved for deterministic validation.`,
+        elapsedMs: error instanceof CodexExecutionTimeoutError ? error.elapsedMs : 0
       });
     }
 
     const changedFiles = await collectChangedFiles(input.repositoryPath);
-    const result: ImplementResult = recoveredFromTimeout
+    const result: ImplementResult = recoveredFromInterruption
       ? {
           outcome: 'changes_made',
-          summary: `Codex stopped after inactivity; preserved ${changedFiles.length} changed file(s) for validation and review.`,
+          summary: `${recoverySummary}; preserved ${changedFiles.length} changed file(s) for validation and independent review.`,
           changedFiles,
           diffStat: await collectDiffStat(input.repositoryPath, changedFiles),
           validationChecks: []
@@ -1142,6 +1148,10 @@ export class CodexProvider implements AIProvider {
       await emitCapturedUsage(input.onActivity, capturedUsage ? { ...capturedUsage, source: 'actual_total' } : undefined);
       return await readFile(outputPath, 'utf8');
     } catch (error) {
+      const partialUsage = readCodexErrorUsage(error);
+      await emitCapturedUsage(input.onActivity, partialUsage ? normalizeTokenBreakdown({
+        provider: 'codex', model: this.model, ...partialUsage
+      }) : undefined);
       if (error instanceof CodexExecutionTimeoutError) {
         error.lastMessage = await readFile(outputPath, 'utf8').catch(() => '');
       }
@@ -1162,6 +1172,7 @@ export class CodexProvider implements AIProvider {
       }
 
       const clientRequestId = randomUUID();
+      const cacheableModel = /^gpt-(?:[6-9]|5\.(?:[6-9]|\d{2,}))(?:\.|-|$)/i.test(this.model);
       const response = await fetch(this.apiBaseUrl, {
         method: 'POST',
         headers: {
@@ -1174,9 +1185,11 @@ export class CodexProvider implements AIProvider {
           model: this.model,
           previous_response_id: resolveCompatibleSessionId(session, 'codex', this.model),
           input: messages.map((message) => ({
-            role: message.role,
-            content: [{ type: 'input_text', text: message.content }]
+            role: message.role === 'system' ? 'developer' : message.role,
+            content: [{ type: 'input_text', text: message.content,
+              ...(cacheableModel && message.role === 'system' ? { prompt_cache_breakpoint: { mode: 'explicit' } } : {}) }]
           })),
+          ...(cacheableModel ? { prompt_cache_options: { mode: 'explicit' } } : {}),
           reasoning: { effort: this.reasoningEffort },
           max_output_tokens: 8_000,
           store: false
@@ -1327,7 +1340,7 @@ export function buildCodexExecArgs(input: {
 }
 
 export function buildCodexNativeImplementationPrompt(baseProviderPrompt: string): string {
-  return `Use only the discoverable forgemind_native filesystem and process tools for repository access and commands. The built-in shell is disabled so every process preserves separate stdout and stderr. Work directly in this one checkout; do not delegate or spawn subagents. The leased Git checkout is writable through write_file, remove_path, run_process, and run_unreal_authoring even if the outer built-in shell sandbox appears read-only. These scoped tools are already authorized for this task and do not require runtime approval. Before reporting a write-access blocker, call the relevant write tool and report its concrete error. Invoke UnrealEditor only through run_unreal_authoring, which selects the runner-probed editor and adds the required automation flags. Compile an Unreal Editor target only through run_unreal_authoring with tool=unreal-build; never invoke Build.bat or UnrealBuildTool through run_process. The runner leased this task only after its required capabilities passed local probes. Do not convert a concrete build or tool failure into waiting_for_capability: diagnose and repair the concrete failure, then rerun the structured tool. Do not return a validationChecks command that invokes UnrealEditor or UnrealBuildTool; the runner records structured calls and performs mandatory final Unreal verification after implementation.\n\n${baseProviderPrompt}`;
+  return `Use only the discoverable forgemind_native filesystem and process tools for repository access and commands. The built-in shell is disabled so every process preserves separate stdout and stderr. Work directly in this one checkout; do not delegate or spawn subagents. The leased Git checkout is writable through write_file, remove_path, run_process, and run_unreal_authoring even if the outer built-in shell sandbox appears read-only. These scoped tools are already authorized for this task and do not require runtime approval. Before reporting a write-access blocker, call the relevant write tool and report its concrete error. Invoke UnrealEditor only through run_unreal_authoring, which selects the runner-probed editor and adds the required automation flags. Compile an Unreal Editor target only through run_unreal_authoring with tool=unreal-build; never invoke Build.bat or UnrealBuildTool through run_process. The runner leased this task only after its required capabilities passed local probes. Do not convert a concrete build or tool failure into waiting_for_capability: diagnose and repair the concrete failure, then rerun the structured tool. Keep this paid authoring turn focused on producing the requested repository and Unreal assets. Run only the minimum authoring or compile action needed to create a valid checkpoint; do not repeat a successful build, broad test suite, package inspection, or evidence narration. Once the requested changes and minimum save/load proof exist, return the structured result promptly. The runner performs mandatory final Unreal verification and subsequent acceptance validation outside this turn. Do not return a validationChecks command that invokes UnrealEditor or UnrealBuildTool.\n\n${baseProviderPrompt}`;
 }
 
 export function resolveCodexSandboxBypass(
@@ -1358,6 +1371,13 @@ export interface CodexProcessResult {
   cachedTokens?: number;
   totalTokens?: number;
   sessionId?: string;
+}
+
+type CodexPartialUsage = Pick<CodexProcessResult, 'inputTokens' | 'outputTokens' | 'cachedTokens' | 'totalTokens'>;
+
+function readCodexErrorUsage(error: unknown): CodexPartialUsage | undefined {
+  if (!error || typeof error !== 'object' || !('codexUsage' in error)) return undefined;
+  return (error as { codexUsage?: CodexPartialUsage }).codexUsage;
 }
 
 export class CodexExecutionTimeoutError extends Error {
@@ -1452,6 +1472,14 @@ export async function runCodexProcess(
     };
     const finish = (error?: Error, result: CodexProcessResult = {}) => {
       if (settled) return;
+      if (error && (jsonTotalTokens !== undefined || jsonInputTokens !== undefined || jsonOutputTokens !== undefined)) {
+        Object.assign(error, { codexUsage: {
+          inputTokens: jsonInputTokens,
+          outputTokens: jsonOutputTokens,
+          cachedTokens: jsonCachedTokens,
+          totalTokens: jsonTotalTokens ?? ((jsonInputTokens ?? 0) + (jsonOutputTokens ?? 0))
+        } satisfies CodexPartialUsage });
+      }
       flushBufferedActivity();
       settled = true;
       cleanup();

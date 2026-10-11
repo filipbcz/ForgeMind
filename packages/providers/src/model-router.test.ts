@@ -1,13 +1,19 @@
 import { describe, expect, it, vi } from 'vitest';
 import type { AIProvider } from './provider.js';
 import { parseTaskModelRoutingDecision } from './provider.js';
-import { hasSubstantiveImplementationFeedback, ModelRoutedProvider, resolveModelRoute, type ModelRoutingState } from './model-router.js';
+import { hasSubstantiveImplementationFeedback, ModelRoutedProvider, resolveModelRoute, shouldEscalateImplementation, type ModelRoutingState } from './model-router.js';
 
 describe('model routing', () => {
   it('does not escalate merely because orchestration resumed at a later attempt', () => {
     expect(hasSubstantiveImplementationFeedback({})).toBe(false);
     expect(hasSubstantiveImplementationFeedback({ previousValidationError: 'Acceptance validation failed.' })).toBe(true);
     expect(hasSubstantiveImplementationFeedback({ previousReviewBlockers: ['Missing evidence.'] })).toBe(true);
+    expect(shouldEscalateImplementation({ previousValidationError: 'Acceptance validation failed.' })).toBe(false);
+    expect(shouldEscalateImplementation({ previousValidationError: 'Acceptance validation failed.',
+      escalationEvidence: { occurrences: 2, lowerCostAttempts: 1 } })).toBe(true);
+    expect(shouldEscalateImplementation({ previousValidationError: 'waiting_for_capability failed again without progress',
+      escalationEvidence: { occurrences: 3, lowerCostAttempts: 2 } })).toBe(false);
+    expect(shouldEscalateImplementation({ previousValidationError: 'The same Windows validation failed again without progress.' })).toBe(true);
   });
   it('uses Luna, Sol and Astra for balanced economy, standard and critical work', () => {
     expect(resolveModelRoute({ profile: 'balanced', workload: 'economy', environment: {} }).model).toBe('gpt-6-luna');

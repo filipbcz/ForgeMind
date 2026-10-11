@@ -320,7 +320,8 @@ describe('simple autonomous worker workflow', () => {
     expect(implementOnWindows).toHaveBeenCalledTimes(2);
     expect(routeTask).toHaveBeenCalledTimes(1);
     expect(implementOnWindows.mock.calls[0]?.[0]).toMatchObject({ modelRoute: { model: 'gpt-6-luna', reasoningEffort: 'medium' } });
-    expect(implementOnWindows.mock.calls[1]?.[0]).toMatchObject({ modelRoute: { model: 'gpt-6-astra', reasoningEffort: 'high' } });
+    expect(implementOnWindows.mock.calls[1]?.[0]).toMatchObject({ modelRoute: { model: 'gpt-6-luna', reasoningEffort: 'medium' } });
+    expect(implementOnWindows.mock.calls[1]?.[0]).toMatchObject({ escalationEvidence: { occurrences: 1, lowerCostAttempts: 0 } });
     expect(implementOnWindows.mock.calls[1]?.[0]).toMatchObject({ previousReviewBlockers: ['Fix native output.'] });
     expect(linuxImplement).not.toHaveBeenCalled();
     expect(reviewer.review).toHaveBeenCalledWith(expect.objectContaining({ repositoryPath: result.workspacePath }));

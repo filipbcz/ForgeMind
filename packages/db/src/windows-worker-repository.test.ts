@@ -294,19 +294,25 @@ describe('WindowsWorkerRepository capability leases', () => {
       resourcePolicy: { timeoutSeconds: 60, maxLogBytes: 100, maxArtifactBytes: 100 }, nonce: 'nonce_1', inputHash: packetDigest,
       authority: { database: 'none', productionHosts: 'none', globalGitHubCredentials: 'none' } } as const;
     const updateMany = vi.fn(async () => ({ count: 1 }));
+    const createUsage = vi.fn(async () => ({ count: 1 }));
     const tx: any = { $queryRaw: vi.fn(async () => [{ jobId: 'job_1', projectId: 'project_1', taskId: 'task_1', runId: 'run_1', packet }]),
-      windowsExecutionJob: { updateMany }, windowsExecutionLease: { update: vi.fn(async () => undefined) }, workerDevice: { update: vi.fn(async () => undefined) } };
+      windowsExecutionJob: { updateMany }, providerUsage: { createMany: createUsage },
+      windowsExecutionLease: { update: vi.fn(async () => undefined) }, workerDevice: { update: vi.fn(async () => undefined) } };
     const prisma: any = { $transaction: vi.fn(async (work: (client: unknown) => unknown) => work(tx)) };
     const result = { kind: 'authoring-result', protocolVersion: 1, projectId: 'project_1', taskId: 'task_1', runId: 'run_1', jobId: 'job_1', leaseId: 'lease_1',
       deviceId: 'device_1', sessionId: 'session_1', nonce: 'nonce_1', inputHash: packetDigest, baseCommitSha: packet.baseCommitSha,
       resultTreeSha: 'c'.repeat(40), tree: [{ path: 'Content/map.bin', kind: 'file', sha256: 'd'.repeat(64), sizeBytes: 8, binary: true, mode: '100644' }], patch: 'diff --git',
       resultBundle: { version: 1, format: 'git-binary-patch', sha256: createHash('sha256').update('diff --git').digest('hex'), sizeBytes: 10, lfsObjects: [], outputs: [] },
       completedOperationIds: ['op-1'], checkpointIds: ['cp-1'], artifacts: [], processes: [], status: 'succeeded',
+      providerUsage: [{ provider: 'codex', model: 'gpt-6.1-sol', inputTokens: 100, outputTokens: 20, cachedTokens: 40,
+        totalTokens: 120, source: 'actual_breakdown', actualCostUsd: 0.00036, pricingVersion: 'openai-2026-10-11', attempt: 1 }],
       contentAssessment: { technicalVerification: 'passed', productionReviewRequired: false, rationale: 'Technical verification passed.' },
       startedAt: '2026-09-01T00:00:00Z', completedAt: '2026-09-01T00:01:00Z', summary: 'done' } as const;
     const repository = new WindowsWorkerRepository(prisma);
     expect(await repository.submitResult('device_1', result as any)).toEqual({ accepted: true, packet });
     expect(updateMany).toHaveBeenCalledWith(expect.objectContaining({ data: { status: 'succeeded', packet: { ...packet, authoringResult: result } } }));
+    expect(createUsage).toHaveBeenCalledWith({ data: [expect.objectContaining({ taskId: 'task_1', taskRunId: 'run_1',
+      phase: 'windows-authoring', model: 'gpt-6.1-sol', totalTokens: 120, actualCostUsd: 0.00036 })] });
     expect(await repository.submitResult('device_1', { ...result, protocolVersion: 2 } as any)).toEqual({ accepted: false });
     expect(await repository.submitResult('device_1', { ...result, baseCommitSha: 'e'.repeat(40) } as any)).toEqual({ accepted: false });
     expect(await repository.submitResult('device_1', { ...result, resultBundle: { ...result.resultBundle,

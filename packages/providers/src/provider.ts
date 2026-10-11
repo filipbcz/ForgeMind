@@ -32,6 +32,7 @@ export function buildTaskRoutingMessages(input: TaskRoutingInput): Array<{ role:
       role: 'system',
       content: 'You route one software task to the cheapest model and reasoning effort likely to complete it reliably. ' +
         'GPT-6 Luna is for focused, well-scoped and repeatable work; GPT-6.1 Sol is for complex coding and coordinated deliverables; GPT-6 Astra is for ambiguous, demanding or critical work. ' +
+        'Prefer Sol for ordinary multi-file implementation. Select Astra for initial implementation only when the task itself contains concrete ambiguity or reasoning complexity that Sol is unlikely to resolve; repository size, Windows/Unreal tooling, or a prior operational failure alone are not sufficient. State that concrete reason in the rationale. ' +
         'Choose implementation and independent review separately. Escalation is used only after a substantive implementation or review failure and must be at least as capable as the initial implementation route. ' +
         'Return JSON only with implementation, review, escalation (each containing model and reasoningEffort), rationale, and confidence from 0 to 1.'
     },
@@ -327,6 +328,9 @@ export interface ImplementInput {
   attemptNumber?: number;
   previousValidationError?: string;
   previousReviewBlockers?: string[];
+  /** Evidence that the same substantive failure survived lower-cost repair work.
+   * A previous error by itself is correction context, not an escalation signal. */
+  escalationEvidence?: { failureFingerprint: string; occurrences: number; lowerCostAttempts: number };
   visualEvidence?: Array<{ artifactHash: string; resultTreeSha: string; buildId: string; scene: string; settings: Record<string, import('@forgemind/shared').JsonValue>; localPath: string; contentBase64: string }>;
   nativeToolChannel?: { command: string; args: string[] };
   onActivity?: ProviderActivityHandler;

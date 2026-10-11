@@ -46,6 +46,22 @@ export function hasSubstantiveImplementationFeedback(input: {
   return Boolean(input.previousValidationError?.trim() || input.previousReviewBlockers?.some((blocker) => blocker.trim()));
 }
 
+const OPERATIONAL_FAILURE = /(?:out of credits|no credits|insufficient_quota|unauthorized|timed?[- ]out|cancelled|canceled|connection|websocket|checkpoint|lease|waiting_for_capability|missing capability|not configured)/i;
+
+/** Correction context alone is not evidence that a stronger model is needed. */
+export function shouldEscalateImplementation(input: {
+  previousValidationError?: string;
+  previousReviewBlockers?: string[];
+  escalationEvidence?: { occurrences: number; lowerCostAttempts: number };
+}): boolean {
+  const feedback = [input.previousValidationError, ...(input.previousReviewBlockers ?? [])].filter(Boolean).join('\n');
+  if (!feedback || OPERATIONAL_FAILURE.test(feedback)) return false;
+  if (/same .*failed again without progress|unresolved blockers again without any .* change/i.test(feedback)) return true;
+  return Boolean(input.escalationEvidence
+    && input.escalationEvidence.occurrences >= 2
+    && input.escalationEvidence.lowerCostAttempts >= 1);
+}
+
 /** Resolve the effective model without embedding provider policy in orchestration. */
 export function resolveModelRoute(input: {
   profile: ModelProfile;
@@ -227,7 +243,7 @@ export class ModelRoutedProvider implements AIProvider {
       onActivity: input.onActivity,
       signal: input.signal
     });
-    const escalated = hasSubstantiveImplementationFeedback(input);
+    const escalated = shouldEscalateImplementation(input);
     const selection = escalated ? decision.escalation : decision.implementation;
     const provider = this.providerForSelection(selection);
     const route: ModelRoute = { workload: escalated ? 'critical' : 'standard', ...selection,

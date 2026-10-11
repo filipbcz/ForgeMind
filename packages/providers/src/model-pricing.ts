@@ -5,10 +5,10 @@ export interface ModelTokenPricing {
   sourceVersion: string;
 }
 
-/** Standard-processing, short-context prices captured from the OpenAI pricing page on 2026-09-29. */
+/** Standard-processing, short-context prices captured from the OpenAI pricing page on 2026-10-11. */
 const OPENAI_PRICING: Array<{ pattern: RegExp; pricing: ModelTokenPricing }> = [
-  { pattern: /^gpt-6-astra(?:-|$)/, pricing: { inputPerMillionUsd: 5, cachedInputPerMillionUsd: 0.5, outputPerMillionUsd: 25, sourceVersion: 'openai-2026-09-29' } },
-  { pattern: /^gpt-6\.1-sol(?:-|$)/, pricing: { inputPerMillionUsd: 1, cachedInputPerMillionUsd: 0.05, outputPerMillionUsd: 5, sourceVersion: 'openai-2026-09-29' } },
+  { pattern: /^gpt-6-astra(?:-|$)/, pricing: { inputPerMillionUsd: 10, cachedInputPerMillionUsd: 1, outputPerMillionUsd: 50, sourceVersion: 'openai-2026-10-11' } },
+  { pattern: /^gpt-6\.1-sol(?:-|$)/, pricing: { inputPerMillionUsd: 2, cachedInputPerMillionUsd: 0.1, outputPerMillionUsd: 10, sourceVersion: 'openai-2026-10-11' } },
   { pattern: /^gpt-6-luna(?:-|$)/, pricing: { inputPerMillionUsd: 0.05, cachedInputPerMillionUsd: 0.005, outputPerMillionUsd: 0.25, sourceVersion: 'openai-2026-09-29' } },
   { pattern: /^gpt-5\.6-sol(?:-|$)/, pricing: { inputPerMillionUsd: 4, cachedInputPerMillionUsd: 0.4, outputPerMillionUsd: 20, sourceVersion: 'openai-2026-09-29' } },
   { pattern: /^gpt-5\.3-codex(?:-|$)/, pricing: { inputPerMillionUsd: 1.75, cachedInputPerMillionUsd: 0.175, outputPerMillionUsd: 14, sourceVersion: 'openai-2026-09-29' } }

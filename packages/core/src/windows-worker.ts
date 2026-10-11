@@ -1,5 +1,5 @@
 import type { IsoDateString, JsonValue } from '@forgemind/shared';
-import type { TaskModelSelection, ValidationCheckCategory } from './model.js';
+import type { ProviderKind, TaskModelSelection, ValidationCheckCategory } from './model.js';
 
 export const WINDOWS_WORKER_SCHEMA_VERSION = 1 as const;
 export type WindowsWorkerSchemaVersion = typeof WINDOWS_WORKER_SCHEMA_VERSION;
@@ -316,6 +316,9 @@ export interface WindowsAuthoringResult {
   checkpointIds: string[];
   artifacts: ExecutionArtifactResult[];
   processes: WindowsAuthoringProcessResult[];
+  /** Actual provider usage captured by the native runner, including failed or
+   * cancelled Codex turns when the CLI emitted a final usage event. */
+  providerUsage?: WindowsProviderUsage[];
   contentAssessment: { technicalVerification: 'passed' | 'failed' | 'not-required'; productionReviewRequired: boolean; rationale: string };
   status: 'succeeded' | 'failed' | 'cancelled';
   failure?: { kind: 'provider-configuration' | 'missing-capability' | 'timeout' | 'validation' | 'tool-failure' | 'cancelled' | 'unknown'; retryable: boolean };
@@ -323,6 +326,21 @@ export interface WindowsAuthoringResult {
   completedAt: IsoDateString;
   summary: string;
   realEngineEvidence?: RealEngineEvidence;
+}
+
+export interface WindowsProviderUsage {
+  provider: ProviderKind;
+  model: string;
+  totalTokens: number;
+  inputTokens?: number;
+  outputTokens?: number;
+  cachedTokens?: number;
+  source: 'actual_total' | 'actual_breakdown';
+  actualCostUsd?: number;
+  requestId?: string;
+  clientRequestId?: string;
+  pricingVersion?: string;
+  attempt: number;
 }
 
 export interface WindowsAuthoringProcessResult {
@@ -691,6 +709,15 @@ export function isWindowsAuthoringResult(value: unknown): value is WindowsAuthor
     && isRecord(value.contentAssessment) && ['passed', 'failed', 'not-required'].includes(value.contentAssessment.technicalVerification as string)
     && typeof value.contentAssessment.productionReviewRequired === 'boolean' && isNonEmpty(value.contentAssessment.rationale)
     && areCapabilityKeys(value.checkpointIds) && Array.isArray(value.artifacts) && value.artifacts.every(isArtifactResult)
+    && (value.providerUsage === undefined || (Array.isArray(value.providerUsage) && value.providerUsage.every((usage) => isRecord(usage)
+      && ['codex', 'openai', 'github_copilot'].includes(usage.provider as string) && isNonEmpty(usage.model)
+      && Number.isSafeInteger(usage.totalTokens) && (usage.totalTokens as number) >= 0
+      && (usage.inputTokens === undefined || (Number.isSafeInteger(usage.inputTokens) && (usage.inputTokens as number) >= 0))
+      && (usage.outputTokens === undefined || (Number.isSafeInteger(usage.outputTokens) && (usage.outputTokens as number) >= 0))
+      && (usage.cachedTokens === undefined || (Number.isSafeInteger(usage.cachedTokens) && (usage.cachedTokens as number) >= 0))
+      && ['actual_total', 'actual_breakdown'].includes(usage.source as string)
+      && (usage.actualCostUsd === undefined || (typeof usage.actualCostUsd === 'number' && Number.isFinite(usage.actualCostUsd) && usage.actualCostUsd >= 0))
+      && Number.isSafeInteger(usage.attempt) && (usage.attempt as number) >= 1)))
     && Array.isArray(value.processes) && value.processes.every((process) => isRecord(process) && isNonEmpty(process.checkId)
       && process.leaseId === value.leaseId && process.sessionId === value.sessionId
       && isNonEmpty(process.command) && ['powershell', 'cmd', 'system'].includes(process.shell as string)

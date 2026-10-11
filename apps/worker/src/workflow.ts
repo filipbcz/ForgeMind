@@ -21,7 +21,7 @@ import {
   slugifyBranchSegment,
   type GitHubAdapter
 } from '@forgemind/github';
-import { createProvider, hasSubstantiveImplementationFeedback, type AIProvider, type ImplementResult, type PlanResult, type ProviderSessionContext, type ReviewResult, type ValidationCheck } from '@forgemind/providers';
+import { createProvider, shouldEscalateImplementation, type AIProvider, type ImplementResult, type PlanResult, type ProviderSessionContext, type ReviewResult, type ValidationCheck } from '@forgemind/providers';
 import { parseAgentConfigYaml } from '@forgemind/config';
 import { nowIso, toErrorMessage, type JsonValue } from '@forgemind/shared';
 import {
@@ -376,6 +376,7 @@ export async function runWorkerTask(input: WorkerTaskInput): Promise<WorkerTaskR
   const retryReasons: string[] = [];
   const resolvedReviewBlockers = new Set<string>();
   const failedReviewStates = new Set<string>();
+  const correctionOccurrences = new Map<string, number>();
   let completedAttempts = 0;
   let review: ReviewResult | undefined = input.resume?.previousReviewBlockers?.length
       ? {
@@ -425,6 +426,17 @@ export async function runWorkerTask(input: WorkerTaskInput): Promise<WorkerTaskR
       });
     }
     const isResumedImplementation = Boolean(resumedImplementation);
+    const correctionFeedback = validation && !validation.passed
+      ? formatValidationFailure(validation)
+      : review?.blockers.length
+        ? review.blockers.join('\n')
+        : input.resume?.previousValidationError ?? input.resume?.previousReviewBlockers?.join('\n');
+    const correctionFingerprint = correctionFeedback
+      ? createHash('sha256').update(correctionFeedback.replace(/\s+/g, ' ').trim()).digest('hex')
+      : undefined;
+    const priorOccurrences = correctionFingerprint ? correctionOccurrences.get(correctionFingerprint) ?? 0 : 0;
+    const correctionOccurrence = correctionFingerprint ? priorOccurrences + 1 : 0;
+    if (correctionFingerprint) correctionOccurrences.set(correctionFingerprint, correctionOccurrence);
     const implementationInput: Parameters<AIProvider['implement']>[0] = {
         taskId: input.task.id,
         prompt: executionPrompt,
@@ -437,6 +449,11 @@ export async function runWorkerTask(input: WorkerTaskInput): Promise<WorkerTaskR
           ? formatValidationFailure(validation)
           : input.resume?.previousValidationError,
         previousReviewBlockers: review?.blockers.length ? review.blockers : undefined,
+        ...(correctionFingerprint ? { escalationEvidence: {
+          failureFingerprint: correctionFingerprint,
+          occurrences: correctionOccurrence,
+          lowerCostAttempts: Math.max(0, correctionOccurrence - 1)
+        } } : {}),
         visualEvidence: input.visualEvidence,
         onActivity: (activity) => input.hooks?.onProviderActivity?.({ phase: 'implementation', attempt, ...activity })
       };
@@ -448,7 +465,7 @@ export async function runWorkerTask(input: WorkerTaskInput): Promise<WorkerTaskR
         ? await input.implementOnWindows!({
             ...implementationInput,
             baseCommitSha: windowsBaseCommitSha!,
-            modelRoute: hasSubstantiveImplementationFeedback(implementationInput)
+            modelRoute: shouldEscalateImplementation(implementationInput)
               ? taskModelRoutingDecision?.escalation
               : taskModelRoutingDecision?.implementation
           })
