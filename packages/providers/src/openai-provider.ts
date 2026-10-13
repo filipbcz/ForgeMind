@@ -10,7 +10,6 @@ import type {
   CostEstimateResult,
   ImplementInput,
   ImplementResult,
-  NormalizedProviderError,
   PlanInput,
   PlanResult,
   ProviderPreflightResult,
@@ -25,7 +24,7 @@ import type {
   ValidationImpactInput,
   ValidationImpactResult
 } from './provider.js';
-import { ProviderContractError, buildTaskRoutingMessages, normalizeProviderError, normalizeProviderPreflight, normalizeValidationChecks, parseChatResult, parseImplementResult, parsePlanResult, parseProviderJsonObject, parseReviewResult, parseTaskModelRoutingDecision, parseValidationImpactResult } from './provider.js';
+import { ProviderContractError, buildTaskRoutingMessages, normalizeProviderError, normalizeProviderHttpError, normalizeProviderPreflight, normalizeValidationChecks, parseChatResult, parseImplementResult, parsePlanResult, parseProviderJsonObject, parseReviewResult, parseTaskModelRoutingDecision, parseValidationImpactResult } from './provider.js';
 import { emitCapturedUsage, normalizeTokenBreakdown } from './provider-usage.js';
 import { calculateModelCostUsd } from './model-pricing.js';
 import { buildReviewPrompt } from './review-prompt.js';
@@ -49,7 +48,7 @@ export async function listOpenAIModels(apiKey: string, apiBaseUrl = process.env.
     headers: { Authorization: `Bearer ${apiKey}` }
   });
   if (!response.ok) {
-    throw normalizeOpenAIHttpError(response, 'OpenAI model listing failed.');
+    throw await normalizeProviderHttpError('openai', response, 'OpenAI model listing failed.');
   }
 
   const payload = await readProviderJson<{ data?: Array<{ id?: string; owned_by?: string }> }>(response, 'OpenAI model listing');
@@ -96,7 +95,7 @@ export class OpenAIProvider implements AIProvider {
         signal
       });
       if (!response.ok) {
-        throw normalizeOpenAIHttpError(response, 'OpenAI preflight failed.');
+        throw await normalizeProviderHttpError('openai', response, 'OpenAI preflight failed.');
       }
       const payload = await readProviderJson<{ data?: Array<{ id?: string }> }>(response, 'OpenAI preflight');
       assertModelAvailable(payload.data, this.model, 'OpenAI');
@@ -446,7 +445,7 @@ export class OpenAIProvider implements AIProvider {
       });
 
       if (!response.ok) {
-        throw normalizeOpenAIHttpError(response, 'OpenAI request failed.');
+        throw await normalizeProviderHttpError('openai', response, 'OpenAI request failed.');
       }
 
       const data = await readProviderJson<{
@@ -505,13 +504,6 @@ function buildOpenAIModelsUrl(apiBaseUrl: string): URL {
     url.pathname = `${url.pathname.replace(/\/$/, '')}/models`;
   }
   return url;
-}
-
-function normalizeOpenAIHttpError(response: Response, message: string): NormalizedProviderError {
-  return normalizeProviderError('openai', {
-    status: response.status,
-    message: `${message} HTTP ${response.status}.`
-  });
 }
 
 async function readProviderJson<T>(response: Response, operation: string): Promise<T> {

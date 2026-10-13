@@ -1,11 +1,12 @@
 import { createHash } from 'node:crypto';
 import { describe, expect, it, vi } from 'vitest';
-import { assertNativeCodexCliCompatibility, parseCliArgs, requiredProbeFailures, resolveCodexPreflightTimeouts, selectLocalCodexModel, uploadAuthoringResultBlobs } from './cli.js';
+import { assertNativeCodexCliCompatibility, createWindowsProviderPool, parseCliArgs, requiredProbeFailures, resolveCodexPreflightTimeouts, selectLocalCodexModel, uploadAuthoringResultBlobs } from './cli.js';
 
 describe('Windows runner CLI parsing', () => {
   it.each([
     [['enroll', '--api-url', 'https://forgemind.test'], { command: 'enroll', apiUrl: 'https://forgemind.test' }],
     [['probe', '--api-url', 'https://forgemind.test'], { command: 'probe', apiUrl: 'https://forgemind.test' }],
+    [['provider', 'connect-chatgpt', '--api-url', 'https://forgemind.test'], { command: 'provider-connect-chatgpt', apiUrl: 'https://forgemind.test' }],
     [['session', 'start', '--project', '11111111-1111-4111-8111-111111111111', '--api-url', 'https://forgemind.test'], { command: 'session-start', apiUrl: 'https://forgemind.test', projectIds: ['11111111-1111-4111-8111-111111111111'] }],
     [['session', 'drain', '--api-url', 'https://forgemind.test', '--session-id', 'session-1'], { command: 'session-drain', apiUrl: 'https://forgemind.test', sessionId: 'session-1' }],
     [['session', 'stop', '--api-url', 'https://forgemind.test', '--session-id', 'session-1'], { command: 'session-stop', apiUrl: 'https://forgemind.test', sessionId: 'session-1' }]
@@ -57,6 +58,25 @@ describe('Windows runner CLI parsing', () => {
   it('rejects invalid or unbounded Codex preflight timeouts', () => {
     expect(() => resolveCodexPreflightTimeouts({ FORGEMIND_CODEX_CLI_INSPECTION_TIMEOUT_MS: 'not-a-number' })).toThrow(/integer from 1000/i);
     expect(() => resolveCodexPreflightTimeouts({ FORGEMIND_CODEX_SANDBOX_PROBE_TIMEOUT_MS: '1800001' })).toThrow(/integer from 1000/i);
+  });
+
+  it('continues Windows authoring through the next connection after credits are exhausted', async () => {
+    const reports: string[] = [];
+    const primaryImplement = vi.fn(async () => {
+      throw new Error('Your workspace is out of credits. Ask your workspace owner to refill.');
+    });
+    const fallbackImplement = vi.fn(async () => ({ summary: 'done', changedFiles: [], diffStat: { filesChanged: 0, insertions: 0, deletions: 0 } }));
+    const pool = createWindowsProviderPool([
+      { id: 'primary', label: 'API key', allowedModels: ['gpt-6.1-sol'], create: async () => ({ implement: primaryImplement }) as never },
+      { id: 'fallback', label: 'ChatGPT plan', allowedModels: ['gpt-6.1-sol'], create: async () => ({ implement: fallbackImplement }) as never }
+    ], { model: 'gpt-6.1-sol', reasoningEffort: 'medium' }, (message) => reports.push(message));
+    const session = { id: 'provider-session' };
+
+    await expect(pool.implement({ session } as never)).resolves.toMatchObject({ summary: 'done' });
+    expect(primaryImplement).toHaveBeenCalledOnce();
+    expect(fallbackImplement).toHaveBeenCalledOnce();
+    expect(session.id).toBeUndefined();
+    expect(reports).toEqual([expect.stringContaining('ChatGPT plan')]);
   });
 
   it('uploads binary authoring payloads in bounded chunks and returns a small content-addressed manifest', async () => {

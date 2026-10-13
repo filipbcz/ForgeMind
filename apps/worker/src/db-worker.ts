@@ -356,7 +356,13 @@ export async function runDatabaseWorkerOnce(options: { deferInterruptSignals?: b
   const prisma = getPrismaClient();
   const repository = createRepository(prisma);
   const windowsWorkers = new WindowsWorkerRepository(prisma);
-  const defaultAIProviderConnection = await readAIProviderConnectionSecret(repository);
+  let allAIProviderConnections = await listAIProviderConnectionSecrets(repository);
+  if (allAIProviderConnections.length === 0) {
+    const legacyDefaultConnection = await readAIProviderConnectionSecret(repository);
+    if (legacyDefaultConnection) allAIProviderConnections = [legacyDefaultConnection];
+  }
+  const defaultAIProviderConnection = allAIProviderConnections.find((connection) => connection.isDefault)
+    ?? allAIProviderConnections[0];
   const providerOverride = process.env.FORGEMIND_PROVIDER as ProviderKind | undefined;
   const fallbackProviderOverride = process.env.FORGEMIND_FALLBACK_PROVIDER as ProviderKind | undefined;
   const providerConnectionIdOverride = process.env.FORGEMIND_PROVIDER_CONNECTION_ID?.trim() || undefined;
@@ -377,6 +383,7 @@ export async function runDatabaseWorkerOnce(options: { deferInterruptSignals?: b
   const auditResult = await runNextProjectAudit({
     repository,
     defaultConnection: defaultAIProviderConnection,
+    availableConnections: allAIProviderConnections,
     providerOverride,
     fallbackProviderOverride,
     providerConnectionIdOverride,
@@ -492,6 +499,7 @@ export async function runDatabaseWorkerOnce(options: { deferInterruptSignals?: b
     projectConfig,
     projectProviderConnectionId: claimed.project.aiProviderConnectionId,
     defaultConnection: defaultAIProviderConnection,
+    availableConnections: allAIProviderConnections,
     providerOverride,
     fallbackProviderOverride,
     providerConnectionIdOverride,
@@ -509,12 +517,28 @@ export async function runDatabaseWorkerOnce(options: { deferInterruptSignals?: b
   }
   const routingState: ModelRoutingState = { decision: claimed.task.modelRoutingDecision };
   const primaryRuntimeProvider = buildRuntimeProvider(selection.primary.kind, selection.primary.connection, resolveConfiguredModelProfile(projectConfig?.ai.model_profile), routingState);
-  const fallbackRuntimeProvider = selection.fallback
-    ? buildRuntimeProvider(selection.fallback.kind, selection.fallback.connection, resolveConfiguredModelProfile(projectConfig?.ai.model_profile), routingState)
-    : undefined;
-  const { provider, getLastProviderKind } = createPolicyAwareProvider({
+  const fallbackRuntimeProviders = selection.fallbacks.map((candidate) =>
+    buildRuntimeProvider(candidate.kind, candidate.connection, resolveConfiguredModelProfile(projectConfig?.ai.model_profile), routingState));
+  let providerSession: ProviderSessionContext;
+  let activeConnectionId = selection.primary.connection?.id ?? null;
+  const { provider, getLastProviderKind, getLastConnectionId } = createPolicyAwareProvider({
     primary: primaryRuntimeProvider,
-    fallback: fallbackRuntimeProvider,
+    fallbacks: fallbackRuntimeProviders,
+    onConnectionSwitch: async (candidate) => {
+      activeConnectionId = candidate.connectionId;
+      // Provider-native conversation ids are credential specific. Preserve the
+      // repository checkpoint, but start a fresh conversation for another account.
+      providerSession.id = undefined;
+      providerSession.provider = candidate.kind;
+      providerSession.model = candidate.model ?? undefined;
+      await repository.updateTaskProviderSession({
+        taskId: claimed.task.id,
+        sessionId: undefined,
+        provider: candidate.kind,
+        model: candidate.model ?? candidate.kind,
+        connectionId: candidate.connectionId ?? undefined
+      });
+    },
     audit: (event) => repository.writeAudit({
       actorType: 'system',
       eventType: event.eventType,
@@ -538,20 +562,18 @@ export async function runDatabaseWorkerOnce(options: { deferInterruptSignals?: b
   const primaryConnectionId = selection.primary.connection?.id;
   const hasCompatibleProviderSession = claimed.task.providerSessionProvider === selection.primary.kind
     && claimed.task.providerSessionConnectionId === primaryConnectionId;
-  const providerSession: ProviderSessionContext = {
+  providerSession = {
     id: hasCompatibleProviderSession ? claimed.task.providerSessionId : undefined,
     provider: hasCompatibleProviderSession ? claimed.task.providerSessionProvider : selection.primary.kind,
     model: hasCompatibleProviderSession ? claimed.task.providerSessionModel : selectedProviderModel,
     onUpdate: async (session) => {
-      const connectionId = session.provider === selection.primary.kind
-        ? selection.primary.connection?.id
-        : selection.fallback?.connection?.id;
+      activeConnectionId = getLastConnectionId();
       await repository.updateTaskProviderSession({
         taskId: claimed.task.id,
         sessionId: session.id,
         provider: session.provider,
         model: session.model,
-        connectionId
+        connectionId: activeConnectionId ?? undefined
       });
     }
   };
@@ -1003,6 +1025,7 @@ export async function runDatabaseWorkerOnce(options: { deferInterruptSignals?: b
 async function runNextProjectAudit(input: {
   repository: ForgeMindRepository;
   defaultConnection?: AIProviderConnectionSecret;
+  availableConnections: AIProviderConnectionSecret[];
   providerOverride?: ProviderKind;
   fallbackProviderOverride?: ProviderKind;
   providerConnectionIdOverride?: string;
@@ -1030,6 +1053,7 @@ async function runNextProjectAudit(input: {
       projectConfig,
       projectProviderConnectionId: claimed.project.aiProviderConnectionId,
       defaultConnection: input.defaultConnection,
+      availableConnections: input.availableConnections,
       providerOverride: input.providerOverride,
       fallbackProviderOverride: input.fallbackProviderOverride,
       providerConnectionIdOverride: input.providerConnectionIdOverride,
@@ -1037,7 +1061,7 @@ async function runNextProjectAudit(input: {
     });
     const { provider, getLastProviderKind } = createPolicyAwareProvider({
       primary: buildRuntimeProvider(selection.primary.kind, selection.primary.connection, resolveConfiguredModelProfile(projectConfig?.ai.model_profile)),
-      fallback: selection.fallback ? buildRuntimeProvider(selection.fallback.kind, selection.fallback.connection, resolveConfiguredModelProfile(projectConfig?.ai.model_profile)) : undefined,
+      fallbacks: selection.fallbacks.map((candidate) => buildRuntimeProvider(candidate.kind, candidate.connection, resolveConfiguredModelProfile(projectConfig?.ai.model_profile))),
       audit: (event) => input.repository.writeAudit({
         actorType: 'system',
         eventType: event.eventType,
@@ -1354,6 +1378,7 @@ function buildRuntimeProvider(
     provider: createProvider(kind, {
       ...(connection?.provider === kind ? {
         apiKey: connection.apiKey,
+        accessToken: connection.accessToken,
         authMode: connection.authMode,
         codexHome: connection.codexHome,
         model: connection.model,
@@ -1374,99 +1399,68 @@ interface ProviderPolicyAuditEvent {
 interface PolicyAwareProviderInput {
   primary: RuntimeProvider;
   fallback?: RuntimeProvider;
+  fallbacks?: RuntimeProvider[];
   audit?: (event: ProviderPolicyAuditEvent) => Promise<unknown>;
+  onConnectionSwitch?: (provider: RuntimeProvider) => void | Promise<void>;
 }
 
-function createPolicyAwareProvider(input: PolicyAwareProviderInput): { provider: AIProvider; getLastProviderKind: () => ProviderKind } {
+function createPolicyAwareProvider(input: PolicyAwareProviderInput): {
+  provider: AIProvider;
+  getLastProviderKind: () => ProviderKind;
+  getLastConnectionId: () => string | null;
+} {
   let lastProviderKind: ProviderKind = input.primary.kind;
+  let lastConnectionId: string | null = input.primary.connectionId;
   const failureThreshold = clampNumber(Number(process.env.FORGEMIND_PROVIDER_CIRCUIT_BREAKER_FAILURE_THRESHOLD ?? 3), 1, 10);
   const openMs = clampNumber(Number(process.env.FORGEMIND_PROVIDER_CIRCUIT_BREAKER_OPEN_MS ?? 300_000), 1_000, 3_600_000);
+  const candidates = [input.primary, ...(input.fallbacks ?? (input.fallback ? [input.fallback] : []))]
+    .filter((candidate, index, all) => all.findIndex((item) => item.contextId === candidate.contextId) === index);
 
   const callWithFallback = async <T>(operation: string, action: (provider: AIProvider) => Promise<T>, signal?: AbortSignal): Promise<T> => {
-    const primaryBreaker = getProviderCircuitBreaker(input.primary.contextId, failureThreshold);
-    const primaryAvailability = resolveCircuitBreakerAvailability(primaryBreaker);
-    if (primaryAvailability.state === 'open') {
-      await auditProviderCircuitBreaker(input, input.primary, operation, 'primary_skipped', primaryBreaker);
-      return callFallbackOrThrow(operation, action, signal, new ProviderExecutionError(operation, 'circuit breaker is open', input.primary.kind, true), true);
-    }
-
-    try {
-      const result = await action(input.primary.provider);
-      lastProviderKind = input.primary.kind;
-      await recordProviderSuccess(input, input.primary, operation, primaryBreaker);
-      return result;
-    } catch (primaryError) {
-      if (signal?.aborted) {
-        throw signal.reason instanceof Error ? signal.reason : new TaskCancellationError();
+    let lastError: unknown = new Error('No provider connection is available.');
+    let lastRetryable = true;
+    let mayFailOver = true;
+    for (const [index, candidate] of candidates.entries()) {
+      if (index > 0 && !providersAreSemanticallyEquivalent(input.primary, candidate)) {
+        await input.audit?.({ eventType: 'provider_fallback_skipped', payload: {
+          operation, primaryProvider: input.primary.kind, primaryConnectionId: input.primary.connectionId,
+          fallbackProvider: candidate.kind, fallbackConnectionId: candidate.connectionId,
+          fallbackModel: candidate.model, reason: 'fallback_not_semantically_equivalent'
+        } });
+        continue;
       }
-      const normalizedPrimaryError = normalizeProviderError(input.primary.kind, primaryError);
-      await recordProviderFailure(input, input.primary, operation, primaryBreaker, normalizedPrimaryError.toDetails(), openMs);
-      return callFallbackOrThrow(operation, action, signal, primaryError, normalizedPrimaryError.retryable);
-    }
-  };
-
-  const callFallbackOrThrow = async <T>(
-    operation: string,
-    action: (provider: AIProvider) => Promise<T>,
-    signal: AbortSignal | undefined,
-    primaryError: unknown,
-    primaryIsRetryable: boolean
-  ): Promise<T> => {
-    const fallback = input.fallback;
-    const shouldUseFallback = Boolean(
-      primaryIsRetryable
-      && fallback
-      && providersAreSemanticallyEquivalent(input.primary, fallback)
-      && (fallback.kind !== input.primary.kind || fallback.contextId !== input.primary.contextId)
-    );
-    if (fallback && shouldUseFallback) {
-      const fallbackBreaker = getProviderCircuitBreaker(fallback.contextId, failureThreshold);
-      const fallbackAvailability = resolveCircuitBreakerAvailability(fallbackBreaker);
-      if (fallbackAvailability.state === 'open') {
-        await auditProviderCircuitBreaker(input, fallback, operation, 'primary_skipped', fallbackBreaker);
-        throw new ProviderExecutionError(operation, 'primary and fallback circuit breakers are open', input.primary.kind, true);
+      if (index > 0 && !mayFailOver) break;
+      const breaker = getProviderCircuitBreaker(candidate.contextId, failureThreshold);
+      if (resolveCircuitBreakerAvailability(breaker).state === 'open') {
+        await auditProviderCircuitBreaker(input, candidate, operation, 'primary_skipped', breaker);
+        continue;
       }
-      await input.audit?.({
-        eventType: 'provider_fallback_used',
-        payload: {
-          operation,
-          primaryProvider: input.primary.kind,
-          primaryConnectionId: input.primary.connectionId,
-          fallbackProvider: fallback.kind,
-          fallbackConnectionId: fallback.connectionId,
-          fallbackModel: fallback.model,
-          policy: 'semantically_equivalent_same_operation_retryable_primary_failure'
-        }
-      });
+      const connectionChanged = candidate.connectionId !== lastConnectionId || candidate.kind !== lastProviderKind;
+      if (connectionChanged) await input.onConnectionSwitch?.(candidate);
+      lastProviderKind = candidate.kind;
+      lastConnectionId = candidate.connectionId;
+      if (index > 0) {
+        await input.audit?.({ eventType: 'provider_fallback_used', payload: {
+          operation, primaryProvider: input.primary.kind, primaryConnectionId: input.primary.connectionId,
+          fallbackProvider: candidate.kind, fallbackConnectionId: candidate.connectionId,
+          fallbackModel: candidate.model, fallbackIndex: index,
+          policy: 'ordered_connection_pool_failover'
+        } });
+      }
       try {
-        const result = await action(fallback.provider);
-        lastProviderKind = fallback.kind;
-        await recordProviderSuccess(input, fallback, operation, fallbackBreaker);
+        const result = await action(candidate.provider);
+        await recordProviderSuccess(input, candidate, operation, breaker);
         return result;
-      } catch (fallbackError) {
-        const normalizedFallbackError = normalizeProviderError(fallback.kind, fallbackError);
-        await recordProviderFailure(input, fallback, operation, fallbackBreaker, normalizedFallbackError.toDetails(), openMs);
-        throw new ProviderExecutionError(operation, toErrorMessage(fallbackError), fallback.kind, normalizedFallbackError.retryable);
+      } catch (error) {
+        if (signal?.aborted) throw signal.reason instanceof Error ? signal.reason : new TaskCancellationError();
+        const normalized = normalizeProviderError(candidate.kind, error);
+        await recordProviderFailure(input, candidate, operation, breaker, normalized.toDetails(), openMs);
+        lastError = error;
+        lastRetryable = normalized.retryable;
+        mayFailOver = normalized.failoverEligible;
       }
     }
-
-    if (fallback && primaryIsRetryable && !providersAreSemanticallyEquivalent(input.primary, fallback)) {
-      await input.audit?.({
-        eventType: 'provider_fallback_skipped',
-        payload: {
-          operation,
-          primaryProvider: input.primary.kind,
-          primaryConnectionId: input.primary.connectionId,
-          primaryModel: input.primary.model,
-          fallbackProvider: fallback.kind,
-          fallbackConnectionId: fallback.connectionId,
-          fallbackModel: fallback.model,
-          reason: 'fallback_not_semantically_equivalent'
-        }
-      });
-    }
-
-    throw new ProviderExecutionError(operation, toErrorMessage(primaryError), input.primary.kind, primaryIsRetryable);
+    throw new ProviderExecutionError(operation, toErrorMessage(lastError), lastProviderKind, lastRetryable);
   };
 
   const provider: AIProvider = {
@@ -1511,7 +1505,8 @@ function createPolicyAwareProvider(input: PolicyAwareProviderInput): { provider:
 
   return {
     provider,
-    getLastProviderKind: () => lastProviderKind
+    getLastProviderKind: () => lastProviderKind,
+    getLastConnectionId: () => lastConnectionId
   };
 }
 
@@ -1534,7 +1529,7 @@ async function prepareAuditInputForProvider<T extends CapabilityAuditInput | Rel
 }
 
 function providersAreSemanticallyEquivalent(primary: RuntimeProvider, fallback: RuntimeProvider): boolean {
-  return primary.kind === fallback.kind && primary.model === fallback.model;
+  return primary.kind === fallback.kind;
 }
 
 interface ProviderCircuitBreakerRuntimeState extends ProviderCircuitBreakerSnapshot {
@@ -1544,7 +1539,7 @@ interface ProviderCircuitBreakerRuntimeState extends ProviderCircuitBreakerSnaps
 const providerCircuitBreakers = new Map<string, ProviderCircuitBreakerRuntimeState>();
 
 export function resetProviderCircuitBreakersForTests(): void {
-  if (process.env.NODE_ENV === 'test') providerCircuitBreakers.clear();
+  providerCircuitBreakers.clear();
 }
 
 function getProviderCircuitBreaker(contextId: string, failureThreshold: number): ProviderCircuitBreakerRuntimeState {
@@ -1609,15 +1604,17 @@ async function recordProviderFailure(
   openMs: number
 ): Promise<void> {
   const now = new Date();
-  breaker.failureCount = Math.min(breaker.failureCount + 1, breaker.failureThreshold);
+  breaker.failureCount = error.failoverEligible && !error.retryable
+    ? breaker.failureThreshold
+    : Math.min(breaker.failureCount + 1, breaker.failureThreshold);
   breaker.lastFailureAt = now.toISOString();
   breaker.lastFailureKind = error.kind;
   breaker.lastFailureMessage = error.auditSafeMessage;
   breaker.halfOpenInFlight = false;
-  if (error.retryable && breaker.failureCount >= breaker.failureThreshold) {
+  if ((error.retryable || error.failoverEligible) && breaker.failureCount >= breaker.failureThreshold) {
     breaker.state = 'open';
     breaker.openedAt = now.toISOString();
-    breaker.openedUntil = new Date(now.getTime() + openMs).toISOString();
+    breaker.openedUntil = new Date(now.getTime() + Math.max(openMs, error.retryAfterMs ?? 0)).toISOString();
   } else if (breaker.state === 'half_open') {
     breaker.state = 'open';
     breaker.openedAt = now.toISOString();
@@ -1648,7 +1645,10 @@ async function auditProviderCircuitBreaker(
         ? {
             kind: error.kind,
             retryable: error.retryable,
+            failoverEligible: error.failoverEligible,
             statusCode: error.statusCode ?? null,
+            errorCode: error.errorCode ?? null,
+            retryAfterMs: error.retryAfterMs ?? null,
             auditSafeMessage: error.auditSafeMessage
           }
         : null
@@ -1690,6 +1690,12 @@ async function readAIProviderConnectionSecret(repository: {
   return repository.getAIProviderConnectionSecret ? repository.getAIProviderConnectionSecret() : undefined;
 }
 
+async function listAIProviderConnectionSecrets(repository: {
+  listAIProviderConnectionSecrets?: () => Promise<AIProviderConnectionSecret[]>;
+}): Promise<AIProviderConnectionSecret[]> {
+  return repository.listAIProviderConnectionSecrets ? repository.listAIProviderConnectionSecrets() : [];
+}
+
 async function readAIProviderConnectionSecretById(
   repository: {
     getAIProviderConnectionSecretById?: (connectionId: string) => Promise<AIProviderConnectionSecret | undefined>;
@@ -1710,15 +1716,21 @@ async function resolveProviderSelection(input: {
   fallbackProviderOverride?: ProviderKind;
   providerConnectionIdOverride?: string;
   fallbackProviderConnectionIdOverride?: string;
+  availableConnections?: AIProviderConnectionSecret[];
 }): Promise<{
   primary: { kind: ProviderKind; connection?: AIProviderConnectionSecret };
   fallback?: { kind: ProviderKind; connection?: AIProviderConnectionSecret };
+  fallbacks: Array<{ kind: ProviderKind; connection?: AIProviderConnectionSecret }>;
 }> {
+  const connections = input.availableConnections ?? [];
+  const findConnection = async (connectionId: string): Promise<AIProviderConnectionSecret | undefined> =>
+    connections.find((connection) => connection.id === connectionId)
+      ?? readAIProviderConnectionSecretById(input.repository, connectionId);
   const primaryConnectionId = input.providerConnectionIdOverride
     ?? input.projectConfig?.ai.primary_connection_id?.trim()
     ?? input.projectProviderConnectionId;
   const primaryConnection = primaryConnectionId
-    ? await readAIProviderConnectionSecretById(input.repository, primaryConnectionId)
+    ? await findConnection(primaryConnectionId)
     : input.defaultConnection;
 
   if (primaryConnectionId && !primaryConnection) {
@@ -1734,7 +1746,7 @@ async function resolveProviderSelection(input: {
   const fallbackConnectionId = input.fallbackProviderConnectionIdOverride
     ?? input.projectConfig?.ai.fallback_connection_id?.trim();
   const fallbackConnection = fallbackConnectionId
-    ? await readAIProviderConnectionSecretById(input.repository, fallbackConnectionId)
+    ? await findConnection(fallbackConnectionId)
     : undefined;
 
   if (fallbackConnectionId && !fallbackConnection) {
@@ -1745,22 +1757,33 @@ async function resolveProviderSelection(input: {
     ?? fallbackConnection?.provider
     ?? input.projectConfig?.ai.fallback_provider;
 
-  if (!fallbackKind) {
-    return { primary: { kind: primaryKind, connection: normalizedPrimaryConnection } };
+  const orderedConnectionIds = [
+    ...(input.projectConfig?.ai.connection_pool_ids ?? []),
+    ...(fallbackConnectionId ? [fallbackConnectionId] : [])
+  ];
+  const automaticConnections = connections
+    .filter((connection) => connection.automaticFailover)
+    .sort((left, right) => left.failoverPriority - right.failoverPriority || left.connectedAt.localeCompare(right.connectedAt));
+  const candidateConnections: AIProviderConnectionSecret[] = [];
+  for (const connectionId of orderedConnectionIds) {
+    const connection = await findConnection(connectionId);
+    if (!connection) throw new Error(`Provider pool connection "${connectionId}" does not exist.`);
+    candidateConnections.push(connection);
   }
+  candidateConnections.push(...automaticConnections);
 
-  const normalizedFallbackConnection = fallbackConnection?.provider === fallbackKind ? fallbackConnection : undefined;
-  const hasDistinctFallback =
-    fallbackKind !== primaryKind
-    || (normalizedFallbackConnection?.id ?? null) !== (normalizedPrimaryConnection?.id ?? null);
-
-  if (!hasDistinctFallback) {
-    return { primary: { kind: primaryKind, connection: normalizedPrimaryConnection } };
+  const fallbacks: Array<{ kind: ProviderKind; connection?: AIProviderConnectionSecret }> = [];
+  if (fallbackKind && !fallbackConnection) fallbacks.push({ kind: fallbackKind });
+  for (const connection of candidateConnections) {
+    const duplicate = connection.id === normalizedPrimaryConnection?.id
+      || fallbacks.some((candidate) => candidate.connection?.id === connection.id);
+    if (!duplicate) fallbacks.push({ kind: connection.provider, connection });
   }
 
   return {
     primary: { kind: primaryKind, connection: normalizedPrimaryConnection },
-    fallback: { kind: fallbackKind, connection: normalizedFallbackConnection }
+    fallback: fallbacks[0],
+    fallbacks
   };
 }
 

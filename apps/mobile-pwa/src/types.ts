@@ -707,7 +707,7 @@ export interface ProviderStatusApi {
   availableProviders: string[];
   persistent: boolean;
   credentialSource: 'api_key' | 'codex_oauth' | 'env' | 'none' | string;
-  authMode: 'api_key' | 'codex_oauth' | null;
+  authMode: 'api_key' | 'codex_oauth' | 'chatgpt_plan_oauth' | null;
   apiKeyFingerprint: string | null;
   codexHome: string | null;
   accountSummary: string | null;
@@ -735,14 +735,19 @@ export interface ProviderConnectionApi {
   userId: string;
   name: string;
   isDefault: boolean;
-  credentialSource: 'api_key' | 'codex_oauth' | string;
+  credentialSource: 'api_key' | 'codex_oauth' | 'chatgpt_plan_oauth' | string;
   provider: 'openai' | 'codex' | 'github_copilot';
-  authMode: 'api_key' | 'codex_oauth';
+  authMode: 'api_key' | 'codex_oauth' | 'chatgpt_plan_oauth';
   model: string;
   allowedModels?: string[];
   apiKeyFingerprint?: string;
   codexHome?: string;
   accountSummary?: string;
+  automaticFailover: boolean;
+  failoverPriority: number;
+  oauthHostId?: string;
+  oauthScopes?: string[];
+  oauthExpiresAt?: string;
   available?: boolean | null;
   availability?: 'available' | 'api_key_migration_required';
   runtimeStatus?: ProviderConnectionRuntimeStatus | null;
@@ -760,6 +765,14 @@ export interface ProviderConnectRequest {
   apiKey?: string;
   model?: string;
   allowedModels?: string[];
+  automaticFailover?: boolean;
+  failoverPriority?: number;
+}
+
+export interface ChatGPTPlanEnrollmentResponse {
+  enrollmentId: string;
+  code: string;
+  expiresAt: string;
 }
 
 export interface ProviderConnectResponse {

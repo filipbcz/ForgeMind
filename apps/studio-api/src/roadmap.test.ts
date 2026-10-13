@@ -70,7 +70,7 @@ describe('project roadmap generation', () => {
       },
       {
         id: 'connection_1', userId: 'user_1', name: 'Codex API', isDefault: true, credentialSource: 'api_key',
-        provider: 'codex', authMode: 'api_key', apiKey: 'sk-test', model: 'gpt-6.1-sol', connectedAt: '', updatedAt: ''
+        provider: 'codex', authMode: 'api_key', apiKey: 'sk-test', model: 'gpt-6.1-sol', automaticFailover: false, failoverPriority: 100, connectedAt: '', updatedAt: ''
       }
     );
 
@@ -89,7 +89,7 @@ describe('project roadmap generation', () => {
       },
       {
         id: 'connection_1', userId: 'user_1', name: 'Codex API', isDefault: true, credentialSource: 'api_key',
-        provider: 'codex', authMode: 'api_key', apiKey: 'sk-test', model: 'gpt-6.1-sol', connectedAt: '', updatedAt: ''
+        provider: 'codex', authMode: 'api_key', apiKey: 'sk-test', model: 'gpt-6.1-sol', automaticFailover: false, failoverPriority: 100, connectedAt: '', updatedAt: ''
       }
     );
     expect(incompatible.id).toBeUndefined();
@@ -103,7 +103,7 @@ describe('project roadmap generation', () => {
       },
       {
         id: 'connection_1', userId: 'user_1', name: 'Codex API', isDefault: true, credentialSource: 'api_key',
-        provider: 'codex', authMode: 'api_key', apiKey: 'sk-test', model: 'gpt-6.1-sol', connectedAt: '', updatedAt: ''
+        provider: 'codex', authMode: 'api_key', apiKey: 'sk-test', model: 'gpt-6.1-sol', automaticFailover: false, failoverPriority: 100, connectedAt: '', updatedAt: ''
       },
       true
     );

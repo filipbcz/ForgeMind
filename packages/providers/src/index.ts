@@ -7,6 +7,7 @@ export * from './openai-provider.js';
 export * from './codex-provider.js';
 export * from './github-copilot-provider.js';
 export * from './model-pricing.js';
+export * from './chatgpt-plan-oauth.js';
 
 import type { ProviderKind } from '@forgemind/core';
 import type { AIProvider } from './provider.js';
@@ -20,7 +21,8 @@ export { DEFAULT_MODEL_POOL, hasSubstantiveImplementationFeedback, shouldEscalat
 
 export interface ProviderRuntimeConfig {
   apiKey?: string;
-  authMode?: 'api_key';
+  authMode?: 'api_key' | 'chatgpt_plan_oauth';
+  accessToken?: string;
   codexHome?: string;
   model?: string;
   /** Use Codex CLI as the API-key-authenticated local tool runtime. */

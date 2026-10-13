@@ -36,6 +36,7 @@ import {
   completeTask as completeTaskRequest,
   connectGitHubAdapter,
   connectProvider,
+  createChatGPTPlanEnrollment,
   decideProjectRoadmapExtension as decideProjectRoadmapExtensionRequest,
   createProject as createProjectRequest,
   createTask as createTaskRequest,
@@ -89,6 +90,7 @@ import type {
   AssignProjectRepositoryRequest,
   AuthSessionResponse,
   AuditEventApi,
+  ChatGPTPlanEnrollmentResponse,
   CreateProjectRequest,
   CreateTaskRequest,
   DecideProjectRoadmapExtensionRequest,
@@ -287,6 +289,7 @@ function AuthenticatedApp({ auth }: { auth: AuthSessionResponse }) {
   const providerStatusQuery = useQuery({
     queryKey: ['provider-status'],
     queryFn: fetchProviderStatus,
+    refetchInterval: 30_000,
     retry: 1
   });
   const githubAdapterStatusQuery = useQuery({
@@ -765,6 +768,10 @@ function AuthenticatedApp({ auth }: { auth: AuthSessionResponse }) {
     }
   });
 
+  const chatGPTPlanEnrollmentMutation = useMutation({
+    mutationFn: createChatGPTPlanEnrollment
+  });
+
   const providerDeleteMutation = useMutation({
     mutationFn: deleteProviderConnection,
     onSuccess: () => {
@@ -1116,7 +1123,9 @@ function AuthenticatedApp({ auth }: { auth: AuthSessionResponse }) {
             providerBusy={
               providerConnectMutation.isPending
               || providerDeleteMutation.isPending
+              || chatGPTPlanEnrollmentMutation.isPending
             }
+            chatGPTPlanEnrollment={chatGPTPlanEnrollmentMutation.data}
             providerModels={providerModelsMutation.data}
             providerModelsLoading={providerModelsMutation.isPending}
             providerError={
@@ -1126,9 +1135,12 @@ function AuthenticatedApp({ auth }: { auth: AuthSessionResponse }) {
                     ? formatUiError(providerDeleteMutation.error)
                     : providerModelsMutation.error
                       ? formatUiError(providerModelsMutation.error)
+                      : chatGPTPlanEnrollmentMutation.error
+                        ? formatUiError(chatGPTPlanEnrollmentMutation.error)
                       : undefined
             }
             onProviderConnect={(input) => providerConnectMutation.mutate(input)}
+            onChatGPTPlanEnrollmentCreate={(input) => chatGPTPlanEnrollmentMutation.mutate(input)}
             onProviderDelete={(connectionId) => providerDeleteMutation.mutate(connectionId)}
             onProviderModelsLoad={(input) => providerModelsMutation.mutateAsync(input)}
             notificationSettings={notificationSettings}
@@ -3619,10 +3631,12 @@ function SettingsPanel({
   providerStatus,
   providerLoading,
   providerBusy,
+  chatGPTPlanEnrollment,
   providerModels,
   providerModelsLoading,
   providerError,
   onProviderConnect,
+  onChatGPTPlanEnrollmentCreate,
   onProviderDelete,
   onProviderModelsLoad,
   notificationSettings,
@@ -3654,10 +3668,12 @@ function SettingsPanel({
   providerStatus?: ProviderStatusApi;
   providerLoading: boolean;
   providerBusy: boolean;
+  chatGPTPlanEnrollment?: ChatGPTPlanEnrollmentResponse;
   providerModels?: ProviderModelsResponse;
   providerModelsLoading: boolean;
   providerError?: string;
   onProviderConnect: (input: ProviderConnectRequest) => void;
+  onChatGPTPlanEnrollmentCreate: (input: { name?: string; isDefault?: boolean; automaticFailover?: boolean; failoverPriority?: number }) => void;
   onProviderDelete: (connectionId: string) => void;
   onProviderModelsLoad: (input: ProviderModelsRequest) => Promise<ProviderModelsResponse>;
   notificationSettings?: NotificationSettingsApi;
@@ -3687,7 +3703,9 @@ function SettingsPanel({
     apiKey: '',
     model: '',
     allowedModels: [],
-    isDefault: false
+    isDefault: false,
+    automaticFailover: true,
+    failoverPriority: 100
   });
   const [githubAdapterForm, setGitHubAdapterForm] = useState<GitHubAdapterConnectRequest>({
     token: '',
@@ -3716,7 +3734,9 @@ function SettingsPanel({
         apiKey: '',
         model: '',
         allowedModels: [],
-        isDefault: false
+        isDefault: false,
+        automaticFailover: true,
+        failoverPriority: 100
       });
     }
   }, [providerConnections, providerForm.connectionId, providerForm.isDefault]);
@@ -3730,7 +3750,9 @@ function SettingsPanel({
       apiKey: '',
       model: '',
       allowedModels: [],
-      isDefault: providerConnections.length === 0
+      isDefault: providerConnections.length === 0,
+      automaticFailover: true,
+      failoverPriority: 100
     });
   }
 
@@ -3743,7 +3765,9 @@ function SettingsPanel({
       apiKey: '',
       model: connection.model,
       allowedModels: connection.allowedModels,
-      isDefault: connection.isDefault
+      isDefault: connection.isDefault,
+      automaticFailover: connection.automaticFailover,
+      failoverPriority: connection.failoverPriority
     });
   }
 
@@ -3907,6 +3931,35 @@ function SettingsPanel({
           </>
         ) : null}
         {providerError ? <div className="error-banner">{providerError}</div> : null}
+        <div className="wide provider-connection-card">
+          <div className="provider-connection-summary">
+            <strong>Připojit ChatGPT předplatné</strong>
+            <small>Přidá další účet do automatického failover poolu. Přihlášení proběhne lokálně v prohlížeči na Windows notebooku; ForgeMind neukládá heslo.</small>
+          </div>
+          <div className="actions">
+            <button
+              className="primary-action"
+              type="button"
+              disabled={providerBusy}
+              onClick={() => onChatGPTPlanEnrollmentCreate({
+                name: providerForm.name?.trim() || undefined,
+                isDefault: providerForm.isDefault,
+                automaticFailover: providerForm.automaticFailover,
+                failoverPriority: providerForm.failoverPriority
+              })}
+            >
+              Vytvořit připojovací kód
+            </button>
+          </div>
+          {chatGPTPlanEnrollment ? (
+            <div className="wide">
+              <p><strong>Jednorázový kód:</strong> <code>{chatGPTPlanEnrollment.code}</code></p>
+              <p>Na přihlášeném Windows workeru spusťte:</p>
+              <pre>node apps/windows-runner/dist/cli.js provider connect-chatgpt --api-url {window.location.origin}</pre>
+              <small>Kód vyprší {new Date(chatGPTPlanEnrollment.expiresAt).toLocaleString('cs-CZ')}. Příkaz si jej bezpečně vyžádá a otevře přihlášení ChatGPT.</small>
+            </div>
+          ) : null}
+        </div>
         <div className="provider-connection-list wide">
           {providerConnections.length ? (
             providerConnections.map((connection) => (
@@ -3922,6 +3975,7 @@ function SettingsPanel({
                   <small>
                     {connection.authMode}
                     {connection.isDefault ? ' · default' : ''}
+                    {connection.automaticFailover ? ` · failover ${connection.failoverPriority}` : ' · bez automatického failoveru'}
                     {connection.credentialSource ? ` · ${connection.credentialSource}` : ''}
                   </small>
                   {connection.available === false ? <small>Toto staré OAuth připojení je neaktivní; nahraďte je API key připojením.</small> : null}
@@ -3932,9 +3986,11 @@ function SettingsPanel({
                   </small>
                 </div>
                 <div className="actions">
-                  <button className="secondary-action" type="button" onClick={() => editProviderConnection(connection)}>
-                    Upravit
-                  </button>
+                  {connection.authMode !== 'chatgpt_plan_oauth' ? (
+                    <button className="secondary-action" type="button" onClick={() => editProviderConnection(connection)}>
+                      Upravit
+                    </button>
+                  ) : null}
                   <button className="danger-action" type="button" onClick={() => onProviderDelete(connection.id)} disabled={providerBusy}>
                     Smazat
                   </button>
@@ -4056,6 +4112,28 @@ function SettingsPanel({
             <small>Tento connection se pouzije jako vychozi provider pro projekty bez vlastni volby.</small>
           </span>
         </label>
+        <label className="toggle-row wide">
+          <input
+            type="checkbox"
+            checked={Boolean(providerForm.automaticFailover)}
+            onChange={(event) => setProviderForm((previous) => ({ ...previous, automaticFailover: event.target.checked }))}
+          />
+          <span>
+            <strong>Použít pro automatický failover</strong>
+            <small>Při vyčerpání kreditu nebo limitu ForgeMind pokračuje přes další kompatibilní připojení bez ztráty checkoutu.</small>
+          </span>
+        </label>
+        <label>
+          Priorita failoveru
+          <input
+            type="number"
+            min="0"
+            max="10000"
+            value={providerForm.failoverPriority ?? 100}
+            onChange={(event) => setProviderForm((previous) => ({ ...previous, failoverPriority: Number(event.target.value) }))}
+          />
+          <small>Nižší číslo se použije dříve.</small>
+        </label>
         <div className="actions">
           <button
             className="primary-action"
@@ -4070,7 +4148,9 @@ function SettingsPanel({
                 authMode: 'api_key',
                 apiKey: providerForm.apiKey?.trim() || undefined,
                 model: providerForm.model?.trim() || undefined,
-                allowedModels: providerForm.allowedModels?.length ? providerForm.allowedModels : undefined
+                allowedModels: providerForm.allowedModels?.length ? providerForm.allowedModels : undefined,
+                automaticFailover: providerForm.automaticFailover,
+                failoverPriority: providerForm.failoverPriority
               })
             }
           >

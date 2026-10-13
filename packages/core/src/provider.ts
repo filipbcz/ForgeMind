@@ -3,6 +3,10 @@ import type { ProviderKind } from './model.js';
 export type NormalizedProviderErrorKind =
   | 'authentication'
   | 'quota'
+  | 'rate_limit'
+  | 'credit_exhausted'
+  | 'spend_limit'
+  | 'usage_limit'
   | 'timeout'
   | 'invalid_response'
   | 'unavailable'
@@ -14,7 +18,11 @@ export interface NormalizedProviderErrorDetails {
   message: string;
   auditSafeMessage: string;
   retryable: boolean;
+  /** A different explicitly configured connection may safely retry the same operation. */
+  failoverEligible: boolean;
   statusCode?: number;
+  errorCode?: string;
+  retryAfterMs?: number;
 }
 
 export interface ProviderPreflightResult {

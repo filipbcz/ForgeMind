@@ -1,7 +1,8 @@
 import type { FastifyInstance, FastifyReply, FastifyRequest } from 'fastify';
 import { createHash } from 'node:crypto';
 import { z } from 'zod';
-import type { ForgeMindRepository, WindowsRunnerCredentialAdapter, WindowsRunnerPrincipal, WindowsWorkerRepository } from '@forgemind/db';
+import type { ChatGPTPlanTokenSet, ForgeMindRepository, WindowsRunnerCredentialAdapter, WindowsRunnerPrincipal, WindowsWorkerRepository } from '@forgemind/db';
+import { CHATGPT_PLAN_SCOPE, validateChatGPTIdToken } from '@forgemind/providers';
 import { canonicalizeWorkerProbeEvidence, isWindowsAuthoringPacket, isWindowsAuthoringResult, isWindowsExecutionResult, redactSecrets, WINDOWS_AUTHORING_BLOB_CHUNK_BYTES, WINDOWS_AUTHORING_MANIFEST_MAX_BYTES, WINDOWS_EVIDENCE_MAX_ARTIFACT_BYTES, WINDOWS_EVIDENCE_MAX_ARTIFACTS, WINDOWS_EVIDENCE_MAX_LOG_BYTES } from '@forgemind/core';
 
 const deviceParams = z.object({ deviceId: z.string().uuid() });
@@ -71,6 +72,17 @@ const authoringBlobChunk = authoringBlobIdentity.extend({ sizeBytes: z.number().
   contentBase64: z.string().max(Math.ceil(WINDOWS_AUTHORING_BLOB_CHUNK_BYTES / 3) * 4 + 4).regex(/^[A-Za-z0-9+/]*={0,2}$/) });
 const authoringBlobComplete = authoringBlobIdentity.extend({ sizeBytes: z.number().int().nonnegative(),
   totalChunks: z.number().int().positive().max(65_536) });
+const chatGPTEnrollmentExchange = z.object({ code: z.string().min(20) });
+const chatGPTEnrollmentComplete = z.object({
+  uploadToken: z.string().min(32),
+  nonce: z.string().min(16),
+  clientId: z.string().min(1),
+  accessToken: z.string().min(1),
+  refreshToken: z.string().min(1),
+  idToken: z.string().min(1),
+  scope: z.string(),
+  expiresIn: z.number().int().positive().max(86_400)
+});
 
 export function registerWindowsRunnerRoutes(app: FastifyInstance, repository: ForgeMindRepository, credentials: WindowsRunnerCredentialAdapter, workers: WindowsWorkerRepository) {
   app.post('/api/windows-runner/enrollments', async (request) => {
@@ -82,6 +94,71 @@ export function registerWindowsRunnerRoutes(app: FastifyInstance, repository: Fo
       const result = await credentials.redeemEnrollment(redeem.parse(request.body).code);
       return result;
     } catch { return reply.code(401).send({ error: 'Enrollment code is invalid, expired, or already used.' }); }
+  });
+  app.post('/api/windows-runner/device/chatgpt-plan/enroll', { preHandler: runnerAuth(credentials) }, async (request, reply) => {
+    try {
+      const input = chatGPTEnrollmentExchange.parse(request.body);
+      const providerRepository = repository as ForgeMindRepository & {
+        exchangeChatGPTPlanEnrollment?: ForgeMindRepository['exchangeChatGPTPlanEnrollment'];
+      };
+      if (!providerRepository.exchangeChatGPTPlanEnrollment) throw new Error('ChatGPT plan enrollment storage is unavailable.');
+      return reply.send(await providerRepository.exchangeChatGPTPlanEnrollment(input.code));
+    } catch (error) {
+      return reply.code(400).send({ error: error instanceof Error ? error.message : 'ChatGPT plan enrollment failed.' });
+    }
+  });
+  app.post('/api/windows-runner/device/chatgpt-plan/complete', { preHandler: runnerAuth(credentials) }, async (request, reply) => {
+    try {
+      const input = chatGPTEnrollmentComplete.parse(request.body);
+      const scopes = input.scope.split(/\s+/).filter(Boolean);
+      if (!scopes.includes(CHATGPT_PLAN_SCOPE)) throw new Error('ChatGPT plan usage permission was not granted.');
+      const identity = await validateChatGPTIdToken({ idToken: input.idToken, clientId: input.clientId, nonce: input.nonce });
+      const tokenSet: ChatGPTPlanTokenSet = {
+        clientId: input.clientId,
+        subject: identity.subject,
+        issuer: identity.issuer,
+        email: identity.email,
+        accessToken: input.accessToken,
+        refreshToken: input.refreshToken,
+        idToken: input.idToken,
+        scopes,
+        expiresAt: new Date(Date.now() + input.expiresIn * 1_000).toISOString()
+      };
+      const providerRepository = repository as ForgeMindRepository & {
+        completeChatGPTPlanEnrollment?: ForgeMindRepository['completeChatGPTPlanEnrollment'];
+      };
+      if (!providerRepository.completeChatGPTPlanEnrollment) throw new Error('ChatGPT plan enrollment storage is unavailable.');
+      const connection = await providerRepository.completeChatGPTPlanEnrollment(input.uploadToken, tokenSet);
+      return reply.send({ ok: true, connection });
+    } catch (error) {
+      return reply.code(400).send({ error: error instanceof Error ? error.message : 'ChatGPT credential validation failed.' });
+    }
+  });
+  app.get('/api/windows-runner/device/provider-pool', { preHandler: runnerAuth(credentials) }, async (_request, reply) => {
+    try {
+      const providerRepository = repository as ForgeMindRepository & {
+        listAIProviderConnectionSecrets?: ForgeMindRepository['listAIProviderConnectionSecrets'];
+      };
+      if (!providerRepository.listAIProviderConnectionSecrets) throw new Error('AI provider connection storage is unavailable.');
+      const connections = (await providerRepository.listAIProviderConnectionSecrets())
+        .filter((connection) => connection.provider === 'codex'
+          && connection.authMode !== 'codex_oauth'
+          && (connection.isDefault || connection.automaticFailover))
+        .flatMap((connection) => {
+          const credential = connection.authMode === 'chatgpt_plan_oauth' ? connection.accessToken : connection.apiKey;
+          return credential ? [{
+            id: connection.id,
+            name: connection.name,
+            authMode: connection.authMode,
+            model: connection.model,
+            allowedModels: connection.allowedModels ?? [],
+            credential
+          }] : [];
+        });
+      return reply.header('cache-control', 'no-store').send({ connections });
+    } catch (error) {
+      return reply.code(400).send({ error: error instanceof Error ? error.message : 'AI provider pool is unavailable.' });
+    }
   });
   app.post('/api/windows-runner/devices/:deviceId/rotate', async (request) => {
     const { deviceId } = deviceParams.parse(request.params);

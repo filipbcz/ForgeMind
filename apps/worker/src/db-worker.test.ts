@@ -79,6 +79,7 @@ const repositoryMock = {
   claimNextChatRun: vi.fn(async (): Promise<unknown> => undefined),
   getGitHubConnectionSecret: vi.fn(async () => undefined),
   getAIProviderConnectionSecret: vi.fn(async () => undefined),
+  listAIProviderConnectionSecrets: vi.fn(async (): Promise<unknown[]> => []),
   getAIProviderConnectionSecretById: vi.fn(async (_connectionId: string): Promise<unknown> => undefined),
   claimNextSubmittedTask: vi.fn(async (): Promise<unknown> => createClaimedTask()),
   claimNextProjectAudit: vi.fn(async (): Promise<unknown> => undefined),
@@ -182,6 +183,12 @@ describe('db-worker policy enforcement', () => {
     vi.clearAllMocks();
     repositoryMock.getGitHubConnectionSecret.mockReset();
     repositoryMock.getGitHubConnectionSecret.mockResolvedValue(undefined);
+    repositoryMock.getAIProviderConnectionSecret.mockReset();
+    repositoryMock.getAIProviderConnectionSecret.mockResolvedValue(undefined);
+    repositoryMock.getAIProviderConnectionSecretById.mockReset();
+    repositoryMock.getAIProviderConnectionSecretById.mockResolvedValue(undefined);
+    repositoryMock.listAIProviderConnectionSecrets.mockReset();
+    repositoryMock.listAIProviderConnectionSecrets.mockResolvedValue([]);
     repositoryMock.getTask.mockReset();
     repositoryMock.getTask.mockResolvedValue(undefined);
     repositoryMock.getImplementationStepByTaskId.mockReset();
@@ -1733,6 +1740,70 @@ github:
     } else {
       process.env.FORGEMIND_FALLBACK_PROVIDER_CONNECTION_ID = previousFallbackConnection;
     }
+  });
+
+  it('walks the ordered same-provider connection pool after credit and plan limits', async () => {
+    const now = new Date().toISOString();
+    const connection = (id: string, apiKey: string, priority: number, isDefault = false) => ({
+      id,
+      userId: 'user_1',
+      name: id,
+      isDefault,
+      credentialSource: 'api_key' as const,
+      provider: 'codex' as const,
+      authMode: 'api_key' as const,
+      model: 'gpt-6.1-sol',
+      automaticFailover: !isDefault,
+      failoverPriority: priority,
+      connectedAt: now,
+      updatedAt: now,
+      apiKey
+    });
+    const primary = connection('conn_primary', 'key_primary', 0, true);
+    const planFallback = connection('conn_plan', 'key_plan', 10);
+    const apiFallback = connection('conn_api', 'key_api', 20);
+    repositoryMock.getAIProviderConnectionSecret.mockResolvedValue(primary as never);
+    repositoryMock.listAIProviderConnectionSecrets.mockResolvedValue([primary, apiFallback, planFallback]);
+    repositoryMock.claimNextSubmittedTask.mockResolvedValue(createClaimedTask());
+
+    const calls: string[] = [];
+    createProviderMock.mockImplementation((_kind: string, config?: { apiKey?: string }) => ({
+      kind: 'codex',
+      estimateCost: vi.fn(async () => ({ inputTokens: 10, outputTokens: 5, estimatedCostUsd: 0.01 })),
+      plan: vi.fn(async () => {
+        calls.push(config?.apiKey ?? 'none');
+        if (config?.apiKey === 'key_primary') {
+          throw Object.assign(new Error('No API credits remain.'), { status: 429, errorCode: 'credit_balance_exhausted' });
+        }
+        if (config?.apiKey === 'key_plan') {
+          throw Object.assign(new Error('ChatGPT plan limit reached.'), { status: 429, errorCode: 'subscription_sharing_usage_limit_exceeded' });
+        }
+        return { steps: [], validationChecks: [], acceptanceCriteria: [] };
+      }),
+      implement: vi.fn(),
+      review: vi.fn(),
+      async preflight() { return { provider: 'codex', ok: true, checkedAt: now }; },
+      supportsLocalRepo: () => true,
+      supportsGitHubNativeFlow: () => false
+    }));
+    runWorkerTaskMock.mockImplementationOnce(async (input: { provider: { plan: (value: Record<string, unknown>) => Promise<unknown> } }) => {
+      await input.provider.plan({ task: createClaimedTask().task, signal: undefined });
+      return {
+        taskId: 'task_1', status: 'ready_for_user_review', workspacePath: 'C:/tmp/worker',
+        validation: { command: 'node --version', exitCode: 0, stdout: '', stderr: '', passed: true },
+        summary: 'continued through the pool', approvals: [], completedAt: now
+      };
+    });
+
+    const { runDatabaseWorkerOnce } = await import('./db-worker.js');
+    const result = await runDatabaseWorkerOnce();
+
+    expect(result).toEqual(expect.objectContaining({ claimed: true, taskId: 'task_1' }));
+    expect(calls).toEqual(['key_primary', 'key_plan', 'key_api']);
+    expect(repositoryMock.writeAudit).toHaveBeenCalledWith(expect.objectContaining({ eventType: 'provider_fallback_used' }));
+    expect(repositoryMock.updateTaskProviderSession).toHaveBeenCalledWith(expect.objectContaining({
+      taskId: 'task_1', sessionId: undefined, connectionId: 'conn_api'
+    }));
   });
 
   it('persists actual provider usage per phase and finishes the run with measured totals', async () => {

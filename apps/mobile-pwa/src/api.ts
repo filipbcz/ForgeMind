@@ -7,6 +7,7 @@ import type {
   ChatRunApi,
   ChatThreadApi,
   ChatThreadDetailApi,
+  ChatGPTPlanEnrollmentResponse,
   CreateChatThreadRequest,
   CreateProjectRequest,
   CreateTaskRequest,
@@ -364,6 +365,18 @@ export async function disconnectGitHubAdapter(): Promise<{ ok: boolean; status: 
 
 export async function connectProvider(input: ProviderConnectRequest): Promise<ProviderConnectResponse> {
   return request<ProviderConnectResponse>('/api/providers/connect', {
+    method: 'POST',
+    body: JSON.stringify(input)
+  });
+}
+
+export async function createChatGPTPlanEnrollment(input: {
+  name?: string;
+  isDefault?: boolean;
+  automaticFailover?: boolean;
+  failoverPriority?: number;
+}): Promise<ChatGPTPlanEnrollmentResponse> {
+  return request<ChatGPTPlanEnrollmentResponse>('/api/providers/chatgpt-plan/enrollments', {
     method: 'POST',
     body: JSON.stringify(input)
   });

@@ -6,16 +6,17 @@ import { join } from 'node:path';
 import { stdin, stdout } from 'node:process';
 import { pathToFileURL } from 'node:url';
 import { classifyWindowsExecutionPacket, isWindowsAuthoringPacket, isWindowsExecutionPacket, WINDOWS_AUTHORING_BLOB_CHUNK_BYTES, type TaskModelSelection, type WindowsAuthoringResult, type WorkerProbeEvidence } from '@forgemind/core';
-import { createProvider, listOpenAIModels, resolveCodexBinary, type AIProvider, type ProviderModelOption } from '@forgemind/providers';
+import { createProvider, listOpenAIModels, normalizeProviderError, resolveCodexBinary, type AIProvider, type ProviderModelOption, type ProviderSessionContext } from '@forgemind/providers';
 import { WindowsCredentialStore, type RunnerCredential } from './credential-store.js';
 import { cleanupWindowsValidationWorkspace, executeWindowsValidation } from './executor.js';
 import { executeWindowsAuthoring, LifecycleNativeImplementationProvider } from './authoring-executor.js';
 import { runCapabilityProbes, windowsRunnerCapabilityProbes } from './probes.js';
 import { runManualSession } from './session.js';
 import { cleanupAcceptedWindowsAuthoring, prepareWindowsManagedRoots } from './managed-roots.js';
-import { WindowsRunnerTransport } from './transport.js';
+import { WindowsRunnerTransport, type WindowsProviderConnection } from './transport.js';
 import { runBoundedProcess } from './process-runner.js';
 import { CoalescedAuthoringProgressPublisher } from './progress-publisher.js';
+import { connectChatGPTPlan } from './chatgpt-plan-login.js';
 
 const RUNNER_BUILD_ID = process.env.FORGEMIND_RUNNER_BUILD_ID?.trim().replace(/[^a-z0-9_.-]/gi, '-');
 const RUNNER_VERSION = `0.2.0+authoring-v2${RUNNER_BUILD_ID ? `.${RUNNER_BUILD_ID}` : ''}`;
@@ -26,17 +27,19 @@ const MAX_CODEX_PREFLIGHT_TIMEOUT_MS = 1_800_000;
 export type CliCommand =
   | { command: 'enroll'; apiUrl: string }
   | { command: 'probe'; apiUrl: string; json: boolean }
+  | { command: 'provider-connect-chatgpt'; apiUrl: string }
   | { command: 'session-start'; apiUrl: string; projectIds: string[]; workspaceRoot: string; artifactRoot: string }
   | { command: 'session-drain' | 'session-stop'; apiUrl: string; sessionId: string };
 
 export function parseCliArgs(args: string[]): CliCommand {
   const command = args[0];
-  const action = command === 'session' ? args[1] : undefined;
-  const options = command === 'session' ? args.slice(2) : args.slice(1);
+  const action = command === 'session' || command === 'provider' ? args[1] : undefined;
+  const options = command === 'session' || command === 'provider' ? args.slice(2) : args.slice(1);
   const apiUrl = option(options, '--api-url');
   if (!apiUrl) throw new Error('--api-url is required.');
   if (command === 'enroll') return { command, apiUrl };
   if (command === 'probe') return { command, apiUrl, json: options.includes('--json') };
+  if (command === 'provider' && action === 'connect-chatgpt') return { command: 'provider-connect-chatgpt', apiUrl };
   if (command === 'session' && action === 'start') {
     const projectIds = optionsFor(options, '--project');
     if (projectIds.length === 0) throw new Error('At least one --project UUID is required for local activation.');
@@ -53,7 +56,7 @@ export function parseCliArgs(args: string[]): CliCommand {
     if (!sessionId) throw new Error('--session-id is required.');
     return { command: action === 'drain' ? 'session-drain' : 'session-stop', apiUrl, sessionId };
   }
-  throw new Error('Usage: forgemind-windows-runner enroll|probe|session start --project <uuid>|session drain|session stop --api-url https://...');
+  throw new Error('Usage: forgemind-windows-runner enroll|probe|provider connect-chatgpt|session start --project <uuid>|session drain|session stop --api-url https://...');
 }
 
 export function selectLocalCodexModel(models: ProviderModelOption[], requestedModel?: string): string {
@@ -117,7 +120,8 @@ async function runCodexCommand(binary: string, args: string[], codexHome: string
 }
 
 export async function prepareLocalCodexRuntime(environment: NodeJS.ProcessEnv = process.env,
-  report: (message: string) => void = () => undefined): Promise<{
+  report: (message: string) => void = () => undefined,
+  loadRemotePool?: () => Promise<{ connections: WindowsProviderConnection[] }>): Promise<{
   provider: AIProvider; model: string; codexHome: string; availableModels: string[];
   providerForRoute: (route: TaskModelSelection) => AIProvider;
 }> {
@@ -139,27 +143,144 @@ export async function prepareLocalCodexRuntime(environment: NodeJS.ProcessEnv = 
     timeoutMs: timeouts.sandboxProbeMs, timeoutSetting: 'FORGEMIND_CODEX_SANDBOX_PROBE_TIMEOUT_MS', environment });
   if (!sandboxProbe.includes('FORGEMIND_SANDBOX_OK')) throw new Error('Codex Windows sandbox preflight did not execute the expected checkout-confined command.');
   const apiKey = environment.OPENAI_API_KEY?.trim() || environment.CODEX_API_KEY?.trim();
-  if (!apiKey) throw new Error('OPENAI_API_KEY is required. ForgeMind Windows authoring no longer supports ChatGPT OAuth.');
-  report('Loading models available to the OpenAI API project...');
-  const models = await listOpenAIModels(apiKey);
-  const model = selectLocalCodexModel(models, environment.FORGEMIND_MODEL_STANDARD ?? environment.CODEX_MODEL);
-  const providerConfig = { apiKey, authMode: 'api_key' as const, useCli: true, codexHome };
-  const provider = createProvider('codex', { ...providerConfig, model, reasoningEffort: 'medium' });
-  report(`Verifying OpenAI API access with ${model}...`);
+  const initialRemotePool = loadRemotePool ? await loadRemotePool() : { connections: [] };
+  const candidates: WindowsProviderCandidate[] = [];
+  let localModels: ProviderModelOption[] = [];
+  if (apiKey) {
+    report('Loading models available to the local OpenAI API project...');
+    localModels = await listOpenAIModels(apiKey);
+    candidates.push({
+      id: 'local-api-key', label: 'local OpenAI API key', allowedModels: localModels.map(({ id }) => id),
+      create: async (route) => createProvider('codex', {
+        apiKey, authMode: 'api_key', useCli: true, codexHome,
+        model: route?.model ?? selectLocalCodexModel(localModels, environment.FORGEMIND_MODEL_STANDARD ?? environment.CODEX_MODEL),
+        reasoningEffort: route?.reasoningEffort ?? 'medium'
+      })
+    });
+  }
+  for (const remote of initialRemotePool.connections) {
+    if (remote.credential === apiKey) continue;
+    candidates.push({
+      id: remote.id,
+      label: `${remote.name} (${remote.authMode === 'chatgpt_plan_oauth' ? 'ChatGPT plan' : 'API key'})`,
+      allowedModels: remote.allowedModels.length > 0 ? remote.allowedModels : [remote.model],
+      create: async (route) => {
+        const current = loadRemotePool ? (await loadRemotePool()).connections.find((connection) => connection.id === remote.id) : remote;
+        if (!current) throw new Error(`ForgeMind provider connection "${remote.name}" is no longer available.`);
+        return createProvider('codex', {
+          ...(current.authMode === 'chatgpt_plan_oauth'
+            ? { authMode: 'chatgpt_plan_oauth' as const, accessToken: current.credential }
+            : { authMode: 'api_key' as const, apiKey: current.credential }),
+          useCli: true,
+          codexHome,
+          model: route?.model ?? current.model,
+          allowedModels: current.allowedModels,
+          reasoningEffort: route?.reasoningEffort ?? 'medium'
+        });
+      }
+    });
+  }
+  if (candidates.length === 0) {
+    throw new Error('No Windows authoring AI connection is available. Set OPENAI_API_KEY or connect an API/ChatGPT-plan connection in ForgeMind.');
+  }
+  const availableModels = Array.from(new Set(candidates.flatMap((candidate) => candidate.allowedModels)));
+  const modelOptions = localModels.length > 0
+    ? localModels
+    : availableModels.map((id, index) => ({ id, name: id, isDefault: index === 0 }));
+  const model = selectLocalCodexModel(modelOptions, environment.FORGEMIND_MODEL_STANDARD ?? environment.CODEX_MODEL);
+  const provider = createWindowsProviderPool(candidates, undefined, report);
+  report(`Verifying AI access with ${model} across ${candidates.length} connection(s)...`);
   const preflight = await provider.preflight();
-  if (!preflight.ok) throw new Error(`OpenAI API preflight failed before starting a Windows session: ${preflight.error?.auditSafeMessage ?? 'unknown error'}`);
-  const availableModels = models.map(({ id }) => id);
+  if (!preflight.ok) throw new Error(`AI provider preflight failed before starting a Windows session: ${preflight.error?.auditSafeMessage ?? 'unknown error'}`);
   return {
     provider,
     model,
     codexHome,
     availableModels,
-    providerForRoute: (route) => {
-      if (!availableModels.includes(route.model)) {
-        throw new Error(`Server-selected model "${route.model}" is not available to this Windows runner API key.`);
+    providerForRoute: (route) => createWindowsProviderPool(
+      candidates.filter((candidate) => candidate.allowedModels.includes(route.model)),
+      route,
+      report
+    )
+  };
+}
+
+export interface WindowsProviderCandidate {
+  id: string;
+  label: string;
+  allowedModels: string[];
+  create(route?: TaskModelSelection): Promise<AIProvider>;
+}
+
+export function createWindowsProviderPool(
+  candidates: WindowsProviderCandidate[],
+  route: TaskModelSelection | undefined,
+  report: (message: string) => void
+): AIProvider {
+  if (candidates.length === 0) {
+    throw new Error(`Server-selected model "${route?.model ?? 'unknown'}" is not available to any Windows runner AI connection.`);
+  }
+  let activeId = candidates[0]!.id;
+  const unavailable = new Set<string>();
+  const call = async <T>(operation: string, session: ProviderSessionContext | undefined,
+    action: (provider: AIProvider) => Promise<T>): Promise<T> => {
+    const ordered = [...candidates].sort((left, right) => left.id === activeId ? -1 : right.id === activeId ? 1 : 0);
+    let lastError: unknown;
+    for (const candidate of ordered) {
+      if (unavailable.has(candidate.id)) continue;
+      if (candidate.id !== activeId) {
+        report(`Switching AI connection to ${candidate.label} after ${operation} could not continue.`);
+        if (session) {
+          session.id = undefined;
+          session.provider = 'codex';
+          session.model = route?.model;
+        }
       }
-      return createProvider('codex', { ...providerConfig, model: route.model, reasoningEffort: route.reasoningEffort });
+      try {
+        const result = await action(await candidate.create(route));
+        activeId = candidate.id;
+        return result;
+      } catch (error) {
+        const normalized = normalizeProviderError('codex', error);
+        lastError = error;
+        if (!normalized.failoverEligible) throw error;
+        if (!normalized.retryable) unavailable.add(candidate.id);
+      }
     }
+    throw lastError ?? new Error('No Windows authoring AI connection is available.');
+  };
+  return {
+    kind: 'codex',
+    preflight: async (signal) => {
+      try {
+        return await call('preflight', undefined, async (provider) => {
+          const result = await provider.preflight(signal);
+          if (!result.ok) {
+            throw Object.assign(new Error(result.error?.message ?? 'Provider preflight failed.'), {
+              status: result.error?.statusCode,
+              errorCode: result.error?.errorCode,
+              retryAfterMs: result.error?.retryAfterMs
+            });
+          }
+          return result;
+        });
+      } catch (error) {
+        const normalized = normalizeProviderError('codex', error);
+        return { provider: 'codex', ok: false, checkedAt: new Date().toISOString(), error: normalized.toDetails() };
+      }
+    },
+    routeTask: (input) => call('route_task', undefined, (provider) => {
+      if (!provider.routeTask) throw new Error('The selected provider does not support task routing.');
+      return provider.routeTask(input);
+    }),
+    plan: (input) => call('plan', input.session, (provider) => provider.plan(input)),
+    implement: (input) => call('implement', input.session, (provider) => provider.implement(input)),
+    review: (input) => call('review', input.session, (provider) => provider.review(input)),
+    estimateCost: (input) => call('estimate_cost', undefined, (provider) => provider.estimateCost(input)),
+    supportsLocalRepo: () => true,
+    supportsGitHubNativeFlow: () => false,
+    supportsNativeRepositoryReview: () => true,
+    supportsNativeRepositoryAudit: () => true
   };
 }
 
@@ -174,10 +295,21 @@ export async function main(args = process.argv.slice(2)): Promise<void> {
     stdout.write(`Enrolled device ${credential.deviceId}.\n`); return;
   }
   const auth = await store.load(); if (!auth) throw new Error('Runner is not enrolled.');
+  if (parsed.command === 'provider-connect-chatgpt') {
+    const terminal = createInterface({ input: stdin, output: stdout });
+    const code = await terminal.question('One-time ChatGPT connection code: '); terminal.close();
+    const connection = await connectChatGPTPlan(transport, auth, code, (message) => stdout.write(`${message}\n`));
+    stdout.write(`Connected ${connection.name} (${connection.connectionId}).\n`);
+    return;
+  }
   if (parsed.command === 'session-drain') { await transport.drain(auth, parsed.sessionId); return; }
   if (parsed.command === 'session-stop') { await transport.stop(auth, parsed.sessionId); return; }
-  stdout.write('[preflight] Checking Codex CLI sandbox and OpenAI API key...\n');
-  const codexRuntime = await prepareLocalCodexRuntime(process.env, (message) => stdout.write(`[preflight] ${message}\n`));
+  stdout.write('[preflight] Checking Codex CLI sandbox and configured AI connection pool...\n');
+  const codexRuntime = await prepareLocalCodexRuntime(
+    process.env,
+    (message) => stdout.write(`[preflight] ${message}\n`),
+    () => transport.providerPool(auth)
+  );
   stdout.write(`[preflight] Codex passed; selected model ${codexRuntime.model}.\n`);
   stdout.write('[preflight] Checking local Windows capabilities...\n');
   const probes = await runCapabilityProbes(windowsRunnerCapabilityProbes(osRelease()), new Date(), (progress) => {
@@ -188,7 +320,7 @@ export async function main(args = process.argv.slice(2)): Promise<void> {
   if (!process.env.FORGEMIND_UNREAL_EXECUTABLE) {
     stdout.write('[preflight] unreal: not configured; set FORGEMIND_UNREAL_EXECUTABLE in this process before testing Unreal authoring.\n');
   }
-  stdout.write(`OpenAI API preflight passed. Standard model: ${codexRuntime.model}. Available models: ${codexRuntime.availableModels.join(', ')}.\n`);
+  stdout.write(`AI provider pool preflight passed. Standard model: ${codexRuntime.model}. Available models: ${codexRuntime.availableModels.join(', ')}.\n`);
   const failedRequiredProbes = requiredProbeFailures(probes.evidence);
   if (parsed.command === 'probe') {
     if (parsed.json) stdout.write(`${JSON.stringify(probes.evidence, null, 2)}\n`);

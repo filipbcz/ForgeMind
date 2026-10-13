@@ -3,6 +3,14 @@ import type { RunnerCredential } from './credential-store.js';
 
 export interface RunnerControlState { deviceStatus: string; sessionStatus: string; leaseStatus?: string; jobStatus?: string }
 export interface LeaseClaim { job: WindowsExecutionJob | null; lease: WindowsExecutionLease | null }
+export interface WindowsProviderConnection {
+  id: string;
+  name: string;
+  authMode: 'api_key' | 'chatgpt_plan_oauth';
+  model: string;
+  allowedModels: string[];
+  credential: string;
+}
 export const WINDOWS_RUNNER_LEASE_SECONDS = 300;
 
 /** Outbound-only HTTPS control-plane client. It never opens a listening socket. */
@@ -13,6 +21,20 @@ export class WindowsRunnerTransport {
     if (this.baseUrl.protocol !== 'https:') throw new Error('Windows runner API URL must use HTTPS.');
   }
   enroll(code: string) { return this.call<RunnerCredential>('/api/windows-runner/enroll', undefined, { code }); }
+  exchangeChatGPTPlanEnrollment(auth: RunnerCredential, code: string) {
+    return this.call<{ uploadToken: string; hostId: string; expiresAt: string }>('/api/windows-runner/device/chatgpt-plan/enroll', auth, { code });
+  }
+  completeChatGPTPlanEnrollment(auth: RunnerCredential, input: {
+    uploadToken: string; nonce: string; clientId: string; accessToken: string; refreshToken: string;
+    idToken: string; scope: string; expiresIn: number;
+  }) {
+    return this.call<{ ok: true; connection: { id: string; name: string; accountSummary?: string } }>(
+      '/api/windows-runner/device/chatgpt-plan/complete', auth, input
+    );
+  }
+  providerPool(auth: RunnerCredential) {
+    return this.call<{ connections: WindowsProviderConnection[] }>('/api/windows-runner/device/provider-pool', auth, undefined, 'GET');
+  }
   publishDevice(auth: RunnerCredential, input: { runnerVersion: string; displayName: string; capabilities: WorkerCapability[]; probeEvidence: WorkerProbeEvidence[] }) {
     return this.call('/api/windows-runner/device', auth, input, 'PUT');
   }

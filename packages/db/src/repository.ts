@@ -46,7 +46,7 @@ import {
   type TaskModelRoutingDecision,
   type TaskRunState
 } from '@forgemind/core';
-import { createHash, randomUUID } from 'node:crypto';
+import { createHash, randomBytes, randomUUID } from 'node:crypto';
 import { parseAgentConfigYaml } from '@forgemind/config';
 import type { JsonValue } from '@forgemind/shared';
 import { Prisma } from '@prisma/client';
@@ -311,14 +311,14 @@ export interface GitHubConnectionSecret extends GitHubConnectionSnapshot {
 }
 
 export type AIProviderConnectionKind = Extract<ProviderKind, 'openai' | 'codex' | 'github_copilot'>;
-export type AIProviderAuthMode = 'api_key' | 'codex_oauth';
+export type AIProviderAuthMode = 'api_key' | 'codex_oauth' | 'chatgpt_plan_oauth';
 
 export interface AIProviderConnectionSnapshot {
   id: string;
   userId: string;
   name: string;
   isDefault: boolean;
-  credentialSource: 'api_key' | 'codex_oauth';
+  credentialSource: 'api_key' | 'codex_oauth' | 'chatgpt_plan_oauth';
   provider: AIProviderConnectionKind;
   authMode: AIProviderAuthMode;
   model: string;
@@ -326,6 +326,12 @@ export interface AIProviderConnectionSnapshot {
   apiKeyFingerprint?: string;
   codexHome?: string;
   accountSummary?: string;
+  automaticFailover: boolean;
+  failoverPriority: number;
+  oauthClientId?: string;
+  oauthHostId?: string;
+  oauthScopes?: string[];
+  oauthExpiresAt?: string;
   connectedAt: string;
   lastCheckedAt?: string;
   updatedAt: string;
@@ -333,6 +339,23 @@ export interface AIProviderConnectionSnapshot {
 
 export interface AIProviderConnectionSecret extends AIProviderConnectionSnapshot {
   apiKey?: string;
+  accessToken?: string;
+  refreshToken?: string;
+  idToken?: string;
+  oauthSubject?: string;
+  oauthIssuer?: string;
+}
+
+export interface ChatGPTPlanTokenSet {
+  clientId: string;
+  subject: string;
+  issuer: string;
+  email?: string;
+  accessToken: string;
+  refreshToken: string;
+  idToken: string;
+  scopes: string[];
+  expiresAt: string;
 }
 
 export interface NotificationSettingsSnapshot {
@@ -729,6 +752,15 @@ export class ForgeMindRepository {
     return connections.map(toAIProviderConnectionSnapshot);
   }
 
+  async listAIProviderConnectionSecrets(userId = LOCAL_USER_ID): Promise<AIProviderConnectionSecret[]> {
+    const connections = await this.prisma.aiProviderConnection.findMany({
+      where: { userId },
+      orderBy: [{ isDefault: 'desc' }, { failoverPriority: 'asc' }, { createdAt: 'asc' }]
+    });
+    const resolved = await Promise.allSettled(connections.map((connection) => this.toAIProviderConnectionSecret(connection)));
+    return resolved.flatMap((result) => result.status === 'fulfilled' ? [result.value] : []);
+  }
+
   async getAIProviderConnection(userId = LOCAL_USER_ID): Promise<AIProviderConnectionSnapshot | undefined> {
     const connection = await this.findDefaultAIProviderConnection(userId);
     return connection ? toAIProviderConnectionSnapshot(connection) : undefined;
@@ -813,6 +845,8 @@ export class ForgeMindRepository {
     apiKey?: string;
     codexHome?: string;
     accountSummary?: string;
+    automaticFailover?: boolean;
+    failoverPriority?: number;
     userId?: string;
   }): Promise<AIProviderConnectionSnapshot> {
     const userId = input.userId ?? LOCAL_USER_ID;
@@ -857,6 +891,8 @@ export class ForgeMindRepository {
             apiKeyFingerprint,
             codexHome: authMode === 'api_key' ? null : input.codexHome ?? existingConnection?.codexHome,
             accountSummary: authMode === 'api_key' ? null : input.accountSummary ?? existingConnection?.accountSummary,
+            automaticFailover: input.automaticFailover ?? existingConnection?.automaticFailover ?? false,
+            failoverPriority: input.failoverPriority ?? existingConnection?.failoverPriority ?? 100,
             lastCheckedAt: now
           }
         });
@@ -875,6 +911,8 @@ export class ForgeMindRepository {
           apiKeyFingerprint,
           codexHome: input.codexHome,
           accountSummary: input.accountSummary,
+          automaticFailover: input.automaticFailover ?? false,
+          failoverPriority: input.failoverPriority ?? 100,
           lastCheckedAt: now
         }
       });
@@ -885,7 +923,9 @@ export class ForgeMindRepository {
       actorId: userId,
       eventType: 'ai_provider_connection_saved',
       payload: {
-        credentialSource: connection.authMode === 'codex_oauth' ? 'codex_oauth' : 'api_key',
+        credentialSource: connection.authMode === 'chatgpt_plan_oauth'
+          ? 'chatgpt_plan_oauth'
+          : connection.authMode === 'codex_oauth' ? 'codex_oauth' : 'api_key',
         connectionId: connection.id,
         name: connection.name,
         isDefault: connection.isDefault,
@@ -900,6 +940,124 @@ export class ForgeMindRepository {
     });
 
     return toAIProviderConnectionSnapshot(connection);
+  }
+
+  async createChatGPTPlanEnrollment(input: {
+    name?: string;
+    isDefault?: boolean;
+    automaticFailover?: boolean;
+    failoverPriority?: number;
+    userId?: string;
+  }): Promise<{ enrollmentId: string; code: string; expiresAt: string }> {
+    const userId = input.userId ?? LOCAL_USER_ID;
+    await this.ensureLocalUser();
+    const code = randomBytes(24).toString('base64url');
+    const expiresAt = new Date(Date.now() + 15 * 60_000);
+    const existingHost = await this.prisma.aiProviderConnection.findFirst({
+      where: { userId, authMode: 'chatgpt_plan_oauth', oauthHostId: { not: null } },
+      select: { oauthHostId: true }
+    });
+    const created = await this.prisma.aiProviderOAuthEnrollment.create({
+      data: {
+        userId,
+        codeHash: createHash('sha256').update(code).digest('hex'),
+        name: input.name?.trim() || 'ChatGPT plan',
+        isDefault: input.isDefault ?? false,
+        automaticFailover: input.automaticFailover ?? true,
+        failoverPriority: input.failoverPriority ?? 100,
+        hostId: existingHost?.oauthHostId ?? `urn:uuid:${randomUUID()}`,
+        expiresAt
+      }
+    });
+    return { enrollmentId: created.id, code, expiresAt: expiresAt.toISOString() };
+  }
+
+  async exchangeChatGPTPlanEnrollment(code: string): Promise<{
+    uploadToken: string;
+    hostId: string;
+    expiresAt: string;
+  }> {
+    const uploadToken = randomBytes(32).toString('base64url');
+    const codeHash = createHash('sha256').update(code).digest('hex');
+    const now = new Date();
+    const enrollment = await this.prisma.aiProviderOAuthEnrollment.findUnique({ where: { codeHash } });
+    if (!enrollment || enrollment.expiresAt <= now || enrollment.exchangedAt || enrollment.completedAt) {
+      throw new Error('ChatGPT connection code is invalid, expired, or already used.');
+    }
+    const claimed = await this.prisma.aiProviderOAuthEnrollment.updateMany({
+      where: { id: enrollment.id, exchangedAt: null, completedAt: null, expiresAt: { gt: now } },
+      data: {
+        exchangedAt: now,
+        uploadTokenHash: createHash('sha256').update(uploadToken).digest('hex')
+      }
+    });
+    if (claimed.count !== 1) throw new Error('ChatGPT connection code is invalid, expired, or already used.');
+    return { uploadToken, hostId: enrollment.hostId, expiresAt: enrollment.expiresAt.toISOString() };
+  }
+
+  async completeChatGPTPlanEnrollment(uploadToken: string, tokens: ChatGPTPlanTokenSet): Promise<AIProviderConnectionSnapshot> {
+    const uploadTokenHash = createHash('sha256').update(uploadToken).digest('hex');
+    const enrollment = await this.prisma.aiProviderOAuthEnrollment.findUnique({ where: { uploadTokenHash } });
+    if (!enrollment || enrollment.expiresAt <= new Date() || enrollment.completedAt) {
+      throw new Error('ChatGPT credential upload is invalid, expired, or already completed.');
+    }
+    if (!tokens.scopes.includes('chatgpt.tokens.use.direct')) {
+      throw new Error('ChatGPT plan usage permission was not granted.');
+    }
+    const existingCount = await this.prisma.aiProviderConnection.count({ where: { userId: enrollment.userId } });
+    const isDefault = enrollment.isDefault || existingCount === 0;
+    const name = await this.resolveAIProviderConnectionName(enrollment.userId, enrollment.name);
+    const accessTokenCiphertext = await encryptSecret(tokens.accessToken);
+    const refreshTokenCiphertext = await encryptSecret(tokens.refreshToken);
+    const idTokenCiphertext = await encryptSecret(tokens.idToken);
+    const connection = await this.prisma.$transaction(async (tx) => {
+      const claimed = await tx.aiProviderOAuthEnrollment.updateMany({
+        where: { id: enrollment.id, completedAt: null, expiresAt: { gt: new Date() } },
+        data: { completedAt: new Date() }
+      });
+      if (claimed.count !== 1) throw new Error('ChatGPT credential upload is invalid, expired, or already completed.');
+      if (isDefault) await tx.aiProviderConnection.updateMany({ where: { userId: enrollment.userId }, data: { isDefault: false } });
+      const created = await tx.aiProviderConnection.create({
+        data: {
+          userId: enrollment.userId,
+          name,
+          isDefault,
+          provider: 'codex',
+          authMode: 'chatgpt_plan_oauth',
+          model: 'gpt-6.1-sol',
+          allowedModels: toPrismaJson(['gpt-6-luna', 'gpt-6.1-sol', 'gpt-6-astra']),
+          accountSummary: tokens.email ?? tokens.subject,
+          automaticFailover: enrollment.automaticFailover,
+          failoverPriority: enrollment.failoverPriority,
+          oauthClientId: tokens.clientId,
+          oauthSubject: tokens.subject,
+          oauthIssuer: tokens.issuer,
+          oauthHostId: enrollment.hostId,
+          oauthScopes: toPrismaJson(tokens.scopes),
+          oauthAccessTokenCiphertext: accessTokenCiphertext,
+          oauthRefreshTokenCiphertext: refreshTokenCiphertext,
+          oauthIdTokenCiphertext: idTokenCiphertext,
+          oauthExpiresAt: new Date(tokens.expiresAt),
+          lastCheckedAt: new Date()
+        }
+      });
+      return created;
+    });
+    return toAIProviderConnectionSnapshot(connection);
+  }
+
+  async updateChatGPTPlanTokens(connectionId: string, tokens: Pick<ChatGPTPlanTokenSet, 'accessToken' | 'refreshToken' | 'idToken' | 'scopes' | 'expiresAt'>): Promise<void> {
+    await this.prisma.aiProviderConnection.update({
+      where: { id: connectionId },
+      data: {
+        oauthAccessTokenCiphertext: await encryptSecret(tokens.accessToken),
+        oauthRefreshTokenCiphertext: await encryptSecret(tokens.refreshToken),
+        oauthIdTokenCiphertext: await encryptSecret(tokens.idToken),
+        oauthScopes: toPrismaJson(tokens.scopes),
+        oauthExpiresAt: new Date(tokens.expiresAt),
+        lastCheckedAt: new Date()
+      }
+    });
   }
 
   async deleteAIProviderConnection(connectionId: string, userId = LOCAL_USER_ID): Promise<boolean> {
@@ -954,10 +1112,69 @@ export class ForgeMindRepository {
   }
 
   private async toAIProviderConnectionSecret(connection: AiProviderConnection): Promise<AIProviderConnectionSecret> {
+    const current = connection.authMode === 'chatgpt_plan_oauth'
+      && connection.oauthExpiresAt
+      && connection.oauthExpiresAt.getTime() <= Date.now() + 5 * 60_000
+      ? await this.refreshChatGPTPlanConnection(connection)
+      : connection;
     return {
-      ...toAIProviderConnectionSnapshot(connection),
-      apiKey: connection.apiKeyCiphertext ? await decryptSecret(connection.apiKeyCiphertext) : undefined
+      ...toAIProviderConnectionSnapshot(current),
+      apiKey: current.apiKeyCiphertext ? await decryptSecret(current.apiKeyCiphertext) : undefined,
+      accessToken: current.oauthAccessTokenCiphertext ? await decryptSecret(current.oauthAccessTokenCiphertext) : undefined,
+      refreshToken: current.oauthRefreshTokenCiphertext ? await decryptSecret(current.oauthRefreshTokenCiphertext) : undefined,
+      idToken: current.oauthIdTokenCiphertext ? await decryptSecret(current.oauthIdTokenCiphertext) : undefined,
+      oauthSubject: current.oauthSubject ?? undefined,
+      oauthIssuer: current.oauthIssuer ?? undefined
     };
+  }
+
+  private async refreshChatGPTPlanConnection(connection: AiProviderConnection): Promise<AiProviderConnection> {
+    return this.prisma.$transaction(async (tx) => {
+      await tx.$queryRaw`SELECT pg_advisory_xact_lock(hashtext(${connection.id}))`;
+      const current = await tx.aiProviderConnection.findUnique({ where: { id: connection.id } });
+      if (!current) throw new Error(`ChatGPT plan connection "${connection.name}" no longer exists.`);
+      if (current.oauthExpiresAt && current.oauthExpiresAt.getTime() > Date.now() + 5 * 60_000) return current;
+      if (!current.oauthClientId || !current.oauthRefreshTokenCiphertext || !current.oauthIdTokenCiphertext) {
+        throw new Error(`ChatGPT plan connection "${current.name}" cannot be refreshed.`);
+      }
+      const refreshToken = await decryptSecret(current.oauthRefreshTokenCiphertext);
+      const response = await fetch('https://auth.openai.com/api/accounts/oauth/token', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+        body: new URLSearchParams({
+          grant_type: 'refresh_token',
+          client_id: current.oauthClientId,
+          refresh_token: refreshToken,
+          resource: 'https://api.openai.com/v1'
+        })
+      });
+      const payload = await response.json().catch(() => ({})) as Record<string, unknown>;
+      if (!response.ok) {
+        const error = new Error(`ChatGPT plan token refresh failed. HTTP ${response.status}.`) as Error & { status?: number; errorCode?: string };
+        error.status = response.status;
+        error.errorCode = typeof payload.error === 'string' ? payload.error : undefined;
+        throw error;
+      }
+      const accessToken = typeof payload.access_token === 'string' ? payload.access_token : undefined;
+      if (!accessToken) throw new Error('ChatGPT plan token refresh returned no access token.');
+      const replacementRefreshToken = typeof payload.refresh_token === 'string' ? payload.refresh_token : refreshToken;
+      const currentIdToken = await decryptSecret(current.oauthIdTokenCiphertext);
+      const replacementIdToken = typeof payload.id_token === 'string' ? payload.id_token : currentIdToken;
+      const currentScopes = jsonStringArray(current.oauthScopes);
+      const scopes = typeof payload.scope === 'string' ? payload.scope.split(/\s+/).filter(Boolean) : currentScopes;
+      const expiresIn = typeof payload.expires_in === 'number' ? payload.expires_in : 3600;
+      return tx.aiProviderConnection.update({
+        where: { id: current.id },
+        data: {
+          oauthAccessTokenCiphertext: await encryptSecret(accessToken),
+          oauthRefreshTokenCiphertext: await encryptSecret(replacementRefreshToken),
+          oauthIdTokenCiphertext: await encryptSecret(replacementIdToken),
+          oauthScopes: toPrismaJson(scopes),
+          oauthExpiresAt: new Date(Date.now() + expiresIn * 1_000),
+          lastCheckedAt: new Date()
+        }
+      });
+    });
   }
 
   private async resolveAIProviderConnectionName(userId: string, requestedName: string, connectionId?: string): Promise<string> {
@@ -2519,7 +2736,7 @@ export class ForgeMindRepository {
 
   async updateTaskProviderSession(input: {
     taskId: string;
-    sessionId: string;
+    sessionId?: string;
     provider: ProviderKind;
     model: string;
     connectionId?: string;
@@ -2543,10 +2760,10 @@ export class ForgeMindRepository {
     await this.prisma.task.update({
       where: { id: input.taskId },
       data: {
-        providerSessionId: input.sessionId,
+        providerSessionId: input.sessionId ?? null,
         providerSessionProvider: input.provider,
         providerSessionModel: input.model,
-        providerSessionConnectionId: input.connectionId,
+        providerSessionConnectionId: input.connectionId ?? null,
         providerSessionUpdatedAt: new Date()
       }
     });
@@ -5290,7 +5507,9 @@ function toAIProviderConnectionSnapshot(connection: AiProviderConnection): AIPro
     userId: connection.userId,
     name: connection.name,
     isDefault: connection.isDefault,
-    credentialSource: authMode === 'codex_oauth' ? 'codex_oauth' : 'api_key',
+    credentialSource: authMode === 'chatgpt_plan_oauth'
+      ? 'chatgpt_plan_oauth'
+      : authMode === 'codex_oauth' ? 'codex_oauth' : 'api_key',
     provider: connection.provider as AIProviderConnectionKind,
     authMode,
     model: connection.model,
@@ -5298,6 +5517,12 @@ function toAIProviderConnectionSnapshot(connection: AiProviderConnection): AIPro
     apiKeyFingerprint: connection.apiKeyFingerprint ?? undefined,
     codexHome: connection.codexHome ?? undefined,
     accountSummary: connection.accountSummary ?? undefined,
+    automaticFailover: connection.automaticFailover,
+    failoverPriority: connection.failoverPriority,
+    oauthClientId: connection.oauthClientId ?? undefined,
+    oauthHostId: connection.oauthHostId ?? undefined,
+    oauthScopes: jsonStringArray(connection.oauthScopes),
+    oauthExpiresAt: connection.oauthExpiresAt?.toISOString(),
     connectedAt: connection.connectedAt.toISOString(),
     lastCheckedAt: connection.lastCheckedAt?.toISOString(),
     updatedAt: connection.updatedAt.toISOString()
@@ -5316,7 +5541,7 @@ function readProviderCircuitBreakerSnapshot(value: Prisma.JsonValue | undefined)
   const failureCount = typeof record.failureCount === 'number' ? record.failureCount : 0;
   const failureThreshold = typeof record.failureThreshold === 'number' ? record.failureThreshold : 3;
   const lastFailureKind = typeof record.lastFailureKind === 'string'
-    && ['authentication', 'quota', 'timeout', 'invalid_response', 'unavailable', 'unknown'].includes(record.lastFailureKind)
+    && ['authentication', 'quota', 'rate_limit', 'credit_exhausted', 'spend_limit', 'usage_limit', 'timeout', 'invalid_response', 'unavailable', 'unknown'].includes(record.lastFailureKind)
     ? record.lastFailureKind as ProviderConnectionRuntimeStatus['circuitBreaker']['lastFailureKind']
     : undefined;
   return {
@@ -5370,7 +5595,7 @@ function toProjectArchitectureUpdate(value: Prisma.JsonValue | undefined): Proje
 
 function buildAIProviderConnectionName(provider: AIProviderConnectionKind, authMode: AIProviderAuthMode, model: string): string {
   const providerName = provider === 'codex' ? 'Codex' : 'OpenAI';
-  const authName = authMode === 'codex_oauth' ? 'OAuth' : 'API key';
+  const authName = authMode === 'chatgpt_plan_oauth' ? 'ChatGPT plan' : authMode === 'codex_oauth' ? 'Legacy OAuth' : 'API key';
   return `${providerName} ${authName} ${model}`.trim();
 }
 

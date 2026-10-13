@@ -34,7 +34,7 @@ import type {
   ValidationImpactInput,
   ValidationImpactResult
 } from './provider.js';
-import { ProviderContractError, buildTaskRoutingMessages, normalizeProviderError, normalizeProviderPreflight, normalizeValidationChecks, parseChatResult, parseImplementResult, parsePlanResult, parseProviderJsonObject, parseReviewResult, parseTaskModelRoutingDecision, parseValidationImpactResult } from './provider.js';
+import { ProviderContractError, buildTaskRoutingMessages, normalizeProviderError, normalizeProviderHttpError, normalizeProviderPreflight, normalizeValidationChecks, parseChatResult, parseImplementResult, parsePlanResult, parseProviderJsonObject, parseReviewResult, parseTaskModelRoutingDecision, parseValidationImpactResult } from './provider.js';
 import { emitCapturedUsage, normalizeTokenBreakdown } from './provider-usage.js';
 import { calculateModelCostUsd } from './model-pricing.js';
 import { buildReviewPrompt } from './review-prompt.js';
@@ -434,6 +434,7 @@ export class CodexProvider implements AIProvider {
   readonly kind: ProviderKind = 'codex';
 
   private readonly apiKey?: string;
+  private readonly authMode: 'api_key' | 'chatgpt_plan_oauth';
   private readonly apiBaseUrl: string;
   private readonly useCli: boolean;
   private readonly commandEnv: NodeJS.ProcessEnv;
@@ -445,24 +446,30 @@ export class CodexProvider implements AIProvider {
     if ((config as { authMode?: string } | undefined)?.authMode === 'codex_oauth') {
       throw new Error('ChatGPT OAuth support was removed. Configure an OpenAI project API key instead.');
     }
-    const key = config?.apiKey ?? process.env.CODEX_API_KEY ?? process.env.OPENAI_API_KEY;
+    this.authMode = config?.authMode ?? 'api_key';
+    const key = this.authMode === 'chatgpt_plan_oauth'
+      ? config?.accessToken
+      : config?.apiKey ?? process.env.CODEX_API_KEY ?? process.env.OPENAI_API_KEY;
     if (!key) {
-      throw new Error('OPENAI_API_KEY or CODEX_API_KEY is required for the Codex API provider.');
+      throw new Error(this.authMode === 'chatgpt_plan_oauth'
+        ? 'A ChatGPT plan OAuth access token is required.'
+        : 'OPENAI_API_KEY or CODEX_API_KEY is required for the Codex API provider.');
     }
     this.apiKey = key;
     this.useCli = config?.useCli ?? false;
     this.apiBaseUrl = process.env.CODEX_API_BASE_URL ?? DEFAULT_CODEX_API_URL;
     const apiKeyCodexHome = config?.codexHome ?? process.env.FORGEMIND_API_CODEX_HOME
       ?? (process.env.CODEX_HOME ? join(process.env.CODEX_HOME, 'api-key') : join(homedir(), '.forgemind-codex-api'));
-    this.commandEnv = {
-      ...createWorkspaceEnvironment(),
-      // `codex exec` supports the dedicated CODEX_API_KEY environment
-      // variable for non-interactive API-key authentication. Keep
-      // OPENAI_API_KEY as well for compatible CLI versions and tools.
-      OPENAI_API_KEY: key,
-      CODEX_API_KEY: key,
-      CODEX_HOME: apiKeyCodexHome
-    };
+    this.commandEnv = this.authMode === 'chatgpt_plan_oauth'
+      ? { ...createWorkspaceEnvironment(), ACCESS_TOKEN: key, CODEX_HOME: apiKeyCodexHome }
+      : {
+          ...createWorkspaceEnvironment(),
+          // `codex exec` supports the dedicated CODEX_API_KEY environment
+          // variable for non-interactive API-key authentication.
+          OPENAI_API_KEY: key,
+          CODEX_API_KEY: key,
+          CODEX_HOME: apiKeyCodexHome
+        };
     this.model = config?.model?.trim() || (process.env.CODEX_MODEL ?? DEFAULT_CODEX_MODEL);
     const configuredModels = config?.allowedModels?.map((model) => model.trim()).filter(Boolean) ?? [];
     this.allowedModels = configuredModels.length > 0 ? configuredModels : [this.model];
@@ -471,12 +478,16 @@ export class CodexProvider implements AIProvider {
 
   async preflight(signal?: AbortSignal): Promise<ProviderPreflightResult> {
     return normalizeProviderPreflight(this.kind, async () => {
+      if (this.authMode === 'chatgpt_plan_oauth') {
+        await this.requestResponses([{ role: 'user', content: 'Reply with OK.' }], undefined, signal);
+        return;
+      }
       const response = await fetch(buildCodexModelsUrl(this.apiBaseUrl), {
         headers: { Authorization: `Bearer ${this.apiKey}` },
         signal
       });
       if (!response.ok) {
-        throw normalizeCodexHttpError(response, 'Codex preflight failed.');
+        throw await normalizeProviderHttpError('codex', response, 'Codex preflight failed.');
       }
       const payload = await readProviderJson<{ data?: Array<{ id?: string }> }>(response, 'Codex preflight');
       const ids = (payload.data ?? []).flatMap((item) => typeof item.id === 'string' ? [item.id] : []);
@@ -1109,8 +1120,9 @@ export class CodexProvider implements AIProvider {
       schemaPath,
       outputPath,
       repositoryPath: executionDirectory,
-      sessionId: resolveCompatibleSessionId(input.session, 'codex', this.model),
-      nativeToolChannel: input.nativeToolChannel
+      sessionId: this.authMode === 'chatgpt_plan_oauth' ? undefined : resolveCompatibleSessionId(input.session, 'codex', this.model),
+      nativeToolChannel: input.nativeToolChannel,
+      chatgptPlan: this.authMode === 'chatgpt_plan_oauth'
     });
 
     try {
@@ -1173,6 +1185,7 @@ export class CodexProvider implements AIProvider {
 
       const clientRequestId = randomUUID();
       const cacheableModel = /^gpt-(?:[6-9]|5\.(?:[6-9]|\d{2,}))(?:\.|-|$)/i.test(this.model);
+      const chatgptPlan = this.authMode === 'chatgpt_plan_oauth';
       const response = await fetch(this.apiBaseUrl, {
         method: 'POST',
         headers: {
@@ -1183,24 +1196,24 @@ export class CodexProvider implements AIProvider {
         signal,
         body: JSON.stringify({
           model: this.model,
-          previous_response_id: resolveCompatibleSessionId(session, 'codex', this.model),
+          ...(!chatgptPlan ? { previous_response_id: resolveCompatibleSessionId(session, 'codex', this.model) } : {}),
           input: messages.map((message) => ({
             role: message.role === 'system' ? 'developer' : message.role,
             content: [{ type: 'input_text', text: message.content,
-              ...(cacheableModel && message.role === 'system' ? { prompt_cache_breakpoint: { mode: 'explicit' } } : {}) }]
+              ...(!chatgptPlan && cacheableModel && message.role === 'system' ? { prompt_cache_breakpoint: { mode: 'explicit' } } : {}) }]
           })),
-          ...(cacheableModel ? { prompt_cache_options: { mode: 'explicit' } } : {}),
+          ...(!chatgptPlan && cacheableModel ? { prompt_cache_options: { mode: 'explicit' } } : {}),
           reasoning: { effort: this.reasoningEffort },
-          max_output_tokens: 8_000,
+          ...(!chatgptPlan ? { max_output_tokens: 8_000 } : { stream: true }),
           store: false
         })
       });
 
       if (!response.ok) {
-        throw normalizeCodexHttpError(response, 'Codex request failed.');
+        throw await normalizeProviderHttpError('codex', response, 'Codex request failed.');
       }
 
-      const data = await readProviderJson<{
+      const data = chatgptPlan ? await readChatGPTPlanResponseStream(response) : await readProviderJson<{
         id?: string;
         output_text?: string;
         output?: Array<{ content?: Array<{ text?: string }> }>;
@@ -1212,7 +1225,7 @@ export class CodexProvider implements AIProvider {
         };
       }>(response, 'Codex request');
 
-      if (data.id && session) {
+      if (!chatgptPlan && data.id && session) {
         session.id = data.id;
         session.provider = 'codex';
         session.model = this.model;
@@ -1262,19 +1275,50 @@ function buildCodexModelsUrl(apiBaseUrl: string): URL {
   return url;
 }
 
-function normalizeCodexHttpError(response: Response, message: string) {
-  return normalizeProviderError('codex', {
-    status: response.status,
-    message: `${message} HTTP ${response.status}.`
-  });
-}
-
 async function readProviderJson<T>(response: Response, operation: string): Promise<T> {
   try {
     return await response.json() as T;
   } catch (error) {
     throw new ProviderContractError(`${operation} returned invalid JSON.`);
   }
+}
+
+async function readChatGPTPlanResponseStream(response: Response): Promise<{
+  id?: string;
+  output_text?: string;
+  output?: Array<{ content?: Array<{ text?: string }> }>;
+  usage?: { input_tokens?: number; output_tokens?: number; total_tokens?: number; input_tokens_details?: { cached_tokens?: number } };
+}> {
+  const source = await response.text();
+  let text = '';
+  let completed: Record<string, unknown> | undefined;
+  for (const line of source.split(/\r?\n/)) {
+    if (!line.startsWith('data:')) continue;
+    const value = line.slice(5).trim();
+    if (!value || value === '[DONE]') continue;
+    let event: Record<string, unknown>;
+    try { event = JSON.parse(value) as Record<string, unknown>; }
+    catch { continue; }
+    const type = typeof event.type === 'string' ? event.type : '';
+    if (type === 'response.output_text.delta' && typeof event.delta === 'string') text += event.delta;
+    if (type === 'response.completed' && event.response && typeof event.response === 'object') completed = event.response as Record<string, unknown>;
+    if (type === 'error' || type === 'response.failed') {
+      const nested = event.error && typeof event.error === 'object' ? event.error as Record<string, unknown> : event;
+      const error = new Error(typeof nested.message === 'string' ? nested.message : 'ChatGPT plan response stream failed.') as Error & { errorCode?: string };
+      error.errorCode = typeof nested.code === 'string' ? nested.code : undefined;
+      throw error;
+    }
+  }
+  const output = Array.isArray(completed?.output) ? completed.output as Array<{ content?: Array<{ text?: string }> }> : undefined;
+  const usage = completed?.usage && typeof completed.usage === 'object'
+    ? completed.usage as { input_tokens?: number; output_tokens?: number; total_tokens?: number; input_tokens_details?: { cached_tokens?: number } }
+    : undefined;
+  return {
+    id: typeof completed?.id === 'string' ? completed.id : undefined,
+    output_text: text || undefined,
+    output,
+    usage
+  };
 }
 
 function serializeMessages(messages: Array<{ role: 'system' | 'user' | 'assistant'; content: string }>): string {
@@ -1302,6 +1346,7 @@ export function buildCodexExecArgs(input: {
   repositoryPath?: string;
   sessionId?: string;
   nativeToolChannel?: { command: string; args: string[] };
+  chatgptPlan?: boolean;
 }): string[] {
   const args = input.sessionId ? ['exec', 'resume'] : ['exec', '--color', 'never'];
 
@@ -1314,6 +1359,17 @@ export function buildCodexExecArgs(input: {
   }
 
   args.push('--model', input.model);
+  if (input.chatgptPlan) {
+    args.push(
+      '-c', 'model_provider="openai_chatgpt_plan"',
+      '-c', 'model_providers.openai_chatgpt_plan.name="ChatGPT plan"',
+      '-c', 'model_providers.openai_chatgpt_plan.base_url="https://api.openai.com/v1"',
+      '-c', 'model_providers.openai_chatgpt_plan.env_key="ACCESS_TOKEN"',
+      '-c', 'model_providers.openai_chatgpt_plan.wire_api="responses"',
+      '-c', 'model_providers.openai_chatgpt_plan.requires_openai_auth=false',
+      '-c', 'model_providers.openai_chatgpt_plan.supports_websockets=false'
+    );
+  }
   if (input.reasoningEffort) {
     args.push('-c', `model_reasoning_effort=${JSON.stringify(input.reasoningEffort)}`);
   }

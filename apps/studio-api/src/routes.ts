@@ -226,7 +226,9 @@ const providerConnectSchema = z
     authMode: z.literal('api_key').optional().default('api_key'),
     apiKey: z.string().min(1).optional(),
     model: z.string().trim().min(1).optional(),
-    allowedModels: z.array(z.string().trim().min(1)).max(16).optional()
+    allowedModels: z.array(z.string().trim().min(1)).max(16).optional(),
+    automaticFailover: z.boolean().optional().default(false),
+    failoverPriority: z.number().int().min(0).max(10_000).optional().default(100)
   })
   .superRefine((input, context) => {
     if (input.provider !== 'github_copilot' && !input.apiKey && !input.connectionId) {
@@ -237,6 +239,13 @@ const providerConnectSchema = z
       });
     }
   });
+
+const chatGPTPlanEnrollmentSchema = z.object({
+  name: z.string().trim().min(1).max(80).optional(),
+  isDefault: z.boolean().optional().default(false),
+  automaticFailover: z.boolean().optional().default(true),
+  failoverPriority: z.number().int().min(0).max(10_000).optional().default(100)
+});
 
 const providerModelsSchema = z.object({
   provider: z.enum(['openai', 'codex', 'github_copilot']),
@@ -315,8 +324,8 @@ export function registerRoutes(
       return {
         ...connection,
         runtimeStatus,
-        available: connection.authMode === 'api_key',
-        availability: connection.authMode === 'api_key' ? 'available' : 'api_key_migration_required'
+        available: connection.authMode !== 'codex_oauth',
+        availability: connection.authMode === 'codex_oauth' ? 'api_key_migration_required' : 'available'
       };
     });
     const envProvider = process.env.FORGEMIND_PROVIDER === 'openai'
@@ -362,7 +371,7 @@ export function registerRoutes(
       configured: {
         openai: providerConnection?.provider === 'openai' || Boolean(process.env.OPENAI_API_KEY),
         codex: providerConnection?.provider === 'codex'
-          ? providerConnection.authMode === 'api_key'
+          ? providerConnection.authMode !== 'codex_oauth'
           : Boolean(process.env.CODEX_API_KEY || process.env.OPENAI_API_KEY),
         github_copilot:
           providerConnection?.provider === 'github_copilot'
@@ -387,6 +396,19 @@ export function registerRoutes(
   });
 
   app.get('/api/providers/connections', async () => listAIProviderConnections(repository));
+
+  app.post('/api/providers/chatgpt-plan/enrollments', async (request, reply) => {
+    try {
+      const input = chatGPTPlanEnrollmentSchema.parse(request.body ?? {});
+      const providerRepository = repository as ForgeMindRepository & {
+        createChatGPTPlanEnrollment?: ForgeMindRepository['createChatGPTPlanEnrollment'];
+      };
+      if (!providerRepository.createChatGPTPlanEnrollment) throw new Error('ChatGPT plan enrollment storage is unavailable.');
+      return reply.send(await providerRepository.createChatGPTPlanEnrollment(input));
+    } catch (error) {
+      return sendBadRequest(reply, error);
+    }
+  });
 
   app.post('/api/providers/models', async (request, reply) => {
     try {
@@ -672,7 +694,9 @@ export function registerRoutes(
         model: routerModel,
         allowedModels,
         codexHome: undefined,
-        accountSummary: undefined
+        accountSummary: undefined,
+        automaticFailover: input.automaticFailover,
+        failoverPriority: input.failoverPriority
       });
       await repository.writeAudit({
         actorType: 'user',
@@ -2632,12 +2656,14 @@ async function saveAIProviderConnection(
     name?: string;
     isDefault?: boolean;
     provider: AIProviderConnectionKind;
-    authMode?: 'api_key' | 'codex_oauth';
+    authMode?: 'api_key' | 'codex_oauth' | 'chatgpt_plan_oauth';
     apiKey?: string;
     model: string;
     allowedModels?: string[];
     codexHome?: string;
     accountSummary?: string;
+    automaticFailover?: boolean;
+    failoverPriority?: number;
   }
 ) {
   const maybeRepository = repository as ForgeMindRepository & {

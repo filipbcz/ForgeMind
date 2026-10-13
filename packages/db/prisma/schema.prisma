@@ -111,6 +111,7 @@ enum AuditActorType {
 enum AiProviderAuthMode {
   api_key
   codex_oauth
+  chatgpt_plan_oauth
 }
 
 enum ChatThreadStatus {
@@ -148,6 +149,7 @@ model User {
   notificationSubscriptions NotificationSubscription[]
   githubConnection          GitHubConnection?
   aiProviderConnections     AiProviderConnection[]
+  aiProviderOAuthEnrollments AiProviderOAuthEnrollment[]
   chatThreads               ChatThread[]
   authSessions              AuthSession[]
 
@@ -301,6 +303,17 @@ model AiProviderConnection {
   apiKeyFingerprint String?            @map("api_key_fingerprint")
   codexHome         String?            @map("codex_home")
   accountSummary    String?            @map("account_summary")
+  automaticFailover Boolean            @default(false) @map("automatic_failover")
+  failoverPriority  Int                @default(100) @map("failover_priority")
+  oauthClientId     String?            @map("oauth_client_id")
+  oauthSubject      String?            @map("oauth_subject")
+  oauthIssuer       String?            @map("oauth_issuer")
+  oauthHostId       String?            @map("oauth_host_id")
+  oauthScopes       Json               @default("[]") @map("oauth_scopes")
+  oauthAccessTokenCiphertext  String?  @map("oauth_access_token_ciphertext")
+  oauthRefreshTokenCiphertext String?  @map("oauth_refresh_token_ciphertext")
+  oauthIdTokenCiphertext      String?  @map("oauth_id_token_ciphertext")
+  oauthExpiresAt    DateTime?          @map("oauth_expires_at")
   connectedAt       DateTime           @default(now()) @map("connected_at")
   lastCheckedAt     DateTime?          @map("last_checked_at")
   createdAt         DateTime           @default(now()) @map("created_at")
@@ -313,6 +326,27 @@ model AiProviderConnection {
   @@unique([userId, name])
   @@index([userId, isDefault])
   @@map("ai_provider_connections")
+}
+
+model AiProviderOAuthEnrollment {
+  id                String    @id @default(uuid())
+  userId            String    @map("user_id")
+  codeHash          String    @unique @map("code_hash")
+  uploadTokenHash   String?   @unique @map("upload_token_hash")
+  name              String
+  isDefault         Boolean   @default(false) @map("is_default")
+  automaticFailover Boolean   @default(true) @map("automatic_failover")
+  failoverPriority  Int       @default(100) @map("failover_priority")
+  hostId            String    @map("host_id")
+  expiresAt         DateTime  @map("expires_at")
+  exchangedAt       DateTime? @map("exchanged_at")
+  completedAt       DateTime? @map("completed_at")
+  createdAt         DateTime  @default(now()) @map("created_at")
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId, expiresAt])
+  @@map("ai_provider_oauth_enrollments")
 }
 
 model ChatThread {

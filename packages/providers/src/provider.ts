@@ -436,7 +436,10 @@ export class NormalizedProviderError extends Error implements NormalizedProvider
   readonly kind: NormalizedProviderErrorKind;
   readonly auditSafeMessage: string;
   readonly retryable: boolean;
+  readonly failoverEligible: boolean;
   readonly statusCode?: number;
+  readonly errorCode?: string;
+  readonly retryAfterMs?: number;
 
   constructor(details: NormalizedProviderErrorDetails, options?: { cause?: unknown }) {
     super(details.message, options);
@@ -445,7 +448,10 @@ export class NormalizedProviderError extends Error implements NormalizedProvider
     this.kind = details.kind;
     this.auditSafeMessage = details.auditSafeMessage;
     this.retryable = details.retryable;
+    this.failoverEligible = details.failoverEligible;
     this.statusCode = details.statusCode;
+    this.errorCode = details.errorCode;
+    this.retryAfterMs = details.retryAfterMs;
   }
 
   toJSON(): NormalizedProviderErrorDetails {
@@ -459,7 +465,10 @@ export class NormalizedProviderError extends Error implements NormalizedProvider
       message: this.message,
       auditSafeMessage: this.auditSafeMessage,
       retryable: this.retryable,
-      ...(this.statusCode === undefined ? {} : { statusCode: this.statusCode })
+      failoverEligible: this.failoverEligible,
+      ...(this.statusCode === undefined ? {} : { statusCode: this.statusCode }),
+      ...(this.errorCode === undefined ? {} : { errorCode: this.errorCode }),
+      ...(this.retryAfterMs === undefined ? {} : { retryAfterMs: this.retryAfterMs })
     };
   }
 }
@@ -474,15 +483,62 @@ export function normalizeProviderError(
   const statusCode = readStatusCode(error);
   const rawMessage = readErrorMessage(error) ?? fallbackMessage;
   const kind = classifyProviderError(error, rawMessage, statusCode);
+  const errorCode = readStringProperty(error, 'errorCode') ?? readStringProperty(error, 'code');
+  const retryAfterMs = readNumberProperty(error, 'retryAfterMs');
   const auditSafeMessage = redactError(rawMessage);
+  const retryable = kind === 'timeout' || kind === 'unavailable' || kind === 'rate_limit';
+  const failoverEligible = retryable
+    || kind === 'credit_exhausted'
+    || kind === 'spend_limit'
+    || kind === 'usage_limit'
+    || kind === 'quota'
+    || kind === 'authentication';
   return new NormalizedProviderError({
     provider,
     kind,
     message: auditSafeMessage || fallbackMessage,
     auditSafeMessage: auditSafeMessage || fallbackMessage,
-    retryable: kind === 'timeout' || kind === 'unavailable',
-    statusCode
+    retryable,
+    failoverEligible,
+    statusCode,
+    ...(errorCode ? { errorCode } : {}),
+    ...(retryAfterMs === undefined ? {} : { retryAfterMs })
   }, { cause: error });
+}
+
+/** Preserve machine-readable OpenAI recovery metadata without copying arbitrary
+ * response bodies into task logs. */
+export async function normalizeProviderHttpError(
+  provider: ProviderKind,
+  response: Response,
+  message: string
+): Promise<NormalizedProviderError> {
+  let payload: unknown;
+  try {
+    payload = await response.clone().json();
+  } catch {
+    payload = undefined;
+  }
+  const record = payload && typeof payload === 'object' ? payload as Record<string, unknown> : undefined;
+  const nested = record?.error && typeof record.error === 'object' ? record.error as Record<string, unknown> : undefined;
+  const errorCode = readStringProperty(nested, 'code') ?? readStringProperty(record, 'code');
+  const diagnostic = readStringProperty(nested, 'message') ?? readStringProperty(record, 'detail');
+  const header = (name: string): string | null => response.headers?.get?.(name) ?? null;
+  const retryAfterValue = header('retry-after');
+  const retryAfterSeconds = retryAfterValue === null ? Number.NaN : Number(retryAfterValue);
+  const retryAfterMs = Number.isFinite(retryAfterSeconds) && retryAfterSeconds >= 0
+    ? Math.ceil(retryAfterSeconds * 1_000)
+    : undefined;
+  const suffix = [errorCode ? `code=${errorCode}` : '', diagnostic ? diagnostic.slice(0, 300) : '']
+    .filter(Boolean)
+    .join(': ');
+  return normalizeProviderError(provider, {
+    status: response.status,
+    errorCode,
+    retryAfterMs,
+    requestId: header('x-request-id') ?? undefined,
+    message: `${message} HTTP ${response.status}.${suffix ? ` ${suffix}` : ''}`
+  });
 }
 
 export async function normalizeProviderPreflight(
@@ -511,6 +567,11 @@ function classifyProviderError(
 ): NormalizedProviderErrorKind {
   if (error instanceof ProviderContractError) return 'invalid_response';
   if (statusCode === 401 || statusCode === 403) return 'authentication';
+  const errorCode = readStringProperty(error, 'errorCode') ?? readStringProperty(error, 'code');
+  if (errorCode === 'credit_balance_exhausted') return 'credit_exhausted';
+  if (errorCode === 'organization_spend_limit_exceeded' || errorCode === 'project_spend_limit_exceeded') return 'spend_limit';
+  if (errorCode === 'organization_usage_limit_exceeded' || errorCode === 'subscription_sharing_usage_limit_exceeded') return 'usage_limit';
+  if (errorCode === 'rate_limit_exceeded' || errorCode === 'slow_down') return 'rate_limit';
   if (statusCode === 429) return 'quota';
   if (statusCode === 408 || statusCode === 504) return 'timeout';
   if (statusCode && statusCode >= 500) return 'unavailable';
@@ -518,14 +579,32 @@ function classifyProviderError(
   const normalized = message.toLowerCase();
   if (error instanceof Error && error.name === 'AbortError') return 'timeout';
   if (/\b(?:timeout|timed out|aborted)\b/.test(normalized)) return 'timeout';
+  if (/(?:no|out of|without|insufficient) credits?|credit balance (?:is )?(?:empty|exhausted)|add credits? to continue/.test(normalized)) {
+    return 'credit_exhausted';
+  }
+  if (/\b(?:organization|project|monthly)?\s*spend(?:ing)?[\s_-]?limit\b/.test(normalized)) return 'spend_limit';
+  if (/\b(?:workspace|subscription|organization)?\s*usage[\s_-]?limit\b/.test(normalized)) return 'usage_limit';
+  if (/\brate[\s_-]?limit\b|too many requests|slow_down/.test(normalized)) return 'rate_limit';
   if (/\b(?:unauthorized|forbidden|invalid[\s_-]?api[\s_-]?key|api[\s_-]?key|required|not active|login|auth(?:entication)?)\b/.test(normalized)) {
     return 'authentication';
   }
-  if (/\b(?:quota|rate[\s_-]?limit|insufficient[\s_-]?quota|billing)\b/.test(normalized)) return 'quota';
+  if (/\b(?:quota|insufficient[\s_-]?quota|billing)\b/.test(normalized)) return 'quota';
   if (/\b(?:invalid json|invalid response|malformed|must return|empty response)\b/.test(normalized)) {
     return 'invalid_response';
   }
   return 'unknown';
+}
+
+function readStringProperty(value: unknown, key: string): string | undefined {
+  if (!value || typeof value !== 'object') return undefined;
+  const candidate = (value as Record<string, unknown>)[key];
+  return typeof candidate === 'string' && candidate.trim() ? candidate.trim() : undefined;
+}
+
+function readNumberProperty(value: unknown, key: string): number | undefined {
+  if (!value || typeof value !== 'object') return undefined;
+  const candidate = (value as Record<string, unknown>)[key];
+  return typeof candidate === 'number' && Number.isFinite(candidate) ? candidate : undefined;
 }
 
 function readStatusCode(error: unknown): number | undefined {

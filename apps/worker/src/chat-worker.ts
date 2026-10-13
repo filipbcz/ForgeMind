@@ -72,9 +72,11 @@ export async function runNextChatTurn(repository: ForgeMindRepository, runtime: 
       : projectModelProfile;
     const provider = (runtime.createProvider ?? createProvider)(providerKind, connection?.provider === providerKind ? {
       apiKey: connection.apiKey,
+      accessToken: connection.accessToken,
       authMode: connection.authMode,
       codexHome: connection.codexHome,
       model: connection.model,
+      allowedModels: connection.allowedModels,
       modelProfile,
       useCli: providerKind === 'codex'
     } : { modelProfile, useCli: providerKind === 'codex' });

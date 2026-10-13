@@ -4,7 +4,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { listOpenAIModels, OpenAIProvider } from './openai-provider.js';
 import { CodexProvider, buildCodexExecArgs, buildCodexNativeImplementationPrompt, resolveCodexBinary, resolveCodexSandboxBypass } from './codex-provider.js';
-import { ProviderContractError, normalizeProviderError } from './provider.js';
+import { ProviderContractError, normalizeProviderError, normalizeProviderHttpError } from './provider.js';
 
 function successfulResponse(body: unknown): Response {
   return {
@@ -79,6 +79,8 @@ describe('OpenAI provider', () => {
       .toMatchObject({ provider: 'openai', kind: 'timeout', retryable: true, statusCode: 504 });
     expect(normalizeProviderError('openai', new ProviderContractError('OpenAI request returned invalid JSON')))
       .toMatchObject({ provider: 'openai', kind: 'invalid_response', retryable: false });
+    expect(normalizeProviderError('codex', new Error('Your workspace is out of credits. Ask your workspace owner to refill.')))
+      .toMatchObject({ provider: 'codex', kind: 'credit_exhausted', retryable: false, failoverEligible: true });
   });
 
   it('keeps normalized provider errors audit safe', () => {
@@ -90,6 +92,29 @@ describe('OpenAI provider', () => {
     expect(error.auditSafeMessage).toContain('[secret-redacted]');
     expect(error.auditSafeMessage).not.toContain('sk-test_1234567890abcdef');
     expect(error.message).toBe(error.auditSafeMessage);
+  });
+
+  it('preserves exact OpenAI exhaustion codes for safe connection failover', async () => {
+    const credit = await normalizeProviderHttpError('openai', new Response(JSON.stringify({
+      error: { code: 'credit_balance_exhausted', message: 'Add credits.' }
+    }), { status: 429, headers: { 'content-type': 'application/json', 'retry-after': '12', 'x-request-id': 'req_1' } }), 'OpenAI request failed.');
+    expect(credit.toDetails()).toMatchObject({
+      kind: 'credit_exhausted',
+      errorCode: 'credit_balance_exhausted',
+      retryable: false,
+      failoverEligible: true,
+      retryAfterMs: 12_000
+    });
+
+    const subscription = await normalizeProviderHttpError('codex', new Response(JSON.stringify({
+      error: { code: 'subscription_sharing_usage_limit_exceeded', message: 'Plan usage exhausted.' }
+    }), { status: 429, headers: { 'content-type': 'application/json' } }), 'Codex request failed.');
+    expect(subscription.toDetails()).toMatchObject({
+      kind: 'usage_limit',
+      errorCode: 'subscription_sharing_usage_limit_exceeded',
+      retryable: false,
+      failoverEligible: true
+    });
   });
 
   it('returns normalized preflight failures without exposing response bodies', async () => {
