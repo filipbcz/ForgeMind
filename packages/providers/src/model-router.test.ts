@@ -72,6 +72,43 @@ describe('model routing', () => {
     expect(state.decision?.implementation.model).toBe('gpt-6-luna');
   });
 
+  it('re-evaluates a persisted task route for retry and then reuses the refreshed decision', async () => {
+    const original = {
+      version: 1 as const,
+      routerModel: 'gpt-6.1-sol',
+      implementation: { model: 'gpt-6-astra', reasoningEffort: 'high' as const },
+      review: { model: 'gpt-6-astra', reasoningEffort: 'medium' as const },
+      escalation: { model: 'gpt-6-astra', reasoningEffort: 'high' as const },
+      rationale: 'Original route.', confidence: 0.8, decidedAt: new Date().toISOString()
+    };
+    const refreshed = {
+      ...original,
+      implementation: { model: 'gpt-6.1-sol', reasoningEffort: 'medium' as const },
+      review: { model: 'gpt-6.1-sol', reasoningEffort: 'medium' as const },
+      rationale: 'The retry failure is operational and does not justify Astra.'
+    };
+    const routeTask = vi.fn(async () => refreshed);
+    const fakeProvider = { kind: 'codex', routeTask } as unknown as AIProvider;
+    const state: ModelRoutingState = { decision: original };
+    const routed = new ModelRoutedProvider('codex', {
+      modelProfile: 'balanced', model: 'gpt-6.1-sol',
+      allowedModels: ['gpt-6-luna', 'gpt-6.1-sol', 'gpt-6-astra'], routingState: state
+    }, () => fakeProvider);
+    const input = {
+      taskId: 'task-1', title: 'Retry Unreal authoring', prompt: 'Repair the scene.', acceptanceCriteria: ['Scene loads.'],
+      availableModels: [], routerModel: '', previousFailure: 'Worker connection timed out.', reevaluate: true
+    };
+
+    const retryDecision = await routed.routeTask(input);
+    const reusedDecision = await routed.routeTask({ ...input, reevaluate: false });
+
+    expect(routeTask).toHaveBeenCalledTimes(1);
+    expect(routeTask).toHaveBeenCalledWith(expect.objectContaining({ reevaluate: true, previousDecision: original }));
+    expect(retryDecision).toEqual(refreshed);
+    expect(reusedDecision).toEqual(refreshed);
+    expect(state.decision).toEqual(refreshed);
+  });
+
   it('rejects a router response whose escalation route is weaker than implementation', () => {
     expect(() => parseTaskModelRoutingDecision(JSON.stringify({
       implementation: { model: 'gpt-6-astra', reasoningEffort: 'high' },

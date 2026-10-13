@@ -330,19 +330,6 @@ export async function runWorkerTask(input: WorkerTaskInput): Promise<WorkerTaskR
   }
 
   let taskModelRoutingDecision: TaskModelRoutingDecision | undefined = input.task.modelRoutingDecision;
-  if (input.resume?.resumeFrom !== 'delivery' && provider.routeTask) {
-    taskModelRoutingDecision = await provider.routeTask({
-      taskId: input.task.id,
-      title: input.task.title,
-      prompt: executionPrompt,
-      acceptanceCriteria: plan.acceptanceCriteria,
-      availableModels: [],
-      routerModel: '',
-      previousFailure: input.resume?.previousValidationError ?? input.resume?.previousReviewBlockers?.join(' | '),
-      signal: input.signal,
-      onActivity: (activity) => input.hooks?.onProviderActivity?.({ phase: 'planning', attempt: 0, ...activity })
-    });
-  }
   let validationChecks = normalizeValidationChecks(input.resume?.validationChecks);
   let externalValidationChecks = validationChecks.filter((check) => check.target === 'windows');
   if (!input.resume || rerunPlanning) {
@@ -437,6 +424,21 @@ export async function runWorkerTask(input: WorkerTaskInput): Promise<WorkerTaskR
     const priorOccurrences = correctionFingerprint ? correctionOccurrences.get(correctionFingerprint) ?? 0 : 0;
     const correctionOccurrence = correctionFingerprint ? priorOccurrences + 1 : 0;
     if (correctionFingerprint) correctionOccurrences.set(correctionFingerprint, correctionOccurrence);
+    const willInvokeImplementation = !resumedImplementation;
+    if (willInvokeImplementation && provider.routeTask) {
+      taskModelRoutingDecision = await provider.routeTask({
+        taskId: input.task.id,
+        title: input.task.title,
+        prompt: executionPrompt,
+        acceptanceCriteria: plan.acceptanceCriteria,
+        availableModels: [],
+        routerModel: '',
+        previousFailure: correctionFeedback,
+        reevaluate: Boolean(input.resume) || attempt > firstAttempt,
+        signal: input.signal,
+        onActivity: (activity) => input.hooks?.onProviderActivity?.({ phase: 'planning', attempt, ...activity })
+      });
+    }
     const implementationInput: Parameters<AIProvider['implement']>[0] = {
         taskId: input.task.id,
         prompt: executionPrompt,

@@ -667,8 +667,9 @@ export interface TaskModelSelection {
   reasoningEffort: ModelReasoningEffort;
 }
 
-/** One persisted model assignment for a task. The escalation route is used only
- * after a substantive implementation or review failure. */
+/** The latest persisted model assignment for a task. It is re-evaluated for
+ * each retry; the escalation route is used only after repeated substantive
+ * implementation or review failure. */
 export interface TaskModelRoutingDecision {
   version: 1;
   routerModel: string;

@@ -12,7 +12,8 @@ import type {
   ImplementResult,
   PlanResult,
   ReviewInput,
-  ReviewResult
+  ReviewResult,
+  TaskRoutingInput
 } from '@forgemind/providers';
 import { buildTaskExecutionPrompt, collectValidationWorkspacePatch, createDirectTaskPlan, runWorkerTask, selectReusableValidationResults, validationCheckFingerprint } from './workflow.js';
 import { replaceGitPatch } from './db-worker.js';
@@ -298,7 +299,7 @@ describe('simple autonomous worker workflow', () => {
   it('arbitrates implementation ownership to Windows before Linux validation and independent review', async () => {
     const project = createProject(); const task = createTask(project.id);
     const linuxImplement = vi.fn(async () => { throw new Error('Linux must not implement a Windows-owned step.'); });
-    const routeTask = vi.fn(async () => ({
+    const routeTask = vi.fn(async (_input: TaskRoutingInput) => ({
       version: 1 as const, routerModel: 'gpt-6.1-sol',
       implementation: { model: 'gpt-6-luna', reasoningEffort: 'medium' as const },
       review: { model: 'gpt-6.1-sol', reasoningEffort: 'low' as const },
@@ -318,7 +319,8 @@ describe('simple autonomous worker workflow', () => {
     expect(result.status).toBe('ready_for_user_review');
     expect(implementOnWindows).toHaveBeenCalledWith(expect.objectContaining({ baseCommitSha: expect.stringMatching(/^[a-f0-9]{40}$/) }));
     expect(implementOnWindows).toHaveBeenCalledTimes(2);
-    expect(routeTask).toHaveBeenCalledTimes(1);
+    expect(routeTask).toHaveBeenCalledTimes(2);
+    expect(routeTask.mock.calls[1]?.[0]).toMatchObject({ reevaluate: true, previousFailure: 'Fix native output.' });
     expect(implementOnWindows.mock.calls[0]?.[0]).toMatchObject({ modelRoute: { model: 'gpt-6-luna', reasoningEffort: 'medium' } });
     expect(implementOnWindows.mock.calls[1]?.[0]).toMatchObject({ modelRoute: { model: 'gpt-6-luna', reasoningEffort: 'medium' } });
     expect(implementOnWindows.mock.calls[1]?.[0]).toMatchObject({ escalationEvidence: { occurrences: 1, lowerCostAttempts: 0 } });

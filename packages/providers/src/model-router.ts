@@ -157,14 +157,15 @@ export class ModelRoutedProvider implements AIProvider {
   }
 
   async routeTask(input: TaskRoutingInput): Promise<TaskModelRoutingDecision> {
-    if (this.routingState.decision) return this.routingState.decision;
+    if (this.routingState.decision && !input.reevaluate) return this.routingState.decision;
     const availableModels = this.availableModels();
     const routerModel = this.routerModel();
     const router = this.providerForSelection({ model: routerModel, reasoningEffort: 'low' });
+    const previousDecision = this.routingState.decision;
     let decision: TaskModelRoutingDecision;
     if (router.routeTask) {
       try {
-        decision = await router.routeTask({ ...input, availableModels, routerModel });
+        decision = await router.routeTask({ ...input, availableModels, routerModel, previousDecision });
       } catch (error) {
         const kind = error && typeof error === 'object' && 'kind' in error
           ? (error as { kind?: unknown }).kind
@@ -178,7 +179,7 @@ export class ModelRoutedProvider implements AIProvider {
     this.routingState.decision = decision;
     await input.onActivity?.({
       kind: 'lifecycle',
-      message: `Task model route selected once: implementation ${decision.implementation.model} (${decision.implementation.reasoningEffort}), review ${decision.review.model} (${decision.review.reasoningEffort}), escalation ${decision.escalation.model} (${decision.escalation.reasoningEffort}). ${decision.rationale}`,
+      message: `Task model route ${input.reevaluate ? 're-evaluated for retry' : 'selected'}: implementation ${decision.implementation.model} (${decision.implementation.reasoningEffort}), review ${decision.review.model} (${decision.review.reasoningEffort}), escalation ${decision.escalation.model} (${decision.escalation.reasoningEffort}). ${decision.rationale}`,
       elapsedMs: 0,
       routingDecision: decision
     });

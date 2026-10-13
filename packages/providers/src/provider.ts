@@ -22,6 +22,9 @@ export interface TaskRoutingInput {
   availableModels: string[];
   routerModel: string;
   previousFailure?: string;
+  /** Re-evaluate a persisted route for a new implementation/review retry. */
+  reevaluate?: boolean;
+  previousDecision?: TaskModelRoutingDecision;
   onActivity?: ProviderActivityHandler;
   signal?: AbortSignal;
 }
@@ -33,6 +36,7 @@ export function buildTaskRoutingMessages(input: TaskRoutingInput): Array<{ role:
       content: 'You route one software task to the cheapest model and reasoning effort likely to complete it reliably. ' +
         'GPT-6 Luna is for focused, well-scoped and repeatable work; GPT-6.1 Sol is for complex coding and coordinated deliverables; GPT-6 Astra is for ambiguous, demanding or critical work. ' +
         'Prefer Sol for ordinary multi-file implementation. Select Astra for initial implementation only when the task itself contains concrete ambiguity or reasoning complexity that Sol is unlikely to resolve; repository size, Windows/Unreal tooling, or a prior operational failure alone are not sufficient. State that concrete reason in the rationale. ' +
+        'When retry is true, make a fresh selection from the current failure evidence: you may keep, downgrade, or upgrade the previous route. Do not treat authentication, quota, timeout, connection, worker interruption, checkpoint, lease, or missing-capability failures as evidence that a stronger model is needed. ' +
         'Choose implementation and independent review separately. Escalation is used only after a substantive implementation or review failure and must be at least as capable as the initial implementation route. ' +
         'Return JSON only with implementation, review, escalation (each containing model and reasoningEffort), rationale, and confidence from 0 to 1.'
     },
@@ -43,7 +47,9 @@ export function buildTaskRoutingMessages(input: TaskRoutingInput): Array<{ role:
         prompt: input.prompt,
         acceptanceCriteria: input.acceptanceCriteria,
         availableModels: input.availableModels,
-        previousFailure: input.previousFailure ?? null
+        previousFailure: input.previousFailure ?? null,
+        retry: input.reevaluate === true,
+        previousDecision: input.reevaluate ? input.previousDecision ?? null : null
       })
     }
   ];
