@@ -25,7 +25,8 @@ export interface NativeAuthoringTools {
 
 export interface NativeImplementationProvider {
   implement(input: { prompt: string; acceptanceCriteria: string[]; previousValidationError?: string; previousReviewBlockers?: string[];
-    operations: WindowsAuthoringPacket['operations']; tools: NativeAuthoringTools; signal?: AbortSignal }): Promise<{ summary: string; completedOperationIds: string[]; checkpointIds: string[]; providerUsage?: WindowsProviderUsage[] }>;
+    operations: WindowsAuthoringPacket['operations']; tools: NativeAuthoringTools; signal?: AbortSignal;
+    verifyCompletion?: () => Promise<void> }): Promise<{ summary: string; completedOperationIds: string[]; checkpointIds: string[]; providerUsage?: WindowsProviderUsage[] }>;
 }
 
 /** Bridges the runner lease to the ordinary implementation provider lifecycle.
@@ -111,6 +112,19 @@ export class LifecycleNativeImplementationProvider implements NativeImplementati
         const process = await input.tools.run({ command: check.command, shell, checkId: `provider-check-${index + 1}` });
         if (process.exitCode === 0) passed.set(identity, process); else { failure = process; break; }
       }
+      if (!failure && input.verifyCompletion) {
+        const verifiedAt = new Date().toISOString();
+        try {
+          await input.verifyCompletion();
+        } catch (error) {
+          failure = {
+            leaseId: 'local-verification', sessionId: 'local-verification', checkId: 'mandatory-final-verification',
+            command: 'runner.verify-authored-result', shell: 'system', exitCode: 1, stdout: '',
+            stderr: error instanceof Error ? error.message : String(error), startedAt: verifiedAt, completedAt: new Date().toISOString()
+          };
+          await input.tools.record(failure);
+        }
+      }
       if (!failure) break;
       const fingerprint = createHash('sha256').update(JSON.stringify({ command: failure.command, shell: failure.shell,
         exitCode: failure.exitCode, stdout: failure.stdout, stderr: failure.stderr })).digest('hex');
@@ -176,7 +190,10 @@ export async function executeWindowsAuthoring(packet: WindowsAuthoringPacket, co
   const reusableResult = checkout.resumed ? await readReusableCompletedResult(evidenceDirectory, packet, context, workspacePath) : undefined;
   if (reusableResult) return { workspacePath, result: reusableResult };
   let latestCheckpoint: AuthoringDiskCheckpoint | undefined;
-  let liveActivity = '';
+  const resumedUnrealPackages = checkout.checkpoint?.tree.filter((entry) => /\.(?:uasset|umap)$/i.test(entry.path)) ?? [];
+  let liveActivity = checkout.resumed && checkout.checkpoint
+    ? `Recovered durable checkpoint ${checkout.checkpoint.resultTreeSha.slice(0, 12)} with ${resumedUnrealPackages.length} Unreal package(s) (${resumedUnrealPackages.reduce((sum, entry) => sum + entry.sizeBytes, 0)} bytes).`
+    : '';
   let progressDelivery = Promise.resolve();
   const emitProgress = async (phase: import('@forgemind/core').WindowsAuthoringProgress['phase']) => {
     if (!context.onProgress || !latestCheckpoint) return;
@@ -206,10 +223,23 @@ export async function executeWindowsAuthoring(packet: WindowsAuthoringPacket, co
   let completedOperationIds: string[] = [];
   let checkpointIds: string[] = [];
   let providerUsage: WindowsProviderUsage[] = [];
+  let productionReviewRequired = false;
+  let completionVerified = false;
+  const verifyCompletion = async () => {
+    await rm(resolve(workspacePath, '.forgemind-tmp'), { recursive: true, force: true });
+    await cleanupIgnoredUnrealRuntimeState(workspacePath, processes, context.signal);
+    const currentChangedPaths = await stageChangedPaths(workspacePath, context.signal);
+    await rejectProhibitedResultPaths(packet, workspacePath, context.signal);
+    productionReviewRequired = await enforceRequiredUnrealAssets(packet, workspacePath, evidenceDirectory, outputDirectory, currentChangedPaths, processes,
+      packet.resourcePolicy.timeoutSeconds * 1_000, selectedUnrealCommandletExecutable, context.signal);
+    completionVerified = true;
+    await publishCheckpoint('verified');
+  };
   try {
-    const output = await context.provider.implement({ prompt: packet.step.prompt, acceptanceCriteria: packet.step.acceptanceCriteria,
+    const output = await context.provider.implement({ prompt: nativeImplementationPrompt(packet), acceptanceCriteria: packet.step.acceptanceCriteria,
       previousValidationError: packet.step.previousValidationError, previousReviewBlockers: packet.step.previousReviewBlockers,
-      operations: packet.operations, tools, signal: context.signal });
+      operations: packet.operations, tools, signal: context.signal,
+      verifyCompletion: packet.contentPolicy.requiresUnrealAssets ? verifyCompletion : undefined });
     summary = output.summary; completedOperationIds = output.completedOperationIds; checkpointIds = output.checkpointIds;
     providerUsage = output.providerUsage ?? [];
   } catch (error) {
@@ -223,8 +253,7 @@ export async function executeWindowsAuthoring(packet: WindowsAuthoringPacket, co
   await cleanupIgnoredUnrealRuntimeState(workspacePath, processes, context.signal);
   const changedPaths = await stageChangedPaths(workspacePath, context.signal);
   await rejectProhibitedResultPaths(packet, workspacePath, context.signal);
-  let productionReviewRequired = false;
-  if (status === 'succeeded') {
+  if (status === 'succeeded' && !completionVerified) {
     try {
       productionReviewRequired = await enforceRequiredUnrealAssets(packet, workspacePath, evidenceDirectory, outputDirectory, changedPaths, processes,
         packet.resourcePolicy.timeoutSeconds * 1_000, selectedUnrealCommandletExecutable, context.signal);
@@ -233,9 +262,11 @@ export async function executeWindowsAuthoring(packet: WindowsAuthoringPacket, co
       summary = `Final native Unreal verification failed: ${redactSecrets(error instanceof Error ? error.message : String(error))}`;
       authoringFailureState = classifyAuthoringFailure(summary, context.signal?.aborted === true, processes);
     }
+    await publishCheckpoint(status === 'succeeded' ? 'verified' : 'verification-failed');
+  }
+  if (status === 'succeeded') {
     await cleanupIgnoredUnrealRuntimeState(workspacePath, processes, context.signal);
     await copyReviewableChangedImages(workspacePath, outputDirectory, changedPaths);
-    await publishCheckpoint(status === 'succeeded' ? 'verified' : 'verification-failed');
   }
   const tree = await collectTree(workspacePath, changedPaths);
   const treeSha = await gitTree(workspacePath, context.signal);
@@ -289,6 +320,16 @@ export async function executeWindowsAuthoring(packet: WindowsAuthoringPacket, co
   await writeFile(resolve(evidenceDirectory, 'result-checkpoint.json'), JSON.stringify({ version: 2,
     semanticHash: authoringSemanticHash(packet), result }), 'utf8');
   return { workspacePath, result };
+}
+
+export function nativeImplementationPrompt(packet: Pick<WindowsAuthoringPacket, 'step' | 'contentPolicy'>): string {
+  if (!packet.contentPolicy.requiresUnrealAssets) return packet.step.prompt;
+  return [
+    packet.step.prompt,
+    'MANDATORY UNREAL DELIVERABLE: This task is incomplete until the selected project contains at least one newly saved or modified .uasset or .umap package.',
+    'Before returning, invoke run_unreal_authoring with tool=unreal-python or tool=unreal-editor and phase=author, and make that editor operation save the requested package into the project Content directory.',
+    'Writing C++, Python, configuration, or build files alone is not an Unreal authoring result. The runner will immediately verify the saved package and return the exact failure to this same checkout for correction.'
+  ].join('\n\n');
 }
 
 export function authoringSemanticHash(packet: WindowsAuthoringPacket): string {
@@ -477,7 +518,10 @@ async function prepareCheckout(packet: WindowsAuthoringPacket, root: string, che
 }
 
 export function checkpointRecoveryScore(checkpoint: Pick<AuthoringDiskCheckpoint, 'patch' | 'tree' | 'resultBundle' | 'authoringProvenance'>): number {
-  return Buffer.byteLength(checkpoint.patch, 'utf8')
+  const unrealPackages = checkpoint.tree.filter((entry) => /\.(?:uasset|umap)$/i.test(entry.path));
+  return (unrealPackages.length > 0 ? 1_000_000_000_000 : 0)
+    + unrealPackages.reduce((sum, entry) => sum + entry.sizeBytes, 0)
+    + Buffer.byteLength(checkpoint.patch, 'utf8')
     + checkpoint.tree.length * 1_024
     + checkpoint.resultBundle.lfsObjects.reduce((sum, item) => sum + item.sizeBytes, 0)
     + checkpoint.resultBundle.outputs.reduce((sum, item) => sum + item.sizeBytes, 0)
@@ -632,7 +676,21 @@ async function writeCheckpointAtomically(path: string, content: string): Promise
   await rename(temporary, generation);
   const prefix = `${basename(path)}.generation-`;
   const generations = (await readdir(dirname(path))).filter((name) => name.startsWith(prefix) && name.endsWith('.json')).sort().reverse();
-  await Promise.all(generations.slice(3).map((name) => rm(resolve(dirname(path), name), { force: true })));
+  const candidates: Array<{ name: string; checkpoint: AuthoringDiskCheckpoint }> = [];
+  for (const name of generations) {
+    try { candidates.push({ name, checkpoint: JSON.parse(await readFile(resolve(dirname(path), name), 'utf8')) as AuthoringDiskCheckpoint }); } catch { /* corrupt generations are not recovery candidates */ }
+  }
+  const keep = retainedCheckpointGenerations(candidates);
+  await Promise.all(generations.filter((name) => !keep.has(name)).map((name) => rm(resolve(dirname(path), name), { force: true })));
+}
+
+export function retainedCheckpointGenerations(
+  generations: Array<{ name: string; checkpoint: AuthoringDiskCheckpoint }>,
+  recentCount = 3
+): Set<string> {
+  const newest = [...generations].sort((left, right) => right.name.localeCompare(left.name)).slice(0, recentCount);
+  const richest = [...generations].sort((left, right) => checkpointRecoveryScore(right.checkpoint) - checkpointRecoveryScore(left.checkpoint))[0];
+  return new Set([...newest.map(({ name }) => name), ...(richest ? [richest.name] : [])]);
 }
 
 async function materializeLfsObjects(root: string, objects: AuthoringDiskCheckpoint['resultBundle']['lfsObjects']): Promise<void> {

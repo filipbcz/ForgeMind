@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from 'vitest';
-import { assertReadableAuthoringCheckout, authoringSemanticHash, buildUnrealPackageVerificationArgs, buildUnrealPackageVerificationScript, canResumeAuthoringCheckpoint, checkpointRecoveryScore, classifyAuthoringFailure, classifyWindowsAuthoringFailure, collectAuthoringToolVersions, collectCheckpointAuthoringProvenance, compactProcessResults, hasRestorableAuthoringCheckpoint, isProhibitedAuthoringPath, LifecycleNativeImplementationProvider, materializeOutputs, requiresProductionContent, restoreCheckpointAuthoringProvenance, selectRecoveryCheckpoint, type NativeAuthoringTools, unrealObjectPath, validateRequiredUnrealAssets } from './authoring-executor.js';
+import { assertReadableAuthoringCheckout, authoringSemanticHash, buildUnrealPackageVerificationArgs, buildUnrealPackageVerificationScript, canResumeAuthoringCheckpoint, checkpointRecoveryScore, classifyAuthoringFailure, classifyWindowsAuthoringFailure, collectAuthoringToolVersions, collectCheckpointAuthoringProvenance, compactProcessResults, hasRestorableAuthoringCheckpoint, isProhibitedAuthoringPath, LifecycleNativeImplementationProvider, materializeOutputs, nativeImplementationPrompt, requiresProductionContent, retainedCheckpointGenerations, restoreCheckpointAuthoringProvenance, selectRecoveryCheckpoint, type NativeAuthoringTools, unrealObjectPath, validateRequiredUnrealAssets } from './authoring-executor.js';
 import { mkdtemp, rm } from 'node:fs/promises';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
@@ -15,6 +15,19 @@ const implementation = {
 };
 
 describe('native implementation provider lifecycle', () => {
+  it('makes a saved Unreal package an explicit mandatory deliverable', () => {
+    const prompt = nativeImplementationPrompt({
+      step: { prompt: 'Create the qualification scene' } as any,
+      contentPolicy: { requiresUnrealAssets: true } as any
+    });
+    expect(prompt).toContain('Create the qualification scene');
+    expect(prompt).toContain('at least one newly saved or modified .uasset or .umap');
+    expect(prompt).toContain('invoke run_unreal_authoring');
+    expect(nativeImplementationPrompt({
+      step: { prompt: 'Update documentation' } as any,
+      contentPolicy: { requiresUnrealAssets: false } as any
+    })).toBe('Update documentation');
+  });
   it('records selected Unreal tool versions from native process provenance', () => {
     expect(collectAuthoringToolVersions([{ leaseId: 'l', sessionId: 's', checkId: 'c', command: 'editor', shell: 'system', exitCode: 0,
       stdout: '', stderr: '', startedAt: '2026-01-01T00:00:00Z', completedAt: '2026-01-01T00:01:00Z',
@@ -55,6 +68,22 @@ describe('native implementation provider lifecycle', () => {
       patch: 'x'.repeat(20_000), tree: Array.from({ length: 49 }, (_, index) => ({ path: String(index) })) };
     expect(checkpointRecoveryScore(preserved)).toBeGreaterThan(checkpointRecoveryScore(partial));
     expect(selectRecoveryCheckpoint([partial, preserved], 'new-probe')).toBe(preserved);
+  });
+  it('never prunes an Unreal package checkpoint behind newer text-only retries', () => {
+    const bundle = { version: 1 as const, format: 'git-binary-patch' as const, sha256: 'a', sizeBytes: 1, lfsObjects: [], outputs: [] };
+    const checkpoint = (path: string, patchSize: number): any => ({ version: 2, taskId: 'task-1', baseCommitSha: 'a'.repeat(40),
+      resultTreeSha: createHash('sha1').update(path).digest('hex'), updatedAt: '2026-10-11T19:33:08Z', patch: 'x'.repeat(patchSize),
+      tree: [{ path, kind: 'file', sha256: 'a', sizeBytes: 64, binary: path.endsWith('.umap'), mode: '100644' }], resultBundle: bundle });
+    const generations = [
+      { name: 'checkpoint.generation-004.json', checkpoint: checkpoint('Source/Four.cpp', 40_000) },
+      { name: 'checkpoint.generation-003.json', checkpoint: checkpoint('Source/Three.cpp', 30_000) },
+      { name: 'checkpoint.generation-002.json', checkpoint: checkpoint('Source/Two.cpp', 20_000) },
+      { name: 'checkpoint.generation-001.json', checkpoint: checkpoint('Content/Flying.umap', 100) }
+    ];
+    expect(checkpointRecoveryScore(generations[3]!.checkpoint)).toBeGreaterThan(checkpointRecoveryScore(generations[0]!.checkpoint));
+    expect([...retainedCheckpointGenerations(generations)]).toEqual(expect.arrayContaining([
+      'checkpoint.generation-004.json', 'checkpoint.generation-003.json', 'checkpoint.generation-002.json', 'checkpoint.generation-001.json'
+    ]));
   });
   it('keeps completed-result reuse stable across delivery retries but not product changes', () => {
     const packet: any = { taskId: 'task', baseCommitSha: 'a'.repeat(40), step: { prompt: 'Build scene', acceptanceCriteria: ['Map exists'],
@@ -222,6 +251,30 @@ describe('native implementation provider lifecycle', () => {
     expect(completed).toEqual(['provider-check-1', 'provider-check-2']);
     expect(provider.implement).toHaveBeenCalledTimes(2);
     expect(provider.implement.mock.calls[1][0]).toMatchObject({ previousValidationError: expect.stringContaining('provider-check-2') });
+  });
+
+  it('returns mandatory Unreal package verification failure to the same checkout before completing', async () => {
+    const provider: any = { implement: vi.fn(async () => ({ ...implementation, validationChecks: [] })) };
+    const tools = { root: 'C:/exact/job', managedRoots: { inputs: 'C:/inputs', sourceAssets: 'C:/source-assets', cache: 'C:/cache', outputs: 'C:/outputs', diagnostics: 'C:/diagnostics' },
+      nativeToolChannel: { command: 'node', args: ['server'] }, drainNativeProcesses: vi.fn(), read: vi.fn(), write: vi.fn(), remove: vi.fn(),
+      record: vi.fn(), run: vi.fn() } as unknown as NativeAuthoringTools;
+    const verifyCompletion = vi.fn()
+      .mockRejectedValueOnce(new Error('Required Unreal authoring did not produce a .uasset or .umap payload.'))
+      .mockResolvedValueOnce(undefined);
+
+    await new LifecycleNativeImplementationProvider(provider).implement({
+      prompt: 'author scene', acceptanceCriteria: ['saved scene loads'], operations: [], tools, verifyCompletion
+    });
+
+    expect(provider.implement).toHaveBeenCalledTimes(2);
+    expect(verifyCompletion).toHaveBeenCalledTimes(2);
+    expect(provider.implement.mock.calls[1][0]).toMatchObject({
+      previousValidationError: expect.stringContaining('Required Unreal authoring did not produce a .uasset or .umap payload.')
+    });
+    expect(provider.implement.mock.calls[1][0].session).toBe(provider.implement.mock.calls[0][0].session);
+    expect(tools.record).toHaveBeenCalledWith(expect.objectContaining({
+      checkId: 'mandatory-final-verification', command: 'runner.verify-authored-result', exitCode: 1
+    }));
   });
 
   it('stops when a repair repeats the exact same failing validation instead of spending turns forever', async () => {
