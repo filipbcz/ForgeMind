@@ -167,10 +167,7 @@ export class ModelRoutedProvider implements AIProvider {
       try {
         decision = await router.routeTask({ ...input, availableModels, routerModel, previousDecision });
       } catch (error) {
-        const kind = error && typeof error === 'object' && 'kind' in error
-          ? (error as { kind?: unknown }).kind
-          : undefined;
-        if (typeof kind === 'string' && kind !== 'invalid_response') throw error;
+        if (input.signal?.aborted) throw error;
         decision = fallbackTaskRoutingDecision(availableModels, routerModel, `Router fallback: ${error instanceof Error ? error.message : String(error)}`);
       }
     } else {

@@ -109,6 +109,35 @@ describe('model routing', () => {
     expect(state.decision).toEqual(refreshed);
   });
 
+  it('uses deterministic routing when the router account has exhausted its credits', async () => {
+    const routeTask = vi.fn(async () => {
+      throw Object.assign(new Error('You have no credits remaining.'), {
+        status: 429,
+        errorCode: 'credit_balance_exhausted',
+        kind: 'credit_exhausted'
+      });
+    });
+    const fakeProvider = { kind: 'codex', routeTask } as unknown as AIProvider;
+    const state: ModelRoutingState = {};
+    const activities: string[] = [];
+    const routed = new ModelRoutedProvider('codex', {
+      modelProfile: 'balanced', model: 'gpt-6.1-sol',
+      allowedModels: ['gpt-6-luna', 'gpt-6.1-sol', 'gpt-6-astra'], routingState: state
+    }, () => fakeProvider);
+
+    const decision = await routed.routeTask({
+      taskId: 'task-1', title: 'Continue implementation', prompt: 'Implement the next step.',
+      acceptanceCriteria: ['The step passes validation.'], availableModels: [], routerModel: '',
+      onActivity: (activity) => { activities.push(activity.message); }
+    });
+
+    expect(routeTask).toHaveBeenCalledTimes(1);
+    expect(decision.implementation.model).toBe('gpt-6.1-sol');
+    expect(decision.rationale).toContain('Router fallback: You have no credits remaining.');
+    expect(state.decision).toEqual(decision);
+    expect(activities).toEqual([expect.stringContaining('Task model route selected')]);
+  });
+
   it('rejects a router response whose escalation route is weaker than implementation', () => {
     expect(() => parseTaskModelRoutingDecision(JSON.stringify({
       implementation: { model: 'gpt-6-astra', reasoningEffort: 'high' },

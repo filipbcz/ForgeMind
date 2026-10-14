@@ -3944,7 +3944,7 @@ function SettingsPanel({
               onClick={() => onChatGPTPlanEnrollmentCreate({
                 name: providerForm.name?.trim() || undefined,
                 isDefault: providerForm.isDefault,
-                automaticFailover: providerForm.automaticFailover,
+                automaticFailover: true,
                 failoverPriority: providerForm.failoverPriority
               })}
             >
