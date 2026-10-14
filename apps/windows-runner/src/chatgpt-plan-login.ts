@@ -15,6 +15,9 @@ export async function connectChatGPTPlan(
   report: (message: string) => void
 ): Promise<{ connectionId: string; name: string }> {
   const enrollment = await transport.exchangeChatGPTPlanEnrollment(auth, enrollmentCode.trim());
+  if (!isSupportedHostId(enrollment.hostId)) {
+    throw new Error('ForgeMind returned an invalid ChatGPT OAuth host identifier. Create a new connection code after updating ForgeMind.');
+  }
   const state = randomBytes(32).toString('base64url');
   const nonce = randomBytes(32).toString('base64url');
   const verifier = randomBytes(64).toString('base64url');
@@ -35,7 +38,8 @@ export async function connectChatGPTPlan(
     code_challenge: challenge
   }).toString();
   report('Opening ChatGPT authorization in the default browser...');
-  spawn('cmd.exe', ['/d', '/c', 'start', '', authorize.toString()], { detached: true, stdio: 'ignore', windowsHide: true }).unref();
+  const browser = windowsBrowserLaunch(authorize.toString());
+  spawn(browser.command, browser.args, { detached: true, stdio: 'ignore', windowsHide: true }).unref();
   let result: { code: string; clientId: string };
   try {
     result = await callback.result;
@@ -70,6 +74,25 @@ export async function connectChatGPTPlan(
     expiresIn: typeof payload.expires_in === 'number' ? payload.expires_in : 3600
   });
   return { connectionId: completed.connection.id, name: completed.connection.name };
+}
+
+/**
+ * Open the URL without passing it through cmd.exe. OAuth URLs contain ampersands,
+ * which cmd treats as command separators and can therefore silently truncate.
+ */
+export function windowsBrowserLaunch(url: string): { command: string; args: string[] } {
+  const parsed = new URL(url);
+  if (parsed.protocol !== 'https:') throw new Error('ChatGPT authorization URL must use HTTPS.');
+  return {
+    command: 'rundll32.exe',
+    args: ['url.dll,FileProtocolHandler', parsed.toString()]
+  };
+}
+
+function isSupportedHostId(hostId: string): boolean {
+  return /^urn:uuid:[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(hostId)
+    || hostId.startsWith('urn:ietf:params:oauth:jwk-thumbprint:')
+    || hostId.startsWith('did:key:');
 }
 
 async function createLoopbackCallback(expectedState: string): Promise<{
