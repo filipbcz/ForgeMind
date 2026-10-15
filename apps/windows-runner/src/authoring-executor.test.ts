@@ -1,9 +1,10 @@
 import { describe, expect, it, vi } from 'vitest';
-import { assertReadableAuthoringCheckout, authoringSemanticHash, buildUnrealPackageVerificationArgs, buildUnrealPackageVerificationScript, canResumeAuthoringCheckpoint, checkpointRecoveryScore, classifyAuthoringFailure, classifyWindowsAuthoringFailure, collectAuthoringToolVersions, collectCheckpointAuthoringProvenance, compactProcessResults, hasRestorableAuthoringCheckpoint, isProhibitedAuthoringPath, LifecycleNativeImplementationProvider, materializeOutputs, nativeImplementationPrompt, requiresProductionContent, retainedCheckpointGenerations, restoreCheckpointAuthoringProvenance, selectRecoveryCheckpoint, type NativeAuthoringTools, unrealObjectPath, validateRequiredUnrealAssets } from './authoring-executor.js';
-import { mkdtemp, rm } from 'node:fs/promises';
+import { assertReadableAuthoringCheckout, authoringSemanticHash, buildUnrealPackageVerificationArgs, buildUnrealPackageVerificationScript, canResumeAuthoringCheckpoint, checkpointRecoveryScore, classifyAuthoringFailure, classifyWindowsAuthoringFailure, cleanupIgnoredUnrealRuntimeState, collectAuthoringToolVersions, collectCheckpointAuthoringProvenance, compactProcessResults, hasRestorableAuthoringCheckpoint, isProhibitedAuthoringPath, LifecycleNativeImplementationProvider, materializeOutputs, nativeImplementationPrompt, requiresProductionContent, retainedCheckpointGenerations, restoreCheckpointAuthoringProvenance, selectRecoveryCheckpoint, type NativeAuthoringTools, unrealObjectPath, validateRequiredUnrealAssets } from './authoring-executor.js';
+import { access, mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { createHash } from 'node:crypto';
+import type { WindowsAuthoringProcessResult } from '@forgemind/core';
 
 const implementation = {
   outcome: 'changes_made' as const, summary: 'implemented', changedFiles: ['src/a.ts'], evidenceFiles: [],
@@ -84,6 +85,19 @@ describe('native implementation provider lifecycle', () => {
     expect([...retainedCheckpointGenerations(generations)]).toEqual(expect.arrayContaining([
       'checkpoint.generation-004.json', 'checkpoint.generation-003.json', 'checkpoint.generation-002.json', 'checkpoint.generation-001.json'
     ]));
+  });
+  it('removes generated Unreal runtime state even after a checkpoint staged it', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'forgemind-unreal-runtime-'));
+    const generated = join(root, 'unreal', 'Intermediate', 'Build', 'BuildRules', 'FlyingModuleRules.dll');
+    try {
+      await mkdir(join(root, 'unreal', 'Intermediate', 'Build', 'BuildRules'), { recursive: true });
+      await writeFile(generated, 'generated cache');
+      const process = { authoring: { projectRelativePath: 'unreal/Flying.uproject' } } as WindowsAuthoringProcessResult;
+      await cleanupIgnoredUnrealRuntimeState(root, [process]);
+      await expect(access(generated)).rejects.toThrow();
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
   });
   it('keeps completed-result reuse stable across delivery retries but not product changes', () => {
     const packet: any = { taskId: 'task', baseCommitSha: 'a'.repeat(40), step: { prompt: 'Build scene', acceptanceCriteria: ['Map exists'],

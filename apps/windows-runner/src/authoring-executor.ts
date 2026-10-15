@@ -227,7 +227,7 @@ export async function executeWindowsAuthoring(packet: WindowsAuthoringPacket, co
   let completionVerified = false;
   const verifyCompletion = async () => {
     await rm(resolve(workspacePath, '.forgemind-tmp'), { recursive: true, force: true });
-    await cleanupIgnoredUnrealRuntimeState(workspacePath, processes, context.signal);
+    await cleanupIgnoredUnrealRuntimeState(workspacePath, processes);
     const currentChangedPaths = await stageChangedPaths(workspacePath, context.signal);
     await rejectProhibitedResultPaths(packet, workspacePath, context.signal);
     productionReviewRequired = await enforceRequiredUnrealAssets(packet, workspacePath, evidenceDirectory, outputDirectory, currentChangedPaths, processes,
@@ -250,7 +250,7 @@ export async function executeWindowsAuthoring(packet: WindowsAuthoringPacket, co
     authoringFailureState = classifyAuthoringFailure(summary, context.signal?.aborted === true, processes);
   }
   await rm(resolve(workspacePath, '.forgemind-tmp'), { recursive: true, force: true });
-  await cleanupIgnoredUnrealRuntimeState(workspacePath, processes, context.signal);
+  await cleanupIgnoredUnrealRuntimeState(workspacePath, processes);
   const changedPaths = await stageChangedPaths(workspacePath, context.signal);
   await rejectProhibitedResultPaths(packet, workspacePath, context.signal);
   if (status === 'succeeded' && !completionVerified) {
@@ -265,7 +265,7 @@ export async function executeWindowsAuthoring(packet: WindowsAuthoringPacket, co
     await publishCheckpoint(status === 'succeeded' ? 'verified' : 'verification-failed');
   }
   if (status === 'succeeded') {
-    await cleanupIgnoredUnrealRuntimeState(workspacePath, processes, context.signal);
+    await cleanupIgnoredUnrealRuntimeState(workspacePath, processes);
     await copyReviewableChangedImages(workspacePath, outputDirectory, changedPaths);
   }
   const tree = await collectTree(workspacePath, changedPaths);
@@ -410,15 +410,18 @@ export function classifyWindowsAuthoringFailure(summary: string, cancelled: bool
   return { kind: 'unknown', retryable: false };
 }
 
-async function cleanupIgnoredUnrealRuntimeState(root: string, processes: WindowsAuthoringProcessResult[], signal?: AbortSignal): Promise<void> {
+export async function cleanupIgnoredUnrealRuntimeState(root: string, processes: WindowsAuthoringProcessResult[]): Promise<void> {
   const projectDirectories = new Set(processes.flatMap((process) => process.authoring
     ? [posix.dirname(process.authoring.projectRelativePath.replaceAll('\\', '/'))]
     : []));
   for (const projectDirectory of projectDirectories) {
     for (const name of ['DerivedDataCache', 'Intermediate', 'Saved']) {
       const relativePath = projectDirectory === '.' ? name : `${projectDirectory}/${name}`;
-      const ignored = await spawnComplete('git.exe', ['check-ignore', '-q', '--', relativePath], root, 30_000, signal);
-      if (ignored.exitCode === 0) await rm(resolve(root, relativePath), { recursive: true, force: true });
+      // These directories are always disposable Unreal runtime/build state.
+      // Once a checkpoint stages a generated file, `git check-ignore` stops
+      // reporting it as ignored, so consulting Git here would leak cache into
+      // the result bundle.
+      await rm(resolve(root, relativePath), { recursive: true, force: true });
     }
   }
 }

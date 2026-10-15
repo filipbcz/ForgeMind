@@ -170,6 +170,7 @@ export async function prepareLocalCodexRuntime(environment: NodeJS.ProcessEnv = 
       // The ChatGPT model list is an advisory client catalogue, not proof of
       // per-request entitlement. The inference request is the authority.
       modelCatalogIsAdvisory: remote.authMode === 'chatgpt_plan_oauth',
+      refreshableCredential: remote.authMode === 'chatgpt_plan_oauth',
       create: async (route) => {
         const current = loadRemotePool ? (await loadRemotePool()).connections.find((connection) => connection.id === remote.id) : remote;
         if (!current) throw new Error(`ForgeMind provider connection "${remote.name}" is no longer available.`);
@@ -216,6 +217,8 @@ export interface WindowsProviderCandidate {
   label: string;
   allowedModels: string[];
   modelCatalogIsAdvisory?: boolean;
+  /** The server-held credential can be renewed between provider instances. */
+  refreshableCredential?: boolean;
   create(route?: TaskModelSelection): Promise<AIProvider>;
 }
 
@@ -298,9 +301,26 @@ export function createWindowsProviderPool(
         activeId = candidate.id;
         return result;
       } catch (error) {
-        const normalized = normalizeProviderError('codex', error);
+        let normalized = normalizeProviderError('codex', error);
         lastError = error;
-        if (!normalized.failoverEligible) throw error;
+        if (normalized.kind === 'authentication' && candidate.refreshableCredential) {
+          report(`${candidate.label} authentication expired during ${operation}; refreshing the remote credential once.`);
+          if (session) {
+            session.id = undefined;
+            session.provider = 'codex';
+            session.model = effectiveRoute?.model;
+          }
+          try {
+            const result = await action(await candidate.create(effectiveRoute));
+            health.unavailable.delete(candidate.id);
+            activeId = candidate.id;
+            return result;
+          } catch (refreshedError) {
+            normalized = normalizeProviderError('codex', refreshedError);
+            lastError = refreshedError;
+          }
+        }
+        if (!normalized.failoverEligible) throw lastError;
         report(`${candidate.label} failed during ${operation} (${normalized.kind}); ${ordered.length > 1 ? 'trying the next configured connection' : 'no compatible fallback is configured'}.`);
         if (!normalized.retryable) health.unavailable.add(candidate.id);
       }

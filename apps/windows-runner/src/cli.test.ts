@@ -84,6 +84,31 @@ describe('Windows runner CLI parsing', () => {
     ]);
   });
 
+  it('refreshes an expired remote OAuth credential once without abandoning the connection', async () => {
+    const reports: string[] = [];
+    const expired = vi.fn(async () => {
+      throw Object.assign(new Error('Provided authentication token is expired'), { status: 401, errorCode: 'token_expired' });
+    });
+    const recovered = vi.fn(async () => ({ summary: 'continued', changedFiles: [], diffStat: { filesChanged: 0, insertions: 0, deletions: 0 } }));
+    const create = vi.fn()
+      .mockResolvedValueOnce({ implement: expired })
+      .mockResolvedValueOnce({ implement: recovered });
+    const fallback = vi.fn(async () => ({ implement: vi.fn() }) as never);
+    const pool = createWindowsProviderPool([
+      { id: 'plan', label: 'ChatGPT plan', allowedModels: ['gpt-6.1-sol'], refreshableCredential: true, create },
+      { id: 'fallback', label: 'Fallback', allowedModels: ['gpt-6.1-sol'], create: fallback }
+    ], { model: 'gpt-6.1-sol', reasoningEffort: 'medium' }, (message) => reports.push(message));
+    const session = { id: 'expired-provider-session' };
+
+    await expect(pool.implement({ session } as never)).resolves.toMatchObject({ summary: 'continued' });
+    expect(create).toHaveBeenCalledTimes(2);
+    expect(expired).toHaveBeenCalledOnce();
+    expect(recovered).toHaveBeenCalledOnce();
+    expect(fallback).not.toHaveBeenCalled();
+    expect(session).toEqual({ id: undefined, provider: 'codex', model: 'gpt-6.1-sol' });
+    expect(reports).toContainEqual(expect.stringContaining('refreshing the remote credential once'));
+  });
+
   it('uses an equal or stronger fallback tier but never silently lowers model quality', () => {
     const candidate = (allowedModels: string[]) => ({ id: 'fallback', label: 'fallback', allowedModels, create: vi.fn() });
     const route = { model: 'gpt-6.1-sol', reasoningEffort: 'high' as const };
