@@ -21,7 +21,10 @@ interface WorkerSignalSource {
 }
 
 export async function runWorkerDaemon(options: WorkerDaemonOptions = {}): Promise<WorkerDaemonResult> {
-  const runOnce = options.runOnce ?? (() => runDatabaseWorkerOnce({ deferInterruptSignals: true }));
+  // Let the claimed-task lifecycle persist an interruption and exit promptly.
+  // Merely draining the outer polling loop can otherwise wait indefinitely for
+  // an external Windows authoring job and block production deployments.
+  const runOnce = options.runOnce ?? (() => runDatabaseWorkerOnce({ deferInterruptSignals: false }));
   const pollDelayMs = options.pollDelayMs ?? 2500;
   const errorDelayMs = options.errorDelayMs ?? pollDelayMs;
   const stopWhenIdle = options.stopWhenIdle ?? false;

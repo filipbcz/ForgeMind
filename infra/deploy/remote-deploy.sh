@@ -140,7 +140,10 @@ assert_deploy_free_space
 
 worker_container="$("${compose[@]}" ps -q worker)"
 if [ -n "${worker_container}" ]; then
-  WORKER_DRAIN_TIMEOUT_SECONDS="${FORGEMIND_WORKER_DRAIN_TIMEOUT_SECONDS:-5400}"
+  # New workers persist and requeue their active claim on SIGTERM. Keep a
+  # bounded fallback for upgrading an older worker that only drained between
+  # tasks and could therefore wait forever on an external Windows job.
+  WORKER_DRAIN_TIMEOUT_SECONDS="${FORGEMIND_WORKER_DRAIN_TIMEOUT_SECONDS:-30}"
   echo "Draining worker before downloading release images (timeout: ${WORKER_DRAIN_TIMEOUT_SECONDS}s)."
   "${compose[@]}" stop --timeout "${WORKER_DRAIN_TIMEOUT_SECONDS}" worker
   worker_was_drained=true
