@@ -270,8 +270,10 @@ export async function executeWindowsAuthoring(packet: WindowsAuthoringPacket, co
   }
   const tree = await collectTree(workspacePath, changedPaths);
   const treeSha = await gitTree(workspacePath, context.signal);
-  const patchResult = await spawnComplete('git.exe', ['diff', '--binary', '--no-ext-diff', '--cached', 'HEAD'], workspacePath, 30_000, context.signal);
+  const patchResult = await spawnComplete('git.exe', ['diff', '--binary', '--no-ext-diff', '--cached', 'HEAD'], workspacePath, 30_000, context.signal,
+    authoringPatchOutputLimit(packet.resourcePolicy.maxArtifactBytes));
   if (patchResult.exitCode !== 0) throw new Error(`Could not package result tree: ${patchResult.stderr}`);
+  if (patchResult.stdoutTruncated) throw new Error('Could not package result tree: the binary Git patch exceeds the bounded authoring result size.');
   const patchBytes = Buffer.from(patchResult.stdout, 'utf8');
   const lfsObjects = await collectLfsObjects(workspacePath, changedPaths, context.signal);
   const outputs = await collectManagedOutputs(outputDirectory, packet.resourcePolicy.maxArtifactBytes);
@@ -410,10 +412,32 @@ export function classifyWindowsAuthoringFailure(summary: string, cancelled: bool
   return { kind: 'unknown', retryable: false };
 }
 
-export async function cleanupIgnoredUnrealRuntimeState(root: string, processes: WindowsAuthoringProcessResult[]): Promise<void> {
-  const projectDirectories = new Set(processes.flatMap((process) => process.authoring
-    ? [posix.dirname(process.authoring.projectRelativePath.replaceAll('\\', '/'))]
-    : []));
+export async function discoverUnrealProjectDirectories(root: string, processes: WindowsAuthoringProcessResult[] = []): Promise<string[]> {
+  const projectDirectories = new Set<string>(['.']);
+  for (const processResult of processes) {
+    const projectPath = processResult.authoring?.projectRelativePath.replaceAll('\\', '/');
+    if (!projectPath || posix.isAbsolute(projectPath)) continue;
+    const directory = posix.dirname(projectPath);
+    if (directory === '..' || directory.startsWith('../')) continue;
+    projectDirectories.add(directory);
+  }
+  const excluded = new Set(['.git', 'binaries', 'content', 'deriveddatacache', 'intermediate', 'node_modules', 'saved', 'source']);
+  const pending = ['.'];
+  while (pending.length > 0) {
+    const directory = pending.pop()!;
+    let entries;
+    try { entries = await readdir(resolve(root, directory), { withFileTypes: true }); } catch { continue; }
+    for (const entry of entries) {
+      const relativePath = directory === '.' ? entry.name : `${directory}/${entry.name}`;
+      if (entry.isFile() && entry.name.toLowerCase().endsWith('.uproject')) projectDirectories.add(directory);
+      if (entry.isDirectory() && !excluded.has(entry.name.toLowerCase())) pending.push(relativePath);
+    }
+  }
+  return [...projectDirectories].sort();
+}
+
+export async function cleanupIgnoredUnrealRuntimeState(root: string, processes: WindowsAuthoringProcessResult[] = []): Promise<void> {
+  const projectDirectories = await discoverUnrealProjectDirectories(root, processes);
   for (const projectDirectory of projectDirectories) {
     for (const name of ['DerivedDataCache', 'Intermediate', 'Saved']) {
       const relativePath = projectDirectory === '.' ? name : `${projectDirectory}/${name}`;
@@ -498,11 +522,18 @@ async function prepareCheckout(packet: WindowsAuthoringPacket, root: string, che
     try {
       const actual = await spawnComplete('git.exe', ['rev-parse', 'HEAD'], retainedPath, 30_000, signal);
       if (actual.exitCode !== 0 || actual.stdout.trim().toLowerCase() !== packet.baseCommitSha.toLowerCase()) continue;
+      // A physical workspace can outlive checkpoint metadata. Clean disposable
+      // engine state before scoring it, then synthesize recovery metadata from
+      // its Git index when the matching checkpoint generation was pruned.
+      await cleanupIgnoredUnrealRuntimeState(retainedPath);
+      await stageChangedPaths(retainedPath, signal);
+      await rejectProhibitedResultPaths(packet, retainedPath, signal);
       const status = await spawnComplete('git.exe', ['status', '--porcelain=v1'], retainedPath, 30_000, signal);
       if (status.exitCode !== 0 || status.stdout.trim().length === 0) continue;
       const retainedTree = await gitTree(retainedPath, signal);
-      const checkpoint = checkpoints.find((item) => item.resultTreeSha.toLowerCase() === retainedTree.toLowerCase());
-      if (checkpoint) retained.push({ path: retainedPath, checkpoint });
+      const checkpoint = checkpoints.find((item) => item.resultTreeSha.toLowerCase() === retainedTree.toLowerCase())
+        ?? await captureCheckpoint(packet, retainedPath, 'recovered-physical-workspace', [], selectedUnrealIdentity, signal, outputRoot);
+      if (hasRestorableAuthoringCheckpoint(checkpoint)) retained.push({ path: retainedPath, checkpoint });
     } catch { /* inspect the other retained workspaces */ }
   }
   const bestRetained = retained.sort((left, right) => checkpointRecoveryScore(right.checkpoint) - checkpointRecoveryScore(left.checkpoint))[0];
@@ -657,9 +688,18 @@ export function hasRestorableAuthoringCheckpoint(
 
 async function persistCheckpoint(path: string, packet: WindowsAuthoringPacket, workspacePath: string, status: string,
   processes: WindowsAuthoringProcessResult[], unrealProbeIdentity?: string, signal?: AbortSignal, outputRoot?: string): Promise<AuthoringDiskCheckpoint> {
+  const checkpoint = await captureCheckpoint(packet, workspacePath, status, processes, unrealProbeIdentity, signal, outputRoot);
+  await writeCheckpointAtomically(path, JSON.stringify(checkpoint));
+  return checkpoint;
+}
+
+async function captureCheckpoint(packet: WindowsAuthoringPacket, workspacePath: string, status: string,
+  processes: WindowsAuthoringProcessResult[], unrealProbeIdentity?: string, signal?: AbortSignal, outputRoot?: string): Promise<AuthoringDiskCheckpoint> {
   const resultTreeSha = await gitTree(workspacePath, signal);
-  const patchResult = await spawnComplete('git.exe', ['diff', '--binary', '--no-ext-diff', '--cached', 'HEAD'], workspacePath, 30_000, signal);
+  const patchResult = await spawnComplete('git.exe', ['diff', '--binary', '--no-ext-diff', '--cached', 'HEAD'], workspacePath, 30_000, signal,
+    authoringPatchOutputLimit(packet.resourcePolicy.maxArtifactBytes));
   if (patchResult.exitCode !== 0) throw new Error(`Could not persist Windows checkpoint: ${patchResult.stderr}`);
+  if (patchResult.stdoutTruncated) throw new Error('Could not persist Windows checkpoint: the binary Git patch exceeds the bounded authoring result size.');
   const changedPaths = await indexedChangedPaths(workspacePath, signal);
   const patchBytes = Buffer.from(patchResult.stdout, 'utf8'); const lfsObjects = await collectLfsObjects(workspacePath, changedPaths, signal);
   const outputs = outputRoot ? await collectManagedOutputs(outputRoot, packet.resourcePolicy.maxArtifactBytes) : [];
@@ -669,7 +709,6 @@ async function persistCheckpoint(path: string, packet: WindowsAuthoringPacket, w
     resultBundle: { version: 1, format: 'git-binary-patch', sha256: createHash('sha256').update(patchBytes).digest('hex'),
       sizeBytes: patchBytes.length, lfsObjects, outputs }, authoringProvenance: collectCheckpointAuthoringProvenance(processes), unrealProbeIdentity,
     updatedAt: new Date().toISOString() };
-  await writeCheckpointAtomically(path, JSON.stringify(checkpoint));
   return checkpoint;
 }
 
@@ -940,8 +979,12 @@ async function copyReviewableChangedImages(root: string, outputRoot: string, cha
   }
 }
 
-async function spawnComplete(executable: string, args: string[], cwd: string, timeoutMs: number, signal?: AbortSignal) {
-  return await runBoundedProcess(executable, args, { cwd, timeoutMs, signal, maxOutputBytes: 1_000_000 });
+export function authoringPatchOutputLimit(maxArtifactBytes: number): number {
+  return Math.min(128 * 1024 * 1024, Math.max(4 * 1024 * 1024, maxArtifactBytes * 8));
+}
+
+async function spawnComplete(executable: string, args: string[], cwd: string, timeoutMs: number, signal?: AbortSignal, maxOutputBytes = 1_000_000) {
+  return await runBoundedProcess(executable, args, { cwd, timeoutMs, signal, maxOutputBytes });
 }
 
 async function spawnWithInput(executable: string, args: string[], cwd: string, input: string, signal?: AbortSignal) {

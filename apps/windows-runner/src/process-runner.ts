@@ -5,6 +5,8 @@ export interface BoundedProcessResult {
   stdout: string;
   stderr: string;
   terminationReason?: 'cancelled' | 'timed-out' | 'missing-capability';
+  stdoutTruncated?: boolean;
+  stderrTruncated?: boolean;
 }
 
 export interface BoundedProcessOptions {
@@ -44,9 +46,16 @@ export async function runBoundedProcess(
   const maxOutputBytes = options.maxOutputBytes ?? DEFAULT_MAX_OUTPUT_BYTES;
   let stdoutBuffer: Buffer<ArrayBufferLike> = Buffer.alloc(0);
   let stderrBuffer: Buffer<ArrayBufferLike> = Buffer.alloc(0);
+  let stdoutTruncated = false; let stderrTruncated = false;
   let resetIdleTimer = () => undefined;
-  child.stdout?.on('data', (chunk: Buffer) => { stdoutBuffer = appendBounded(stdoutBuffer, chunk, maxOutputBytes); resetIdleTimer(); });
-  child.stderr?.on('data', (chunk: Buffer) => { stderrBuffer = appendBounded(stderrBuffer, chunk, maxOutputBytes); resetIdleTimer(); });
+  child.stdout?.on('data', (chunk: Buffer) => {
+    stdoutTruncated ||= stdoutBuffer.length + chunk.length > maxOutputBytes;
+    stdoutBuffer = appendBounded(stdoutBuffer, chunk, maxOutputBytes); resetIdleTimer();
+  });
+  child.stderr?.on('data', (chunk: Buffer) => {
+    stderrTruncated ||= stderrBuffer.length + chunk.length > maxOutputBytes;
+    stderrBuffer = appendBounded(stderrBuffer, chunk, maxOutputBytes); resetIdleTimer();
+  });
   if (options.input === undefined) child.stdin?.end();
   else child.stdin?.end(options.input);
 
@@ -79,12 +88,15 @@ export async function runBoundedProcess(
     if (outcome === 'cancelled' || outcome === 'timed-out') {
       await terminateProcessTree(child);
       await awaitChildClose(completion, child);
-      return { stdout: stdoutBuffer.toString('utf8'), stderr: stderrBuffer.toString('utf8'), terminationReason: outcome };
+      return { stdout: stdoutBuffer.toString('utf8'), stderr: stderrBuffer.toString('utf8'), terminationReason: outcome,
+        ...(stdoutTruncated ? { stdoutTruncated: true } : {}), ...(stderrTruncated ? { stderrTruncated: true } : {}) };
     }
     return {
       exitCode: outcome,
       stdout: stdoutBuffer.toString('utf8'),
       stderr: stderrBuffer.toString('utf8'),
+      ...(stdoutTruncated ? { stdoutTruncated: true } : {}),
+      ...(stderrTruncated ? { stderrTruncated: true } : {}),
       ...(spawnError?.code === 'ENOENT' ? { terminationReason: 'missing-capability' as const } : {})
     };
   } finally {

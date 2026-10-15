@@ -12,6 +12,14 @@ describe('bounded native process runner', () => {
     expect(result).toMatchObject({ exitCode: 0, stdout: 'probe-input', stderr: '' });
   });
 
+  it('reports output truncation instead of silently treating a partial payload as complete', async () => {
+    const result = await runBoundedProcess(process.execPath, ['-e', "process.stdout.write('abcdefgh')"], {
+      timeoutMs: 2_000,
+      maxOutputBytes: 4
+    });
+    expect(result).toMatchObject({ exitCode: 0, stdout: 'efgh', stdoutTruncated: true });
+  });
+
   it('waits for a timed-out process to close before returning', async () => {
     const startedAt = Date.now();
     const result = await runBoundedProcess(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], { timeoutMs: 50 });

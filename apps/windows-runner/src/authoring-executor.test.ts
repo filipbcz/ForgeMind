@@ -1,10 +1,9 @@
 import { describe, expect, it, vi } from 'vitest';
-import { assertReadableAuthoringCheckout, authoringSemanticHash, buildUnrealPackageVerificationArgs, buildUnrealPackageVerificationScript, canResumeAuthoringCheckpoint, checkpointRecoveryScore, classifyAuthoringFailure, classifyWindowsAuthoringFailure, cleanupIgnoredUnrealRuntimeState, collectAuthoringToolVersions, collectCheckpointAuthoringProvenance, compactProcessResults, hasRestorableAuthoringCheckpoint, isProhibitedAuthoringPath, LifecycleNativeImplementationProvider, materializeOutputs, nativeImplementationPrompt, requiresProductionContent, retainedCheckpointGenerations, restoreCheckpointAuthoringProvenance, selectRecoveryCheckpoint, type NativeAuthoringTools, unrealObjectPath, validateRequiredUnrealAssets } from './authoring-executor.js';
+import { assertReadableAuthoringCheckout, authoringPatchOutputLimit, authoringSemanticHash, buildUnrealPackageVerificationArgs, buildUnrealPackageVerificationScript, canResumeAuthoringCheckpoint, checkpointRecoveryScore, classifyAuthoringFailure, classifyWindowsAuthoringFailure, cleanupIgnoredUnrealRuntimeState, collectAuthoringToolVersions, collectCheckpointAuthoringProvenance, compactProcessResults, discoverUnrealProjectDirectories, hasRestorableAuthoringCheckpoint, isProhibitedAuthoringPath, LifecycleNativeImplementationProvider, materializeOutputs, nativeImplementationPrompt, requiresProductionContent, retainedCheckpointGenerations, restoreCheckpointAuthoringProvenance, selectRecoveryCheckpoint, type NativeAuthoringTools, unrealObjectPath, validateRequiredUnrealAssets } from './authoring-executor.js';
 import { access, mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { createHash } from 'node:crypto';
-import type { WindowsAuthoringProcessResult } from '@forgemind/core';
 
 const implementation = {
   outcome: 'changes_made' as const, summary: 'implemented', changedFiles: ['src/a.ts'], evidenceFiles: [],
@@ -86,18 +85,29 @@ describe('native implementation provider lifecycle', () => {
       'checkpoint.generation-004.json', 'checkpoint.generation-003.json', 'checkpoint.generation-002.json', 'checkpoint.generation-001.json'
     ]));
   });
-  it('removes generated Unreal runtime state even after a checkpoint staged it', async () => {
+  it('discovers projects and removes staged runtime state without retained process evidence', async () => {
     const root = await mkdtemp(join(tmpdir(), 'forgemind-unreal-runtime-'));
-    const generated = join(root, 'unreal', 'Intermediate', 'Build', 'BuildRules', 'FlyingModuleRules.dll');
+    const rootGenerated = join(root, 'Intermediate', 'Build', 'BuildRules', 'FlyingModuleRules.dll');
+    const nestedGenerated = join(root, 'unreal', 'Intermediate', 'Build', 'nested.dll');
     try {
-      await mkdir(join(root, 'unreal', 'Intermediate', 'Build', 'BuildRules'), { recursive: true });
-      await writeFile(generated, 'generated cache');
-      const process = { authoring: { projectRelativePath: 'unreal/Flying.uproject' } } as WindowsAuthoringProcessResult;
-      await cleanupIgnoredUnrealRuntimeState(root, [process]);
-      await expect(access(generated)).rejects.toThrow();
+      await mkdir(join(root, 'Intermediate', 'Build', 'BuildRules'), { recursive: true });
+      await mkdir(join(root, 'unreal', 'Intermediate', 'Build'), { recursive: true });
+      await writeFile(join(root, 'Flying.uproject'), '{}');
+      await writeFile(join(root, 'unreal', 'Flying.uproject'), '{}');
+      await writeFile(rootGenerated, 'generated root cache');
+      await writeFile(nestedGenerated, 'generated nested cache');
+      expect(await discoverUnrealProjectDirectories(root)).toEqual(['.', 'unreal']);
+      await cleanupIgnoredUnrealRuntimeState(root);
+      await expect(access(rootGenerated)).rejects.toThrow();
+      await expect(access(nestedGenerated)).rejects.toThrow();
     } finally {
       await rm(root, { recursive: true, force: true });
     }
+  });
+  it('retains enough bounded Git output for Unreal binary patches', () => {
+    expect(authoringPatchOutputLimit(10_000_000)).toBe(80_000_000);
+    expect(authoringPatchOutputLimit(1)).toBe(4 * 1024 * 1024);
+    expect(authoringPatchOutputLimit(100_000_000)).toBe(128 * 1024 * 1024);
   });
   it('keeps completed-result reuse stable across delivery retries but not product changes', () => {
     const packet: any = { taskId: 'task', baseCommitSha: 'a'.repeat(40), step: { prompt: 'Build scene', acceptanceCriteria: ['Map exists'],
