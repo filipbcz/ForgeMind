@@ -13,7 +13,7 @@ import { executeWindowsAuthoring, LifecycleNativeImplementationProvider } from '
 import { runCapabilityProbes, windowsRunnerCapabilityProbes } from './probes.js';
 import { runManualSession } from './session.js';
 import { cleanupAcceptedWindowsAuthoring, prepareWindowsManagedRoots } from './managed-roots.js';
-import { WindowsRunnerTransport, type WindowsProviderConnection } from './transport.js';
+import { WindowsRunnerTransport, type WindowsProviderConnection, type WindowsProviderPool } from './transport.js';
 import { runBoundedProcess } from './process-runner.js';
 import { CoalescedAuthoringProgressPublisher } from './progress-publisher.js';
 import { connectChatGPTPlan } from './chatgpt-plan-login.js';
@@ -121,7 +121,7 @@ async function runCodexCommand(binary: string, args: string[], codexHome: string
 
 export async function prepareLocalCodexRuntime(environment: NodeJS.ProcessEnv = process.env,
   report: (message: string) => void = () => undefined,
-  loadRemotePool?: () => Promise<{ connections: WindowsProviderConnection[] }>): Promise<{
+  loadRemotePool?: () => Promise<WindowsProviderPool>): Promise<{
   provider: AIProvider; model: string; codexHome: string; availableModels: string[];
   providerForRoute: (route: TaskModelSelection) => AIProvider;
 }> {
@@ -144,6 +144,9 @@ export async function prepareLocalCodexRuntime(environment: NodeJS.ProcessEnv = 
   if (!sandboxProbe.includes('FORGEMIND_SANDBOX_OK')) throw new Error('Codex Windows sandbox preflight did not execute the expected checkout-confined command.');
   const apiKey = environment.OPENAI_API_KEY?.trim() || environment.CODEX_API_KEY?.trim();
   const initialRemotePool = loadRemotePool ? await loadRemotePool() : { connections: [] };
+  for (const unavailable of initialRemotePool.unavailableConnections ?? []) {
+    report(`AI connection unavailable: ${unavailable.name} (${unavailable.authMode === 'chatgpt_plan_oauth' ? 'ChatGPT plan' : 'API key'}); reconnect or replace its credential.`);
+  }
   const candidates: WindowsProviderCandidate[] = [];
   let localModels: ProviderModelOption[] = [];
   if (apiKey) {
@@ -164,6 +167,9 @@ export async function prepareLocalCodexRuntime(environment: NodeJS.ProcessEnv = 
       id: remote.id,
       label: `${remote.name} (${remote.authMode === 'chatgpt_plan_oauth' ? 'ChatGPT plan' : 'API key'})`,
       allowedModels: remote.allowedModels.length > 0 ? remote.allowedModels : [remote.model],
+      // The ChatGPT model list is an advisory client catalogue, not proof of
+      // per-request entitlement. The inference request is the authority.
+      modelCatalogIsAdvisory: remote.authMode === 'chatgpt_plan_oauth',
       create: async (route) => {
         const current = loadRemotePool ? (await loadRemotePool()).connections.find((connection) => connection.id === remote.id) : remote;
         if (!current) throw new Error(`ForgeMind provider connection "${remote.name}" is no longer available.`);
@@ -183,12 +189,16 @@ export async function prepareLocalCodexRuntime(environment: NodeJS.ProcessEnv = 
   if (candidates.length === 0) {
     throw new Error('No Windows authoring AI connection is available. Set OPENAI_API_KEY or connect an API/ChatGPT-plan connection in ForgeMind.');
   }
+  for (const candidate of candidates) {
+    report(`AI connection ready: ${candidate.label}; models: ${candidate.allowedModels.join(', ') || 'none advertised'}.`);
+  }
   const availableModels = Array.from(new Set(candidates.flatMap((candidate) => candidate.allowedModels)));
   const modelOptions = localModels.length > 0
     ? localModels
     : availableModels.map((id, index) => ({ id, name: id, isDefault: index === 0 }));
   const model = selectLocalCodexModel(modelOptions, environment.FORGEMIND_MODEL_STANDARD ?? environment.CODEX_MODEL);
-  const provider = createWindowsProviderPool(candidates, undefined, report);
+  const health: WindowsProviderPoolHealth = { unavailable: new Set() };
+  const provider = createWindowsProviderPool(candidates, undefined, report, health);
   report(`Verifying AI access with ${model} across ${candidates.length} connection(s)...`);
   const preflight = await provider.preflight();
   if (!preflight.ok) throw new Error(`AI provider preflight failed before starting a Windows session: ${preflight.error?.auditSafeMessage ?? 'unknown error'}`);
@@ -197,11 +207,7 @@ export async function prepareLocalCodexRuntime(environment: NodeJS.ProcessEnv = 
     model,
     codexHome,
     availableModels,
-    providerForRoute: (route) => createWindowsProviderPool(
-      candidates.filter((candidate) => candidate.allowedModels.includes(route.model)),
-      route,
-      report
-    )
+    providerForRoute: (route) => createWindowsProviderPool(candidates, route, report, health)
   };
 }
 
@@ -209,42 +215,94 @@ export interface WindowsProviderCandidate {
   id: string;
   label: string;
   allowedModels: string[];
+  modelCatalogIsAdvisory?: boolean;
   create(route?: TaskModelSelection): Promise<AIProvider>;
+}
+
+interface WindowsProviderPoolHealth {
+  unavailable: Set<string>;
+}
+
+const MODEL_QUALITY: Record<string, number> = { luna: 1, terra: 2, sol: 3, astra: 4 };
+
+/** Select an equivalent model for another account whose model catalogue may
+ * have been saved under an older version name. Never silently lower the
+ * requested quality tier. */
+export function resolveWindowsCandidateRoute(
+  candidate: WindowsProviderCandidate,
+  route: TaskModelSelection | undefined
+): TaskModelSelection | undefined {
+  if (!route) return undefined;
+  if (candidate.modelCatalogIsAdvisory || candidate.allowedModels.includes(route.model)) return route;
+  const requestedTier = modelQualityTier(route.model);
+  if (!requestedTier) return undefined;
+  const compatible = candidate.allowedModels
+    .map((model) => ({ model, tier: modelQualityTier(model) }))
+    .filter((item): item is { model: string; tier: { name: string; rank: number } } => Boolean(item.tier))
+    .filter(({ tier }) => tier.name === requestedTier.name || tier.rank > requestedTier.rank)
+    .sort((left, right) => {
+      const leftPenalty = left.tier.name === requestedTier.name ? 0 : left.tier.rank - requestedTier.rank;
+      const rightPenalty = right.tier.name === requestedTier.name ? 0 : right.tier.rank - requestedTier.rank;
+      return leftPenalty - rightPenalty || compareModelVersions(right.model, left.model);
+    });
+  return compatible[0] ? { ...route, model: compatible[0].model } : undefined;
+}
+
+function modelQualityTier(model: string): { name: string; rank: number } | undefined {
+  const match = model.toLowerCase().match(/(?:^|-)(luna|terra|sol|astra)(?:-|$)/);
+  const name = match?.[1];
+  return name ? { name, rank: MODEL_QUALITY[name]! } : undefined;
+}
+
+function compareModelVersions(left: string, right: string): number {
+  const version = (model: string) => model.match(/^gpt-(\d+(?:\.\d+)?)/i)?.[1]?.split('.').map(Number) ?? [];
+  const leftVersion = version(left); const rightVersion = version(right);
+  return (leftVersion[0] ?? 0) - (rightVersion[0] ?? 0)
+    || (leftVersion[1] ?? 0) - (rightVersion[1] ?? 0);
 }
 
 export function createWindowsProviderPool(
   candidates: WindowsProviderCandidate[],
   route: TaskModelSelection | undefined,
-  report: (message: string) => void
+  report: (message: string) => void,
+  health: WindowsProviderPoolHealth = { unavailable: new Set() }
 ): AIProvider {
-  if (candidates.length === 0) {
+  const routedCandidates = candidates.flatMap((candidate) => {
+    const effectiveRoute = resolveWindowsCandidateRoute(candidate, route);
+    return route && !effectiveRoute ? [] : [{ candidate, effectiveRoute }];
+  });
+  if (routedCandidates.length === 0) {
     throw new Error(`Server-selected model "${route?.model ?? 'unknown'}" is not available to any Windows runner AI connection.`);
   }
-  let activeId = candidates[0]!.id;
-  const unavailable = new Set<string>();
+  let activeId = routedCandidates.find(({ candidate }) => !health.unavailable.has(candidate.id))?.candidate.id
+    ?? routedCandidates[0]!.candidate.id;
   const call = async <T>(operation: string, session: ProviderSessionContext | undefined,
     action: (provider: AIProvider) => Promise<T>): Promise<T> => {
-    const ordered = [...candidates].sort((left, right) => left.id === activeId ? -1 : right.id === activeId ? 1 : 0);
+    const ordered = [...routedCandidates].sort((left, right) => left.candidate.id === activeId ? -1 : right.candidate.id === activeId ? 1 : 0);
     let lastError: unknown;
-    for (const candidate of ordered) {
-      if (unavailable.has(candidate.id)) continue;
+    for (const { candidate, effectiveRoute } of ordered) {
+      if (health.unavailable.has(candidate.id)) continue;
       if (candidate.id !== activeId) {
         report(`Switching AI connection to ${candidate.label} after ${operation} could not continue.`);
         if (session) {
           session.id = undefined;
           session.provider = 'codex';
-          session.model = route?.model;
+          session.model = effectiveRoute?.model;
         }
       }
+      if (route && effectiveRoute?.model !== route.model) {
+        report(`Using compatible model ${effectiveRoute?.model} on ${candidate.label} instead of unavailable ${route.model}; quality tier is preserved.`);
+      }
       try {
-        const result = await action(await candidate.create(route));
+        const result = await action(await candidate.create(effectiveRoute));
         activeId = candidate.id;
         return result;
       } catch (error) {
         const normalized = normalizeProviderError('codex', error);
         lastError = error;
         if (!normalized.failoverEligible) throw error;
-        if (!normalized.retryable) unavailable.add(candidate.id);
+        report(`${candidate.label} failed during ${operation} (${normalized.kind}); ${ordered.length > 1 ? 'trying the next configured connection' : 'no compatible fallback is configured'}.`);
+        if (!normalized.retryable) health.unavailable.add(candidate.id);
       }
     }
     throw lastError ?? new Error('No Windows authoring AI connection is available.');

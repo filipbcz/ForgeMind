@@ -138,12 +138,18 @@ export function registerWindowsRunnerRoutes(app: FastifyInstance, repository: Fo
     try {
       const providerRepository = repository as ForgeMindRepository & {
         listAIProviderConnectionSecrets?: ForgeMindRepository['listAIProviderConnectionSecrets'];
+        listAIProviderConnections?: ForgeMindRepository['listAIProviderConnections'];
       };
       if (!providerRepository.listAIProviderConnectionSecrets) throw new Error('AI provider connection storage is unavailable.');
-      const connections = (await providerRepository.listAIProviderConnectionSecrets())
-        .filter((connection) => connection.provider === 'codex'
-          && connection.authMode !== 'codex_oauth'
-          && (connection.isDefault || connection.automaticFailover))
+      const [secrets, snapshots] = await Promise.all([
+        providerRepository.listAIProviderConnectionSecrets(),
+        providerRepository.listAIProviderConnections?.() ?? Promise.resolve([])
+      ]);
+      const eligible = (connection: { provider: string; authMode: string; isDefault: boolean; automaticFailover: boolean }) => connection.provider === 'codex'
+        && connection.authMode !== 'codex_oauth'
+        && (connection.isDefault || connection.automaticFailover);
+      const connections = secrets
+        .filter(eligible)
         .flatMap((connection) => {
           const credential = connection.authMode === 'chatgpt_plan_oauth' ? connection.accessToken : connection.apiKey;
           return credential ? [{
@@ -155,7 +161,12 @@ export function registerWindowsRunnerRoutes(app: FastifyInstance, repository: Fo
             credential
           }] : [];
         });
-      return reply.header('cache-control', 'no-store').send({ connections });
+      const availableIds = new Set(connections.map(({ id }) => id));
+      const unavailableConnections = snapshots
+        .filter(eligible)
+        .filter(({ id }) => !availableIds.has(id))
+        .map(({ id, name, authMode }) => ({ id, name, authMode, reason: 'credential_unavailable' as const }));
+      return reply.header('cache-control', 'no-store').send({ connections, unavailableConnections });
     } catch (error) {
       return reply.code(400).send({ error: error instanceof Error ? error.message : 'AI provider pool is unavailable.' });
     }

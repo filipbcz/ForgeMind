@@ -1,6 +1,6 @@
 import { createHash } from 'node:crypto';
 import { describe, expect, it, vi } from 'vitest';
-import { assertNativeCodexCliCompatibility, createWindowsProviderPool, parseCliArgs, requiredProbeFailures, resolveCodexPreflightTimeouts, selectLocalCodexModel, uploadAuthoringResultBlobs } from './cli.js';
+import { assertNativeCodexCliCompatibility, createWindowsProviderPool, parseCliArgs, requiredProbeFailures, resolveCodexPreflightTimeouts, resolveWindowsCandidateRoute, selectLocalCodexModel, uploadAuthoringResultBlobs } from './cli.js';
 
 describe('Windows runner CLI parsing', () => {
   it.each([
@@ -60,23 +60,38 @@ describe('Windows runner CLI parsing', () => {
     expect(() => resolveCodexPreflightTimeouts({ FORGEMIND_CODEX_SANDBOX_PROBE_TIMEOUT_MS: '1800001' })).toThrow(/integer from 1000/i);
   });
 
-  it('continues Windows authoring through the next connection after credits are exhausted', async () => {
+  it('continues Windows authoring through ChatGPT after API credits are exhausted without treating its catalogue as entitlement', async () => {
     const reports: string[] = [];
     const primaryImplement = vi.fn(async () => {
       throw new Error('Your workspace is out of credits. Ask your workspace owner to refill.');
     });
     const fallbackImplement = vi.fn(async () => ({ summary: 'done', changedFiles: [], diffStat: { filesChanged: 0, insertions: 0, deletions: 0 } }));
+    const fallbackCreate = vi.fn(async () => ({ implement: fallbackImplement }) as never);
     const pool = createWindowsProviderPool([
       { id: 'primary', label: 'API key', allowedModels: ['gpt-6.1-sol'], create: async () => ({ implement: primaryImplement }) as never },
-      { id: 'fallback', label: 'ChatGPT plan', allowedModels: ['gpt-6.1-sol'], create: async () => ({ implement: fallbackImplement }) as never }
+      { id: 'fallback', label: 'ChatGPT plan', allowedModels: ['gpt-5.6-sol'], modelCatalogIsAdvisory: true, create: fallbackCreate }
     ], { model: 'gpt-6.1-sol', reasoningEffort: 'medium' }, (message) => reports.push(message));
     const session = { id: 'provider-session' };
 
     await expect(pool.implement({ session } as never)).resolves.toMatchObject({ summary: 'done' });
     expect(primaryImplement).toHaveBeenCalledOnce();
     expect(fallbackImplement).toHaveBeenCalledOnce();
+    expect(fallbackCreate).toHaveBeenCalledWith({ model: 'gpt-6.1-sol', reasoningEffort: 'medium' });
     expect(session.id).toBeUndefined();
-    expect(reports).toEqual([expect.stringContaining('ChatGPT plan')]);
+    expect(reports).toEqual([
+      expect.stringContaining('credit_exhausted'),
+      expect.stringContaining('ChatGPT plan')
+    ]);
+  });
+
+  it('uses an equal or stronger fallback tier but never silently lowers model quality', () => {
+    const candidate = (allowedModels: string[]) => ({ id: 'fallback', label: 'fallback', allowedModels, create: vi.fn() });
+    const route = { model: 'gpt-6.1-sol', reasoningEffort: 'high' as const };
+
+    expect(resolveWindowsCandidateRoute(candidate(['gpt-5.6-sol']), route)).toEqual({ ...route, model: 'gpt-5.6-sol' });
+    expect(resolveWindowsCandidateRoute(candidate(['gpt-6-terra', 'gpt-6-astra']), route)).toEqual({ ...route, model: 'gpt-6-astra' });
+    expect(resolveWindowsCandidateRoute(candidate(['gpt-6-luna', 'gpt-6-terra']), route)).toBeUndefined();
+    expect(resolveWindowsCandidateRoute({ ...candidate(['gpt-5.6-sol']), modelCatalogIsAdvisory: true }, route)).toEqual(route);
   });
 
   it('uploads binary authoring payloads in bounded chunks and returns a small content-addressed manifest', async () => {

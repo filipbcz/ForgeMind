@@ -11,6 +11,16 @@ export interface WindowsProviderConnection {
   allowedModels: string[];
   credential: string;
 }
+export interface WindowsUnavailableProviderConnection {
+  id: string;
+  name: string;
+  authMode: 'api_key' | 'chatgpt_plan_oauth';
+  reason: 'credential_unavailable';
+}
+export interface WindowsProviderPool {
+  connections: WindowsProviderConnection[];
+  unavailableConnections?: WindowsUnavailableProviderConnection[];
+}
 export const WINDOWS_RUNNER_LEASE_SECONDS = 300;
 
 /** Outbound-only HTTPS control-plane client. It never opens a listening socket. */
@@ -33,7 +43,7 @@ export class WindowsRunnerTransport {
     );
   }
   providerPool(auth: RunnerCredential) {
-    return this.call<{ connections: WindowsProviderConnection[] }>('/api/windows-runner/device/provider-pool', auth, undefined, 'GET');
+    return this.call<WindowsProviderPool>('/api/windows-runner/device/provider-pool', auth, undefined, 'GET');
   }
   publishDevice(auth: RunnerCredential, input: { runnerVersion: string; displayName: string; capabilities: WorkerCapability[]; probeEvidence: WorkerProbeEvidence[] }) {
     return this.call('/api/windows-runner/device', auth, input, 'PUT');

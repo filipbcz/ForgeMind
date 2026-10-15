@@ -49,12 +49,17 @@ describe('Windows runner enrollment API', () => {
   it('returns only eligible Codex credentials to an authenticated runner and forbids caching', async () => {
     const app = Fastify();
     const credentials: any = { authenticate: vi.fn(async () => ({ deviceId: '11111111-1111-4111-8111-111111111111' })) };
-    const repository: any = { listAIProviderConnectionSecrets: vi.fn(async () => [
+    const records = [
       { id: 'api', name: 'API', provider: 'codex', authMode: 'api_key', apiKey: 'sk-api', model: 'gpt-6.1-sol', allowedModels: ['gpt-6.1-sol'], isDefault: true, automaticFailover: false },
       { id: 'plan', name: 'Plan', provider: 'codex', authMode: 'chatgpt_plan_oauth', accessToken: 'oauth-access', model: 'gpt-6.1-sol', allowedModels: ['gpt-6-luna', 'gpt-6.1-sol'], isDefault: false, automaticFailover: true },
+      { id: 'expired-plan', name: 'Expired plan', provider: 'codex', authMode: 'chatgpt_plan_oauth', model: 'gpt-6.1-sol', allowedModels: ['gpt-6.1-sol'], isDefault: false, automaticFailover: true },
       { id: 'disabled', name: 'Disabled', provider: 'codex', authMode: 'api_key', apiKey: 'sk-disabled', model: 'gpt-6.1-sol', isDefault: false, automaticFailover: false },
       { id: 'response-only', name: 'Response only', provider: 'openai', authMode: 'api_key', apiKey: 'sk-openai', model: 'gpt-6.1-sol', isDefault: false, automaticFailover: true }
-    ]) };
+    ];
+    const repository: any = {
+      listAIProviderConnectionSecrets: vi.fn(async () => records.filter(({ id }) => id !== 'expired-plan')),
+      listAIProviderConnections: vi.fn(async () => records.map(({ apiKey: _apiKey, accessToken: _accessToken, ...record }) => record))
+    };
     registerWindowsRunnerRoutes(app, repository, credentials, {} as any);
 
     const response = await app.inject({ method: 'GET', url: '/api/windows-runner/device/provider-pool', headers: { authorization: 'Bearer device-token' } });
@@ -64,6 +69,8 @@ describe('Windows runner enrollment API', () => {
     expect(response.json()).toEqual({ connections: [
       { id: 'api', name: 'API', authMode: 'api_key', credential: 'sk-api', model: 'gpt-6.1-sol', allowedModels: ['gpt-6.1-sol'] },
       { id: 'plan', name: 'Plan', authMode: 'chatgpt_plan_oauth', credential: 'oauth-access', model: 'gpt-6.1-sol', allowedModels: ['gpt-6-luna', 'gpt-6.1-sol'] }
+    ], unavailableConnections: [
+      { id: 'expired-plan', name: 'Expired plan', authMode: 'chatgpt_plan_oauth', reason: 'credential_unavailable' }
     ] });
   });
 

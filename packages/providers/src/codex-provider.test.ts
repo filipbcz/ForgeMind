@@ -209,6 +209,26 @@ describe('Codex process activity timeouts', () => {
     expect(commandEnv.CODEX_API_KEY).toBe('sk-test');
   });
 
+  it('isolates ChatGPT-plan CLI authentication from API-key credentials', () => {
+    const previousOpenAIKey = process.env.OPENAI_API_KEY;
+    const previousCodexKey = process.env.CODEX_API_KEY;
+    process.env.OPENAI_API_KEY = 'sk-exhausted';
+    process.env.CODEX_API_KEY = 'sk-exhausted';
+    try {
+      const provider = new CodexProvider({ accessToken: 'oauth-test', authMode: 'chatgpt_plan_oauth', useCli: true });
+      const commandEnv = (provider as unknown as { commandEnv: NodeJS.ProcessEnv }).commandEnv;
+
+      expect(commandEnv.ACCESS_TOKEN).toBe('oauth-test');
+      expect(commandEnv.OPENAI_API_KEY).toBeUndefined();
+      expect(commandEnv.CODEX_API_KEY).toBeUndefined();
+    } finally {
+      if (previousOpenAIKey === undefined) delete process.env.OPENAI_API_KEY;
+      else process.env.OPENAI_API_KEY = previousOpenAIKey;
+      if (previousCodexKey === undefined) delete process.env.CODEX_API_KEY;
+      else process.env.CODEX_API_KEY = previousCodexKey;
+    }
+  });
+
   it('keeps an active process alive past the inactivity timeout', async () => {
     const onActivity = vi.fn();
 
