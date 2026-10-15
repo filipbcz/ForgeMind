@@ -234,19 +234,22 @@ export class WindowsWorkerRepository {
         const hydrate = <T extends { sha256: string; contentBase64?: string; blobSha256?: string }>(entry: T): T & { contentBase64: string } => {
           if (entry.contentBase64 !== undefined) return entry as T & { contentBase64: string };
           const contentBase64 = byHash.get(entry.blobSha256?.toLowerCase() ?? '');
-          if (!contentBase64) throw new Error(`Windows authoring blob ${entry.blobSha256 ?? entry.sha256} is unavailable.`);
+          // Empty content has an empty base64 representation. It is still a
+          // present, valid content-addressed blob and must not be confused
+          // with a missing map entry.
+          if (contentBase64 === undefined) throw new Error(`Windows authoring blob ${entry.blobSha256 ?? entry.sha256} is unavailable.`);
           const { blobSha256: _blobSha256, ...rest } = entry;
           return { ...rest, contentBase64 } as T & { contentBase64: string };
         };
         const patchBase64 = packet.authoringResult.patchBlobSha256
           ? byHash.get(packet.authoringResult.patchBlobSha256.toLowerCase()) : undefined;
-        if (packet.authoringResult.patchBlobSha256 && !patchBase64) {
+        if (packet.authoringResult.patchBlobSha256 && patchBase64 === undefined) {
           throw new Error(`Windows authoring patch blob ${packet.authoringResult.patchBlobSha256} is unavailable.`);
         }
         return { ...packet.authoringResult, resultBundle: { ...packet.authoringResult.resultBundle,
           lfsObjects: packet.authoringResult.resultBundle.lfsObjects.map(hydrate),
           outputs: packet.authoringResult.resultBundle.outputs.map(hydrate) },
-          patch: patchBase64
+          patch: patchBase64 !== undefined
             ? Buffer.from(patchBase64, 'base64').toString('utf8')
             : packet.authoringResult.patch,
           patchBlobSha256: undefined };

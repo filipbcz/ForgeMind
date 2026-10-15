@@ -355,6 +355,35 @@ describe('WindowsWorkerRepository capability leases', () => {
     expect(blob.sha256).toBe(sha256);
   });
 
+  it('hydrates a present zero-byte authoring patch instead of reporting it as unavailable', async () => {
+    const emptySha = createHash('sha256').update('').digest('hex');
+    const authoringResult = {
+      kind: 'authoring-result', protocolVersion: 2, projectId: 'project_1', taskId: 'task_1', runId: 'run_1',
+      jobId: 'job_1', leaseId: 'lease_1', deviceId: 'device_1', sessionId: 'session_1', nonce: 'nonce_1',
+      inputHash: 'a'.repeat(64), baseCommitSha: 'b'.repeat(40), resultTreeSha: 'c'.repeat(40), tree: [],
+      patch: '', patchBlobSha256: emptySha,
+      resultBundle: { version: 1, format: 'git-binary-patch', sha256: emptySha, sizeBytes: 0, lfsObjects: [], outputs: [] },
+      completedOperationIds: [], checkpointIds: [], artifacts: [], processes: [], status: 'failed',
+      failure: { kind: 'provider-configuration', retryable: false },
+      contentAssessment: { technicalVerification: 'failed', productionReviewRequired: false,
+        rationale: 'Authoring did not run.' },
+      startedAt: '2026-10-15T05:59:00.000Z', completedAt: '2026-10-15T05:59:01.000Z',
+      summary: 'No authoring provider is available.'
+    };
+    const prisma: any = {
+      windowsExecutionJob: { findUnique: vi.fn(async () => ({
+        status: 'failed', packet: { kind: 'authoring', authoringResult }
+      })) },
+      windowsAuthoringBlob: { findMany: vi.fn(async () => [{ sha256: emptySha, content: Buffer.alloc(0) }]) }
+    };
+
+    await expect(new WindowsWorkerRepository(prisma).waitForAuthoringResult('job_1')).resolves.toMatchObject({
+      patch: '',
+      patchBlobSha256: undefined,
+      summary: 'No authoring provider is available.'
+    });
+  });
+
   it('accepts the exact deferred check result without restarting the completed task', async () => {
     const digest = 'b'.repeat(64);
     const packet = {

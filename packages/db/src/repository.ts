@@ -1130,7 +1130,11 @@ export class ForgeMindRepository {
 
   private async refreshChatGPTPlanConnection(connection: AiProviderConnection): Promise<AiProviderConnection> {
     return this.prisma.$transaction(async (tx) => {
-      await tx.$queryRaw`SELECT pg_advisory_xact_lock(hashtext(${connection.id}))`;
+      // pg_advisory_xact_lock returns PostgreSQL void. Prisma tries to
+      // deserialize SELECT results issued through $queryRaw and rejects that
+      // value before the refresh request can run. $executeRaw deliberately
+      // discards the row while preserving the transaction-scoped lock.
+      await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtext(${connection.id}))`;
       const current = await tx.aiProviderConnection.findUnique({ where: { id: connection.id } });
       if (!current) throw new Error(`ChatGPT plan connection "${connection.name}" no longer exists.`);
       if (current.oauthExpiresAt && current.oauthExpiresAt.getTime() > Date.now() + 5 * 60_000) return current;
