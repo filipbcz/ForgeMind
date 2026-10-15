@@ -231,17 +231,23 @@ export async function executeWindowsAuthoring(packet: WindowsAuthoringPacket, co
     const currentChangedPaths = await stageChangedPaths(workspacePath, context.signal);
     await rejectProhibitedResultPaths(packet, workspacePath, context.signal);
     productionReviewRequired = await enforceRequiredUnrealAssets(packet, workspacePath, evidenceDirectory, outputDirectory, currentChangedPaths, processes,
-      packet.resourcePolicy.timeoutSeconds * 1_000, selectedUnrealCommandletExecutable, context.signal);
+      packet.resourcePolicy.timeoutSeconds * 1_000, selectedUnrealCommandletExecutable, context.signal, resumedUnrealPackages);
     completionVerified = true;
     await publishCheckpoint('verified');
   };
   try {
-    const output = await context.provider.implement({ prompt: nativeImplementationPrompt(packet), acceptanceCriteria: packet.step.acceptanceCriteria,
-      previousValidationError: packet.step.previousValidationError, previousReviewBlockers: packet.step.previousReviewBlockers,
-      operations: packet.operations, tools, signal: context.signal,
-      verifyCompletion: packet.contentPolicy.requiresUnrealAssets ? verifyCompletion : undefined });
-    summary = output.summary; completedOperationIds = output.completedOperationIds; checkpointIds = output.checkpointIds;
-    providerUsage = output.providerUsage ?? [];
+    if (canFinalizeRecoveredUnrealResult(packet.step.previousValidationError, checkout.resumed, resumedUnrealPackages)) {
+      await verifyCompletion();
+      summary = 'Recovered Unreal packages were re-authored and verified without repeating AI implementation.';
+      completedOperationIds = packet.operations.map(({ id }) => id);
+    } else {
+      const output = await context.provider.implement({ prompt: nativeImplementationPrompt(packet), acceptanceCriteria: packet.step.acceptanceCriteria,
+        previousValidationError: packet.step.previousValidationError, previousReviewBlockers: packet.step.previousReviewBlockers,
+        operations: packet.operations, tools, signal: context.signal,
+        verifyCompletion: packet.contentPolicy.requiresUnrealAssets ? verifyCompletion : undefined });
+      summary = output.summary; completedOperationIds = output.completedOperationIds; checkpointIds = output.checkpointIds;
+      providerUsage = output.providerUsage ?? [];
+    }
   } catch (error) {
     providerUsage = error && typeof error === 'object' && 'providerUsage' in error && Array.isArray(error.providerUsage)
       ? error.providerUsage as WindowsProviderUsage[] : [];
@@ -256,7 +262,7 @@ export async function executeWindowsAuthoring(packet: WindowsAuthoringPacket, co
   if (status === 'succeeded' && !completionVerified) {
     try {
       productionReviewRequired = await enforceRequiredUnrealAssets(packet, workspacePath, evidenceDirectory, outputDirectory, changedPaths, processes,
-        packet.resourcePolicy.timeoutSeconds * 1_000, selectedUnrealCommandletExecutable, context.signal);
+        packet.resourcePolicy.timeoutSeconds * 1_000, selectedUnrealCommandletExecutable, context.signal, resumedUnrealPackages);
     } catch (error) {
       status = context.signal?.aborted ? 'cancelled' : 'failed';
       summary = `Final native Unreal verification failed: ${redactSecrets(error instanceof Error ? error.message : String(error))}`;
@@ -322,6 +328,12 @@ export async function executeWindowsAuthoring(packet: WindowsAuthoringPacket, co
   await writeFile(resolve(evidenceDirectory, 'result-checkpoint.json'), JSON.stringify({ version: 2,
     semanticHash: authoringSemanticHash(packet), result }), 'utf8');
   return { workspacePath, result };
+}
+
+export function canFinalizeRecoveredUnrealResult(previousValidationError: string | undefined, resumed: boolean,
+  recoveredPackages: AuthoringTreeEntry[]): boolean {
+  return resumed && recoveredPackages.length > 0
+    && /Required Unreal content was not created or imported through a successful editor authoring API call/i.test(previousValidationError ?? '');
 }
 
 export function nativeImplementationPrompt(packet: Pick<WindowsAuthoringPacket, 'step' | 'contentPolicy'>): string {
@@ -777,14 +789,26 @@ async function indexedChangedPaths(root: string, signal?: AbortSignal): Promise<
 }
 
 async function enforceRequiredUnrealAssets(packet: WindowsAuthoringPacket, root: string, evidenceRoot: string, outputRoot: string, changedPaths: string[], processes: WindowsAuthoringProcessResult[], timeoutMs: number,
-  selectedUnrealExecutable?: string, signal?: AbortSignal): Promise<boolean> {
+  selectedUnrealExecutable?: string, signal?: AbortSignal, recoveredPackages: AuthoringTreeEntry[] = []): Promise<boolean> {
   if (!packet.contentPolicy.requiresUnrealAssets) return false;
   const assets: string[] = [];
   for (const path of changedPaths.filter((candidate) => /\.(?:uasset|umap)$/i.test(candidate))) {
     try { if ((await lstat(resolve(root, path))).isFile()) assets.push(path); } catch { /* deleted packages are not loadable result assets */ }
   }
-  const authored = processes.find((process) => process.exitCode === 0 && process.authoring?.phase === 'author'
+  let authored = processes.find((process) => process.exitCode === 0 && process.authoring?.phase === 'author'
     && ['unreal-editor', 'unreal-python'].includes(process.authoring.tool));
+  if (assets.length > 0 && !authored && recoveredPackages.length > 0) {
+    if (!selectedUnrealExecutable) throw new Error('The currently probed UnrealEditor executable is unavailable for recovered-package authoring.');
+    await assertRecoveredPackagesUnchanged(root, assets, recoveredPackages);
+    const recovery = await reauthorRecoveredUnrealPackages(root, evidenceRoot, assets, selectedUnrealExecutable, timeoutMs, signal);
+    const recoveredAuthoring = { ...recovery, leaseId: packet.leaseId, sessionId: processes[0]?.sessionId ?? 'authoring-session' };
+    processes.push(recoveredAuthoring);
+    if (recovery.exitCode !== 0 || recovery.terminationReason) {
+      const diagnostic = redactSecrets([recovery.stderr, recovery.stdout].filter(Boolean).join('\n')).slice(-8_000);
+      throw new Error(`Unreal failed while renewing recovered package provenance (${recovery.terminationReason ?? `exit ${recovery.exitCode ?? 'unknown'}`}): ${diagnostic || 'no diagnostic output'}`);
+    }
+    authored = recoveredAuthoring;
+  }
   if (assets.length > 0 && authored?.authoring) {
     if (!selectedUnrealExecutable) throw new Error('The currently probed UnrealEditor executable is unavailable for final verification.');
     const verification = await verifyUnrealPackages(root, evidenceRoot, assets, authored.authoring, selectedUnrealExecutable, timeoutMs, signal);
@@ -798,6 +822,76 @@ async function enforceRequiredUnrealAssets(packet: WindowsAuthoringPacket, root:
     }, null, 2), 'utf8');
   }
   return validateRequiredUnrealAssets(assets, processes, requiresProductionContent(packet.step.acceptanceCriteria));
+}
+
+async function assertRecoveredPackagesUnchanged(root: string, assets: string[], recoveredPackages: AuthoringTreeEntry[]): Promise<void> {
+  const recovered = new Map(recoveredPackages.map((entry) => [entry.path.replaceAll('\\', '/').toLowerCase(), entry]));
+  for (const asset of assets) {
+    const entry = recovered.get(asset.toLowerCase());
+    if (!entry) throw new Error(`Recovered Unreal package has no durable checkpoint identity: ${asset}`);
+    const content = await readFile(resolve(root, asset));
+    if (content.length !== entry.sizeBytes || createHash('sha256').update(content).digest('hex') !== entry.sha256) {
+      throw new Error(`Recovered Unreal package changed after checkpoint restoration without a successful editor authoring call: ${asset}`);
+    }
+  }
+}
+
+async function reauthorRecoveredUnrealPackages(root: string, evidenceRoot: string, assets: string[], selectedUnrealExecutable: string,
+  timeoutMs: number, signal?: AbortSignal): Promise<Omit<WindowsAuthoringProcessResult, 'leaseId' | 'sessionId'>> {
+  const projectRelativePath = await selectUnrealProjectForPackages(root, assets);
+  const projectPath = await realpath(resolve(root, projectRelativePath));
+  const packages = assets.map((path) => ({ path, objectPath: unrealObjectPath(path, projectRelativePath) }));
+  const scriptPath = resolve(evidenceRoot, 'reauthor-recovered-unreal-content.py');
+  await writeFile(scriptPath, buildRecoveredUnrealPackageAuthoringScript(packages), 'utf8');
+  const args = buildUnrealAuthoringArgs(projectPath, [`-ExecutePythonScript=${scriptPath}`, '-NullRHI'], 'author');
+  const startedAt = new Date();
+  const output = await spawnComplete(selectedUnrealExecutable, args, root, timeoutMs, signal);
+  return { checkId: 'unreal-recovered-content-resave', command: [selectedUnrealExecutable, ...args].join(' '), shell: 'system',
+    ...output, stdout: redactSecrets(output.stdout), stderr: redactSecrets(output.stderr),
+    startedAt: startedAt.toISOString(), completedAt: new Date().toISOString(), authoring: { tool: 'unreal-python', phase: 'author',
+      projectRelativePath, executablePath: selectedUnrealExecutable, args: args.slice(1), sourceRelativePaths: [] } };
+}
+
+export async function selectUnrealProjectForPackages(root: string, assets: string[]): Promise<string> {
+  const candidates: string[] = [];
+  for (const directory of await discoverUnrealProjectDirectories(root)) {
+    let entries;
+    try { entries = await readdir(resolve(root, directory), { withFileTypes: true }); } catch { continue; }
+    for (const entry of entries) {
+      if (!entry.isFile() || !entry.name.toLowerCase().endsWith('.uproject')) continue;
+      const projectRelativePath = directory === '.' ? entry.name : `${directory}/${entry.name}`;
+      const contentPrefix = directory === '.' ? 'content/' : `${directory.toLowerCase()}/content/`;
+      if (assets.every((asset) => asset.replaceAll('\\', '/').toLowerCase().startsWith(contentPrefix))) candidates.push(projectRelativePath);
+    }
+  }
+  candidates.sort((left, right) => right.length - left.length || left.localeCompare(right));
+  if (candidates.length === 0) throw new Error(`No Unreal project owns all recovered packages: ${assets.join(', ')}`);
+  return candidates[0]!;
+}
+
+export function buildRecoveredUnrealPackageAuthoringScript(packages: Array<{ path: string; objectPath: string }>): string {
+  return [
+    'import unreal',
+    `packages = ${JSON.stringify(packages)}`,
+    'failed = []',
+    'editor_subsystem = unreal.get_editor_subsystem(unreal.UnrealEditorSubsystem)',
+    'level_subsystem = unreal.get_editor_subsystem(unreal.LevelEditorSubsystem)',
+    'for package in packages:',
+    "    if package['path'].lower().endswith('.umap'):",
+    "        loaded_ok = level_subsystem.load_level(package['objectPath'])",
+    '        loaded = editor_subsystem.get_editor_world() if loaded_ok else None',
+    '        saved = level_subsystem.save_current_level() if loaded is not None else False',
+    '    else:',
+    "        loaded = unreal.load_asset(package['objectPath'])",
+    "        saved = unreal.EditorAssetLibrary.save_asset(package['objectPath'], False) if loaded is not None else False",
+    '    if loaded is None:',
+    "        failed.append(package['path'] + ':load')",
+    '        continue',
+    '    if not saved:',
+    "        failed.append(package['path'] + ':save')",
+    '    del loaded',
+    "if failed: raise RuntimeError('Could not re-save recovered packages: ' + ', '.join(failed))"
+  ].join('\n');
 }
 
 export function requiresProductionContent(criteria: string[]): boolean {

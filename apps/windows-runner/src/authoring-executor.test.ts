@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from 'vitest';
-import { assertReadableAuthoringCheckout, authoringPatchOutputLimit, authoringSemanticHash, buildUnrealPackageVerificationArgs, buildUnrealPackageVerificationScript, canResumeAuthoringCheckpoint, checkpointRecoveryScore, classifyAuthoringFailure, classifyWindowsAuthoringFailure, cleanupIgnoredUnrealRuntimeState, collectAuthoringToolVersions, collectCheckpointAuthoringProvenance, compactProcessResults, discoverUnrealProjectDirectories, hasRestorableAuthoringCheckpoint, isProhibitedAuthoringPath, LifecycleNativeImplementationProvider, materializeOutputs, nativeImplementationPrompt, requiresProductionContent, retainedCheckpointGenerations, restoreCheckpointAuthoringProvenance, selectRecoveryCheckpoint, type NativeAuthoringTools, unrealObjectPath, validateRequiredUnrealAssets } from './authoring-executor.js';
+import { assertReadableAuthoringCheckout, authoringPatchOutputLimit, authoringSemanticHash, buildRecoveredUnrealPackageAuthoringScript, buildUnrealPackageVerificationArgs, buildUnrealPackageVerificationScript, canFinalizeRecoveredUnrealResult, canResumeAuthoringCheckpoint, checkpointRecoveryScore, classifyAuthoringFailure, classifyWindowsAuthoringFailure, cleanupIgnoredUnrealRuntimeState, collectAuthoringToolVersions, collectCheckpointAuthoringProvenance, compactProcessResults, discoverUnrealProjectDirectories, hasRestorableAuthoringCheckpoint, isProhibitedAuthoringPath, LifecycleNativeImplementationProvider, materializeOutputs, nativeImplementationPrompt, requiresProductionContent, retainedCheckpointGenerations, restoreCheckpointAuthoringProvenance, selectRecoveryCheckpoint, selectUnrealProjectForPackages, type NativeAuthoringTools, unrealObjectPath, validateRequiredUnrealAssets } from './authoring-executor.js';
 import { access, mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
@@ -162,6 +162,31 @@ describe('native implementation provider lifecycle', () => {
     expect(script.slice(script.indexOf('    else:'))).toContain("unreal.load_asset(package['objectPath'])");
     expect(script).toContain('def inspect_package(package):');
     expect(script).toContain('observations = list(dict.fromkeys(observations))[:50]');
+  });
+  it('renews missing provenance only by loading and saving recovered packages through Unreal APIs', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'forgemind-recovered-unreal-'));
+    try {
+      await mkdir(join(root, 'unreal', 'Content', 'Maps'), { recursive: true });
+      await writeFile(join(root, 'unreal', 'Flying.uproject'), '{}');
+      expect(await selectUnrealProjectForPackages(root, ['unreal/Content/Maps/Flying.umap'])).toBe('unreal/Flying.uproject');
+      const script = buildRecoveredUnrealPackageAuthoringScript([
+        { path: 'unreal/Content/Maps/Flying.umap', objectPath: '/Game/Maps/Flying' },
+        { path: 'unreal/Content/Props/Wing.uasset', objectPath: '/Game/Props/Wing' }
+      ]);
+      expect(script).toContain("level_subsystem.load_level(package['objectPath'])");
+      expect(script).toContain('level_subsystem.save_current_level()');
+      expect(script).toContain("unreal.load_asset(package['objectPath'])");
+      expect(script).toContain("unreal.EditorAssetLibrary.save_asset(package['objectPath'], False)");
+      expect(script).toContain("raise RuntimeError('Could not re-save recovered packages:");
+      const recovered = [{ path: 'unreal/Content/Maps/Flying.umap' }] as any;
+      expect(canFinalizeRecoveredUnrealResult(
+        'The same Windows validation failed again without progress: Required Unreal content was not created or imported through a successful editor authoring API call.',
+        true, recovered)).toBe(true);
+      expect(canFinalizeRecoveredUnrealResult('another validation failed', true, recovered)).toBe(false);
+      expect(canFinalizeRecoveredUnrealResult('Required Unreal content was not created or imported through a successful editor authoring API call.', false, recovered)).toBe(false);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
   });
   it('requires editor-authored packages to be loaded after saving and retains source and exact tool provenance', () => {
     const base = { leaseId: 'lease', sessionId: 'session', shell: 'system' as const, exitCode: 0, stdout: '', stderr: '',
