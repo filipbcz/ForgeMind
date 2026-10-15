@@ -422,7 +422,7 @@ export async function main(args = process.argv.slice(2)): Promise<void> {
             ? codexRuntime.providerForRoute(claim.job.packet.modelRoute)
             : codexRuntime.provider;
           if (claim.job.packet.modelRoute) {
-            stdout.write(`Using routed model ${claim.job.packet.modelRoute.model} (${claim.job.packet.modelRoute.reasoningEffort}).\n`);
+            stdout.write(`Prepared routed model ${claim.job.packet.modelRoute.model} (${claim.job.packet.modelRoute.reasoningEffort}); it will be called only if checkpoint recovery cannot finish the task.\n`);
           }
           const progressPublisher = new CoalescedAuthoringProgressPublisher(
             async (progress) => {
@@ -434,6 +434,7 @@ export async function main(args = process.argv.slice(2)): Promise<void> {
             workspaceRoot: managedRoots.work, artifactRoot: managedRoots.diagnostics, signal: context.signal,
             managedRoots, observedCapabilities: probes.capabilities,
             onProgress: (progress) => progressPublisher.publish(progress),
+            onStatus: (message) => stdout.write(`[authoring] ${message}\n`),
             provider: new LifecycleNativeImplementationProvider(authoringProvider) });
           await progressPublisher.flush();
           const submitted = await submitAuthoringResultDurably(transport, auth, executed.result, context.signal,

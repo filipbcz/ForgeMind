@@ -156,6 +156,7 @@ export async function executeWindowsAuthoring(packet: WindowsAuthoringPacket, co
   managedRoots?: NativeAuthoringTools['managedRoots']; signal?: AbortSignal; provider: NativeImplementationProvider;
   observedCapabilities?: import('@forgemind/core').WorkerCapability[];
   onProgress?: (progress: import('@forgemind/core').WindowsAuthoringProgress) => Promise<void>;
+  onStatus?: (message: string) => void;
 }): Promise<{ result: WindowsAuthoringResult; workspacePath: string }> {
   if (process.platform !== 'win32') throw new Error('Windows authoring can run only on Windows.');
   const evidenceDirectory = managedChild(context.artifactRoot, packet.taskId);
@@ -189,8 +190,11 @@ export async function executeWindowsAuthoring(packet: WindowsAuthoringPacket, co
   const processes = restoreCheckpointAuthoringProvenance(checkout.checkpoint, packet.leaseId, context.sessionId);
   const reusableResult = checkout.resumed ? await readReusableCompletedResult(evidenceDirectory, packet, context, workspacePath) : undefined;
   if (reusableResult) return { workspacePath, result: reusableResult };
-  let latestCheckpoint: AuthoringDiskCheckpoint | undefined;
   const resumedUnrealPackages = checkout.checkpoint?.tree.filter((entry) => /\.(?:uasset|umap)$/i.test(entry.path)) ?? [];
+  context.onStatus?.(checkout.resumed && checkout.checkpoint
+    ? `Recovered workspace checkpoint ${checkout.checkpoint.resultTreeSha.slice(0, 12)} with ${resumedUnrealPackages.length} Unreal package(s).`
+    : 'No compatible authored workspace checkpoint was recovered; starting from the canonical checkout.');
+  let latestCheckpoint: AuthoringDiskCheckpoint | undefined = checkout.checkpoint;
   let liveActivity = checkout.resumed && checkout.checkpoint
     ? `Recovered durable checkpoint ${checkout.checkpoint.resultTreeSha.slice(0, 12)} with ${resumedUnrealPackages.length} Unreal package(s) (${resumedUnrealPackages.reduce((sum, entry) => sum + entry.sizeBytes, 0)} bytes).`
     : '';
@@ -205,10 +209,15 @@ export async function executeWindowsAuthoring(packet: WindowsAuthoringPacket, co
     progressDelivery = progressDelivery.then(() => context.onProgress!(progress)).catch(() => undefined);
     await progressDelivery;
   };
+  let checkpointDelivery = Promise.resolve();
   const publishCheckpoint = async (status: string) => {
-    const checkpoint = await persistCheckpoint(checkpointPath, packet, workspacePath, status, processes, selectedUnrealIdentity, context.signal, outputDirectory);
-    latestCheckpoint = checkpoint;
-    await emitProgress(processes.at(-1)?.authoring?.phase ?? 'checkout');
+    const delivery = checkpointDelivery.then(async () => {
+      const checkpoint = await persistCheckpoint(checkpointPath, packet, workspacePath, status, processes, selectedUnrealIdentity, context.signal, outputDirectory);
+      latestCheckpoint = checkpoint;
+      await emitProgress(processes.at(-1)?.authoring?.phase ?? 'checkout');
+    });
+    checkpointDelivery = delivery.catch(() => undefined);
+    await delivery;
   };
   const tools = createTools(workspacePath, resolve(evidenceDirectory, `native-processes-${packet.jobId}.jsonl`), packet.resourcePolicy.timeoutSeconds * 1_000,
     context.signal, processes, packet.leaseId, context.sessionId, { ...suppliedRoots, cache: cacheDirectory, outputs: outputDirectory,
@@ -532,6 +541,7 @@ async function prepareCheckout(packet: WindowsAuthoringPacket, root: string, che
   const retained: Array<{ path: string; checkpoint: AuthoringDiskCheckpoint }> = [];
   for (const retainedPath of [path, ...preservedPaths]) {
     try {
+      await removeAbandonedGitIndexLock(retainedPath);
       const actual = await spawnComplete('git.exe', ['rev-parse', 'HEAD'], retainedPath, 30_000, signal);
       if (actual.exitCode !== 0 || actual.stdout.trim().toLowerCase() !== packet.baseCommitSha.toLowerCase()) continue;
       // A physical workspace can outlive checkpoint metadata. Clean disposable
@@ -1086,10 +1096,36 @@ async function spawnWithInput(executable: string, args: string[], cwd: string, i
 }
 
 async function gitTree(root: string, signal?: AbortSignal): Promise<string> {
-  await spawnComplete('git.exe', ['add', '-A'], root, 30_000, signal);
+  const staged = await spawnComplete('git.exe', ['add', '-A'], root, 30_000, signal);
+  if (staged.exitCode !== 0 || staged.terminationReason) {
+    throw new Error(`Could not stage result tree: ${boundedProcessFailure(staged)}`);
+  }
   const result = await spawnComplete('git.exe', ['write-tree'], root, 30_000, signal);
-  if (!/^[a-f0-9]{40}$/i.test(result.stdout.trim())) throw new Error(`Could not inspect result tree: ${result.stderr}`);
+  if (result.exitCode !== 0 || result.terminationReason || !/^[a-f0-9]{40}$/i.test(result.stdout.trim())) {
+    throw new Error(`Could not inspect result tree: ${boundedProcessFailure(result)}`);
+  }
   return result.stdout.trim();
+}
+
+function boundedProcessFailure(result: Awaited<ReturnType<typeof spawnComplete>>): string {
+  const diagnostic = result.stderr.trim() || result.stdout.trim();
+  if (diagnostic) return diagnostic;
+  if (result.terminationReason) return `process was ${result.terminationReason}`;
+  return `process exited with code ${result.exitCode ?? 'unknown'}`;
+}
+
+async function removeAbandonedGitIndexLock(root: string): Promise<void> {
+  const gitDirectory = await spawnComplete('git.exe', ['rev-parse', '--git-dir'], root, 30_000);
+  if (gitDirectory.exitCode !== 0) return;
+  const directory = gitDirectory.stdout.trim();
+  if (!directory) return;
+  const lockPath = resolve(root, directory, 'index.lock');
+  let lock;
+  try { lock = await lstat(lockPath); } catch { return; }
+  // A recent lock may belong to another process. Older locks can only be
+  // remnants of a terminated runner because recovery happens before any
+  // provider or authoring process is started for this lease.
+  if (Date.now() - lock.mtimeMs >= 120_000) await rm(lockPath, { force: true });
 }
 
 async function collectTree(root: string, paths: string[]): Promise<AuthoringTreeEntry[]> {
