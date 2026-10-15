@@ -122,6 +122,24 @@ assert_deploy_free_space() {
   fi
 }
 
+pull_release_image() {
+  local image="$1" attempt max_attempts delay_seconds
+  max_attempts="${FORGEMIND_IMAGE_PULL_ATTEMPTS:-4}"
+  for attempt in $(seq 1 "${max_attempts}"); do
+    echo "Pulling release image ${image} (attempt ${attempt}/${max_attempts})."
+    if docker pull "${image}"; then
+      return 0
+    fi
+    if [ "${attempt}" -eq "${max_attempts}" ]; then
+      echo "Could not pull release image after ${max_attempts} attempts: ${image}" >&2
+      return 1
+    fi
+    delay_seconds="$((attempt * 10))"
+    echo "Image pull failed; retrying in ${delay_seconds}s."
+    sleep "${delay_seconds}"
+  done
+}
+
 docker network inspect shared-edge >/dev/null 2>&1 || docker network create shared-edge >/dev/null
 
 echo "Docker storage before deployment:"
@@ -149,8 +167,8 @@ if [ -n "${worker_container}" ]; then
   worker_was_drained=true
 fi
 
-docker pull "${FORGEMIND_RUNTIME_IMAGE}"
-docker pull "${FORGEMIND_WEB_IMAGE}"
+pull_release_image "${FORGEMIND_RUNTIME_IMAGE}"
+pull_release_image "${FORGEMIND_WEB_IMAGE}"
 
 MIGRATION_STATE_FILE="${APP_ROOT}/shared/migrations.sha256"
 MIGRATIONS_DIR="${APP_DIR}/packages/db/prisma/migrations"
