@@ -1003,12 +1003,16 @@ github:
           createdAt: '2026-10-16T08:43:00.000Z' },
         { phase: 'validation', prompt: 'No executable validation', resultSummary: 'Validation passed',
           validationResult: { command: 'no-validation-required', exitCode: 0, stdout: '', stderr: '', passed: true, attempt: 1 },
-          createdAt: '2026-10-16T08:44:00.000Z' }
+          createdAt: '2026-10-16T08:44:00.000Z' },
+        { phase: 'implementation', prompt: 'Incorrect retry', resultSummary: 'Retry returned an invalid result tree',
+          diffStat: { filesChanged: 0, insertions: 0, deletions: 0 },
+          validationResult: { passed: true, changedFiles: [], attempt: 3 },
+          createdAt: '2026-10-16T14:58:30.000Z' }
       ]
     });
     repositoryMock.listTaskCheckpoints.mockResolvedValueOnce([{
-      key: 'review:final', phase: 'review', status: 'started', inputHash: 'review-input',
-      startedAt: '2026-10-16T08:44:21.000Z', updatedAt: '2026-10-16T08:44:21.000Z'
+      key: 'review:final', phase: 'review', status: 'failed', inputHash: 'review-input',
+      startedAt: '2026-10-16T08:44:21.000Z', updatedAt: '2026-10-16T08:44:53.000Z'
     }]);
     repositoryMock.listTaskAudit.mockResolvedValueOnce([
       { eventType: 'task_iteration_started', payload: { taskRunId: 'review_run', phase: 'review', attempt: 2 }, createdAt: '2026-10-16T08:44:21.000Z' },
@@ -1028,7 +1032,52 @@ github:
     expect(runWorkerTaskMock).toHaveBeenCalledWith(expect.objectContaining({
       resume: expect.objectContaining({
         kind: 'phase_retry', resumeFrom: 'review',
+        implementationSummary: 'Unreal packages authored',
+        changedFiles: ['unreal/Content/Map.umap'],
         validation: expect.objectContaining({ passed: true, command: 'no-validation-required' })
+      })
+    }));
+  });
+
+  it('recovers a failed review from audit history when its checkpoint metadata is unavailable', async () => {
+    repositoryMock.claimNextSubmittedTask.mockResolvedValueOnce(createClaimedTask('task_retried'));
+    repositoryMock.getTaskDiff.mockResolvedValueOnce({
+      taskId: 'task_1', filesChanged: 0, insertions: 0, deletions: 0,
+      iterations: [
+        { phase: 'implementation', prompt: 'Implement', resultSummary: 'Verified implementation',
+          diffStat: { filesChanged: 2, insertions: 0, deletions: 0 },
+          validationResult: { changedFiles: ['unreal/Content/Flying/Maps/FlyingStartup.umap'], attempt: 2 },
+          createdAt: '2026-10-16T08:43:00.000Z' },
+        { phase: 'validation', prompt: 'Verify', resultSummary: 'Validation passed',
+          validationResult: { command: 'native-verifier', exitCode: 0, stdout: 'ok', stderr: '', passed: true, attempt: 2 },
+          createdAt: '2026-10-16T08:44:00.000Z' },
+        { phase: 'implementation', prompt: 'Incorrect retry', resultSummary: 'Invalid retry',
+          diffStat: { filesChanged: 0, insertions: 0, deletions: 0 },
+          validationResult: { changedFiles: [], attempt: 3 },
+          createdAt: '2026-10-16T14:58:30.000Z' }
+      ]
+    });
+    repositoryMock.listTaskAudit.mockResolvedValueOnce([
+      { eventType: 'task_iteration_started', payload: { taskRunId: 'review_run', phase: 'review', attempt: 2 }, createdAt: '2026-10-16T08:44:21.000Z' },
+      { eventType: 'task_failed', payload: { taskRunId: 'review_run', errorMessage: 'Review failed: provider exhausted.' }, createdAt: '2026-10-16T08:44:53.000Z' },
+      { eventType: 'task_iteration_started', payload: { taskRunId: 'bad_retry', phase: 'implementation', attempt: 3 }, createdAt: '2026-10-16T14:58:00.000Z' },
+      { eventType: 'task_failed', payload: { taskRunId: 'bad_retry', errorMessage: 'Required Unreal authoring did not produce a .uasset or .umap payload.' }, createdAt: '2026-10-16T14:59:54.000Z' }
+    ]);
+    runWorkerTaskMock.mockResolvedValueOnce({
+      taskId: 'task_1', status: 'ready_for_user_review', workspacePath: 'C:/tmp/worker',
+      validation: { command: 'native-verifier', exitCode: 0, stdout: 'ok', stderr: '', passed: true },
+      summary: 'Review resumed.', approvals: [], completedAt: new Date().toISOString()
+    });
+
+    const { runDatabaseWorkerOnce } = await import('./db-worker.js');
+    await runDatabaseWorkerOnce();
+
+    expect(runWorkerTaskMock).toHaveBeenCalledWith(expect.objectContaining({
+      resume: expect.objectContaining({
+        resumeFrom: 'review',
+        implementationSummary: 'Verified implementation',
+        changedFiles: ['unreal/Content/Flying/Maps/FlyingStartup.umap'],
+        validation: expect.objectContaining({ passed: true, command: 'native-verifier' })
       })
     }));
   });

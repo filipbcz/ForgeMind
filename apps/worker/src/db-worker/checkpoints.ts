@@ -143,23 +143,38 @@ function buildPhaseRetryResume(
   const effectiveValidationIteration = latestSuccessfulValidation ?? latestValidation;
   const latestReview = findLastIteration(completedIterations, 'review');
   const latestPlanning = findLastIteration(completedIterations, 'planning');
-  const latestImplementationAtForPhase = timestampOf(latestImplementation?.createdAt);
-  const effectiveValidationIsCurrent = Boolean(
-    effectiveValidationIteration
-    && resolveValidationPassed(asRecord(effectiveValidationIteration.validationResult)) === true
-    && timestampOf(effectiveValidationIteration.createdAt) >= latestImplementationAtForPhase
-  );
+  const failureAt = findLatestFailureTimestamp(audit);
   const pendingReviewCheckpoint = [...checkpoints].reverse().find((checkpoint) => (
     checkpoint.key === 'review:final' && checkpoint.status !== 'completed'
   ));
   const pendingReviewCheckpointAt = timestampOf(pendingReviewCheckpoint?.updatedAt ?? pendingReviewCheckpoint?.startedAt);
-  const pendingReviewIsCurrent = Boolean(
-    pendingReviewCheckpoint
-    && effectiveValidationIsCurrent
-    && pendingReviewCheckpointAt > 0
-    && pendingReviewCheckpointAt >= latestImplementationAtForPhase
+  const latestCompletedReviewAt = timestampOf(latestReview?.createdAt);
+  const pendingReviewAudit = [...audit].reverse().find((event) => {
+    const payload = asRecord(event.payload);
+    return event.eventType === 'task_iteration_started'
+      && payload?.phase === 'review'
+      && timestampOf(event.createdAt) > latestCompletedReviewAt
+      && (failureAt === undefined || timestampOf(event.createdAt) <= failureAt);
+  });
+  const pendingReviewAuditAt = timestampOf(pendingReviewAudit?.createdAt);
+  const pendingReviewAt = Math.max(
+    pendingReviewCheckpointAt > latestCompletedReviewAt ? pendingReviewCheckpointAt : 0,
+    pendingReviewAuditAt
   );
-  const failureAt = findLatestFailureTimestamp(audit);
+  const reviewRecoveryValidation = pendingReviewAt > 0
+    ? findLastSuccessfulValidationIterationAtOrBefore(completedIterations, pendingReviewAt)
+    : undefined;
+  const reviewRecoveryImplementation = reviewRecoveryValidation
+    ? findLastIterationAtOrBefore(completedIterations, 'implementation', timestampOf(reviewRecoveryValidation.createdAt))
+    : undefined;
+  const pendingReviewIsCurrent = Boolean(
+    pendingReviewAt > 0
+    && reviewRecoveryValidation
+    && reviewRecoveryImplementation
+    && timestampOf(reviewRecoveryValidation.createdAt) >= timestampOf(reviewRecoveryImplementation.createdAt)
+  );
+  const resumeImplementationIteration = pendingReviewIsCurrent ? reviewRecoveryImplementation : latestImplementation;
+  const resumeValidationIteration = pendingReviewIsCurrent ? reviewRecoveryValidation : effectiveValidationIteration;
   const hasDeliveryEvidence = checkpoints.some((checkpoint) => checkpoint.key.startsWith('external:'))
     || audit.some((event) => {
       const payload = asRecord(event.payload);
@@ -229,27 +244,27 @@ function buildPhaseRetryResume(
     resumeFrom = 'planning';
   }
 
-  const latestImplementationAt = latestImplementationAtForPhase;
+  const latestImplementationAt = timestampOf(resumeImplementationIteration?.createdAt);
   const validationIsCurrent = Boolean(
-    effectiveValidationIteration
-    && timestampOf(effectiveValidationIteration.createdAt) >= latestImplementationAt
+    resumeValidationIteration
+    && timestampOf(resumeValidationIteration.createdAt) >= latestImplementationAt
   );
   const validation = validationIsCurrent
-    ? extractValidationResult(effectiveValidationIteration?.validationResult)
+    ? extractValidationResult(resumeValidationIteration?.validationResult)
     : undefined;
   const reviewBlockers = extractReviewBlockers(latestReview);
-  const implementationPayload = asRecord(latestImplementation?.validationResult);
+  const implementationPayload = asRecord(resumeImplementationIteration?.validationResult);
   const changedFiles = Array.isArray(implementationPayload?.changedFiles)
     ? implementationPayload.changedFiles.filter((item): item is string => typeof item === 'string' && item.length > 0)
     : [];
-  const diffStat = normalizeResumeDiffStat(latestImplementation?.diffStat);
+  const diffStat = normalizeResumeDiffStat(resumeImplementationIteration?.diffStat);
   const startedPayload = asRecord(latestIterationStarted?.payload);
   const persistedAttempt = typeof startedPayload?.attempt === 'number' && Number.isFinite(startedPayload.attempt)
     ? Math.max(1, Math.trunc(startedPayload.attempt))
     : extractLatestAttempt(completedIterations);
   const attempt = persistedAttempt;
   const completedOperations = relevantAudit
-    .filter((event) => timestampOf(event.createdAt) >= timestampOf(latestImplementation?.createdAt))
+    .filter((event) => timestampOf(event.createdAt) >= timestampOf(resumeImplementationIteration?.createdAt))
     .filter((event) => event.eventType === 'task_activity')
     .map((event) => asRecord(event.payload))
     .filter((payload) => (
@@ -276,12 +291,16 @@ function buildPhaseRetryResume(
       : undefined;
   if (mergeConfirmed) completedOperations.push('merge_pr');
   const persistedValidationChecks = validationIsCurrent
-    ? extractPassedValidationChecks(latestValidation?.validationResult)
+    ? extractPassedValidationChecks(resumeValidationIteration?.validationResult)
     : [];
   const passedValidationChecks: NonNullable<WorkerTaskResume['passedValidationChecks']> = [
     ...persistedValidationChecks
   ];
-  for (const checkpoint of checkpoints.filter((item) => item.status === 'completed' && item.key.startsWith('validation:'))) {
+  for (const checkpoint of checkpoints.filter((item) => (
+    item.status === 'completed'
+    && item.key.startsWith('validation:')
+    && (!pendingReviewIsCurrent || timestampOf(item.updatedAt ?? item.completedAt ?? item.startedAt) <= pendingReviewAt)
+  ))) {
     const output = asRecord(checkpoint.output);
     if (output?.evidenceVersion !== 1 || output.deferred === true) continue;
     const command = typeof output?.command === 'string' ? output.command : undefined;
@@ -348,12 +367,12 @@ function buildPhaseRetryResume(
     planSummary: latestPlanning?.resultSummary,
     planSteps: extractStringArray(latestPlanning?.validationResult, 'steps'),
     acceptanceCriteria: extractStringArray(latestPlanning?.validationResult, 'acceptanceCriteria'),
-    implementationSummary: latestImplementation?.resultSummary
+    implementationSummary: resumeImplementationIteration?.resultSummary
       ?? 'Continue from the implementation preserved in the workspace.',
-    ...extractImplementationResume(latestImplementation),
+    ...extractImplementationResume(resumeImplementationIteration),
     changedFiles,
     diffStat,
-    architectureUpdate: extractArchitectureUpdate(latestImplementation),
+    architectureUpdate: extractArchitectureUpdate(resumeImplementationIteration),
     previousValidationError: resumeFrom === 'implementation'
       ? validation && !validation.passed
         ? formatValidationFailure(validation)
@@ -364,7 +383,11 @@ function buildPhaseRetryResume(
     validation,
     passedValidationChecks,
     reviewSummary: latestReview?.resultSummary,
-    validationChecks: extractLatestValidationChecks(completedIterations),
+    validationChecks: pendingReviewIsCurrent
+      ? extractLatestValidationChecks(completedIterations.filter((iteration) => (
+          timestampOf(iteration.createdAt) <= timestampOf(reviewRecoveryValidation?.createdAt)
+        )))
+      : extractLatestValidationChecks(completedIterations),
     completedOperations: Array.from(new Set(completedOperations)),
     mergeCommitSha,
     completedSatisfactionReview,
@@ -595,6 +618,36 @@ function findLastSuccessfulValidationIteration<T extends { phase: string; valida
   for (let index = iterations.length - 1; index >= 0; index -= 1) {
     const iteration = iterations[index];
     if (iteration?.phase === 'validation' && resolveValidationPassed(asRecord(iteration.validationResult)) === true) {
+      return iteration;
+    }
+  }
+  return undefined;
+}
+
+function findLastSuccessfulValidationIterationAtOrBefore<
+  T extends { phase: string; validationResult?: unknown; createdAt?: string }
+>(iterations: T[], cutoff: number): T | undefined {
+  for (let index = iterations.length - 1; index >= 0; index -= 1) {
+    const iteration = iterations[index];
+    if (
+      iteration?.phase === 'validation'
+      && timestampOf(iteration.createdAt) <= cutoff
+      && resolveValidationPassed(asRecord(iteration.validationResult)) === true
+    ) {
+      return iteration;
+    }
+  }
+  return undefined;
+}
+
+function findLastIterationAtOrBefore<T extends { phase: string; createdAt?: string }>(
+  iterations: T[],
+  phase: string,
+  cutoff: number
+): T | undefined {
+  for (let index = iterations.length - 1; index >= 0; index -= 1) {
+    const iteration = iterations[index];
+    if (iteration?.phase === phase && timestampOf(iteration.createdAt) <= cutoff) {
       return iteration;
     }
   }
