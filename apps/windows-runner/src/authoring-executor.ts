@@ -299,15 +299,12 @@ export async function executeWindowsAuthoring(packet: WindowsAuthoringPacket, co
   const evidenceArtifacts = [...artifacts, ...tree.filter((entry) => changedPaths.includes(entry.path)).map((entry) => ({
     name: `result-tree:${entry.path}`, relativePath: entry.path, sizeBytes: entry.sizeBytes, sha256: entry.sha256
   }))];
-  const incomplete = packet.artifactExpectations.some((expectation) => expectation.required
-    && !artifacts.some((artifact) => artifact.relativePath === expectation.relativePath || artifact.name === expectation.name)
-    && !tree.some((entry) => entry.path === expectation.relativePath || entry.path.startsWith(`${expectation.relativePath.replace(/[\\/]$/, '')}/`)));
+  const unrealProjectDirectories = await discoverUnrealProjectDirectories(workspacePath, processes);
+  const missingArtifactExpectations = missingRequiredAuthoringArtifacts(packet.artifactExpectations, artifacts, tree, unrealProjectDirectories);
+  const incomplete = missingArtifactExpectations.length > 0;
   if (status === 'succeeded' && incomplete) {
     status = 'failed';
-    summary = `Required authoring artifacts are missing: ${packet.artifactExpectations.filter((expectation) => expectation.required
-      && !artifacts.some((artifact) => artifact.relativePath === expectation.relativePath || artifact.name === expectation.name)
-      && !tree.some((entry) => entry.path === expectation.relativePath || entry.path.startsWith(`${expectation.relativePath.replace(/[\\/]$/, '')}/`)))
-      .map((expectation) => expectation.relativePath).join(', ')}`;
+    summary = `Required authoring artifacts are missing: ${missingArtifactExpectations.map((expectation) => expectation.relativePath).join(', ')}`;
     authoringFailureState = 'failed';
     await publishCheckpoint('verification-failed');
   }
@@ -342,7 +339,29 @@ export async function executeWindowsAuthoring(packet: WindowsAuthoringPacket, co
 export function canFinalizeRecoveredUnrealResult(previousValidationError: string | undefined, resumed: boolean,
   recoveredPackages: AuthoringTreeEntry[]): boolean {
   return resumed && recoveredPackages.length > 0
-    && /Required Unreal content was not created or imported through a successful editor authoring API call/i.test(previousValidationError ?? '');
+    && /Required Unreal content was not created or imported through a successful editor authoring API call|Required authoring artifacts are missing:\s*Content\s*$/i
+      .test(previousValidationError ?? '');
+}
+
+export function missingRequiredAuthoringArtifacts(
+  expectations: WindowsAuthoringPacket['artifactExpectations'],
+  artifacts: WindowsAuthoringResult['artifacts'],
+  tree: AuthoringTreeEntry[],
+  unrealProjectDirectories: string[]
+): WindowsAuthoringPacket['artifactExpectations'] {
+  const normalize = (value: string) => value.replaceAll('\\', '/').replace(/^\.\//, '').replace(/\/$/, '');
+  const treePaths = tree.map(({ path }) => normalize(path));
+  const projectRelative = /^(?:Content|Config|Source|Plugins)(?:\/|$)|^[^/]+\.uproject$/i;
+  return expectations.filter((expectation) => {
+    if (!expectation.required) return false;
+    const expected = normalize(expectation.relativePath);
+    if (artifacts.some((artifact) => normalize(artifact.relativePath) === expected || artifact.name === expectation.name)) return false;
+    const candidates = new Set([expected]);
+    if (projectRelative.test(expected)) {
+      for (const directory of unrealProjectDirectories) candidates.add(directory === '.' ? expected : `${normalize(directory)}/${expected}`);
+    }
+    return ![...candidates].some((candidate) => treePaths.some((path) => path === candidate || path.startsWith(`${candidate}/`)));
+  });
 }
 
 export function nativeImplementationPrompt(packet: Pick<WindowsAuthoringPacket, 'step' | 'contentPolicy'>): string {

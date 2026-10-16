@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from 'vitest';
-import { assertReadableAuthoringCheckout, authoringPatchOutputLimit, authoringSemanticHash, buildRecoveredUnrealPackageAuthoringScript, buildUnrealPackageVerificationArgs, buildUnrealPackageVerificationScript, canFinalizeRecoveredUnrealResult, canResumeAuthoringCheckpoint, checkpointRecoveryScore, classifyAuthoringFailure, classifyWindowsAuthoringFailure, cleanupIgnoredUnrealRuntimeState, collectAuthoringToolVersions, collectCheckpointAuthoringProvenance, compactProcessResults, discoverUnrealProjectDirectories, hasRestorableAuthoringCheckpoint, isProhibitedAuthoringPath, LifecycleNativeImplementationProvider, materializeOutputs, nativeImplementationPrompt, requiresProductionContent, retainedCheckpointGenerations, restoreCheckpointAuthoringProvenance, selectRecoveryCheckpoint, selectUnrealProjectForPackages, type NativeAuthoringTools, unrealObjectPath, validateRequiredUnrealAssets } from './authoring-executor.js';
+import { assertReadableAuthoringCheckout, authoringPatchOutputLimit, authoringSemanticHash, buildRecoveredUnrealPackageAuthoringScript, buildUnrealPackageVerificationArgs, buildUnrealPackageVerificationScript, canFinalizeRecoveredUnrealResult, canResumeAuthoringCheckpoint, checkpointRecoveryScore, classifyAuthoringFailure, classifyWindowsAuthoringFailure, cleanupIgnoredUnrealRuntimeState, collectAuthoringToolVersions, collectCheckpointAuthoringProvenance, compactProcessResults, discoverUnrealProjectDirectories, hasRestorableAuthoringCheckpoint, isProhibitedAuthoringPath, LifecycleNativeImplementationProvider, materializeOutputs, missingRequiredAuthoringArtifacts, nativeImplementationPrompt, requiresProductionContent, retainedCheckpointGenerations, restoreCheckpointAuthoringProvenance, selectRecoveryCheckpoint, selectUnrealProjectForPackages, type NativeAuthoringTools, unrealObjectPath, validateRequiredUnrealAssets } from './authoring-executor.js';
 import { access, mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
@@ -182,11 +182,28 @@ describe('native implementation provider lifecycle', () => {
       expect(canFinalizeRecoveredUnrealResult(
         'The same Windows validation failed again without progress: Required Unreal content was not created or imported through a successful editor authoring API call.',
         true, recovered)).toBe(true);
+      expect(canFinalizeRecoveredUnrealResult('Required authoring artifacts are missing: Content', true, recovered)).toBe(true);
+      expect(canFinalizeRecoveredUnrealResult('Required authoring artifacts are missing: Content/Maps/Missing.umap', true, recovered)).toBe(false);
       expect(canFinalizeRecoveredUnrealResult('another validation failed', true, recovered)).toBe(false);
       expect(canFinalizeRecoveredUnrealResult('Required Unreal content was not created or imported through a successful editor authoring API call.', false, recovered)).toBe(false);
     } finally {
       await rm(root, { recursive: true, force: true });
     }
+  });
+  it('accepts Unreal artifact expectations relative to a nested uproject directory', () => {
+    const hash = 'a'.repeat(64);
+    const expectations: any[] = [
+      { name: 'authored-unreal-assets', relativePath: 'Content', required: true },
+      { name: 'required-path:Content/Flying/Maps/FlyingStartup.umap', relativePath: 'Content/Flying/Maps/FlyingStartup.umap', required: true },
+      { name: 'required-path:Documentation/Scene.png', relativePath: 'Documentation/Scene.png', required: true }
+    ];
+    const tree: any[] = [
+      { path: 'unreal/Content/Flying/Maps/FlyingStartup.umap', kind: 'file', sha256: hash, sizeBytes: 1, binary: true, mode: '100644' },
+      { path: 'Documentation/Scene.png', kind: 'file', sha256: hash, sizeBytes: 1, binary: true, mode: '100644' }
+    ];
+    expect(missingRequiredAuthoringArtifacts(expectations, [], tree, ['.', 'unreal'])).toEqual([]);
+    expect(missingRequiredAuthoringArtifacts(expectations, [], tree, ['.']).map(({ relativePath }) => relativePath))
+      .toEqual(['Content', 'Content/Flying/Maps/FlyingStartup.umap']);
   });
   it('requires editor-authored packages to be loaded after saving and retains source and exact tool provenance', () => {
     const base = { leaseId: 'lease', sessionId: 'session', shell: 'system' as const, exitCode: 0, stdout: '', stderr: '',
