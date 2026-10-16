@@ -80,7 +80,7 @@ export class WindowsRunnerTransport {
       let diagnostic = responseText;
       try {
         const parsed = JSON.parse(responseText) as { error?: unknown; issues?: unknown };
-        if (typeof parsed.error === 'string') diagnostic = `${parsed.error}${Array.isArray(parsed.issues) && parsed.issues.length
+        if (typeof parsed.error === 'string') diagnostic = `${parsed.error}${!parsed.error.includes('Invalid sections:') && Array.isArray(parsed.issues) && parsed.issues.length
           ? ` Invalid sections: ${parsed.issues.filter((issue): issue is string => typeof issue === 'string').join(', ')}.` : ''}`;
       } catch { /* preserve a plain-text server diagnostic */ }
       throw new Error(`ForgeMind API request failed (${response.status}): ${redactSecrets(diagnostic).slice(0, 4_000) || 'no server diagnostic'}`);

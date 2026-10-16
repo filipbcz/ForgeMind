@@ -248,7 +248,8 @@ export function registerWindowsRunnerRoutes(app: FastifyInstance, repository: Fo
     const principal = runnerPrincipal(request);
     if (!isWindowsExecutionResult(request.body) && !isWindowsAuthoringResult(request.body)) {
       const issues = windowsAuthoringResultValidationIssues(request.body);
-      return reply.code(400).send({ error: 'Invalid execution result.', ...(issues.length ? { issues } : {}) });
+      const detail = issues.length ? ` Invalid sections: ${issues.join(', ')}.` : '';
+      return reply.code(400).send({ error: `Invalid execution result.${detail}`, ...(issues.length ? { issues } : {}) });
     }
     if (request.body.deviceId !== principal.deviceId) return reply.code(403).send({ error: 'Execution result device identity does not match the authenticated runner.' });
     const outcome = await workers.submitResult(principal.deviceId, request.body);
