@@ -627,6 +627,8 @@ export async function runDatabaseWorkerOnce(options: { deferInterruptSignals?: b
         queueReason: claimed.queueReason ?? null,
         kind: resume.kind,
         resumeFrom: resume.resumeFrom ?? null,
+        decisionReason: resume.decisionReason ?? null,
+        decisionEvidence: resume.decisionEvidence ?? null,
         attempt: resume.attempt ?? null,
         skippedExternalEffects: resume.completedOperations ?? [],
         reusedValidationChecks: resume.passedValidationChecks?.map((check) => ({

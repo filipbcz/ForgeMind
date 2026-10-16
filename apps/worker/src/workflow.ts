@@ -64,6 +64,12 @@ type GitHubOperation = 'create_issue' | 'create_branch' | 'commit_and_push' | 'c
 export interface WorkerTaskResume {
   kind: 'validation_retry' | 'worker_interrupted' | 'phase_retry';
   resumeFrom?: 'planning' | 'implementation' | 'validation' | 'review' | 'delivery';
+  decisionReason?: string;
+  decisionEvidence?: {
+    pendingReviewAt?: string;
+    implementationAt?: string;
+    validationAt?: string;
+  };
   attempt?: number;
   planSummary?: string;
   planSteps?: string[];

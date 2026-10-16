@@ -1018,6 +1018,7 @@ github:
       { eventType: 'task_iteration_started', payload: { taskRunId: 'review_run', phase: 'review', attempt: 2 }, createdAt: '2026-10-16T08:44:21.000Z' },
       { eventType: 'task_failed', payload: { taskRunId: 'review_run', status: 'provider_failed' }, createdAt: '2026-10-16T08:44:53.000Z' },
       { eventType: 'task_iteration_started', payload: { taskRunId: 'bad_retry', phase: 'implementation', attempt: 2 }, createdAt: '2026-10-16T14:58:00.000Z' },
+      { eventType: 'task_github_operation_failed', payload: { taskRunId: 'bad_retry', operation: 'create_branch' }, createdAt: '2026-10-16T14:59:00.000Z' },
       { eventType: 'task_failed', payload: { taskRunId: 'bad_retry', status: 'failed', errorMessage: 'Required Unreal authoring did not produce a .uasset or .umap payload.' }, createdAt: '2026-10-16T14:59:54.000Z' }
     ]);
     runWorkerTaskMock.mockResolvedValueOnce({
@@ -1032,6 +1033,7 @@ github:
     expect(runWorkerTaskMock).toHaveBeenCalledWith(expect.objectContaining({
       resume: expect.objectContaining({
         kind: 'phase_retry', resumeFrom: 'review',
+        decisionReason: 'pending_review_after_successful_validation',
         implementationSummary: 'Unreal packages authored',
         changedFiles: ['unreal/Content/Map.umap'],
         validation: expect.objectContaining({ passed: true, command: 'no-validation-required' })

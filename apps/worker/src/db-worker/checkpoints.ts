@@ -218,30 +218,41 @@ function buildPhaseRetryResume(
     : undefined;
 
   let resumeFrom: NonNullable<WorkerTaskResume['resumeFrom']>;
-  if (latestGitHubFailure && timestampOf(latestGitHubFailure.createdAt) > latestCompletedAt) {
+  let decisionReason: string;
+  if (pendingReviewIsCurrent) {
+    // A failed provider review is authoritative: duplicate issue/branch setup
+    // failures from later invalid retries must not send validated work back to
+    // planning or implementation.
+    resumeFrom = 'review';
+    decisionReason = 'pending_review_after_successful_validation';
+  } else if (latestGitHubFailure && timestampOf(latestGitHubFailure.createdAt) > latestCompletedAt) {
     const failedOperation = asRecord(latestGitHubFailure.payload)?.operation;
     resumeFrom = failedOperation === 'create_issue' || failedOperation === 'create_branch' ? 'planning' : 'delivery';
-  } else if (pendingReviewIsCurrent) {
-    // A provider failure can leave review:final in progress. A later broken
-    // retry must not supersede the already validated implementation merely
-    // because it emitted a new implementation-started audit event.
-    resumeFrom = 'review';
+    decisionReason = `github_operation_failed:${typeof failedOperation === 'string' ? failedOperation : 'unknown'}`;
   } else if (inFlightPhase === 'planning' && isFailedValidationIteration(latestValidation)) {
     resumeFrom = 'implementation';
+    decisionReason = 'validation_failed_during_planning_recovery';
   } else if (inFlightPhase) {
     resumeFrom = inFlightPhase;
+    decisionReason = `in_flight_phase:${inFlightPhase}`;
   } else if (githubInfrastructureFailure) {
     resumeFrom = 'delivery';
+    decisionReason = 'github_validation_infrastructure_failure';
   } else if (latestIteration?.phase === 'review') {
     resumeFrom = extractReviewBlockers(latestReview).length > 0 ? 'implementation' : 'delivery';
+    decisionReason = extractReviewBlockers(latestReview).length > 0 ? 'completed_review_has_blockers' : 'completed_review_satisfied';
   } else if (latestIteration?.phase === 'validation') {
     resumeFrom = isFailedValidationIteration(latestValidation) ? 'implementation' : 'review';
+    decisionReason = isFailedValidationIteration(latestValidation) ? 'latest_validation_failed' : 'latest_validation_passed';
   } else if (latestIteration?.phase === 'implementation') {
     resumeFrom = 'validation';
+    decisionReason = 'latest_implementation_completed';
   } else if (latestIteration?.phase === 'planning') {
     resumeFrom = 'implementation';
+    decisionReason = 'latest_planning_completed';
   } else {
     resumeFrom = 'planning';
+    decisionReason = 'no_completed_phase';
   }
 
   const latestImplementationAt = timestampOf(resumeImplementationIteration?.createdAt);
@@ -363,6 +374,12 @@ function buildPhaseRetryResume(
   return {
     kind: 'phase_retry',
     resumeFrom,
+    decisionReason,
+    decisionEvidence: {
+      pendingReviewAt: pendingReviewAt > 0 ? new Date(pendingReviewAt).toISOString() : undefined,
+      implementationAt: resumeImplementationIteration?.createdAt,
+      validationAt: resumeValidationIteration?.createdAt
+    },
     attempt,
     planSummary: latestPlanning?.resultSummary,
     planSteps: extractStringArray(latestPlanning?.validationResult, 'steps'),
