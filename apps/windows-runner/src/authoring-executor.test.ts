@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from 'vitest';
-import { assertReadableAuthoringCheckout, authoringPatchOutputLimit, authoringSemanticHash, buildRecoveredUnrealPackageAuthoringScript, buildUnrealPackageVerificationArgs, buildUnrealPackageVerificationScript, canFinalizeRecoveredUnrealResult, canResumeAuthoringCheckpoint, checkpointRecoveryScore, classifyAuthoringFailure, classifyWindowsAuthoringFailure, cleanupIgnoredUnrealRuntimeState, collectAuthoringToolVersions, collectCheckpointAuthoringProvenance, compactProcessResults, discoverUnrealProjectDirectories, hasRestorableAuthoringCheckpoint, isProhibitedAuthoringPath, LifecycleNativeImplementationProvider, materializeOutputs, missingRequiredAuthoringArtifacts, nativeImplementationPrompt, requiresProductionContent, retainedCheckpointGenerations, restoreCheckpointAuthoringProvenance, selectRecoveryCheckpoint, selectUnrealProjectForPackages, type NativeAuthoringTools, unrealObjectPath, validateRequiredUnrealAssets } from './authoring-executor.js';
+import { assertReadableAuthoringCheckout, authoringPatchOutputLimit, authoringSemanticHash, buildRecoveredUnrealPackageAuthoringScript, buildUnrealPackageVerificationArgs, buildUnrealPackageVerificationScript, canFinalizeRecoveredUnrealResult, canResumeAuthoringCheckpoint, checkpointMatchesPacketBaseline, checkpointRecoveryScore, classifyAuthoringFailure, classifyWindowsAuthoringFailure, cleanupIgnoredUnrealRuntimeState, collectAuthoringToolVersions, collectCheckpointAuthoringProvenance, compactProcessResults, discoverUnrealProjectDirectories, hasRestorableAuthoringCheckpoint, isProhibitedAuthoringPath, LifecycleNativeImplementationProvider, materializeOutputs, missingRequiredAuthoringArtifacts, nativeImplementationPrompt, requiresProductionContent, retainedCheckpointGenerations, restoreCheckpointAuthoringProvenance, selectRecoveryCheckpoint, selectUnrealProjectForPackages, type NativeAuthoringTools, unrealObjectPath, validateRequiredUnrealAssets } from './authoring-executor.js';
 import { access, mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
@@ -59,6 +59,15 @@ describe('native implementation provider lifecycle', () => {
     expect(canResumeAuthoringCheckpoint(checkpoint, { taskId: 'task-1', baseCommitSha: 'b'.repeat(40) })).toBe(false);
     expect(canResumeAuthoringCheckpoint(checkpoint, { taskId: 'task-1', baseCommitSha: 'a'.repeat(40) }, 'probe-5.9.0')).toBe(false);
     expect(canResumeAuthoringCheckpoint(checkpoint, { taskId: 'task-1', baseCommitSha: 'a'.repeat(40) }, 'probe-5.9.0', true)).toBe(true);
+  });
+  it('never lets a stale local checkpoint replace a server-confirmed prior result', () => {
+    const priorPatch = 'diff --git a/unreal/Content/Flying.umap b/unreal/Content/Flying.umap\nGIT binary patch\n';
+    const packet = { inputHash: 'current-input', step: { priorPatch } } as any;
+    const expected = createHash('sha256').update(priorPatch, 'utf8').digest('hex');
+    expect(checkpointMatchesPacketBaseline({ inputHash: 'old-input' }, packet)).toBe(false);
+    expect(checkpointMatchesPacketBaseline({ inputHash: 'current-input' }, packet)).toBe(false);
+    expect(checkpointMatchesPacketBaseline({ inputHash: 'current-input', priorPatchSha256: expected }, packet)).toBe(true);
+    expect(checkpointMatchesPacketBaseline({ inputHash: 'old-input' }, { inputHash: 'new-input', step: {} } as any)).toBe(true);
   });
   it('prefers a materially richer preserved checkpoint over a fresh partial retry', () => {
     const bundle = { version: 1 as const, format: 'git-binary-patch' as const, sha256: 'a', sizeBytes: 1, lfsObjects: [], outputs: [] };

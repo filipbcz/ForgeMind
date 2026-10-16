@@ -551,6 +551,7 @@ async function prepareCheckout(packet: WindowsAuthoringPacket, root: string, che
     try {
       const checkpoint = JSON.parse(await readFile(candidate, 'utf8')) as AuthoringDiskCheckpoint;
       if (canResumeAuthoringCheckpoint(checkpoint, packet, selectedUnrealIdentity, true) && hasRestorableAuthoringCheckpoint(checkpoint)
+        && checkpointMatchesPacketBaseline(checkpoint, packet)
         && !checkpoints.some((item) => item.resultTreeSha === checkpoint.resultTreeSha)) checkpoints.push(checkpoint);
     } catch { /* try the other complete generations */ }
   }
@@ -573,8 +574,9 @@ async function prepareCheckout(packet: WindowsAuthoringPacket, root: string, che
       if (status.exitCode !== 0 || status.stdout.trim().length === 0) continue;
       const retainedTree = await gitTree(retainedPath, signal);
       const checkpoint = checkpoints.find((item) => item.resultTreeSha.toLowerCase() === retainedTree.toLowerCase())
-        ?? await captureCheckpoint(packet, retainedPath, 'recovered-physical-workspace', [], selectedUnrealIdentity, signal, outputRoot);
-      if (hasRestorableAuthoringCheckpoint(checkpoint)) retained.push({ path: retainedPath, checkpoint });
+        ?? (packet.step.priorPatch?.trim() ? undefined
+          : await captureCheckpoint(packet, retainedPath, 'recovered-physical-workspace', [], selectedUnrealIdentity, signal, outputRoot));
+      if (checkpoint && hasRestorableAuthoringCheckpoint(checkpoint)) retained.push({ path: retainedPath, checkpoint });
     } catch { /* inspect the other retained workspaces */ }
   }
   const bestRetained = retained.sort((left, right) => checkpointRecoveryScore(right.checkpoint) - checkpointRecoveryScore(left.checkpoint))[0];
@@ -660,6 +662,8 @@ export async function materializeOutputs(root: string, outputs: AuthoringDiskChe
 
 interface AuthoringDiskCheckpoint {
   version: 2; status: string; taskId: string; inputHash: string; baseCommitSha: string; resultTreeSha: string;
+  /** Binds a local continuation to the server-confirmed result from which it started. */
+  priorPatchSha256?: string;
   tree: AuthoringTreeEntry[]; patch: string;
   resultBundle: { version: 1; format: 'git-binary-patch'; sha256: string; sizeBytes: number;
     lfsObjects: Array<{ oid: string; sha256: string; sizeBytes: number; contentBase64: string }>;
@@ -719,6 +723,20 @@ export function canResumeAuthoringCheckpoint(
     && (allowUnrealProbeMismatch || checkpoint.unrealProbeIdentity === selectedUnrealIdentity);
 }
 
+/** A server-provided prior patch is the authoritative accepted result. A local
+ * checkpoint may supersede it only when it was created from this exact packet
+ * input and this exact accepted baseline. This prevents a stale text-only
+ * checkpoint from hiding already delivered Unreal packages on a later retry. */
+export function checkpointMatchesPacketBaseline(
+  checkpoint: Pick<AuthoringDiskCheckpoint, 'inputHash' | 'priorPatchSha256'>,
+  packet: Pick<WindowsAuthoringPacket, 'inputHash' | 'step'>
+): boolean {
+  const priorPatch = packet.step.priorPatch?.trim() ?? '';
+  if (!priorPatch) return true;
+  const expected = createHash('sha256').update(packet.step.priorPatch!, 'utf8').digest('hex');
+  return checkpoint.inputHash === packet.inputHash && checkpoint.priorPatchSha256 === expected;
+}
+
 export function hasRestorableAuthoringCheckpoint(
   checkpoint: { patch: string; resultBundle: Pick<AuthoringDiskCheckpoint['resultBundle'], 'lfsObjects' | 'outputs'> } | undefined
 ): boolean {
@@ -746,7 +764,11 @@ async function captureCheckpoint(packet: WindowsAuthoringPacket, workspacePath: 
   const outputs = outputRoot ? await collectManagedOutputs(outputRoot, packet.resourcePolicy.maxArtifactBytes) : [];
   const tree = await collectTree(workspacePath, changedPaths);
   const checkpoint: AuthoringDiskCheckpoint = { version: 2, status, taskId: packet.taskId, inputHash: packet.inputHash,
-    baseCommitSha: packet.baseCommitSha, resultTreeSha, tree, patch: patchResult.stdout,
+    baseCommitSha: packet.baseCommitSha,
+    ...(packet.step.priorPatch?.trim()
+      ? { priorPatchSha256: createHash('sha256').update(packet.step.priorPatch, 'utf8').digest('hex') }
+      : {}),
+    resultTreeSha, tree, patch: patchResult.stdout,
     resultBundle: { version: 1, format: 'git-binary-patch', sha256: createHash('sha256').update(patchBytes).digest('hex'),
       sizeBytes: patchBytes.length, lfsObjects, outputs }, authoringProvenance: collectCheckpointAuthoringProvenance(processes), unrealProbeIdentity,
     updatedAt: new Date().toISOString() };
