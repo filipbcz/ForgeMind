@@ -639,6 +639,67 @@ github:
     expect(workerInput.reviewProviderSession).not.toBe(workerInput.providerSession);
   });
 
+  it('fails review over to the next equivalent connection with a fresh independent session', async () => {
+    const now = new Date().toISOString();
+    const primary = {
+      id: 'conn_api', userId: 'user_1', name: 'API credits', isDefault: true,
+      credentialSource: 'api_key' as const, provider: 'codex' as const, authMode: 'api_key' as const,
+      model: 'gpt-6.1-sol', automaticFailover: false, failoverPriority: 0,
+      connectedAt: now, updatedAt: now, apiKey: 'key_exhausted'
+    };
+    const fallback = {
+      id: 'conn_plan', userId: 'user_1', name: 'ChatGPT plan', isDefault: false,
+      credentialSource: 'chatgpt_plan' as const, provider: 'codex' as const, authMode: 'chatgpt_plan_oauth' as const,
+      model: 'gpt-6.1-sol', automaticFailover: true, failoverPriority: 10,
+      connectedAt: now, updatedAt: now, accessToken: 'plan-token'
+    };
+    repositoryMock.getAIProviderConnectionSecret.mockResolvedValue(primary as never);
+    repositoryMock.listAIProviderConnectionSecrets.mockResolvedValue([primary, fallback] as never);
+    repositoryMock.claimNextSubmittedTask.mockResolvedValue(createClaimedTask());
+
+    const reviewCalls: string[] = [];
+    createProviderMock.mockImplementation((_kind: string, config?: { apiKey?: string; accessToken?: string }) => ({
+      kind: 'codex',
+      estimateCost: vi.fn(async () => ({ inputTokens: 10, outputTokens: 5, estimatedCostUsd: 0.01 })),
+      plan: vi.fn(), implement: vi.fn(),
+      review: vi.fn(async (input: { session?: { id?: string; provider?: string; model?: string } }) => {
+        reviewCalls.push(config?.accessToken ?? config?.apiKey ?? 'none');
+        if (config?.apiKey === 'key_exhausted') {
+          throw Object.assign(new Error('stream disconnected before completion: You have no credits remaining.'),
+            { status: 429, errorCode: 'credit_balance_exhausted' });
+        }
+        expect(input.session).toEqual(expect.objectContaining({ id: undefined, provider: 'codex', model: 'gpt-6.1-sol' }));
+        return { verdict: 'satisfied', summary: 'Reviewed through plan fallback.', blockers: [], criterionResults: [] };
+      }),
+      async preflight() { return { provider: 'codex', ok: true, checkedAt: now }; },
+      supportsLocalRepo: () => true,
+      supportsGitHubNativeFlow: () => false,
+      supportsNativeRepositoryReview: () => true
+    }));
+    runWorkerTaskMock.mockImplementationOnce(async (input: {
+      reviewProvider: { review: (value: Record<string, unknown>) => Promise<unknown>; supportsNativeRepositoryReview?: () => boolean };
+      reviewProviderSession: { id?: string; provider: string; model: string };
+    }) => {
+      input.reviewProviderSession.id = 'api-review-session';
+      expect(input.reviewProvider.supportsNativeRepositoryReview?.()).toBe(true);
+      await input.reviewProvider.review({ session: input.reviewProviderSession });
+      return {
+        taskId: 'task_1', status: 'ready_for_user_review', workspacePath: 'C:/tmp/worker',
+        validation: { command: 'node --version', exitCode: 0, stdout: '', stderr: '', passed: true },
+        summary: 'Review completed through fallback.', approvals: [], completedAt: now
+      };
+    });
+
+    const { runDatabaseWorkerOnce } = await import('./db-worker.js');
+    const result = await runDatabaseWorkerOnce();
+
+    expect(result).toEqual(expect.objectContaining({ claimed: true, taskId: 'task_1' }));
+    expect(reviewCalls).toEqual(['key_exhausted', 'plan-token']);
+    expect(repositoryMock.writeAudit).toHaveBeenCalledWith(expect.objectContaining({
+      eventType: 'provider_fallback_used', payload: expect.objectContaining({ phase: 'review', fallbackConnectionId: 'conn_plan' })
+    }));
+  });
+
   it('resumes an interrupted worker run from the preserved workspace', async () => {
     repositoryMock.claimNextSubmittedTask.mockResolvedValueOnce(createClaimedTask('worker_interrupted'));
     repositoryMock.getTaskDiff.mockResolvedValueOnce({
@@ -1725,10 +1786,11 @@ github:
     const result = await runDatabaseWorkerOnce();
 
     expect(result).toEqual(expect.objectContaining({ claimed: true, taskId: 'task_1' }));
-    expect(createProviderMock).toHaveBeenCalledTimes(3);
+    expect(createProviderMock).toHaveBeenCalledTimes(4);
     expect(createProviderMock).toHaveBeenNthCalledWith(1, 'codex', expect.objectContaining({ apiKey: 'key_primary', model: 'gpt-5.5' }));
     expect(createProviderMock).toHaveBeenNthCalledWith(2, 'codex', expect.objectContaining({ apiKey: 'key_fallback', model: 'gpt-5.5' }));
     expect(createProviderMock).toHaveBeenNthCalledWith(3, 'codex', expect.objectContaining({ apiKey: 'key_primary', model: 'gpt-5.5' }));
+    expect(createProviderMock).toHaveBeenNthCalledWith(4, 'codex', expect.objectContaining({ apiKey: 'key_fallback', model: 'gpt-5.5' }));
 
     if (previousPrimaryConnection === undefined) {
       delete process.env.FORGEMIND_PROVIDER_CONNECTION_ID;

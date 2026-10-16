@@ -557,8 +557,39 @@ export async function runDatabaseWorkerOnce(options: { deferInterruptSignals?: b
     fallback: selection.fallback,
     defaultConnection: defaultAIProviderConnection
   });
-  const reviewProvider = buildRuntimeProvider(reviewerSelection.kind, reviewerSelection.connection, resolveConfiguredModelProfile(projectConfig?.ai.model_profile), routingState).provider;
+  const reviewerRuntimeProvider = buildRuntimeProvider(reviewerSelection.kind, reviewerSelection.connection,
+    resolveConfiguredModelProfile(projectConfig?.ai.model_profile), routingState);
+  const reviewerFallbackRuntimeProviders = [selection.primary, ...selection.fallbacks]
+    .filter((candidate) => candidate.kind === reviewerSelection.kind && candidate.connection?.id !== reviewerSelection.connection?.id)
+    .map((candidate) => buildRuntimeProvider(candidate.kind, candidate.connection,
+      resolveConfiguredModelProfile(projectConfig?.ai.model_profile), routingState));
   const reviewProviderModel = resolveProviderModel(reviewerSelection.kind, reviewerSelection.connection);
+  const reviewProviderSession: ProviderSessionContext = {
+    provider: reviewerSelection.kind,
+    model: reviewProviderModel
+  };
+  const { provider: reviewProvider } = createPolicyAwareProvider({
+    primary: reviewerRuntimeProvider,
+    fallbacks: reviewerFallbackRuntimeProviders,
+    onConnectionSwitch: (candidate) => {
+      // Review sessions are intentionally independent from implementation and
+      // credential specific. A failover therefore starts a fresh read-only turn.
+      reviewProviderSession.id = undefined;
+      reviewProviderSession.provider = candidate.kind;
+      reviewProviderSession.model = candidate.model ?? candidate.kind;
+    },
+    audit: (event) => repository.writeAudit({
+      actorType: 'system',
+      eventType: event.eventType,
+      taskId: claimed.task.id,
+      payload: {
+        taskRunId: claimed.taskRun.id,
+        queueJobId: claimed.queueJobId ?? null,
+        phase: 'review',
+        ...event.payload
+      }
+    })
+  });
   const primaryConnectionId = selection.primary.connection?.id;
   const hasCompatibleProviderSession = claimed.task.providerSessionProvider === selection.primary.kind
     && claimed.task.providerSessionConnectionId === primaryConnectionId;
@@ -681,10 +712,7 @@ export async function runDatabaseWorkerOnce(options: { deferInterruptSignals?: b
         : 'Pre-run cost estimate unavailable; execution continued.',
       resume: resumeContext?.workflowResume,
       providerSession,
-      reviewProviderSession: {
-        provider: reviewerSelection.kind,
-        model: reviewProviderModel
-      },
+      reviewProviderSession,
       github,
       signal: taskAbortController.signal,
       hooks: {
@@ -1476,6 +1504,7 @@ function createPolicyAwareProvider(input: PolicyAwareProviderInput): {
     },
     supportsLocalRepo: () => input.primary.provider.supportsLocalRepo(),
     supportsGitHubNativeFlow: () => input.primary.provider.supportsGitHubNativeFlow(),
+    supportsNativeRepositoryReview: () => input.primary.provider.supportsNativeRepositoryReview?.() === true,
     supportsNativeRepositoryAudit: () => input.primary.provider.supportsNativeRepositoryAudit?.() === true,
     async plan(planInput) {
       return callWithFallback('plan', (provider) => provider.plan(planInput), planInput.signal);
