@@ -44,6 +44,9 @@ export interface TaskCheckpointSnapshot {
   status: 'started' | 'completed' | 'failed';
   inputHash: string;
   output?: unknown;
+  startedAt?: string;
+  completedAt?: string;
+  updatedAt?: string;
 }
 
 export async function resolveTaskResumeContext(
@@ -140,6 +143,22 @@ function buildPhaseRetryResume(
   const effectiveValidationIteration = latestSuccessfulValidation ?? latestValidation;
   const latestReview = findLastIteration(completedIterations, 'review');
   const latestPlanning = findLastIteration(completedIterations, 'planning');
+  const latestImplementationAtForPhase = timestampOf(latestImplementation?.createdAt);
+  const effectiveValidationIsCurrent = Boolean(
+    effectiveValidationIteration
+    && resolveValidationPassed(asRecord(effectiveValidationIteration.validationResult)) === true
+    && timestampOf(effectiveValidationIteration.createdAt) >= latestImplementationAtForPhase
+  );
+  const pendingReviewCheckpoint = [...checkpoints].reverse().find((checkpoint) => (
+    checkpoint.key === 'review:final' && checkpoint.status !== 'completed'
+  ));
+  const pendingReviewCheckpointAt = timestampOf(pendingReviewCheckpoint?.updatedAt ?? pendingReviewCheckpoint?.startedAt);
+  const pendingReviewIsCurrent = Boolean(
+    pendingReviewCheckpoint
+    && effectiveValidationIsCurrent
+    && pendingReviewCheckpointAt > 0
+    && pendingReviewCheckpointAt >= latestImplementationAtForPhase
+  );
   const failureAt = findLatestFailureTimestamp(audit);
   const hasDeliveryEvidence = checkpoints.some((checkpoint) => checkpoint.key.startsWith('external:'))
     || audit.some((event) => {
@@ -187,6 +206,11 @@ function buildPhaseRetryResume(
   if (latestGitHubFailure && timestampOf(latestGitHubFailure.createdAt) > latestCompletedAt) {
     const failedOperation = asRecord(latestGitHubFailure.payload)?.operation;
     resumeFrom = failedOperation === 'create_issue' || failedOperation === 'create_branch' ? 'planning' : 'delivery';
+  } else if (pendingReviewIsCurrent) {
+    // A provider failure can leave review:final in progress. A later broken
+    // retry must not supersede the already validated implementation merely
+    // because it emitted a new implementation-started audit event.
+    resumeFrom = 'review';
   } else if (inFlightPhase === 'planning' && isFailedValidationIteration(latestValidation)) {
     resumeFrom = 'implementation';
   } else if (inFlightPhase) {
@@ -205,7 +229,7 @@ function buildPhaseRetryResume(
     resumeFrom = 'planning';
   }
 
-  const latestImplementationAt = timestampOf(latestImplementation?.createdAt);
+  const latestImplementationAt = latestImplementationAtForPhase;
   const validationIsCurrent = Boolean(
     effectiveValidationIteration
     && timestampOf(effectiveValidationIteration.createdAt) >= latestImplementationAt

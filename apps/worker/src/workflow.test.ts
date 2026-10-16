@@ -181,6 +181,33 @@ describe('simple autonomous worker workflow', () => {
     expect(await readFile(join(checkout, 'authoring-checkpoint.txt'), 'utf8')).toContain(`base=${exactBase}`);
   }, workflowTestTimeoutMs);
 
+  it('never falls back to Windows implementation after a validated review resume with sparse metadata', async () => {
+    const project = createProject();
+    const task = createTask(project.id);
+    const workspaceRoot = await mkdtemp(join(tmpdir(), 'forgemind-review-resume-'));
+    const checkout = join(workspaceRoot, task.id); await mkdir(checkout, { recursive: true });
+    const git = simpleGit(checkout); await git.init(); await git.addConfig('user.name', 'ForgeMind Test');
+    await git.addConfig('user.email', 'test@forgemind.local'); await writeFile(join(checkout, 'README.md'), 'preserved result\n');
+    await git.add('README.md'); await git.commit('preserved result');
+    const implementOnWindows = vi.fn(async () => { throw new Error('Windows authoring must not repeat after successful validation.'); });
+    const review = vi.fn(async () => ({ verdict: 'satisfied' as const, summary: 'Preserved result satisfies the task.', blockers: [] }));
+
+    const result = await runWorkerTask({
+      project, task, provider: createProvider(), reviewProvider: createProvider({ review }),
+      implementationOwner: 'windows', implementOnWindows, workspaceRoot,
+      resume: {
+        kind: 'phase_retry', resumeFrom: 'review', attempt: 2,
+        implementationSummary: 'Previously authored and validated Unreal result.',
+        acceptanceCriteria: [],
+        validation: { command: 'no-validation-required', exitCode: 0, stdout: '', stderr: '', passed: true }
+      }
+    });
+
+    expect(result.status).toBe('completed');
+    expect(implementOnWindows).not.toHaveBeenCalled();
+    expect(review).toHaveBeenCalledOnce();
+  }, workflowTestTimeoutMs);
+
   it('replaces a prior base-relative Windows patch instead of stacking correction patches', async () => {
     const workspace = await mkdtemp(join(tmpdir(), 'forgemind-native-patch-')); const git = simpleGit(workspace);
     await git.init(); await git.addConfig('user.name', 'ForgeMind Test'); await git.addConfig('user.email', 'test@forgemind.local');

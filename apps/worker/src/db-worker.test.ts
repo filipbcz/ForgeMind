@@ -992,6 +992,47 @@ github:
     }));
   });
 
+  it('keeps a pending current review checkpoint ahead of a later failed implementation resume', async () => {
+    repositoryMock.claimNextSubmittedTask.mockResolvedValueOnce(createClaimedTask('task_retried'));
+    repositoryMock.getTaskDiff.mockResolvedValueOnce({
+      taskId: 'task_1', filesChanged: 2, insertions: 5, deletions: 0,
+      iterations: [
+        { phase: 'implementation', prompt: 'Implement', resultSummary: 'Unreal packages authored',
+          diffStat: { filesChanged: 2, insertions: 0, deletions: 0 },
+          validationResult: { passed: true, changedFiles: ['unreal/Content/Map.umap'], attempt: 1 },
+          createdAt: '2026-10-16T08:43:00.000Z' },
+        { phase: 'validation', prompt: 'No executable validation', resultSummary: 'Validation passed',
+          validationResult: { command: 'no-validation-required', exitCode: 0, stdout: '', stderr: '', passed: true, attempt: 1 },
+          createdAt: '2026-10-16T08:44:00.000Z' }
+      ]
+    });
+    repositoryMock.listTaskCheckpoints.mockResolvedValueOnce([{
+      key: 'review:final', phase: 'review', status: 'started', inputHash: 'review-input',
+      startedAt: '2026-10-16T08:44:21.000Z', updatedAt: '2026-10-16T08:44:21.000Z'
+    }]);
+    repositoryMock.listTaskAudit.mockResolvedValueOnce([
+      { eventType: 'task_iteration_started', payload: { taskRunId: 'review_run', phase: 'review', attempt: 2 }, createdAt: '2026-10-16T08:44:21.000Z' },
+      { eventType: 'task_failed', payload: { taskRunId: 'review_run', status: 'provider_failed' }, createdAt: '2026-10-16T08:44:53.000Z' },
+      { eventType: 'task_iteration_started', payload: { taskRunId: 'bad_retry', phase: 'implementation', attempt: 2 }, createdAt: '2026-10-16T14:58:00.000Z' },
+      { eventType: 'task_failed', payload: { taskRunId: 'bad_retry', status: 'failed', errorMessage: 'Required Unreal authoring did not produce a .uasset or .umap payload.' }, createdAt: '2026-10-16T14:59:54.000Z' }
+    ]);
+    runWorkerTaskMock.mockResolvedValueOnce({
+      taskId: 'task_1', status: 'ready_for_user_review', workspacePath: 'C:/tmp/worker',
+      validation: { command: 'no-validation-required', exitCode: 0, stdout: '', stderr: '', passed: true },
+      summary: 'Review resumed.', approvals: [], completedAt: new Date().toISOString()
+    });
+
+    const { runDatabaseWorkerOnce } = await import('./db-worker.js');
+    await runDatabaseWorkerOnce();
+
+    expect(runWorkerTaskMock).toHaveBeenCalledWith(expect.objectContaining({
+      resume: expect.objectContaining({
+        kind: 'phase_retry', resumeFrom: 'review',
+        validation: expect.objectContaining({ passed: true, command: 'no-validation-required' })
+      })
+    }));
+  });
+
   it('returns the last technical implementation failure to a manually retried Windows attempt', async () => {
     const queueError = 'Windows authoring failed: Required Unreal content was not created through an authoring API call.';
     repositoryMock.claimNextSubmittedTask.mockResolvedValueOnce(createClaimedTask('phase_retry'));

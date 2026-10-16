@@ -2109,12 +2109,16 @@ async function loadResumedImplementation(
   const status = await git.status();
   const workspaceChangedFiles = collectStageablePaths(status);
   const changedFiles = uniqueStrings([...workspaceChangedFiles, ...(resume.changedFiles ?? [])]);
-  if (changedFiles.length === 0 && !resume.diffStat && resume.implementationOutcome !== 'already_satisfied') {
+  const requiresCompletedImplementation = resume.resumeFrom === 'validation'
+    || resume.resumeFrom === 'review'
+    || resume.resumeFrom === 'delivery';
+  if (changedFiles.length === 0 && !resume.diffStat && resume.implementationOutcome !== 'already_satisfied'
+    && !requiresCompletedImplementation) {
     return undefined;
   }
 
   return {
-    outcome: resume.implementationOutcome,
+    outcome: resume.implementationOutcome ?? (changedFiles.length > 0 || resume.diffStat ? 'changes_made' : 'already_satisfied'),
     summary: resume.implementationSummary,
     changedFiles: uniqueStrings(changedFiles),
     evidenceFiles: resume.evidenceFiles,
