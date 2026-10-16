@@ -81,7 +81,7 @@ describe('Windows runner enrollment API', () => {
     const response = await app.inject({ method: 'POST', url: '/api/windows-runner/device/result',
       headers: { authorization: 'Bearer device-token' }, payload: { invalidProtocolPayload: 'x'.repeat(2_048) } });
     expect(response.statusCode).toBe(400);
-    expect(response.json()).toEqual({ error: 'Invalid execution result.' });
+    expect(response.json()).toEqual({ error: 'Invalid execution result.', issues: ['envelope'] });
   });
 
   it('accepts and byte-bounds progress logs produced by older runners with multibyte output', async () => {

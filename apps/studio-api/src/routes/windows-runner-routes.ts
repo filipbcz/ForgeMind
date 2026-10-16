@@ -3,7 +3,7 @@ import { createHash } from 'node:crypto';
 import { z } from 'zod';
 import type { ChatGPTPlanTokenSet, ForgeMindRepository, WindowsRunnerCredentialAdapter, WindowsRunnerPrincipal, WindowsWorkerRepository } from '@forgemind/db';
 import { CHATGPT_PLAN_SCOPE, validateChatGPTIdToken } from '@forgemind/providers';
-import { canonicalizeWorkerProbeEvidence, isWindowsAuthoringPacket, isWindowsAuthoringResult, isWindowsExecutionResult, redactSecrets, WINDOWS_AUTHORING_BLOB_CHUNK_BYTES, WINDOWS_AUTHORING_MANIFEST_MAX_BYTES, WINDOWS_EVIDENCE_MAX_ARTIFACT_BYTES, WINDOWS_EVIDENCE_MAX_ARTIFACTS, WINDOWS_EVIDENCE_MAX_LOG_BYTES } from '@forgemind/core';
+import { canonicalizeWorkerProbeEvidence, isWindowsAuthoringPacket, isWindowsAuthoringResult, isWindowsExecutionResult, redactSecrets, windowsAuthoringResultValidationIssues, WINDOWS_AUTHORING_BLOB_CHUNK_BYTES, WINDOWS_AUTHORING_MANIFEST_MAX_BYTES, WINDOWS_EVIDENCE_MAX_ARTIFACT_BYTES, WINDOWS_EVIDENCE_MAX_ARTIFACTS, WINDOWS_EVIDENCE_MAX_LOG_BYTES } from '@forgemind/core';
 
 const deviceParams = z.object({ deviceId: z.string().uuid() });
 const enrollment = z.object({
@@ -246,7 +246,11 @@ export function registerWindowsRunnerRoutes(app: FastifyInstance, repository: Fo
   });
   app.post('/api/windows-runner/device/result', { preHandler: runnerAuth(credentials), bodyLimit: WINDOWS_AUTHORING_MANIFEST_MAX_BYTES }, async (request, reply) => {
     const principal = runnerPrincipal(request);
-    if ((!isWindowsExecutionResult(request.body) && !isWindowsAuthoringResult(request.body)) || request.body.deviceId !== principal.deviceId) return reply.code(400).send({ error: 'Invalid execution result.' });
+    if (!isWindowsExecutionResult(request.body) && !isWindowsAuthoringResult(request.body)) {
+      const issues = windowsAuthoringResultValidationIssues(request.body);
+      return reply.code(400).send({ error: 'Invalid execution result.', ...(issues.length ? { issues } : {}) });
+    }
+    if (request.body.deviceId !== principal.deviceId) return reply.code(403).send({ error: 'Execution result device identity does not match the authenticated runner.' });
     const outcome = await workers.submitResult(principal.deviceId, request.body);
     if (!outcome.accepted || !outcome.packet) return reply.code(409).send({ error: 'Execution lease is not active for this device.' });
     if (isWindowsAuthoringPacket(outcome.packet)) {

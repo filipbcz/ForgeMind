@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import {
   WINDOWS_WORKER_SCHEMA_VERSION, canTransitionExecutionJob, canTransitionWorkerDevice, classifyWindowsExecutionPacket,
-  canTransitionWorkerSession, isWindowsAuthoringPacket, isWindowsAuthoringResult, isWindowsExecutionPacket, isWindowsExecutionResult,
+  canTransitionWorkerSession, isWindowsAuthoringPacket, isWindowsAuthoringResult, isWindowsExecutionPacket, isWindowsExecutionResult, windowsAuthoringResultValidationIssues,
   canonicalizeWorkerProbeEvidence, reconcileRealEngineEvidence,
   type WindowsAuthoringPacket, type WindowsExecutionPacket, type WindowsExecutionResult
 } from './windows-worker.js';
@@ -156,5 +156,7 @@ describe('Windows worker shared contracts', () => {
     expect(isWindowsAuthoringResult({ ...result, tree: [{ ...result.tree[0], binary: undefined }] })).toBe(false);
     expect(isWindowsAuthoringResult({ ...result, resultBundle: { ...result.resultBundle,
       outputs: [{ path: '../escape.bin', sha256: hash, sizeBytes: 1, contentBase64: 'YQ==' }] } })).toBe(false);
+    expect(windowsAuthoringResultValidationIssues({ ...result, processes: [{ ...result.processes[0], leaseId: 'other' }] })).toContain('processes');
+    expect(windowsAuthoringResultValidationIssues({ ...result, patch: '' })).toContain('patch-reference');
   });
 });

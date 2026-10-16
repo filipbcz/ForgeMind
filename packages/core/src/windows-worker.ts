@@ -696,20 +696,28 @@ export function isWindowsAuthoringPacket(value: unknown): value is WindowsAuthor
     && value.authority.globalGitHubCredentials === 'none';
 }
 
-export function isWindowsAuthoringResult(value: unknown): value is WindowsAuthoringResult {
+export type WindowsAuthoringResultValidationIssue =
+  | 'envelope' | 'identity' | 'status' | 'content-assessment' | 'artifacts' | 'provider-usage'
+  | 'processes' | 'result-bundle' | 'patch-reference' | 'tree' | 'real-engine-evidence';
+
+/** Returns only coarse, non-secret protocol sections so a remote runner can
+ * diagnose a rejected manifest without echoing commands, logs or credentials. */
+export function windowsAuthoringResultValidationIssues(value: unknown): WindowsAuthoringResultValidationIssue[] {
   if (!isRecord(value) || value.kind !== 'authoring-result'
-    || !WINDOWS_AUTHORING_PROTOCOL_VERSIONS.includes(value.protocolVersion as WindowsAuthoringProtocolVersion)) return false;
+    || !WINDOWS_AUTHORING_PROTOCOL_VERSIONS.includes(value.protocolVersion as WindowsAuthoringProtocolVersion)) return ['envelope'];
   const identities = ['projectId', 'taskId', 'runId', 'jobId', 'leaseId', 'deviceId', 'sessionId', 'nonce', 'summary'];
-  return identities.every((key) => isNonEmpty(value[key])) && isSha256(value.inputHash) && isGitCommitSha(value.baseCommitSha)
-    && isGitCommitSha(value.resultTreeSha) && ['succeeded', 'failed', 'cancelled'].includes(value.status as string)
-    && (value.failure === undefined || (isRecord(value.failure)
+  const issues: WindowsAuthoringResultValidationIssue[] = [];
+  if (!identities.every((key) => isNonEmpty(value[key])) || !isSha256(value.inputHash) || !isGitCommitSha(value.baseCommitSha)
+    || !isGitCommitSha(value.resultTreeSha) || !isIsoDate(value.startedAt) || !isIsoDate(value.completedAt)
+    || !areCapabilityKeys(value.completedOperationIds) || !areCapabilityKeys(value.checkpointIds)) issues.push('identity');
+  if (!['succeeded', 'failed', 'cancelled'].includes(value.status as string)
+    || !(value.failure === undefined || (isRecord(value.failure)
       && ['provider-configuration', 'missing-capability', 'timeout', 'validation', 'tool-failure', 'cancelled', 'unknown'].includes(value.failure.kind as string)
-      && typeof value.failure.retryable === 'boolean'))
-    && isIsoDate(value.startedAt) && isIsoDate(value.completedAt) && areCapabilityKeys(value.completedOperationIds)
-    && isRecord(value.contentAssessment) && ['passed', 'failed', 'not-required'].includes(value.contentAssessment.technicalVerification as string)
-    && typeof value.contentAssessment.productionReviewRequired === 'boolean' && isNonEmpty(value.contentAssessment.rationale)
-    && areCapabilityKeys(value.checkpointIds) && Array.isArray(value.artifacts) && value.artifacts.every(isArtifactResult)
-    && (value.providerUsage === undefined || (Array.isArray(value.providerUsage) && value.providerUsage.every((usage) => isRecord(usage)
+      && typeof value.failure.retryable === 'boolean'))) issues.push('status');
+  if (!(isRecord(value.contentAssessment) && ['passed', 'failed', 'not-required'].includes(value.contentAssessment.technicalVerification as string)
+    && typeof value.contentAssessment.productionReviewRequired === 'boolean' && isNonEmpty(value.contentAssessment.rationale))) issues.push('content-assessment');
+  if (!(Array.isArray(value.artifacts) && value.artifacts.every(isArtifactResult))) issues.push('artifacts');
+  if (!(value.providerUsage === undefined || (Array.isArray(value.providerUsage) && value.providerUsage.every((usage) => isRecord(usage)
       && ['codex', 'openai', 'github_copilot'].includes(usage.provider as string) && isNonEmpty(usage.model)
       && Number.isSafeInteger(usage.totalTokens) && (usage.totalTokens as number) >= 0
       && (usage.inputTokens === undefined || (Number.isSafeInteger(usage.inputTokens) && (usage.inputTokens as number) >= 0))
@@ -717,8 +725,8 @@ export function isWindowsAuthoringResult(value: unknown): value is WindowsAuthor
       && (usage.cachedTokens === undefined || (Number.isSafeInteger(usage.cachedTokens) && (usage.cachedTokens as number) >= 0))
       && ['actual_total', 'actual_breakdown'].includes(usage.source as string)
       && (usage.actualCostUsd === undefined || (typeof usage.actualCostUsd === 'number' && Number.isFinite(usage.actualCostUsd) && usage.actualCostUsd >= 0))
-      && Number.isSafeInteger(usage.attempt) && (usage.attempt as number) >= 1)))
-    && Array.isArray(value.processes) && value.processes.every((process) => isRecord(process) && isNonEmpty(process.checkId)
+      && Number.isSafeInteger(usage.attempt) && (usage.attempt as number) >= 1)))) issues.push('provider-usage');
+  if (!(Array.isArray(value.processes) && value.processes.every((process) => isRecord(process) && isNonEmpty(process.checkId)
       && process.leaseId === value.leaseId && process.sessionId === value.sessionId
       && isNonEmpty(process.command) && ['powershell', 'cmd', 'system'].includes(process.shell as string)
       && (process.exitCode === undefined || Number.isInteger(process.exitCode)) && typeof process.stdout === 'string'
@@ -734,8 +742,8 @@ export function isWindowsAuthoringResult(value: unknown): value is WindowsAuthor
           && process.authoring.loadedPackages.every(isSafeRelativePath)))
         && (process.authoring.inspections === undefined || (Array.isArray(process.authoring.inspections)
           && process.authoring.inspections.every((inspection) => isRecord(inspection) && isSafeRelativePath(inspection.path)
-            && isNonEmpty(inspection.className) && areCapabilityKeys(inspection.technicalObservations)))))))
-    && isRecord(value.resultBundle) && value.resultBundle.version === 1 && value.resultBundle.format === 'git-binary-patch'
+            && isNonEmpty(inspection.className) && areCapabilityKeys(inspection.technicalObservations))))))))) issues.push('processes');
+  if (!(isRecord(value.resultBundle) && value.resultBundle.version === 1 && value.resultBundle.format === 'git-binary-patch'
     && isSha256(value.resultBundle.sha256) && Number.isSafeInteger(value.resultBundle.sizeBytes) && (value.resultBundle.sizeBytes as number) >= 0
     && Array.isArray(value.resultBundle.lfsObjects) && value.resultBundle.lfsObjects.every((object) => isRecord(object)
       && isSha256(object.oid) && object.oid === object.sha256 && Number.isSafeInteger(object.sizeBytes) && (object.sizeBytes as number) >= 0
@@ -745,12 +753,18 @@ export function isWindowsAuthoringResult(value: unknown): value is WindowsAuthor
       && isSafeRelativePath(output.path) && isSha256(output.sha256) && Number.isSafeInteger(output.sizeBytes) && (output.sizeBytes as number) >= 0
       && ((typeof output.contentBase64 === 'string' && /^[A-Za-z0-9+/]*={0,2}$/.test(output.contentBase64)
         && output.blobSha256 === undefined) || (output.contentBase64 === undefined && output.blobSha256 === output.sha256)))
-    && typeof value.patch === 'string'
+  )) issues.push('result-bundle');
+  if (!(isRecord(value.resultBundle) && typeof value.patch === 'string'
     && ((value.patchBlobSha256 === undefined && new TextEncoder().encode(value.patch).byteLength === value.resultBundle.sizeBytes)
-      || (value.patch === '' && value.patchBlobSha256 === value.resultBundle.sha256))
-    && Array.isArray(value.tree) && value.tree.every((entry) => isRecord(entry) && isSafeRelativePath(entry.path)
+      || (value.patch === '' && value.patchBlobSha256 === value.resultBundle.sha256)))) issues.push('patch-reference');
+  if (!(Array.isArray(value.tree) && value.tree.every((entry) => isRecord(entry) && isSafeRelativePath(entry.path)
       && ['file', 'symlink'].includes(entry.kind as string) && isSha256(entry.sha256) && Number.isSafeInteger(entry.sizeBytes)
       && (entry.sizeBytes as number) >= 0 && typeof entry.binary === 'boolean' && /^[0-7]{6}$/.test(String(entry.mode)))
-    && new Set((value.tree as AuthoringTreeEntry[]).map(({ path }) => path)).size === value.tree.length
-    && (value.realEngineEvidence === undefined || isRealEngineEvidence(value.realEngineEvidence));
+    && new Set((value.tree as AuthoringTreeEntry[]).map(({ path }) => path)).size === value.tree.length)) issues.push('tree');
+  if (!(value.realEngineEvidence === undefined || isRealEngineEvidence(value.realEngineEvidence))) issues.push('real-engine-evidence');
+  return issues;
+}
+
+export function isWindowsAuthoringResult(value: unknown): value is WindowsAuthoringResult {
+  return windowsAuthoringResultValidationIssues(value).length === 0;
 }
