@@ -460,10 +460,16 @@ export class CodexProvider implements AIProvider {
     this.apiBaseUrl = process.env.CODEX_API_BASE_URL ?? DEFAULT_CODEX_API_URL;
     const apiKeyCodexHome = config?.codexHome ?? process.env.FORGEMIND_API_CODEX_HOME
       ?? (process.env.CODEX_HOME ? join(process.env.CODEX_HOME, 'api-key') : join(homedir(), '.forgemind-codex-api'));
+    const commandEnvironment = createWorkspaceEnvironment();
+    // Workspace overrides are allowed to provide application-specific values,
+    // but provider authentication must come exclusively from the selected
+    // connection. In particular, never let an exhausted API key leak into a
+    // ChatGPT-plan CLI invocation (or vice versa).
+    for (const name of ['ACCESS_TOKEN', 'OPENAI_API_KEY', 'CODEX_API_KEY']) delete commandEnvironment[name];
     this.commandEnv = this.authMode === 'chatgpt_plan_oauth'
-      ? { ...createWorkspaceEnvironment(), ACCESS_TOKEN: key, CODEX_HOME: apiKeyCodexHome }
+      ? { ...commandEnvironment, ACCESS_TOKEN: key, CODEX_HOME: apiKeyCodexHome }
       : {
-          ...createWorkspaceEnvironment(),
+          ...commandEnvironment,
           // `codex exec` supports the dedicated CODEX_API_KEY environment
           // variable for non-interactive API-key authentication.
           OPENAI_API_KEY: key,
@@ -478,6 +484,28 @@ export class CodexProvider implements AIProvider {
 
   async preflight(signal?: AbortSignal): Promise<ProviderPreflightResult> {
     return normalizeProviderPreflight(this.kind, async () => {
+      if (this.useCli) {
+        const result = await this.runCodexExec({
+          prompt: 'Return JSON with ok set to true.',
+          schema: {
+            type: 'object',
+            additionalProperties: false,
+            required: ['ok'],
+            properties: { ok: { type: 'boolean', const: true } }
+          },
+          packetOnly: true,
+          sandbox: 'read-only',
+          maxRuntimeMs: 180_000,
+          signal
+        });
+        let parsed: unknown;
+        try { parsed = JSON.parse(result); }
+        catch { throw new ProviderContractError('Codex CLI preflight returned invalid JSON.'); }
+        if (!parsed || typeof parsed !== 'object' || (parsed as { ok?: unknown }).ok !== true) {
+          throw new ProviderContractError('Codex CLI preflight returned an invalid result.');
+        }
+        return;
+      }
       if (this.authMode === 'chatgpt_plan_oauth') {
         await this.requestResponses([{ role: 'user', content: 'Reply with OK.' }], undefined, signal);
         return;
@@ -1382,6 +1410,12 @@ export function buildCodexExecArgs(input: {
 }): string[] {
   const args = input.sessionId ? ['exec', 'resume'] : ['exec', '--color', 'never'];
 
+  // Apply user-config isolation before explicit provider overrides. This makes
+  // the selected connection authoritative on every supported CLI version.
+  if (input.nativeToolChannel) {
+    args.push('--ignore-user-config', '--ignore-rules', '--disable', 'shell_tool', '--disable', 'multi_agent');
+  }
+
   if (input.bypassSandbox) {
     args.push('--dangerously-bypass-approvals-and-sandbox');
   } else if (input.sessionId) {
@@ -1406,8 +1440,7 @@ export function buildCodexExecArgs(input: {
     args.push('-c', `model_reasoning_effort=${JSON.stringify(input.reasoningEffort)}`);
   }
   if (input.nativeToolChannel) {
-    args.push('--ignore-user-config', '--ignore-rules', '--disable', 'shell_tool', '--disable', 'multi_agent',
-      '-c', `mcp_servers.forgemind_native.command=${JSON.stringify(input.nativeToolChannel.command)}`,
+    args.push('-c', `mcp_servers.forgemind_native.command=${JSON.stringify(input.nativeToolChannel.command)}`,
       '-c', `mcp_servers.forgemind_native.args=${JSON.stringify(input.nativeToolChannel.args)}`,
       '-c', 'mcp_servers.forgemind_native.required=true',
       '-c', 'mcp_servers.forgemind_native.default_tools_approval_mode="approve"',

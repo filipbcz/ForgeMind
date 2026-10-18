@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 import { createInterface } from 'node:readline/promises';
+import { createHash } from 'node:crypto';
 import { mkdir } from 'node:fs/promises';
 import { homedir, release as osRelease } from 'node:os';
 import { join } from 'node:path';
@@ -91,6 +92,11 @@ export function requiredProbeFailures(
   return evidence.filter(({ capability, status }) => status !== 'supported' && required.has(capability.key));
 }
 
+export function resolveWindowsConnectionCodexHome(root: string, connectionId: string): string {
+  const identity = createHash('sha256').update(connectionId).digest('hex').slice(0, 24);
+  return join(root, 'connections', identity);
+}
+
 export function resolveCodexPreflightTimeouts(environment: NodeJS.ProcessEnv = process.env): {
   inspectionMs: number; sandboxProbeMs: number;
 } {
@@ -155,7 +161,8 @@ export async function prepareLocalCodexRuntime(environment: NodeJS.ProcessEnv = 
     candidates.push({
       id: 'local-api-key', label: 'local OpenAI API key', allowedModels: localModels.map(({ id }) => id),
       create: async (route) => createProvider('codex', {
-        apiKey, authMode: 'api_key', useCli: true, codexHome,
+        apiKey, authMode: 'api_key', useCli: true,
+        codexHome: resolveWindowsConnectionCodexHome(codexHome, 'local-api-key'),
         model: route?.model ?? selectLocalCodexModel(localModels, environment.FORGEMIND_MODEL_STANDARD ?? environment.CODEX_MODEL),
         reasoningEffort: route?.reasoningEffort ?? 'medium'
       })
@@ -179,7 +186,7 @@ export async function prepareLocalCodexRuntime(environment: NodeJS.ProcessEnv = 
             ? { authMode: 'chatgpt_plan_oauth' as const, accessToken: current.credential }
             : { authMode: 'api_key' as const, apiKey: current.credential }),
           useCli: true,
-          codexHome,
+          codexHome: resolveWindowsConnectionCodexHome(codexHome, `remote:${remote.id}:${current.authMode}`),
           model: route?.model ?? current.model,
           allowedModels: current.allowedModels,
           reasoningEffort: route?.reasoningEffort ?? 'medium'

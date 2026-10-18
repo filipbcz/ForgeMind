@@ -1,6 +1,11 @@
 import { describe, expect, it, vi } from 'vitest';
 import { buildCodexImplementationPrompt, buildCodexNativeImplementationPrompt, buildCodexReviewSchema, codexProcessActivity, CodexProvider, formatCodexJsonEvent, isNoisyWorkspaceActivityPath, parseCodexCliTotalTokens, runCodexProcess } from './codex-provider.js';
 
+function restoreEnvironment(name: string, value: string | undefined): void {
+  if (value === undefined) delete process.env[name];
+  else process.env[name] = value;
+}
+
 describe('Codex structured output schemas', () => {
   it('keeps native Unreal validation on the structured runner path', () => {
     const prompt = buildCodexNativeImplementationPrompt('Implement the scene.');
@@ -227,6 +232,41 @@ describe('Codex process activity timeouts', () => {
       if (previousCodexKey === undefined) delete process.env.CODEX_API_KEY;
       else process.env.CODEX_API_KEY = previousCodexKey;
     }
+  });
+
+  it('does not allow workspace overrides to replace the selected CLI credential', () => {
+    const previousAccessToken = process.env.FORGEMIND_WORKSPACE_ENV_ACCESS_TOKEN;
+    const previousOpenAIKey = process.env.FORGEMIND_WORKSPACE_ENV_OPENAI_API_KEY;
+    const previousCodexKey = process.env.FORGEMIND_WORKSPACE_ENV_CODEX_API_KEY;
+    process.env.FORGEMIND_WORKSPACE_ENV_ACCESS_TOKEN = 'wrong-plan-token';
+    process.env.FORGEMIND_WORKSPACE_ENV_OPENAI_API_KEY = 'sk-exhausted';
+    process.env.FORGEMIND_WORKSPACE_ENV_CODEX_API_KEY = 'sk-exhausted';
+    try {
+      const provider = new CodexProvider({ accessToken: 'selected-plan-token', authMode: 'chatgpt_plan_oauth', useCli: true });
+      const commandEnv = (provider as unknown as { commandEnv: NodeJS.ProcessEnv }).commandEnv;
+
+      expect(commandEnv.ACCESS_TOKEN).toBe('selected-plan-token');
+      expect(commandEnv.OPENAI_API_KEY).toBeUndefined();
+      expect(commandEnv.CODEX_API_KEY).toBeUndefined();
+    } finally {
+      restoreEnvironment('FORGEMIND_WORKSPACE_ENV_ACCESS_TOKEN', previousAccessToken);
+      restoreEnvironment('FORGEMIND_WORKSPACE_ENV_OPENAI_API_KEY', previousOpenAIKey);
+      restoreEnvironment('FORGEMIND_WORKSPACE_ENV_CODEX_API_KEY', previousCodexKey);
+    }
+  });
+
+  it('preflights a CLI provider through the same Codex executable path used by implementation', async () => {
+    const provider = new CodexProvider({ accessToken: 'selected-plan-token', authMode: 'chatgpt_plan_oauth', useCli: true });
+    const execute = vi.spyOn(provider as unknown as {
+      runCodexExec: (input: { packetOnly?: boolean; sandbox: string; maxRuntimeMs?: number }) => Promise<string>;
+    }, 'runCodexExec').mockResolvedValue('{"ok":true}');
+
+    await expect(provider.preflight()).resolves.toMatchObject({ ok: true });
+    expect(execute).toHaveBeenCalledWith(expect.objectContaining({
+      packetOnly: true,
+      sandbox: 'read-only',
+      maxRuntimeMs: 180_000
+    }));
   });
 
   it('keeps an active process alive past the inactivity timeout', async () => {

@@ -1,6 +1,6 @@
 import { createHash } from 'node:crypto';
 import { describe, expect, it, vi } from 'vitest';
-import { assertNativeCodexCliCompatibility, createWindowsProviderPool, parseCliArgs, requiredProbeFailures, resolveCodexPreflightTimeouts, resolveWindowsCandidateRoute, selectLocalCodexModel, uploadAuthoringResultBlobs } from './cli.js';
+import { assertNativeCodexCliCompatibility, createWindowsProviderPool, parseCliArgs, requiredProbeFailures, resolveCodexPreflightTimeouts, resolveWindowsCandidateRoute, resolveWindowsConnectionCodexHome, selectLocalCodexModel, uploadAuthoringResultBlobs } from './cli.js';
 
 describe('Windows runner CLI parsing', () => {
   it.each([
@@ -58,6 +58,18 @@ describe('Windows runner CLI parsing', () => {
   it('rejects invalid or unbounded Codex preflight timeouts', () => {
     expect(() => resolveCodexPreflightTimeouts({ FORGEMIND_CODEX_CLI_INSPECTION_TIMEOUT_MS: 'not-a-number' })).toThrow(/integer from 1000/i);
     expect(() => resolveCodexPreflightTimeouts({ FORGEMIND_CODEX_SANDBOX_PROBE_TIMEOUT_MS: '1800001' })).toThrow(/integer from 1000/i);
+  });
+
+  it('isolates every configured AI connection in a stable Codex home', () => {
+    const root = 'C:\\ForgeMind\\codex-api';
+    const first = resolveWindowsConnectionCodexHome(root, 'remote:first:api_key');
+    const firstAgain = resolveWindowsConnectionCodexHome(root, 'remote:first:api_key');
+    const plan = resolveWindowsConnectionCodexHome(root, 'remote:first:chatgpt_plan_oauth');
+
+    expect(first).toBe(firstAgain);
+    expect(plan).not.toBe(first);
+    expect(first).toContain('connections');
+    expect(first).not.toContain('remote:first');
   });
 
   it('continues Windows authoring through ChatGPT after API credits are exhausted without treating its catalogue as entitlement', async () => {
