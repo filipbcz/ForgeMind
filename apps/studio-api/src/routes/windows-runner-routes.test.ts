@@ -2,7 +2,7 @@ import Fastify from 'fastify';
 import { createHash } from 'node:crypto';
 import { describe, expect, it, vi } from 'vitest';
 import { canonicalizeWorkerProbeEvidence } from '@forgemind/core';
-import { registerWindowsRunnerRoutes } from './windows-runner-routes.js';
+import { normalizeLegacyAuthoringProcessSession, registerWindowsRunnerRoutes } from './windows-runner-routes.js';
 
 function probeEvidence(capability: { key: string; version?: string }, status: 'supported' | 'unsupported' | 'error' = 'supported', overrides: Record<string, unknown> = {}) {
   const evidence = { capability, status, probedAt: '2026-09-01T00:00:00.000Z', probeVersion: '1', provenance: 'local-probe' as const, summary: status === 'supported' ? 'Local probe succeeded.' : 'Local probe failed.' };
@@ -10,6 +10,19 @@ function probeEvidence(capability: { key: string; version?: string }, status: 's
 }
 
 describe('Windows runner enrollment API', () => {
+  it('repairs only the known legacy authoring session sentinel', () => {
+    const legacy = { kind: 'authoring-result', leaseId: 'lease-current', sessionId: 'session-current', processes: [
+      { leaseId: 'lease-current', sessionId: 'authoring-session', checkId: 'unreal-recovered-content-resave' },
+      { leaseId: 'lease-current', sessionId: 'session-current', checkId: 'unreal-saved-content-load' }
+    ] };
+    expect(normalizeLegacyAuthoringProcessSession(legacy)).toMatchObject({ processes: [
+      { sessionId: 'session-current' }, { sessionId: 'session-current' }
+    ] });
+
+    const arbitraryMismatch = { ...legacy, processes: [{ ...legacy.processes[0], sessionId: 'other-session' }] };
+    expect(normalizeLegacyAuthoringProcessSession(arbitraryMismatch)).toBe(arbitraryMismatch);
+  });
+
   it('creates an owner-controlled enrollment for a new offline device identity', async () => {
     const app = Fastify();
     const credentials: any = { createEnrollment: vi.fn(async () => ({ enrollmentId: 'enrollment_1', code: 'secret-code', expiresAt: '2026-09-01T00:10:00.000Z' })) };

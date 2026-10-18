@@ -38,6 +38,28 @@ const deviceRegistration = z.object({
 });
 const sessionControl = z.object({ sessionId: z.string().uuid() });
 const controlQuery = z.object({ sessionId: z.string().uuid(), leaseId: z.string().uuid().optional() });
+
+/** Legacy runner builds used this sentinel when a durable Unreal checkpoint
+ * had packages but no retained process provenance. The top-level
+ * authenticated session is authoritative, so narrowly repair only that known
+ * value; arbitrary child identity mismatches remain invalid. */
+export function normalizeLegacyAuthoringProcessSession(value: unknown): unknown {
+  if (!value || typeof value !== 'object') return value;
+  const result = value as Record<string, unknown>;
+  if (result.kind !== 'authoring-result' || typeof result.sessionId !== 'string' || !Array.isArray(result.processes)) return value;
+  if (!result.processes.some((process) => process && typeof process === 'object'
+    && (process as Record<string, unknown>).sessionId === 'authoring-session')) return value;
+  if (!result.processes.every((process) => {
+    if (!process || typeof process !== 'object') return false;
+    const record = process as Record<string, unknown>;
+    return (record.sessionId === 'authoring-session' || record.sessionId === result.sessionId)
+      && record.leaseId === result.leaseId;
+  })) return value;
+  return { ...result, processes: result.processes.map((process) => {
+    const record = process as Record<string, unknown>;
+    return record.sessionId === 'authoring-session' ? { ...record, sessionId: result.sessionId } : record;
+  }) };
+}
 const sha = z.string().regex(/^[a-f0-9]{64}$/i);
 const gitCommitSha = z.string().regex(/^(?:[a-f0-9]{40}|[a-f0-9]{64})$/i);
 const LEGACY_AUTHORING_LOG_MAX_BYTES = WINDOWS_EVIDENCE_MAX_LOG_BYTES * 4;
@@ -246,61 +268,62 @@ export function registerWindowsRunnerRoutes(app: FastifyInstance, repository: Fo
   });
   app.post('/api/windows-runner/device/result', { preHandler: runnerAuth(credentials), bodyLimit: WINDOWS_AUTHORING_MANIFEST_MAX_BYTES }, async (request, reply) => {
     const principal = runnerPrincipal(request);
-    if (!isWindowsExecutionResult(request.body) && !isWindowsAuthoringResult(request.body)) {
-      const issues = windowsAuthoringResultValidationIssues(request.body);
+    const result = normalizeLegacyAuthoringProcessSession(request.body);
+    if (!isWindowsExecutionResult(result) && !isWindowsAuthoringResult(result)) {
+      const issues = windowsAuthoringResultValidationIssues(result);
       const detail = issues.length ? ` Invalid sections: ${issues.join(', ')}.` : '';
       return reply.code(400).send({ error: `Invalid execution result.${detail}`, ...(issues.length ? { issues } : {}) });
     }
-    if (request.body.deviceId !== principal.deviceId) return reply.code(403).send({ error: 'Execution result device identity does not match the authenticated runner.' });
-    const outcome = await workers.submitResult(principal.deviceId, request.body);
+    if (result.deviceId !== principal.deviceId) return reply.code(403).send({ error: 'Execution result device identity does not match the authenticated runner.' });
+    const outcome = await workers.submitResult(principal.deviceId, result);
     if (!outcome.accepted || !outcome.packet) return reply.code(409).send({ error: 'Execution lease is not active for this device.' });
     if (isWindowsAuthoringPacket(outcome.packet)) {
-      if (!isWindowsAuthoringResult(request.body)) return reply.code(409).send({ error: 'Result protocol does not match the leased job.' });
+      if (!isWindowsAuthoringResult(result)) return reply.code(409).send({ error: 'Result protocol does not match the leased job.' });
       await repository.writeAudit({ actorType: 'system', actorId: principal.deviceId, eventType: 'windows_runner_authoring_result_submitted',
-        taskId: request.body.taskId, projectId: request.body.projectId, payload: { deviceId: principal.deviceId, jobId: request.body.jobId,
-          leaseId: request.body.leaseId, status: request.body.status, baseCommitSha: request.body.baseCommitSha,
-          resultTreeSha: request.body.resultTreeSha, binaryEntries: request.body.tree.filter((entry) => entry.binary).length } });
+        taskId: result.taskId, projectId: result.projectId, payload: { deviceId: principal.deviceId, jobId: result.jobId,
+          leaseId: result.leaseId, status: result.status, baseCommitSha: result.baseCommitSha,
+          resultTreeSha: result.resultTreeSha, binaryEntries: result.tree.filter((entry) => entry.binary).length } });
       return { accepted: true, evidenceRecorded: false };
     }
-    if (!isWindowsExecutionResult(request.body)) return reply.code(409).send({ error: 'Result protocol does not match the leased job.' });
+    if (!isWindowsExecutionResult(result)) return reply.code(409).send({ error: 'Result protocol does not match the leased job.' });
     let evidenceRecorded = false;
     const context = outcome.packet.evidenceContext;
     if (context) {
       try {
         await repository.recordAcceptanceEvidence({
-          projectId: request.body.projectId,
+          projectId: result.projectId,
           cycleId: context.cycleId,
           stepId: context.stepId,
-          taskId: request.body.taskId,
-          taskRunId: request.body.runId,
+          taskId: result.taskId,
+          taskRunId: result.runId,
           requirementIds: context.requirementIds,
           criterion: outcome.packet.check.criterion ?? outcome.packet.check.command,
           source: 'artifact',
-          status: request.body.status === 'succeeded' ? 'passed' : request.body.status === 'deferred' ? 'deferred' : 'failed',
-          evidenceIdentity: `windows:${request.body.jobId}`,
+          status: result.status === 'succeeded' ? 'passed' : result.status === 'deferred' ? 'deferred' : 'failed',
+          evidenceIdentity: `windows:${result.jobId}`,
           contractVersion: context.contractVersion,
-          commitSha: request.body.commitSha,
+          commitSha: result.commitSha,
           command: outcome.packet.check.command,
-          exitCode: request.body.exitCode,
+          exitCode: result.exitCode,
           payload: {
             platform: 'windows',
             deviceId: principal.deviceId,
-            summary: request.body.summary,
-            logHash: request.body.logHash,
-            realEngineEvidence: request.body.realEngineEvidence ? JSON.parse(JSON.stringify(request.body.realEngineEvidence)) : null,
-            artifacts: request.body.artifacts.map((artifact) => ({ ...artifact }))
+            summary: result.summary,
+            logHash: result.logHash,
+            realEngineEvidence: result.realEngineEvidence ? JSON.parse(JSON.stringify(result.realEngineEvidence)) : null,
+            artifacts: result.artifacts.map((artifact) => ({ ...artifact }))
           }
         });
         evidenceRecorded = true;
       } catch (error) {
         await repository.writeAudit({
           actorType: 'system', actorId: principal.deviceId, eventType: 'windows_runner_evidence_record_failed',
-          taskId: request.body.taskId, projectId: request.body.projectId,
-          payload: { jobId: request.body.jobId, errorMessage: error instanceof Error ? error.message : String(error) }
+          taskId: result.taskId, projectId: result.projectId,
+          payload: { jobId: result.jobId, errorMessage: error instanceof Error ? error.message : String(error) }
         });
       }
     }
-    await repository.writeAudit({ actorType: 'system', actorId: principal.deviceId, eventType: 'windows_runner_result_submitted', taskId: request.body.taskId, projectId: request.body.projectId, payload: { deviceId: principal.deviceId, jobId: request.body.jobId, leaseId: request.body.leaseId, status: request.body.status, commitSha: request.body.commitSha } });
+    await repository.writeAudit({ actorType: 'system', actorId: principal.deviceId, eventType: 'windows_runner_result_submitted', taskId: result.taskId, projectId: result.projectId, payload: { deviceId: principal.deviceId, jobId: result.jobId, leaseId: result.leaseId, status: result.status, commitSha: result.commitSha } });
     return { accepted: true, evidenceRecorded };
   });
   app.post('/api/windows-runner/device/authoring-progress', { preHandler: runnerAuth(credentials),

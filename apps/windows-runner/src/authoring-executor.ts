@@ -240,7 +240,7 @@ export async function executeWindowsAuthoring(packet: WindowsAuthoringPacket, co
     const currentChangedPaths = await stageChangedPaths(workspacePath, context.signal);
     await rejectProhibitedResultPaths(packet, workspacePath, context.signal);
     productionReviewRequired = await enforceRequiredUnrealAssets(packet, workspacePath, evidenceDirectory, outputDirectory, currentChangedPaths, processes,
-      packet.resourcePolicy.timeoutSeconds * 1_000, selectedUnrealCommandletExecutable, context.signal, resumedUnrealPackages);
+      context.sessionId, packet.resourcePolicy.timeoutSeconds * 1_000, selectedUnrealCommandletExecutable, context.signal, resumedUnrealPackages);
     completionVerified = true;
     await publishCheckpoint('verified');
   };
@@ -271,7 +271,7 @@ export async function executeWindowsAuthoring(packet: WindowsAuthoringPacket, co
   if (status === 'succeeded' && !completionVerified) {
     try {
       productionReviewRequired = await enforceRequiredUnrealAssets(packet, workspacePath, evidenceDirectory, outputDirectory, changedPaths, processes,
-        packet.resourcePolicy.timeoutSeconds * 1_000, selectedUnrealCommandletExecutable, context.signal, resumedUnrealPackages);
+        context.sessionId, packet.resourcePolicy.timeoutSeconds * 1_000, selectedUnrealCommandletExecutable, context.signal, resumedUnrealPackages);
     } catch (error) {
       status = context.signal?.aborted ? 'cancelled' : 'failed';
       summary = `Final native Unreal verification failed: ${redactSecrets(error instanceof Error ? error.message : String(error))}`;
@@ -839,7 +839,7 @@ async function indexedChangedPaths(root: string, signal?: AbortSignal): Promise<
   return changed.stdout.split('\0').filter(Boolean).map((path) => path.replaceAll('\\', '/'));
 }
 
-async function enforceRequiredUnrealAssets(packet: WindowsAuthoringPacket, root: string, evidenceRoot: string, outputRoot: string, changedPaths: string[], processes: WindowsAuthoringProcessResult[], timeoutMs: number,
+async function enforceRequiredUnrealAssets(packet: WindowsAuthoringPacket, root: string, evidenceRoot: string, outputRoot: string, changedPaths: string[], processes: WindowsAuthoringProcessResult[], sessionId: string, timeoutMs: number,
   selectedUnrealExecutable?: string, signal?: AbortSignal, recoveredPackages: AuthoringTreeEntry[] = []): Promise<boolean> {
   if (!packet.contentPolicy.requiresUnrealAssets) return false;
   const assets: string[] = [];
@@ -852,7 +852,7 @@ async function enforceRequiredUnrealAssets(packet: WindowsAuthoringPacket, root:
     if (!selectedUnrealExecutable) throw new Error('The currently probed UnrealEditor executable is unavailable for recovered-package authoring.');
     await assertRecoveredPackagesUnchanged(root, assets, recoveredPackages);
     const recovery = await reauthorRecoveredUnrealPackages(root, evidenceRoot, assets, selectedUnrealExecutable, timeoutMs, signal);
-    const recoveredAuthoring = { ...recovery, leaseId: packet.leaseId, sessionId: processes[0]?.sessionId ?? 'authoring-session' };
+    const recoveredAuthoring = { ...recovery, leaseId: packet.leaseId, sessionId };
     processes.push(recoveredAuthoring);
     if (recovery.exitCode !== 0 || recovery.terminationReason) {
       const diagnostic = redactSecrets([recovery.stderr, recovery.stdout].filter(Boolean).join('\n')).slice(-8_000);
@@ -863,7 +863,7 @@ async function enforceRequiredUnrealAssets(packet: WindowsAuthoringPacket, root:
   if (assets.length > 0 && authored?.authoring) {
     if (!selectedUnrealExecutable) throw new Error('The currently probed UnrealEditor executable is unavailable for final verification.');
     const verification = await verifyUnrealPackages(root, evidenceRoot, assets, authored.authoring, selectedUnrealExecutable, timeoutMs, signal);
-    processes.push({ ...verification, leaseId: packet.leaseId, sessionId: processes[0]?.sessionId ?? 'authoring-session' });
+    processes.push({ ...verification, leaseId: packet.leaseId, sessionId });
     await writeFile(resolve(outputRoot, 'unreal-package-inspection.json'), JSON.stringify({
       schemaVersion: 1,
       projectRelativePath: authored.authoring.projectRelativePath,
