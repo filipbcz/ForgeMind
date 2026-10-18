@@ -494,6 +494,28 @@ export class CodexProvider implements AIProvider {
       if (!ids.some((id) => id === this.model || id.startsWith(`${this.model}-`))) {
         throw new ProviderContractError(`Codex model "${this.model}" is not available to this API project.`);
       }
+
+      // Listing models proves that the credential is valid, but it does not
+      // prove that the API project has spend available. Verify one deliberately
+      // tiny inference now so the shared provider pool can select a working
+      // ChatGPT-plan fallback before a long native authoring turn starts.
+      const inference = await fetch(buildCodexResponsesUrl(this.apiBaseUrl), {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${this.apiKey}`
+        },
+        signal,
+        body: JSON.stringify({
+          model: this.model,
+          input: [{ role: 'user', content: [{ type: 'input_text', text: 'Reply exactly OK.' }] }],
+          max_output_tokens: 16,
+          store: false
+        })
+      });
+      if (!inference.ok) {
+        throw await normalizeProviderHttpError('codex', inference, 'Codex inference preflight failed.');
+      }
     });
   }
 
@@ -1271,6 +1293,16 @@ function buildCodexModelsUrl(apiBaseUrl: string): URL {
     url.pathname = url.pathname.replace(/\/responses\/?$/, '/models');
   } else if (!/\/models\/?$/.test(url.pathname)) {
     url.pathname = `${url.pathname.replace(/\/$/, '')}/models`;
+  }
+  return url;
+}
+
+function buildCodexResponsesUrl(apiBaseUrl: string): URL {
+  const url = new URL(apiBaseUrl);
+  if (/\/models\/?$/.test(url.pathname)) {
+    url.pathname = url.pathname.replace(/\/models\/?$/, '/responses');
+  } else if (!/\/responses\/?$/.test(url.pathname)) {
+    url.pathname = `${url.pathname.replace(/\/$/, '')}/responses`;
   }
   return url;
 }

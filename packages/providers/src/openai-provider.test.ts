@@ -323,14 +323,36 @@ describe('Codex provider', () => {
 
   it('exposes Codex API-key preflight through the adapter contract', async () => {
     process.env.CODEX_API_KEY = 'test-key';
-    vi.mocked(fetch).mockResolvedValueOnce(successfulResponse({ data: [{ id: 'gpt-6-astra' }] }));
+    vi.mocked(fetch).mockClear();
+    vi.mocked(fetch)
+      .mockResolvedValueOnce(successfulResponse({ data: [{ id: 'gpt-6-astra' }] }))
+      .mockResolvedValueOnce(successfulResponse({ output_text: 'OK' }));
 
-    const result = await new CodexProvider({ authMode: 'api_key' }).preflight();
+    const result = await new CodexProvider({ authMode: 'api_key', apiKey: 'test-key' }).preflight();
 
     expect(result).toMatchObject({ provider: 'codex', ok: true });
-    expect(fetch).toHaveBeenLastCalledWith(new URL('https://api.openai.com/v1/models'), {
-      headers: { Authorization: 'Bearer test-key' },
-      signal: undefined
+    expect(fetch).toHaveBeenNthCalledWith(1, new URL('https://api.openai.com/v1/models'), {
+      headers: { Authorization: 'Bearer test-key' }, signal: undefined
+    });
+    expect(fetch).toHaveBeenNthCalledWith(2, new URL('https://api.openai.com/v1/responses'), expect.objectContaining({
+      method: 'POST', headers: { 'Content-Type': 'application/json', Authorization: 'Bearer test-key' }, signal: undefined
+    }));
+  });
+
+  it('rejects an API-key connection with no inference credits during preflight', async () => {
+    process.env.CODEX_API_KEY = 'test-key';
+    vi.mocked(fetch).mockClear();
+    vi.mocked(fetch)
+      .mockResolvedValueOnce(successfulResponse({ data: [{ id: 'gpt-6-astra' }] }))
+      .mockResolvedValueOnce(new Response(JSON.stringify({
+        error: { code: 'credit_balance_exhausted', message: 'You have no credits remaining.' }
+      }), { status: 429, headers: { 'content-type': 'application/json' } }));
+
+    const result = await new CodexProvider({ authMode: 'api_key', apiKey: 'test-key' }).preflight();
+
+    expect(result).toMatchObject({
+      provider: 'codex', ok: false,
+      error: { kind: 'credit_exhausted', errorCode: 'credit_balance_exhausted', failoverEligible: true }
     });
   });
 
