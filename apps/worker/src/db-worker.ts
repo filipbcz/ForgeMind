@@ -516,14 +516,17 @@ export async function runDatabaseWorkerOnce(options: { deferInterruptSignals?: b
     claimed.taskRun.model = selectedProviderModel;
   }
   const routingState: ModelRoutingState = { decision: claimed.task.modelRoutingDecision };
-  const primaryRuntimeProvider = buildRuntimeProvider(selection.primary.kind, selection.primary.connection, resolveConfiguredModelProfile(projectConfig?.ai.model_profile), routingState);
+  const modelProfile = resolveConfiguredModelProfile(projectConfig?.ai.model_profile);
+  const refreshRuntimeProvider = createRuntimeProviderRefresher(repository, modelProfile, routingState);
+  const primaryRuntimeProvider = buildRuntimeProvider(selection.primary.kind, selection.primary.connection, modelProfile, routingState);
   const fallbackRuntimeProviders = selection.fallbacks.map((candidate) =>
-    buildRuntimeProvider(candidate.kind, candidate.connection, resolveConfiguredModelProfile(projectConfig?.ai.model_profile), routingState));
+    buildRuntimeProvider(candidate.kind, candidate.connection, modelProfile, routingState));
   let providerSession: ProviderSessionContext;
   let activeConnectionId = selection.primary.connection?.id ?? null;
   const { provider, getLastProviderKind, getLastConnectionId } = createPolicyAwareProvider({
     primary: primaryRuntimeProvider,
     fallbacks: fallbackRuntimeProviders,
+    refreshCandidate: refreshRuntimeProvider,
     onConnectionSwitch: async (candidate) => {
       activeConnectionId = candidate.connectionId;
       // Provider-native conversation ids are credential specific. Preserve the
@@ -558,11 +561,11 @@ export async function runDatabaseWorkerOnce(options: { deferInterruptSignals?: b
     defaultConnection: defaultAIProviderConnection
   });
   const reviewerRuntimeProvider = buildRuntimeProvider(reviewerSelection.kind, reviewerSelection.connection,
-    resolveConfiguredModelProfile(projectConfig?.ai.model_profile), routingState);
+    modelProfile, routingState);
   const reviewerFallbackRuntimeProviders = [selection.primary, ...selection.fallbacks]
     .filter((candidate) => candidate.kind === reviewerSelection.kind && candidate.connection?.id !== reviewerSelection.connection?.id)
     .map((candidate) => buildRuntimeProvider(candidate.kind, candidate.connection,
-      resolveConfiguredModelProfile(projectConfig?.ai.model_profile), routingState));
+      modelProfile, routingState));
   const reviewProviderModel = resolveProviderModel(reviewerSelection.kind, reviewerSelection.connection);
   const reviewProviderSession: ProviderSessionContext = {
     provider: reviewerSelection.kind,
@@ -571,6 +574,7 @@ export async function runDatabaseWorkerOnce(options: { deferInterruptSignals?: b
   const { provider: reviewProvider } = createPolicyAwareProvider({
     primary: reviewerRuntimeProvider,
     fallbacks: reviewerFallbackRuntimeProviders,
+    refreshCandidate: refreshRuntimeProvider,
     onConnectionSwitch: (candidate) => {
       // Review sessions are intentionally independent from implementation and
       // credential specific. A failover therefore starts a fresh read-only turn.
@@ -1089,9 +1093,11 @@ async function runNextProjectAudit(input: {
       providerConnectionIdOverride: input.providerConnectionIdOverride,
       fallbackProviderConnectionIdOverride: input.fallbackProviderConnectionIdOverride
     });
+    const modelProfile = resolveConfiguredModelProfile(projectConfig?.ai.model_profile);
     const { provider, getLastProviderKind } = createPolicyAwareProvider({
-      primary: buildRuntimeProvider(selection.primary.kind, selection.primary.connection, resolveConfiguredModelProfile(projectConfig?.ai.model_profile)),
-      fallbacks: selection.fallbacks.map((candidate) => buildRuntimeProvider(candidate.kind, candidate.connection, resolveConfiguredModelProfile(projectConfig?.ai.model_profile))),
+      primary: buildRuntimeProvider(selection.primary.kind, selection.primary.connection, modelProfile),
+      fallbacks: selection.fallbacks.map((candidate) => buildRuntimeProvider(candidate.kind, candidate.connection, modelProfile)),
+      refreshCandidate: createRuntimeProviderRefresher(input.repository, modelProfile),
       audit: (event) => input.repository.writeAudit({
         actorType: 'system',
         eventType: event.eventType,
@@ -1380,6 +1386,7 @@ interface RuntimeProvider {
   contextId: string;
   connectionId: string | null;
   model: string | null;
+  refreshableCredential: boolean;
   provider: AIProvider;
 }
 
@@ -1405,6 +1412,7 @@ function buildRuntimeProvider(
     contextId,
     connectionId: connection?.id ?? null,
     model: resolveProviderModel(kind, connection),
+    refreshableCredential: connection?.authMode === 'chatgpt_plan_oauth',
     provider: createProvider(kind, {
       ...(connection?.provider === kind ? {
         apiKey: connection.apiKey,
@@ -1430,6 +1438,7 @@ interface PolicyAwareProviderInput {
   primary: RuntimeProvider;
   fallback?: RuntimeProvider;
   fallbacks?: RuntimeProvider[];
+  refreshCandidate?: (provider: RuntimeProvider) => Promise<RuntimeProvider>;
   audit?: (event: ProviderPolicyAuditEvent) => Promise<unknown>;
   onConnectionSwitch?: (provider: RuntimeProvider) => void | Promise<void>;
 }
@@ -1450,7 +1459,8 @@ function createPolicyAwareProvider(input: PolicyAwareProviderInput): {
     let lastError: unknown = new Error('No provider connection is available.');
     let lastRetryable = true;
     let mayFailOver = true;
-    for (const [index, candidate] of candidates.entries()) {
+    for (const [index, configuredCandidate] of candidates.entries()) {
+      let candidate = configuredCandidate;
       if (index > 0 && !providersAreSemanticallyEquivalent(input.primary, candidate)) {
         await input.audit?.({ eventType: 'provider_fallback_skipped', payload: {
           operation, primaryProvider: input.primary.kind, primaryConnectionId: input.primary.connectionId,
@@ -1464,6 +1474,19 @@ function createPolicyAwareProvider(input: PolicyAwareProviderInput): {
       if (resolveCircuitBreakerAvailability(breaker).state === 'open') {
         await auditProviderCircuitBreaker(input, candidate, operation, 'primary_skipped', breaker);
         continue;
+      }
+      if (input.refreshCandidate) {
+        try {
+          candidate = await input.refreshCandidate(candidate);
+        } catch (error) {
+          if (signal?.aborted) throw signal.reason instanceof Error ? signal.reason : new TaskCancellationError();
+          const normalized = normalizeProviderError(candidate.kind, error);
+          await recordProviderFailure(input, candidate, operation, breaker, normalized.toDetails(), openMs);
+          lastError = error;
+          lastRetryable = normalized.retryable;
+          mayFailOver = normalized.failoverEligible;
+          continue;
+        }
       }
       const connectionChanged = candidate.connectionId !== lastConnectionId || candidate.kind !== lastProviderKind;
       if (connectionChanged) await input.onConnectionSwitch?.(candidate);
@@ -1483,9 +1506,25 @@ function createPolicyAwareProvider(input: PolicyAwareProviderInput): {
         return result;
       } catch (error) {
         if (signal?.aborted) throw signal.reason instanceof Error ? signal.reason : new TaskCancellationError();
-        const normalized = normalizeProviderError(candidate.kind, error);
+        let failure = error;
+        let normalized = normalizeProviderError(candidate.kind, failure);
+        if (normalized.toDetails().kind === 'authentication' && candidate.refreshableCredential && input.refreshCandidate) {
+          try {
+            candidate = await input.refreshCandidate(candidate);
+            await input.audit?.({ eventType: 'provider_credential_refresh_retry', payload: {
+              operation, provider: candidate.kind, connectionId: candidate.connectionId
+            } });
+            const result = await action(candidate.provider);
+            await recordProviderSuccess(input, candidate, operation, breaker);
+            return result;
+          } catch (refreshError) {
+            if (signal?.aborted) throw signal.reason instanceof Error ? signal.reason : new TaskCancellationError();
+            failure = refreshError;
+            normalized = normalizeProviderError(candidate.kind, failure);
+          }
+        }
         await recordProviderFailure(input, candidate, operation, breaker, normalized.toDetails(), openMs);
-        lastError = error;
+        lastError = failure;
         lastRetryable = normalized.retryable;
         mayFailOver = normalized.failoverEligible;
       }
@@ -1538,6 +1577,28 @@ function createPolicyAwareProvider(input: PolicyAwareProviderInput): {
     provider,
     getLastProviderKind: () => lastProviderKind,
     getLastConnectionId: () => lastConnectionId
+  };
+}
+
+function createRuntimeProviderRefresher(
+  repository: {
+    getAIProviderConnectionSecretById?: (connectionId: string) => Promise<AIProviderConnectionSecret | undefined>;
+  },
+  modelProfile: AgentConfig['ai']['model_profile'],
+  routingState?: ModelRoutingState
+): (candidate: RuntimeProvider) => Promise<RuntimeProvider> {
+  return async (candidate) => {
+    if (!candidate.connectionId || !repository.getAIProviderConnectionSecretById) return candidate;
+    const connection = await repository.getAIProviderConnectionSecretById(candidate.connectionId);
+    // A task may outlive an account token. Re-resolving the secret here lets
+    // the repository refresh ChatGPT-plan OAuth before every provider phase
+    // and failover attempt, instead of reusing the credential captured when
+    // the queue job was first claimed.
+    if (!connection) return candidate;
+    if (connection.provider !== candidate.kind) {
+      throw new Error(`Provider connection "${candidate.connectionId}" changed from ${candidate.kind} to ${connection.provider} while in use.`);
+    }
+    return buildRuntimeProvider(candidate.kind, connection, modelProfile, routingState);
   };
 }
 

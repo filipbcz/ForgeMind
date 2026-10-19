@@ -651,10 +651,16 @@ github:
       id: 'conn_plan', userId: 'user_1', name: 'ChatGPT plan', isDefault: false,
       credentialSource: 'chatgpt_plan' as const, provider: 'codex' as const, authMode: 'chatgpt_plan_oauth' as const,
       model: 'gpt-6.1-sol', automaticFailover: true, failoverPriority: 10,
-      connectedAt: now, updatedAt: now, accessToken: 'plan-token'
+      connectedAt: now, updatedAt: now, accessToken: 'stale-plan-token'
     };
+    const refreshedFallback = { ...fallback, accessToken: 'refreshed-plan-token' };
     repositoryMock.getAIProviderConnectionSecret.mockResolvedValue(primary as never);
     repositoryMock.listAIProviderConnectionSecrets.mockResolvedValue([primary, fallback] as never);
+    repositoryMock.getAIProviderConnectionSecretById.mockImplementation(async (connectionId: string) => {
+      if (connectionId === primary.id) return primary;
+      if (connectionId === fallback.id) return refreshedFallback;
+      return undefined;
+    });
     repositoryMock.claimNextSubmittedTask.mockResolvedValue(createClaimedTask());
 
     const reviewCalls: string[] = [];
@@ -694,9 +700,65 @@ github:
     const result = await runDatabaseWorkerOnce();
 
     expect(result).toEqual(expect.objectContaining({ claimed: true, taskId: 'task_1' }));
-    expect(reviewCalls).toEqual(['key_exhausted', 'plan-token']);
+    expect(reviewCalls).toEqual(['key_exhausted', 'refreshed-plan-token']);
+    expect(repositoryMock.getAIProviderConnectionSecretById).toHaveBeenCalledWith('conn_plan');
     expect(repositoryMock.writeAudit).toHaveBeenCalledWith(expect.objectContaining({
       eventType: 'provider_fallback_used', payload: expect.objectContaining({ phase: 'review', fallbackConnectionId: 'conn_plan' })
+    }));
+  });
+
+  it('refreshes an expired ChatGPT plan credential and retries the same review operation once', async () => {
+    const now = new Date().toISOString();
+    const plan = {
+      id: 'conn_plan', userId: 'user_1', name: 'ChatGPT plan', isDefault: true,
+      credentialSource: 'chatgpt_plan' as const, provider: 'codex' as const, authMode: 'chatgpt_plan_oauth' as const,
+      model: 'gpt-6.1-sol', automaticFailover: false, failoverPriority: 0,
+      connectedAt: now, updatedAt: now, accessToken: 'expired-plan-token'
+    };
+    const refreshedPlan = { ...plan, accessToken: 'refreshed-plan-token' };
+    repositoryMock.getAIProviderConnectionSecret.mockResolvedValue(plan as never);
+    repositoryMock.listAIProviderConnectionSecrets.mockResolvedValue([plan] as never);
+    repositoryMock.getAIProviderConnectionSecretById
+      .mockResolvedValueOnce(plan as never)
+      .mockResolvedValueOnce(refreshedPlan as never);
+    repositoryMock.claimNextSubmittedTask.mockResolvedValue(createClaimedTask());
+
+    const reviewCalls: string[] = [];
+    createProviderMock.mockImplementation((_kind: string, config?: { accessToken?: string }) => ({
+      kind: 'codex',
+      estimateCost: vi.fn(async () => ({ inputTokens: 10, outputTokens: 5, estimatedCostUsd: 0.01 })),
+      plan: vi.fn(), implement: vi.fn(),
+      review: vi.fn(async () => {
+        reviewCalls.push(config?.accessToken ?? 'none');
+        if (config?.accessToken === 'expired-plan-token') {
+          throw Object.assign(new Error('Provided authentication token is expired.'), { status: 401, errorCode: 'token_expired' });
+        }
+        return { verdict: 'satisfied', summary: 'Reviewed after refreshing OAuth.', blockers: [], criterionResults: [] };
+      }),
+      async preflight() { return { provider: 'codex', ok: true, checkedAt: now }; },
+      supportsLocalRepo: () => true,
+      supportsGitHubNativeFlow: () => false,
+      supportsNativeRepositoryReview: () => true
+    }));
+    runWorkerTaskMock.mockImplementationOnce(async (input: {
+      reviewProvider: { review: (value: Record<string, unknown>) => Promise<unknown> };
+    }) => {
+      await input.reviewProvider.review({});
+      return {
+        taskId: 'task_1', status: 'ready_for_user_review', workspacePath: 'C:/tmp/worker',
+        validation: { command: 'node --version', exitCode: 0, stdout: '', stderr: '', passed: true },
+        summary: 'Review completed with refreshed OAuth.', approvals: [], completedAt: now
+      };
+    });
+
+    const { runDatabaseWorkerOnce } = await import('./db-worker.js');
+    const result = await runDatabaseWorkerOnce();
+
+    expect(result).toEqual(expect.objectContaining({ claimed: true, taskId: 'task_1' }));
+    expect(reviewCalls).toEqual(['expired-plan-token', 'refreshed-plan-token']);
+    expect(repositoryMock.writeAudit).toHaveBeenCalledWith(expect.objectContaining({
+      eventType: 'provider_credential_refresh_retry',
+      payload: expect.objectContaining({ phase: 'review', connectionId: 'conn_plan' })
     }));
   });
 
