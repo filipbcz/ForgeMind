@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 import { createInterface } from 'node:readline';
-import { access, appendFile, mkdir, readFile, readdir, realpath, rm, stat, writeFile } from 'node:fs/promises';
+import { appendFile, mkdir, readFile, readdir, realpath, rm, stat, writeFile } from 'node:fs/promises';
 import { dirname, relative, resolve } from 'node:path';
 import { redactSecrets } from '@forgemind/core';
 import { assertEvidenceOutsideCheckout, buildSandboxedExecutableInvocation, buildSandboxedProcessInvocation,
@@ -8,6 +8,7 @@ import { assertEvidenceOutsideCheckout, buildSandboxedExecutableInvocation, buil
   selectUnrealAutomationExecutable } from './native-sandbox.js';
 import { nativeToolDefinitions, nativeToolServerInstructions } from './native-tool-contract.js';
 import { runBoundedProcess } from './process-runner.js';
+import { resolveUnrealBuildRuntime } from './unreal-build-runtime.js';
 
 const root = resolve(process.argv[2] ?? '');
 const evidencePath = resolve(process.argv[3] ?? '');
@@ -155,25 +156,6 @@ function sandboxEnvironment(temporaryDirectory: string, isolatedCodexHome: strin
   safe.NUGET_PACKAGES = resolve(temporaryDirectory, 'nuget-packages');
   safe.DOTNET_CLI_TELEMETRY_OPTOUT = '1';
   return safe;
-}
-
-async function resolveUnrealBuildRuntime(editorExecutable: string): Promise<{ dotnetExecutable: string; unrealBuildToolDll: string }> {
-  if (!editorExecutable || !/(?:^|[\\/])UnrealEditor(?:-Cmd)?\.exe$/i.test(editorExecutable)) {
-    throw new Error('Unreal build requires the runner-probed UnrealEditor executable.');
-  }
-  const engineRoot = resolve(dirname(editorExecutable), '..', '..');
-  const unrealBuildToolDll = resolve(engineRoot, 'Binaries', 'DotNET', 'UnrealBuildTool', 'UnrealBuildTool.dll');
-  await access(unrealBuildToolDll);
-  const dotnetRoot = resolve(engineRoot, 'Binaries', 'ThirdParty', 'DotNet');
-  const versions = (await readdir(dotnetRoot, { withFileTypes: true }))
-    .filter((entry) => entry.isDirectory())
-    .map((entry) => entry.name)
-    .sort((left, right) => right.localeCompare(left, undefined, { numeric: true }));
-  for (const version of versions) {
-    const candidate = resolve(dotnetRoot, version, 'win-x64', 'dotnet.exe');
-    try { await access(candidate); return { dotnetExecutable: candidate, unrealBuildToolDll }; } catch { /* continue */ }
-  }
-  throw new Error(`The runner-probed Unreal installation has no bundled win-x64 dotnet runtime under ${dotnetRoot}.`);
 }
 
 function contained(path: string) { const target = resolve(root, String(path)); const rel = relative(root, target); if (rel === '..' || rel.startsWith(`..${process.platform === 'win32' ? '\\' : '/'}`)) throw new Error('Path escapes leased checkout.'); return target; }

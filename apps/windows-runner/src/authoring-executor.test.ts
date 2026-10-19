@@ -4,6 +4,7 @@ import { access, mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { createHash } from 'node:crypto';
+import { recoveredUnrealEditorTarget, resolveUnrealBuildRuntime } from './unreal-build-runtime.js';
 
 const implementation = {
   outcome: 'changes_made' as const, summary: 'implemented', changedFiles: ['src/a.ts'], evidenceFiles: [],
@@ -195,6 +196,48 @@ describe('native implementation provider lifecycle', () => {
       expect(canFinalizeRecoveredUnrealResult('Required authoring artifacts are missing: Content/Maps/Missing.umap', true, recovered)).toBe(false);
       expect(canFinalizeRecoveredUnrealResult('another validation failed', true, recovered)).toBe(false);
       expect(canFinalizeRecoveredUnrealResult('Required Unreal content was not created or imported through a successful editor authoring API call.', false, recovered)).toBe(false);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+  it('rebuilds only native recovered Unreal projects before reopening their packages', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'forgemind-recovered-native-unreal-'));
+    try {
+      const nativeProject = join(root, 'native', 'Flying.uproject');
+      const contentProject = join(root, 'content', 'Scenery.uproject');
+      const sourceDetectedProject = join(root, 'source-detected', 'Tools.uproject');
+      const pluginDetectedProject = join(root, 'plugin-detected', 'Plugins.uproject');
+      await mkdir(join(root, 'native'), { recursive: true });
+      await mkdir(join(root, 'content'), { recursive: true });
+      await mkdir(join(root, 'source-detected', 'Source', 'ToolsRuntime'), { recursive: true });
+      await mkdir(join(root, 'plugin-detected', 'Plugins', 'LocalRuntime', 'Source'), { recursive: true });
+      await writeFile(nativeProject, JSON.stringify({ Modules: [{ Name: 'FlyingPresentation', Type: 'Runtime' }] }));
+      await writeFile(contentProject, JSON.stringify({ Plugins: [{ Name: 'PythonScriptPlugin', Enabled: true }] }));
+      await writeFile(sourceDetectedProject, '{}');
+      await writeFile(pluginDetectedProject, '{}');
+      await writeFile(join(root, 'source-detected', 'Source', 'ToolsRuntime', 'ToolsRuntime.Build.cs'), 'public class ToolsRuntime {}');
+      await writeFile(join(root, 'plugin-detected', 'Plugins', 'LocalRuntime', 'Source', 'LocalRuntime.Build.cs'), 'public class LocalRuntime {}');
+      expect(await recoveredUnrealEditorTarget(nativeProject)).toBe('FlyingEditor');
+      expect(await recoveredUnrealEditorTarget(contentProject)).toBeUndefined();
+      expect(await recoveredUnrealEditorTarget(sourceDetectedProject)).toBe('ToolsEditor');
+      expect(await recoveredUnrealEditorTarget(pluginDetectedProject)).toBe('PluginsEditor');
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+  it('resolves UBT only from the exact probed Unreal installation', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'forgemind-unreal-build-runtime-'));
+    try {
+      const editor = join(root, 'Engine', 'Binaries', 'Win64', 'UnrealEditor.exe');
+      const ubt = join(root, 'Engine', 'Binaries', 'DotNET', 'UnrealBuildTool', 'UnrealBuildTool.dll');
+      const olderDotnet = join(root, 'Engine', 'Binaries', 'ThirdParty', 'DotNet', '8.0', 'win-x64', 'dotnet.exe');
+      const newerDotnet = join(root, 'Engine', 'Binaries', 'ThirdParty', 'DotNet', '10.0', 'win-x64', 'dotnet.exe');
+      await mkdir(join(root, 'Engine', 'Binaries', 'Win64'), { recursive: true });
+      await mkdir(join(root, 'Engine', 'Binaries', 'DotNET', 'UnrealBuildTool'), { recursive: true });
+      await mkdir(join(root, 'Engine', 'Binaries', 'ThirdParty', 'DotNet', '8.0', 'win-x64'), { recursive: true });
+      await mkdir(join(root, 'Engine', 'Binaries', 'ThirdParty', 'DotNet', '10.0', 'win-x64'), { recursive: true });
+      await Promise.all([writeFile(editor, ''), writeFile(ubt, ''), writeFile(olderDotnet, ''), writeFile(newerDotnet, '')]);
+      expect(await resolveUnrealBuildRuntime(editor)).toEqual({ dotnetExecutable: newerDotnet, unrealBuildToolDll: ubt });
     } finally {
       await rm(root, { recursive: true, force: true });
     }

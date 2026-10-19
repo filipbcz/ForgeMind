@@ -6,9 +6,10 @@ import { fileURLToPath } from 'node:url';
 import type { AuthoringTreeEntry, WindowsAuthoringPacket, WindowsAuthoringProcessResult, WindowsAuthoringResult, WindowsProviderUsage } from '@forgemind/core';
 import { isWindowsAuthoringResult, redactSecrets } from '@forgemind/core';
 import { resolveCodexBinary, type AIProvider, type ProviderSessionContext } from '@forgemind/providers';
-import { buildSandboxedProcessInvocation, buildUnrealAuthoringArgs, containsUnrealBuildInvocation, containsUnrealEditorInvocation } from './native-sandbox.js';
+import { buildSandboxedProcessInvocation, buildUnrealAuthoringArgs, buildUnrealBuildToolArgs, containsUnrealBuildInvocation, containsUnrealEditorInvocation } from './native-sandbox.js';
 import { runBoundedProcess } from './process-runner.js';
 import { truncateUtf8Tail } from './utf8.js';
+import { recoveredUnrealEditorTarget, resolveUnrealBuildRuntime } from './unreal-build-runtime.js';
 
 export interface NativeAuthoringTools {
   root: string;
@@ -851,7 +852,16 @@ async function enforceRequiredUnrealAssets(packet: WindowsAuthoringPacket, root:
   if (assets.length > 0 && !authored && recoveredPackages.length > 0) {
     if (!selectedUnrealExecutable) throw new Error('The currently probed UnrealEditor executable is unavailable for recovered-package authoring.');
     await assertRecoveredPackagesUnchanged(root, assets, recoveredPackages);
-    const recovery = await reauthorRecoveredUnrealPackages(root, evidenceRoot, assets, selectedUnrealExecutable, timeoutMs, signal);
+    const projectRelativePath = await selectUnrealProjectForPackages(root, assets);
+    const recoveredBuild = await buildRecoveredUnrealProject(root, projectRelativePath, selectedUnrealExecutable, timeoutMs, signal);
+    if (recoveredBuild) {
+      processes.push({ ...recoveredBuild, leaseId: packet.leaseId, sessionId });
+      if (recoveredBuild.exitCode !== 0 || recoveredBuild.terminationReason) {
+        const diagnostic = redactSecrets([recoveredBuild.stderr, recoveredBuild.stdout].filter(Boolean).join('\n')).slice(-8_000);
+        throw new Error(`Unreal failed while rebuilding the recovered C++ Editor target (${recoveredBuild.terminationReason ?? `exit ${recoveredBuild.exitCode ?? 'unknown'}`}): ${diagnostic || 'no diagnostic output'}`);
+      }
+    }
+    const recovery = await reauthorRecoveredUnrealPackages(root, evidenceRoot, assets, projectRelativePath, selectedUnrealExecutable, timeoutMs, signal);
     const recoveredAuthoring = { ...recovery, leaseId: packet.leaseId, sessionId };
     processes.push(recoveredAuthoring);
     if (recovery.exitCode !== 0 || recovery.terminationReason) {
@@ -887,9 +897,24 @@ async function assertRecoveredPackagesUnchanged(root: string, assets: string[], 
   }
 }
 
-async function reauthorRecoveredUnrealPackages(root: string, evidenceRoot: string, assets: string[], selectedUnrealExecutable: string,
+async function buildRecoveredUnrealProject(root: string, projectRelativePath: string, selectedUnrealExecutable: string,
+  timeoutMs: number, signal?: AbortSignal): Promise<Omit<WindowsAuthoringProcessResult, 'leaseId' | 'sessionId'> | undefined> {
+  const projectPath = await realpath(resolve(root, projectRelativePath));
+  const target = await recoveredUnrealEditorTarget(projectPath);
+  if (!target) return undefined;
+  const runtime = await resolveUnrealBuildRuntime(selectedUnrealExecutable);
+  const args = buildUnrealBuildToolArgs({ unrealBuildToolDll: runtime.unrealBuildToolDll, projectPath, target,
+    platform: 'Win64', configuration: 'Development' });
+  const startedAt = new Date();
+  const output = await spawnComplete(runtime.dotnetExecutable, args, root, timeoutMs, signal);
+  return { checkId: 'unreal-recovered-editor-build', command: [runtime.dotnetExecutable, ...args].join(' '), shell: 'system',
+    ...output, stdout: redactSecrets(output.stdout), stderr: redactSecrets(output.stderr),
+    startedAt: startedAt.toISOString(), completedAt: new Date().toISOString(), authoring: { tool: 'unreal-build', phase: 'build',
+      projectRelativePath, executablePath: runtime.dotnetExecutable, args: args.slice(1), sourceRelativePaths: [projectRelativePath] } };
+}
+
+async function reauthorRecoveredUnrealPackages(root: string, evidenceRoot: string, assets: string[], projectRelativePath: string, selectedUnrealExecutable: string,
   timeoutMs: number, signal?: AbortSignal): Promise<Omit<WindowsAuthoringProcessResult, 'leaseId' | 'sessionId'>> {
-  const projectRelativePath = await selectUnrealProjectForPackages(root, assets);
   const projectPath = await realpath(resolve(root, projectRelativePath));
   const packages = assets.map((path) => ({ path, objectPath: unrealObjectPath(path, projectRelativePath) }));
   const scriptPath = resolve(evidenceRoot, 'reauthor-recovered-unreal-content.py');
