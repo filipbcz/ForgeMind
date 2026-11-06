@@ -193,6 +193,12 @@ export interface RoadmapQualityReviewInput {
   implementationSteps: ImplementationStepPlan[];
   requiredRequirementIds: string[];
   completedStepTitles: string[];
+  executionProfile?: {
+    defaultExecutor: 'linux' | 'windows';
+    windowsDefaultCapabilities: string[];
+    supportsHttpsAcquisition: boolean;
+    supportsPersistentOutputs: boolean;
+  };
   repositoryPath?: string;
   repositoryBaseline?: RepositoryBaseline;
   /** The provider can inspect repositoryPath directly and must not receive the repository contents in its prompt. */

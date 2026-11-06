@@ -20,7 +20,7 @@ import type {
   TaskRun as CoreTaskRun,
   TaskModelRoutingDecision
 } from '@forgemind/core';
-import { normalizeRunState, parseTaskRunState } from '@forgemind/core';
+import { normalizeRunState, normalizeTaskExecutionIntent, parseTaskRunState } from '@forgemind/core';
 import type { JsonValue } from '@forgemind/shared';
 import type { AcceptanceEvidence, AuditLog, ChatMessage, ChatRun, ChatThread, Prisma, Project, ProjectArchitectureVersion, ProjectAuditJob, ProjectContractVersion, ProjectImplementationStep, ProjectRoadmapCycle, ProjectSpecificationVersion, Task, TaskRun } from '@prisma/client';
 
@@ -269,6 +269,7 @@ export function toProjectImplementationStep(step: ProjectImplementationStep): Co
       (item): item is CoreProjectImplementationStep['validationFocus'][number] =>
         item === 'implementation' || item === 'migration' || item === 'compatibility' || item === 'regression'
     ),
+    executionIntent: normalizeTaskExecutionIntent(step.executionIntent) ?? undefined,
     status: step.status,
     taskId: step.taskId ?? undefined,
     createdAt: step.createdAt.toISOString(),
@@ -414,6 +415,7 @@ export function toTask(task: Task): ForgeTask {
     title: task.title,
     prompt: task.prompt,
     acceptanceCriteria: jsonStringArray(task.acceptanceCriteria),
+    executionIntent: normalizeTaskExecutionIntent(task.executionIntent) ?? undefined,
     mode: task.mode,
     status: task.status,
     deferredValidationCapabilities: jsonStringArray(task.deferredValidationCapabilities),

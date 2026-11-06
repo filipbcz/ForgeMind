@@ -43,6 +43,7 @@ import {
   type TaskDiagnosticExport,
   type TaskStatus,
   type TaskCheckpoint,
+  type TaskExecutionIntent,
   type TaskModelRoutingDecision,
   type TaskRunState
 } from '@forgemind/core';
@@ -270,6 +271,7 @@ export interface CreateProjectRoadmapCycleInput {
     changeRationale: string;
     dependsOnStepTitles: string[];
     validationFocus: ProjectImplementationStep['validationFocus'];
+    executionIntent?: TaskExecutionIntent;
   }>;
 }
 
@@ -293,6 +295,7 @@ export interface AppendProjectImplementationStepsInput {
     changeRationale: string;
     dependsOnStepTitles: string[];
     validationFocus: ProjectImplementationStep['validationFocus'];
+    executionIntent?: TaskExecutionIntent;
   }>;
 }
 
@@ -387,6 +390,7 @@ export interface CreateTaskInput {
   title: string;
   prompt: string;
   acceptanceCriteria?: string[];
+  executionIntent?: TaskExecutionIntent;
   mode: TaskMode;
   architectureVersionId?: string;
 }
@@ -1930,6 +1934,7 @@ export class ForgeMindRepository {
               changeRationale: step.changeRationale,
               dependsOnStepTitles: toPrismaJson(step.dependsOnStepTitles),
               validationFocus: toPrismaJson(step.validationFocus),
+              executionIntent: step.executionIntent ? toPrismaJson(step.executionIntent as unknown as JsonValue) : undefined,
               status: 'pending'
             }))
           });
@@ -2254,6 +2259,7 @@ export class ForgeMindRepository {
             changeRationale: step.changeRationale,
             dependsOnStepTitles: toPrismaJson(step.dependsOnStepTitles),
             validationFocus: toPrismaJson(step.validationFocus),
+            executionIntent: step.executionIntent ? toPrismaJson(step.executionIntent as unknown as JsonValue) : undefined,
             status: 'pending'
           }
         });
@@ -2366,6 +2372,11 @@ export class ForgeMindRepository {
           title: input.title,
           prompt: input.prompt,
           acceptanceCriteria: toPrismaJson(input.acceptanceCriteria ?? []),
+          executionIntent: step.executionIntent
+            ? toPrismaJson(step.executionIntent as unknown as JsonValue)
+            : input.executionIntent
+              ? toPrismaJson(input.executionIntent as unknown as JsonValue)
+              : undefined,
           mode: input.mode,
           status: 'submitted',
           architectureVersionId,
@@ -3921,6 +3932,9 @@ export class ForgeMindRepository {
         title: input.title,
         prompt: input.prompt,
         acceptanceCriteria: toPrismaJson(input.acceptanceCriteria ?? []),
+        executionIntent: input.executionIntent
+          ? toPrismaJson(input.executionIntent as unknown as JsonValue)
+          : undefined,
         mode: input.mode,
         status: 'draft',
         architectureVersionId

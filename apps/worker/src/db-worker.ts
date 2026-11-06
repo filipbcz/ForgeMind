@@ -3,7 +3,7 @@ import { createHash, randomUUID } from 'node:crypto';
 import { spawn } from 'node:child_process';
 import { mkdir, readFile, writeFile } from 'node:fs/promises';
 import { resolve } from 'node:path';
-import { activeProjectContractRequirements, createBlockedRunState, createFailedRunState, WINDOWS_EVIDENCE_MAX_ARTIFACT_BYTES, WINDOWS_EVIDENCE_MAX_LOG_BYTES, type RealEngineEvidenceIntent, type TaskModelSelection, type WindowsAuthoringPacket, type WindowsAuthoringResult } from '@forgemind/core';
+import { activeProjectContractRequirements, createBlockedRunState, createFailedRunState, legacyTaskExecutionIntent, WINDOWS_EVIDENCE_MAX_ARTIFACT_BYTES, WINDOWS_EVIDENCE_MAX_LOG_BYTES, type RealEngineEvidenceIntent, type TaskExecutionIntent, type TaskModelSelection, type WindowsAuthoringPacket, type WindowsAuthoringResult } from '@forgemind/core';
 import { advanceRoadmapAfterTaskCompletion, createRepository, getPrismaClient, startNextRoadmapStep, WindowsWorkerRepository, type AIProviderConnectionSecret, type ForgeMindRepository } from '@forgemind/db';
 import { GitHubAppAdapter, createGitHubAdapterFromEnv } from '@forgemind/github';
 import { buildProjectExtensionProposalPrompt, createProvider, formatProjectExtensionProposal, normalizeProviderError, resolveModelRoute, type AIProvider, type CapabilityAuditInput, type ImplementResult, type ModelRoutingState, type ProviderSessionContext, type ProviderUsageMeasurement, type ReleaseAuditInput, type ValidationCheck } from '@forgemind/providers';
@@ -149,18 +149,18 @@ async function enqueueExternalWindowsValidations(
 async function implementThroughWindowsLease(windowsWorkers: WindowsWorkerRepository, input: {
   project: import('@forgemind/core').Project; taskId: string; taskRunId: string; workspacePath: string;
   prompt: string; acceptanceCriteria: string[]; previousValidationError?: string; previousReviewBlockers?: string[];
-  baseCommitSha: string; requiredCapabilities: string[]; requiresUnrealAssets: boolean; modelRoute?: TaskModelSelection; signal?: AbortSignal;
+  baseCommitSha: string; executionIntent: TaskExecutionIntent; modelRoute?: TaskModelSelection; signal?: AbortSignal;
 }): Promise<ImplementResult> {
   if (!input.project.githubOwner || !input.project.githubRepo) throw new Error('Windows authoring requires a GitHub repository.');
   const jobId = randomUUID();
   const requiredCapabilities = Array.from(new Set([
     'windows', 'codex', 'git',
-    ...(input.requiresUnrealAssets ? ['git-lfs', 'unreal'] : []),
-    ...input.requiredCapabilities
+    ...(input.executionIntent.requiresUnrealAuthoring ? ['git-lfs', 'unreal'] : []),
+    ...input.executionIntent.requiredCapabilities
   ]));
   const priorPatch = await readGitPatch(input.workspacePath, input.signal);
   const realEngineEvidence = classifyAuthoringEvidence(input.prompt, input.acceptanceCriteria, input.baseCommitSha,
-    requiredCapabilities, input.requiresUnrealAssets);
+    requiredCapabilities, input.executionIntent.requiresUnrealAuthoring);
   const packet: WindowsAuthoringPacket = {
     kind: 'authoring', protocolVersion: 2, projectId: input.project.id, taskId: input.taskId, runId: input.taskRunId,
     jobId, leaseId: 'pending', repository: `${input.project.githubOwner}/${input.project.githubRepo}`,
@@ -168,17 +168,18 @@ async function implementThroughWindowsLease(windowsWorkers: WindowsWorkerReposit
     workspaceRoot: 'runner-managed', artifactRoot: 'runner-managed', step: { prompt: input.prompt, acceptanceCriteria: input.acceptanceCriteria,
       previousValidationError: input.previousValidationError, previousReviewBlockers: input.previousReviewBlockers, priorPatch },
     operations: [{ id: 'implementation', kind: 'tool', tool: 'ai-implementation', arguments: { acceptanceCriteria: input.acceptanceCriteria }, rationale: 'Implement the current task step in the exact native checkout.' }],
+    executionIntent: input.executionIntent,
     requiredCapabilities, managedRoots: ['.'], checkpoints: [],
-    artifactExpectations: deriveWindowsAuthoringArtifactExpectations(input.acceptanceCriteria, input.requiresUnrealAssets),
-    contentPolicy: { requiresUnrealAssets: input.requiresUnrealAssets,
+    artifactExpectations: deriveWindowsAuthoringArtifactExpectations(input.acceptanceCriteria, input.executionIntent.requiresUnrealAuthoring),
+    contentPolicy: { requiresUnrealAssets: input.executionIntent.requiresUnrealAuthoring,
       prohibitedDatasetExtensions: ['.tif', '.tiff', '.geotiff', '.shp', '.dbf', '.shx', '.prj', '.gpkg', '.geojson', '.kml', '.kmz', '.gdb', '.fgb', '.las', '.laz', '.copc', '.dem', '.dt0', '.dt1', '.dt2', '.asc', '.img', '.jp2', '.ecw', '.mrf', '.mbtiles', '.pmtiles', '.osm', '.pbf', '.grib', '.nc', '.hdf'],
       maxUnclassifiedFileBytes: 50 * 1024 * 1024 },
     resourcePolicy: { timeoutSeconds: 36_000, maxLogBytes: WINDOWS_EVIDENCE_MAX_LOG_BYTES, maxArtifactBytes: WINDOWS_EVIDENCE_MAX_ARTIFACT_BYTES },
     ...(input.modelRoute ? { modelRoute: input.modelRoute } : {}),
     nonce: 'pending', inputHash: createWindowsAuthoringInputHash({ taskId: input.taskId, baseCommitSha: input.baseCommitSha,
       prompt: input.prompt, acceptanceCriteria: input.acceptanceCriteria, previousValidationError: input.previousValidationError,
-      previousReviewBlockers: input.previousReviewBlockers, priorPatch, requiresUnrealAssets: input.requiresUnrealAssets,
-      modelRoute: input.modelRoute }),
+      previousReviewBlockers: input.previousReviewBlockers, priorPatch, requiresUnrealAssets: input.executionIntent.requiresUnrealAuthoring,
+      executionIntent: input.executionIntent, modelRoute: input.modelRoute }),
     ...(realEngineEvidence ? { realEngineEvidence } : {}),
     authority: { database: 'none', productionHosts: 'none', globalGitHubCredentials: 'none' }
   };
@@ -227,6 +228,9 @@ async function implementThroughWindowsLease(windowsWorkers: WindowsWorkerReposit
   const changedFiles = (await runGitCapture(input.workspacePath, ['diff', '--cached', '--name-only', '-z', 'HEAD'], input.signal))
     .split('\0').filter(Boolean).map((path) => path.replaceAll('\\', '/'));
   const outputEvidence = await materializeWindowsOutputs(input.workspacePath, result.resultBundle.outputs);
+  const persistentEvidence = await materializePersistentOutputReceipt(input.workspacePath, result.deviceId,
+    result.resultBundle.persistentOutputs ?? [], result.processes, input.executionIntent);
+  outputEvidence.push(...persistentEvidence);
   const reviewNotice = result.contentAssessment.productionReviewRequired
     ? '\n\nProduction-content review required: technical loadability and provenance passed, but these signals do not approve visual or domain quality.' : '';
   return { outcome: result.patch.trim() ? 'changes_made' : 'already_satisfied',
@@ -238,6 +242,7 @@ async function implementThroughWindowsLease(windowsWorkers: WindowsWorkerReposit
 export function createWindowsAuthoringInputHash(input: {
   taskId: string; baseCommitSha: string; prompt: string; acceptanceCriteria: string[];
   previousValidationError?: string; previousReviewBlockers?: string[]; priorPatch: string; requiresUnrealAssets: boolean;
+  executionIntent?: TaskExecutionIntent;
   modelRoute?: TaskModelSelection;
 }): string {
   return createHash('sha256').update(JSON.stringify(input)).digest('hex');
@@ -276,15 +281,46 @@ export function classifyAuthoringEvidence(prompt: string, acceptanceCriteria: st
 async function materializeWindowsOutputs(workspacePath: string, outputs: WindowsAuthoringResult['resultBundle']['outputs']): Promise<string[]> {
   if (outputs.length === 0) return [];
   const root = resolve(workspacePath, '.forgemind-outputs'); await mkdir(root, { recursive: true });
-  const excludePath = resolve(workspacePath, '.git', 'info', 'exclude');
-  let exclude = ''; try { exclude = await readFile(excludePath, 'utf8'); } catch { /* new checkout */ }
-  if (!exclude.split(/\r?\n/).includes('.forgemind-outputs/')) await writeFile(excludePath, `${exclude}${exclude.endsWith('\n') || !exclude ? '' : '\n'}.forgemind-outputs/\n`, 'utf8');
+  await excludeManagedEvidenceFromGit(workspacePath);
   const evidence: string[] = [];
   for (const output of outputs) {
     const target = resolve(root, output.path); const content = decodeHydratedAuthoringPayload(output, `managed output ${output.path}`);
     await mkdir(resolve(target, '..'), { recursive: true }); await writeFile(target, content); evidence.push(`.forgemind-outputs/${output.path}`);
   }
   return evidence;
+}
+
+async function materializePersistentOutputReceipt(
+  workspacePath: string,
+  deviceId: string,
+  outputs: NonNullable<WindowsAuthoringResult['resultBundle']['persistentOutputs']>,
+  processes: WindowsAuthoringResult['processes'],
+  executionIntent: TaskExecutionIntent
+): Promise<string[]> {
+  if (outputs.length === 0) return [];
+  const root = resolve(workspacePath, '.forgemind-outputs');
+  await mkdir(root, { recursive: true });
+  await excludeManagedEvidenceFromGit(workspacePath);
+  const target = resolve(root, 'persistent-project-data.json');
+  const processEvidence = processes.map((process) => ({
+    checkId: process.checkId, command: process.command, shell: process.shell, exitCode: process.exitCode,
+    terminationReason: process.terminationReason,
+    stdoutSha256: createHash('sha256').update(process.stdout).digest('hex'),
+    stderrSha256: createHash('sha256').update(process.stderr).digest('hex'),
+    startedAt: process.startedAt, completedAt: process.completedAt,
+    authoring: process.authoring
+  }));
+  await writeFile(target, `${JSON.stringify({ schemaVersion: 1, deviceId, executionIntent, outputs, processEvidence }, null, 2)}\n`, 'utf8');
+  return ['.forgemind-outputs/persistent-project-data.json'];
+}
+
+async function excludeManagedEvidenceFromGit(workspacePath: string): Promise<void> {
+  const excludePath = resolve(workspacePath, '.git', 'info', 'exclude');
+  let exclude = ''; try { exclude = await readFile(excludePath, 'utf8'); } catch { /* new checkout */ }
+  if (!exclude.split(/\r?\n/).includes('.forgemind-outputs/')) {
+    await mkdir(resolve(excludePath, '..'), { recursive: true });
+    await writeFile(excludePath, `${exclude}${exclude.endsWith('\n') || !exclude ? '' : '\n'}.forgemind-outputs/\n`, 'utf8');
+  }
 }
 
 function decodeHydratedAuthoringPayload(entry: { contentBase64?: string }, label: string): Buffer {
@@ -456,6 +492,11 @@ export async function runDatabaseWorkerOnce(options: { deferInterruptSignals?: b
   const startedAtMs = Date.now();
   const workspaceRoot = resolveWorkerWorkspaceRoot();
   const projectConfig = parseProjectConfig(claimed.project.configYaml);
+  const executionIntent = claimed.task.executionIntent ?? legacyTaskExecutionIntent({
+    implementationOwner: projectConfig?.workflow.implementation_owner ?? 'linux',
+    requiredCapabilities: projectConfig?.workflow.windows_authoring_capabilities,
+    requiresUnrealAssets: projectConfig?.workflow.windows_authoring_requires_unreal_assets
+  });
   const requiresGitHub = !projectConfig
     || projectConfig.workflow.create_issue
     || projectConfig.workflow.create_branch
@@ -699,15 +740,14 @@ export async function runDatabaseWorkerOnce(options: { deferInterruptSignals?: b
       reviewProvider,
       workspaceRoot,
       visualEvidence,
-      implementationOwner: projectConfig?.workflow.implementation_owner ?? 'linux',
-      implementOnWindows: projectConfig?.workflow.implementation_owner === 'windows'
+      implementationOwner: executionIntent.executor,
+      implementOnWindows: executionIntent.executor === 'windows'
         ? async (implementationInput) => implementThroughWindowsLease(windowsWorkers, {
             project: claimed.project, taskId: claimed.task.id, taskRunId: claimed.taskRun.id,
             workspacePath: `${workspaceRoot}/${claimed.task.id}`, prompt: implementationInput.prompt,
             acceptanceCriteria: implementationInput.plan.acceptanceCriteria, baseCommitSha: implementationInput.baseCommitSha,
             previousValidationError: implementationInput.previousValidationError, previousReviewBlockers: implementationInput.previousReviewBlockers,
-            requiredCapabilities: projectConfig.workflow.windows_authoring_capabilities,
-            requiresUnrealAssets: projectConfig.workflow.windows_authoring_requires_unreal_assets,
+            executionIntent,
             modelRoute: implementationInput.modelRoute,
             signal: implementationInput.signal
           })

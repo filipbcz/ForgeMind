@@ -1,4 +1,5 @@
 import type { IsoDateString, JsonValue } from '@forgemind/shared';
+import type { TaskExecutionIntent } from './task-execution.js';
 
 export type ProviderKind = 'codex' | 'github_copilot' | 'openai';
 
@@ -625,6 +626,7 @@ export interface ProjectImplementationStep {
   changeRationale: string;
   dependsOnStepTitles: string[];
   validationFocus: Array<'implementation' | 'migration' | 'compatibility' | 'regression'>;
+  executionIntent?: TaskExecutionIntent;
   status: ProjectImplementationStepStatus;
   taskId?: string;
   createdAt: IsoDateString;
@@ -639,6 +641,7 @@ export interface ForgeTask {
   title: string;
   prompt: string;
   acceptanceCriteria: string[];
+  executionIntent?: TaskExecutionIntent;
   mode: TaskMode;
   status: TaskStatus;
   deferredValidationCapabilities?: string[];

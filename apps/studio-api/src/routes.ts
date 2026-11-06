@@ -1,6 +1,7 @@
 import type { FastifyInstance, FastifyReply, FastifyRequest } from 'fastify';
 import { createHash } from 'node:crypto';
 import { z } from 'zod';
+import { parseAgentConfigYaml } from '@forgemind/config';
 import { buildProjectExtensionProposalPrompt, CodexExecutionTimeoutError, createProvider, DEFAULT_MODEL_POOL, formatProjectExtensionProposal, GitHubCopilotProvider, listOpenAIModels, resolveModelRoute } from '@forgemind/providers';
 import type { AIProvider, PlanResult, ProviderSessionContext } from '@forgemind/providers';
 import type { ProviderRuntimeConfig } from '@forgemind/providers';
@@ -27,9 +28,9 @@ import { advanceRoadmapAfterTaskCompletion, buildRoadmapStepTaskPrompt, composeA
 import type { AIProviderConnectionKind, AIProviderConnectionSecret, ForgeMindRepository, WindowsRunnerCredentialAdapter, WindowsWorkerRepository } from '@forgemind/db';
 import { parseGitHubWebhookPayload, projectGitHubWebhookEvent, verifyGitHubWebhookSignature } from './webhook.js';
 import type { NotificationService } from './notifications.js';
-import { ROADMAP_GENERATION_CONFIRMATION, activeProjectContractRequirements, applyProjectContractDelta, buildSpecificationChangeImpactReview, redactError, redactSecrets } from '@forgemind/core';
+import { ROADMAP_GENERATION_CONFIRMATION, activeProjectContractRequirements, applyProjectContractDelta, assertTaskExecutionIntent, buildSpecificationChangeImpactReview, redactError, redactSecrets } from '@forgemind/core';
 import type { ProviderConnectionRuntimeStatus, RoadmapGenerationCheckpoint } from '@forgemind/core';
-import type { Project, ProjectArchitectureUpdate, ProjectContract, ProjectContractDelta, TaskMode } from '@forgemind/core';
+import type { Project, ProjectArchitectureUpdate, ProjectContract, ProjectContractDelta, TaskExecutionIntent, TaskMode } from '@forgemind/core';
 import { readSessionId, registerAuthRoutes } from './routes/auth-routes.js';
 import { registerNotificationRoutes } from './routes/notification-routes.js';
 import { registerChatRoutes } from './routes/chat-routes.js';
@@ -1147,6 +1148,7 @@ export function registerRoutes(
           authoritativeSpecification: specification,
           projectContract: reviewContract,
           completedStepTitles: roadmap.steps.filter((step) => step.status === 'completed').map((step) => step.title),
+          executionProfile: projectRoadmapExecutionProfile(project),
           repositoryPath: checkout.repositoryPath,
           repositoryBaseline: { commitSha: checkout.commitSha, evidence: checkout.evidence },
           signal: operation.signal
@@ -1319,6 +1321,7 @@ export function registerRoutes(
           projectContract,
           requiredRequirementIds,
           completedStepTitles: planning.completedSteps,
+          executionProfile: projectRoadmapExecutionProfile(project),
           repositoryPath: planning.repositoryPath,
           repositoryBaseline: planning.repositoryBaseline
         },
@@ -1463,6 +1466,7 @@ export function registerRoutes(
           projectContract,
           requiredRequirementIds: appliedContract.touchedRequirementIds,
           completedStepTitles: planning.completedSteps,
+          executionProfile: projectRoadmapExecutionProfile(project),
           repositoryPath: planning.repositoryPath,
           repositoryBaseline: planning.repositoryBaseline
         },
@@ -1903,10 +1907,12 @@ export async function generateRoadmapPlan(
     const existingRoadmap = await repository.getProjectRoadmap(project.id);
     const completedSteps = existingRoadmap?.steps.filter((step) => step.status === 'completed').map((step) => step.title) ?? [];
     const unfinishedSteps = selectUnfinishedRoadmapSteps(existingRoadmap, sourceContractVersionId);
+    const executionProfile = projectRoadmapExecutionProfile(project);
     const sourceKey = await roadmapSourceKey(repository, project.id);
     const contextKey = createHash('sha256').update(JSON.stringify({
       sourceKey, objective, currentSpecification, currentContract, sourceContractVersionId, operation,
       repositoryCommitSha: repositoryBaseline?.commitSha,
+      executionProfile,
       provider: connection.provider, model: connection.model, connectionId: connection.id
     })).digest('hex');
     const assertCurrentSource = async () => {
@@ -1947,7 +1953,8 @@ export async function generateRoadmapPlan(
         completedSteps,
         unfinishedSteps,
         continuation: Boolean(session.id),
-        currentContract
+        currentContract,
+        executionProfile
       }),
       maxRuntimeMs: roadmapPlanningMaxRuntimeMs(),
       signal,
@@ -2026,6 +2033,7 @@ export function buildRoadmapPlanningPrompt(input: {
   unfinishedSteps?: Array<{ title: string; requirementIds: string[] }>;
   continuation: boolean;
   currentContract?: ProjectContract;
+  executionProfile?: NonNullable<import('@forgemind/providers').RoadmapQualityReviewInput['executionProfile']>;
 }): string {
   if (input.currentContract) {
     return [
@@ -2040,12 +2048,14 @@ export function buildRoadmapPlanningPrompt(input: {
       input.unfinishedSteps?.length
         ? `Carry forward every unfinished work item below. It may be adapted or explicitly merged with another returned step, but all of its still-active requirement ids must remain covered:\n${input.unfinishedSteps.map((step) => `- ${step.title} [${step.requirementIds.join(', ')}]`).join('\n')}`
         : undefined,
+      `Execution environment profile (authoritative):\n${JSON.stringify(input.executionProfile ?? projectRoadmapExecutionProfile({}))}`,
       `Return projectContract as null and contractDelta with baseVersion ${input.currentContract.version}.`,
       'The delta must list every requirement addition, update, supersession, or removal explicitly. Every update, supersession, and removal requires a concrete rationale.',
       'Never replace the complete contract with a smaller topical contract. Requirements omitted from the delta remain active and unchanged.',
       'Preserve all unchanged active requirements. Include migrationImpacts and compatibilityImpacts, using empty arrays when there are none.',
       'Return implementationSteps needed to realize the delta and to finish all carried-forward work. Every added, updated, superseded, removed, or carried-forward active requirement must be referenced by at least one returned step.',
-      'Every step must include a concrete changeRationale, dependsOnStepTitles referencing only earlier returned steps, and validationFocus. Include regression validation and add migration or compatibility validation when those impacts are declared.',
+      'Every step must include a concrete changeRationale, dependsOnStepTitles referencing only earlier returned steps, validationFocus, and task-scoped executionIntent. Split steps when acquisition, persistent-data generation, and editor authoring need different execution environments or artifacts. Include regression validation and add migration or compatibility validation when those impacts are declared.',
+      'Managed HTTPS acquisition and persistent project outputs currently require the Windows executor. Include https-download for HTTPS and disk-capacity whenever minimumFreeSpaceBytes is positive. Unreal authoring is required only when that exact step must save a .uasset or .umap through Unreal Editor.',
       'Every changeRationale must cite repository evidence for the concrete missing behavior and name existing components, modules, or interfaces that the implementation will reuse.',
       'Keep each implementation step focused: at most 3 requirementIds, 3 deliverables, 5 acceptanceCriteria, and 5 inScope items. Split broader work into additional ordered steps.',
       'Return a compact architectureUpdate containing only architecture changes caused by this extension.'
@@ -2066,6 +2076,7 @@ export function buildRoadmapPlanningPrompt(input: {
       input.unfinishedSteps?.length
         ? `Unfinished implementation steps that must remain covered:\n${input.unfinishedSteps.map((step) => `- ${step.title} [${step.requirementIds.join(', ')}]`).join('\n')}`
         : undefined,
+      `Execution environment profile (authoritative):\n${JSON.stringify(input.executionProfile ?? projectRoadmapExecutionProfile({}))}`,
       '',
       'Return concrete implementation steps that can be executed one by one as individual engineering tasks in implementationSteps.',
       'Also return projectContract with version 1, summary, global invariants, prohibited substitutes, atomic requirements, and release criteria.',
@@ -2074,7 +2085,8 @@ export function buildRoadmapPlanningPrompt(input: {
       'Return architectureUpdate with the intended modules, their paths and public interfaces, allowed dependencies, conventions, decisions, known debt, and lightweight executable architecture validation commands that remain valid after every implementation step.',
       'Every requirement id must use REQ-UPPERCASE format and describe one independently verifiable product capability, not an implementation layer.',
       'Each implementationSteps item must contain title, a distinct implementation-focused description, acceptanceCriteria, inScope, outOfScope, requirementIds, and concrete deliverables.',
-      'Each implementationSteps item must also contain changeRationale, dependsOnStepTitles, and validationFocus. Dependencies may reference only earlier step titles. validationFocus uses implementation, migration, compatibility, or regression.',
+      'Each implementationSteps item must also contain changeRationale, dependsOnStepTitles, validationFocus, and task-scoped executionIntent. Dependencies may reference only earlier step titles. validationFocus uses implementation, migration, compatibility, or regression.',
+      'executionIntent chooses linux or windows, exact requiredCapabilities, repository/persistent-data/unreal-assets/validation-evidence artifactKinds, none or https networkAccess, whether Unreal authoring is genuinely required, project-relative persistentOutputPaths, and minimumFreeSpaceBytes. Managed HTTPS acquisition and persistent project outputs currently require the Windows executor. Include https-download for HTTPS and disk-capacity whenever minimumFreeSpaceBytes is positive. Do not require Unreal assets for data acquisition, compilation, or source-only work.',
       'Every changeRationale must cite repository evidence for the concrete missing behavior and name existing components, modules, or interfaces that the implementation will reuse.',
       'Each implementation step must fit one focused pull request and cover at most three contract requirements. Split broad epics into multiple steps.',
       'Each implementation step may contain at most 3 deliverables, 5 acceptanceCriteria, and 5 inScope items.',
@@ -2268,6 +2280,7 @@ export function toImplementationStepBlueprints(
   changeRationale: string;
   dependsOnStepTitles: string[];
   validationFocus: Array<'implementation' | 'migration' | 'compatibility' | 'regression'>;
+  executionIntent: TaskExecutionIntent;
 }> {
   if (!Array.isArray(plan.implementationSteps) || plan.implementationSteps.length === 0) {
     throw new Error('AI provider did not return structured implementationSteps for the project roadmap.');
@@ -2286,6 +2299,7 @@ export function toImplementationStepBlueprints(
     const changeRationale = step.changeRationale?.trim();
     const dependsOnStepTitles = step.dependsOnStepTitles?.map((item) => item.trim()).filter(Boolean) ?? [];
     const validationFocus = Array.from(new Set(['implementation' as const, ...(step.validationFocus ?? [])]));
+    const executionIntent = assertTaskExecutionIntent(step.executionIntent, `Implementation step ${index + 1} execution intent`);
 
     if (!title || !description || acceptanceCriteria.length === 0 || inScope.length === 0 || requirementIds.length === 0 || deliverables.length === 0 || !changeRationale) {
       throw new Error(`AI provider returned an incomplete implementation step at position ${index + 1}.`);
@@ -2331,7 +2345,8 @@ export function toImplementationStepBlueprints(
       deliverables,
       changeRationale,
       dependsOnStepTitles,
-      validationFocus
+      validationFocus,
+      executionIntent
     };
   });
 
@@ -2577,6 +2592,25 @@ function buildProviderRuntimeConfig(connection: AIProviderConnectionSecret, proj
     modelProfile,
     useCli: connection.provider === 'codex' && connection.authMode === 'api_key'
   };
+}
+
+function projectRoadmapExecutionProfile(project: Pick<Project, 'configYaml'>): NonNullable<import('@forgemind/providers').RoadmapQualityReviewInput['executionProfile']> {
+  if (!project.configYaml) {
+    return { defaultExecutor: 'linux', windowsDefaultCapabilities: [], supportsHttpsAcquisition: true, supportsPersistentOutputs: true };
+  }
+  try {
+    const config = parseAgentConfigYaml(project.configYaml);
+    return {
+      defaultExecutor: config.workflow.implementation_owner,
+      windowsDefaultCapabilities: Array.from(new Set([
+        'windows', 'codex', 'git', 'https-download', ...config.workflow.windows_authoring_capabilities
+      ])),
+      supportsHttpsAcquisition: true,
+      supportsPersistentOutputs: true
+    };
+  } catch {
+    return { defaultExecutor: 'linux', windowsDefaultCapabilities: [], supportsHttpsAcquisition: true, supportsPersistentOutputs: true };
+  }
 }
 
 function readProjectModelProfile(configYaml: string): NonNullable<ProviderRuntimeConfig['modelProfile']> | undefined {

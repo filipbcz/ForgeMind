@@ -306,6 +306,23 @@ function architectureUpdateJsonSchema(): Record<string, unknown> {
   };
 }
 
+function taskExecutionIntentJsonSchema(): Record<string, unknown> {
+  return {
+    type: 'object',
+    additionalProperties: false,
+    required: ['executor', 'requiredCapabilities', 'artifactKinds', 'networkAccess', 'requiresUnrealAuthoring', 'persistentOutputPaths', 'minimumFreeSpaceBytes'],
+    properties: {
+      executor: { type: 'string', enum: ['linux', 'windows'] },
+      requiredCapabilities: { type: 'array', items: { type: 'string', minLength: 1 } },
+      artifactKinds: { type: 'array', minItems: 1, items: { type: 'string', enum: ['repository', 'persistent-data', 'unreal-assets', 'validation-evidence'] } },
+      networkAccess: { type: 'string', enum: ['none', 'https'] },
+      requiresUnrealAuthoring: { type: 'boolean' },
+      persistentOutputPaths: { type: 'array', items: { type: 'string', minLength: 1 } },
+      minimumFreeSpaceBytes: { type: 'integer', minimum: 0 }
+    }
+  };
+}
+
 function implementationStepsJsonSchema(): Record<string, unknown> {
   return {
     type: 'array',
@@ -314,7 +331,7 @@ function implementationStepsJsonSchema(): Record<string, unknown> {
       additionalProperties: false,
       required: [
         'title', 'description', 'acceptanceCriteria', 'inScope', 'outOfScope',
-        'requirementIds', 'deliverables', 'changeRationale', 'dependsOnStepTitles', 'validationFocus'
+        'requirementIds', 'deliverables', 'changeRationale', 'dependsOnStepTitles', 'validationFocus', 'executionIntent'
       ],
       properties: {
         title: { type: 'string' },
@@ -329,7 +346,8 @@ function implementationStepsJsonSchema(): Record<string, unknown> {
         validationFocus: {
           type: 'array',
           items: { type: 'string', enum: ['implementation', 'migration', 'compatibility', 'regression'] }
-        }
+        },
+        executionIntent: taskExecutionIntentJsonSchema()
       }
     }
   };
@@ -339,7 +357,7 @@ function capabilityAuditJsonSchema(expectedCriteria: string[] = []): Record<stri
   const gapWorkItem = {
     type: 'object',
     additionalProperties: false,
-    required: ['title', 'description', 'acceptanceCriteria', 'inScope', 'outOfScope', 'requirementIds', 'deliverables', 'changeRationale', 'dependsOnStepTitles', 'validationFocus'],
+    required: ['title', 'description', 'acceptanceCriteria', 'inScope', 'outOfScope', 'requirementIds', 'deliverables', 'changeRationale', 'dependsOnStepTitles', 'validationFocus', 'executionIntent'],
     properties: {
       title: { type: 'string', minLength: 1 },
       description: { type: 'string', minLength: 1 },
@@ -353,7 +371,8 @@ function capabilityAuditJsonSchema(expectedCriteria: string[] = []): Record<stri
       validationFocus: {
         type: 'array',
         items: { type: 'string', enum: ['implementation', 'migration', 'compatibility', 'regression'] }
-      }
+      },
+      executionIntent: taskExecutionIntentJsonSchema()
     }
   };
   return {
@@ -577,7 +596,7 @@ export class CodexProvider implements AIProvider {
         role: 'system',
         content: 'You are Codex. Return JSON with summary, steps, acceptanceCriteria, implementationSteps, projectContract, contractDelta, and architectureUpdate. ' +
             'For ordinary task plans, implementationSteps must be an empty array and projectContract, contractDelta, and architectureUpdate must be null. For an initial project roadmap, include a full projectContract, set contractDelta to null, and include implementationSteps and architectureUpdate. For an approved project extension, set projectContract to null and return contractDelta against the supplied base contract, plus only implementationSteps required by that delta and a compact architectureUpdate. Never silently omit an existing requirement: update, supersede, or remove it with an explicit rationale. Every new or replacement requirement must include briefReferences with short source phrases or section names from the brief. ' +
-            'Every implementation step must include changeRationale, dependsOnStepTitles referencing only earlier steps, and validationFocus. Include regression validation for extensions and migration or compatibility validation when the delta declares those impacts. Architecture updates must include databaseSchemas. ' +
+            'Every implementation step must include changeRationale, dependsOnStepTitles referencing only earlier steps, validationFocus, and a task-scoped executionIntent. executionIntent must choose linux or windows, exact requiredCapabilities, artifactKinds, none or https networkAccess, whether an Unreal editor save is genuinely required, persistent output paths, and minimum free bytes. Managed HTTPS acquisition and persistent outputs require the Windows executor; HTTPS requires https-download and a positive minimum free-space guard requires disk-capacity. Do not require Unreal authoring for data acquisition, compilation, or source-only tasks. Include regression validation for extensions and migration or compatibility validation when the delta declares those impacts. Architecture updates must include databaseSchemas. ' +
             'Do not propose executable validation commands during planning; the implementation provider will derive them from the resulting repository. Reply with JSON only.'
       },
       {
@@ -611,6 +630,7 @@ export class CodexProvider implements AIProvider {
       'The CURRENT SPECIFICATION is authoritative. The existing contract is historical derived context, not a current normative instruction. Preserve valid steps and untouched requirement IDs and semantics. Never turn an obsolete contract obligation into roadmap work.',
       'For a contract contradiction, return the smallest explicit delta against the supplied contract version, with a non-empty rationale on every update, supersession, or removal. Do not broadly regenerate the contract.',
       'Each step may contain at most 3 requirementIds, 3 deliverables, 5 acceptanceCriteria, and 5 inScope items. Split an oversized step into ordered focused steps while preserving complete requirement coverage.',
+      'Preserve or repair each step executionIntent so it describes only that step. Separate network acquisition, persistent-data generation, and Unreal asset authoring when they need different capabilities or artifacts.',
       `Objective: ${input.objective}`,
       `CURRENT SPECIFICATION (authoritative, complete):\n${input.authoritativeSpecification ?? input.objective}`,
       `Validation error: ${input.validationError}`,
@@ -962,7 +982,7 @@ export class CodexProvider implements AIProvider {
     const providerPrompt = [
       'Create an implementation plan for this ForgeMind task.',
       'Return only JSON matching the provided schema.',
-      'For roadmap plans, every implementation step must include changeRationale, dependsOnStepTitles referencing only earlier steps, and validationFocus. Architecture updates must include databaseSchemas.',
+      'For roadmap plans, every implementation step must include changeRationale, dependsOnStepTitles referencing only earlier steps, validationFocus, and task-scoped executionIntent. Do not use a project-wide editor requirement for steps that only acquire data, compile code, or write repository files. Architecture updates must include databaseSchemas.',
       'Do not propose executable validation commands during planning; the implementation provider will derive them from the resulting repository.',
       `Task id: ${input.taskId}`,
       `Title: ${input.title}`,

@@ -11,8 +11,8 @@ describe('Windows managed roots', () => {
   it('creates separate canonical roots for every retention role', async () => {
     const base = await mkdtemp(join(tmpdir(), 'forgemind-windows-roots-')); created.push(base);
     const roots = await prepareWindowsManagedRoots(base);
-    expect(Object.keys(roots).sort()).toEqual(['cache', 'diagnostics', 'inputs', 'outputs', 'sourceAssets', 'work']);
-    expect(new Set(Object.values(roots)).size).toBe(6);
+    expect(Object.keys(roots).sort()).toEqual(['cache', 'diagnostics', 'inputs', 'outputs', 'projectData', 'sourceAssets', 'work']);
+    expect(new Set(Object.values(roots)).size).toBe(7);
     const canonicalBase = await realpath(base);
     for (const path of Object.values(roots)) expect(relative(canonicalBase, path)).not.toMatch(/^\.\./);
   });
@@ -21,12 +21,14 @@ describe('Windows managed roots', () => {
     const roots = await prepareWindowsManagedRoots(base);
     await Promise.all([mkdir(join(roots.work, 'task-1')), mkdir(join(roots.outputs, 'task-1'))]);
     await writeFile(join(roots.inputs, 'region.gpkg'), 'persistent'); await writeFile(join(roots.sourceAssets, 'source.uasset'), 'persistent');
+    await writeFile(join(roots.projectData, 'normalized-region.json'), 'persistent');
     const unfinished = join(roots.diagnostics, 'unfinished'); await mkdir(unfinished); await writeFile(join(unfinished, 'authoring-checkpoint.json'), '{}');
     await utimes(unfinished, new Date(0), new Date(0));
     await cleanupAcceptedWindowsAuthoring(roots, 'task-1');
     await expect(access(join(roots.work, 'task-1'))).rejects.toThrow();
     await expect(access(join(roots.inputs, 'region.gpkg'))).resolves.toBeUndefined();
     await expect(access(join(roots.sourceAssets, 'source.uasset'))).resolves.toBeUndefined();
+    await expect(access(join(roots.projectData, 'normalized-region.json'))).resolves.toBeUndefined();
     await expect(access(join(unfinished, 'authoring-checkpoint.json'))).resolves.toBeUndefined();
   });
 });

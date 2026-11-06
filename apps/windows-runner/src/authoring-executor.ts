@@ -1,5 +1,5 @@
 import { createHash, randomUUID } from 'node:crypto';
-import { access, lstat, mkdir, readFile, readdir, realpath, rename, rm, writeFile } from 'node:fs/promises';
+import { access, lstat, mkdir, open, readFile, readdir, realpath, rename, rm, writeFile } from 'node:fs/promises';
 import { constants as fsConstants } from 'node:fs';
 import { basename, dirname, posix, relative, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -13,7 +13,7 @@ import { recoveredUnrealEditorTarget, resolveUnrealBuildRuntime } from './unreal
 
 export interface NativeAuthoringTools {
   root: string;
-  managedRoots: { inputs: string; sourceAssets: string; cache: string; outputs: string; diagnostics: string };
+  managedRoots: { inputs: string; sourceAssets: string; cache: string; outputs: string; projectData?: string; diagnostics: string };
   read(path: string): Promise<Buffer>;
   write(path: string, content: Buffer | string): Promise<void>;
   remove(path: string): Promise<void>;
@@ -163,15 +163,21 @@ export async function executeWindowsAuthoring(packet: WindowsAuthoringPacket, co
   const evidenceDirectory = managedChild(context.artifactRoot, packet.taskId);
   await mkdir(evidenceDirectory, { recursive: true });
   const suppliedRoots = context.managedRoots ?? { inputs: resolve(context.artifactRoot, 'inputs'), sourceAssets: resolve(context.artifactRoot, 'source-assets'),
-    cache: resolve(context.artifactRoot, 'cache'), outputs: resolve(context.artifactRoot, 'outputs'), diagnostics: context.artifactRoot };
+    cache: resolve(context.artifactRoot, 'cache'), outputs: resolve(context.artifactRoot, 'outputs'),
+    projectData: resolve(context.artifactRoot, 'project-data'), diagnostics: context.artifactRoot };
   await Promise.all(Object.values(suppliedRoots).map((path) => mkdir(path, { recursive: true })));
-  const cacheDirectory = managedChild(suppliedRoots.cache, packet.taskId); const outputDirectory = managedChild(suppliedRoots.outputs, packet.taskId);
+  const inputDirectory = managedChild(suppliedRoots.inputs, packet.projectId);
+  const sourceAssetDirectory = managedChild(suppliedRoots.sourceAssets, packet.taskId);
+  const cacheDirectory = managedChild(suppliedRoots.cache, packet.taskId);
+  const outputDirectory = managedChild(suppliedRoots.outputs, packet.taskId);
+  const projectDataDirectory = managedChild(suppliedRoots.projectData ?? suppliedRoots.outputs, packet.projectId);
   const cacheIdentityPath = resolve(cacheDirectory, 'forgemind-cache-identity.json');
   try {
     const identity = JSON.parse(await readFile(cacheIdentityPath, 'utf8')) as { taskId?: string; baseCommitSha?: string };
     if (identity.taskId !== packet.taskId || identity.baseCommitSha?.toLowerCase() !== packet.baseCommitSha.toLowerCase()) await rm(cacheDirectory, { recursive: true, force: true });
   } catch { await rm(cacheDirectory, { recursive: true, force: true }); }
-  await Promise.all([mkdir(cacheDirectory, { recursive: true }), mkdir(outputDirectory, { recursive: true })]);
+  await Promise.all([inputDirectory, sourceAssetDirectory, cacheDirectory, outputDirectory, projectDataDirectory]
+    .map((path) => mkdir(path, { recursive: true })));
   await writeFile(cacheIdentityPath, JSON.stringify({ version: 2, taskId: packet.taskId, baseCommitSha: packet.baseCommitSha }), 'utf8');
   const selectedUnrealCapability = context.observedCapabilities?.find((capability) => capability.key === 'unreal');
   const selectedUnrealExecutableValue = selectedUnrealCapability?.metadata?.executable;
@@ -189,7 +195,7 @@ export async function executeWindowsAuthoring(packet: WindowsAuthoringPacket, co
     if (prior.exitCode !== 0) throw new Error(`Could not materialize the previous Windows attempt: ${prior.stderr}`);
   }
   const processes = restoreCheckpointAuthoringProvenance(checkout.checkpoint, packet.leaseId, context.sessionId);
-  const reusableResult = checkout.resumed ? await readReusableCompletedResult(evidenceDirectory, packet, context, workspacePath) : undefined;
+  const reusableResult = await readReusableCompletedResult(evidenceDirectory, packet, context, workspacePath, projectDataDirectory);
   if (reusableResult) return { workspacePath, result: reusableResult };
   const resumedUnrealPackages = checkout.checkpoint?.tree.filter((entry) => /\.(?:uasset|umap)$/i.test(entry.path)) ?? [];
   context.onStatus?.(checkout.resumed && checkout.checkpoint
@@ -221,9 +227,11 @@ export async function executeWindowsAuthoring(packet: WindowsAuthoringPacket, co
     await delivery;
   };
   const tools = createTools(workspacePath, resolve(evidenceDirectory, `native-processes-${packet.jobId}.jsonl`), packet.resourcePolicy.timeoutSeconds * 1_000,
-    context.signal, processes, packet.leaseId, context.sessionId, { ...suppliedRoots, cache: cacheDirectory, outputs: outputDirectory,
+    context.signal, processes, packet.leaseId, context.sessionId, {
+      inputs: inputDirectory, sourceAssets: sourceAssetDirectory, cache: cacheDirectory, outputs: outputDirectory,
+      projectData: projectDataDirectory,
       diagnostics: evidenceDirectory }, async () => publishCheckpoint('in-progress'),
-    selectedUnrealExecutable, selectedUnrealCommandletExecutable,
+    selectedUnrealExecutable, selectedUnrealCommandletExecutable, context.observedCapabilities ?? [], packet.executionIntent, packet.taskId,
     async (message) => { liveActivity = truncateUtf8Tail(`${liveActivity}\n${message}`, packet.resourcePolicy.maxLogBytes); await emitProgress('author'); });
   await publishCheckpoint('started');
   const startedAt = new Date();
@@ -235,13 +243,17 @@ export async function executeWindowsAuthoring(packet: WindowsAuthoringPacket, co
   let providerUsage: WindowsProviderUsage[] = [];
   let productionReviewRequired = false;
   let completionVerified = false;
+  let verifiedPersistentOutputs: PersistentOutputReference[] | undefined;
   const verifyCompletion = async () => {
     await rm(resolve(workspacePath, '.forgemind-tmp'), { recursive: true, force: true });
     await cleanupIgnoredUnrealRuntimeState(workspacePath, processes);
     const currentChangedPaths = await stageChangedPaths(workspacePath, context.signal);
     await rejectProhibitedResultPaths(packet, workspacePath, context.signal);
-    productionReviewRequired = await enforceRequiredUnrealAssets(packet, workspacePath, evidenceDirectory, outputDirectory, currentChangedPaths, processes,
+    const persistentOutputs = await requirePersistentOutputs(packet, projectDataDirectory, outputDirectory);
+    verifiedPersistentOutputs = persistentOutputs;
+    const unrealReviewRequired = await enforceRequiredUnrealAssets(packet, workspacePath, evidenceDirectory, outputDirectory, currentChangedPaths, processes,
       context.sessionId, packet.resourcePolicy.timeoutSeconds * 1_000, selectedUnrealCommandletExecutable, context.signal, resumedUnrealPackages);
+    productionReviewRequired = persistentOutputs.length > 0 || unrealReviewRequired;
     completionVerified = true;
     await publishCheckpoint('verified');
   };
@@ -254,7 +266,9 @@ export async function executeWindowsAuthoring(packet: WindowsAuthoringPacket, co
       const output = await context.provider.implement({ prompt: nativeImplementationPrompt(packet), acceptanceCriteria: packet.step.acceptanceCriteria,
         previousValidationError: packet.step.previousValidationError, previousReviewBlockers: packet.step.previousReviewBlockers,
         operations: packet.operations, tools, signal: context.signal,
-        verifyCompletion: packet.contentPolicy.requiresUnrealAssets ? verifyCompletion : undefined });
+        verifyCompletion: packet.contentPolicy.requiresUnrealAssets || (packet.executionIntent?.persistentOutputPaths.length ?? 0) > 0
+          ? verifyCompletion
+          : undefined });
       summary = output.summary; completedOperationIds = output.completedOperationIds; checkpointIds = output.checkpointIds;
       providerUsage = output.providerUsage ?? [];
     }
@@ -271,11 +285,14 @@ export async function executeWindowsAuthoring(packet: WindowsAuthoringPacket, co
   await rejectProhibitedResultPaths(packet, workspacePath, context.signal);
   if (status === 'succeeded' && !completionVerified) {
     try {
-      productionReviewRequired = await enforceRequiredUnrealAssets(packet, workspacePath, evidenceDirectory, outputDirectory, changedPaths, processes,
+      const persistentOutputs = await requirePersistentOutputs(packet, projectDataDirectory, outputDirectory);
+      verifiedPersistentOutputs = persistentOutputs;
+      const unrealReviewRequired = await enforceRequiredUnrealAssets(packet, workspacePath, evidenceDirectory, outputDirectory, changedPaths, processes,
         context.sessionId, packet.resourcePolicy.timeoutSeconds * 1_000, selectedUnrealCommandletExecutable, context.signal, resumedUnrealPackages);
+      productionReviewRequired = persistentOutputs.length > 0 || unrealReviewRequired;
     } catch (error) {
       status = context.signal?.aborted ? 'cancelled' : 'failed';
-      summary = `Final native Unreal verification failed: ${redactSecrets(error instanceof Error ? error.message : String(error))}`;
+      summary = `Final native verification failed: ${redactSecrets(error instanceof Error ? error.message : String(error))}`;
       authoringFailureState = classifyAuthoringFailure(summary, context.signal?.aborted === true, processes);
     }
     await publishCheckpoint(status === 'succeeded' ? 'verified' : 'verification-failed');
@@ -293,10 +310,14 @@ export async function executeWindowsAuthoring(packet: WindowsAuthoringPacket, co
   const patchBytes = Buffer.from(patchResult.stdout, 'utf8');
   const lfsObjects = await collectLfsObjects(workspacePath, changedPaths, context.signal);
   const outputs = await collectManagedOutputs(outputDirectory, packet.resourcePolicy.maxArtifactBytes);
+  const persistentOutputs = verifiedPersistentOutputs ?? await collectExistingPersistentOutputs(packet, projectDataDirectory);
   const resultBundle = { version: 1 as const, format: 'git-binary-patch' as const,
-    sha256: createHash('sha256').update(patchBytes).digest('hex'), sizeBytes: patchBytes.length, lfsObjects, outputs };
+    sha256: createHash('sha256').update(patchBytes).digest('hex'), sizeBytes: patchBytes.length, lfsObjects, outputs, persistentOutputs };
   const completedAt = new Date();
-  const artifacts = outputs.map((output) => ({ name: `managed-output:${output.path}`, relativePath: output.path, sizeBytes: output.sizeBytes, sha256: output.sha256 }));
+  const artifacts = [
+    ...outputs.map((output) => ({ name: `managed-output:${output.path}`, relativePath: output.path, sizeBytes: output.sizeBytes, sha256: output.sha256 })),
+    ...persistentOutputs.map((output) => ({ name: `persistent-output:${output.path}`, relativePath: output.path, sizeBytes: output.sizeBytes, sha256: output.sha256 }))
+  ];
   const evidenceArtifacts = [...artifacts, ...tree.filter((entry) => changedPaths.includes(entry.path)).map((entry) => ({
     name: `result-tree:${entry.path}`, relativePath: entry.path, sizeBytes: entry.sizeBytes, sha256: entry.sha256
   }))];
@@ -324,7 +345,7 @@ export async function executeWindowsAuthoring(packet: WindowsAuthoringPacket, co
     tree, patch: patchResult.stdout, completedOperationIds, checkpointIds,
     artifacts, ...(providerUsage.length ? { providerUsage } : {}), ...(classified ? { realEngineEvidence: classified } : {}),
     processes: compactProcessResults(processes), status, ...(failure ? { failure } : {}), contentAssessment: { technicalVerification: status !== 'succeeded' ? 'failed'
-      : packet.contentPolicy.requiresUnrealAssets ? 'passed' : 'not-required',
+      : packet.contentPolicy.requiresUnrealAssets || (packet.executionIntent?.persistentOutputPaths.length ?? 0) > 0 ? 'passed' : 'not-required',
       productionReviewRequired, rationale: status !== 'succeeded'
         ? `Technical verification did not complete because Windows authoring ${status}.`
         : productionReviewRequired
@@ -365,26 +386,36 @@ export function missingRequiredAuthoringArtifacts(
   });
 }
 
-export function nativeImplementationPrompt(packet: Pick<WindowsAuthoringPacket, 'step' | 'contentPolicy'>): string {
-  if (!packet.contentPolicy.requiresUnrealAssets) return packet.step.prompt;
-  return [
-    packet.step.prompt,
-    'MANDATORY UNREAL DELIVERABLE: This task is incomplete until the selected project contains at least one newly saved or modified .uasset or .umap package.',
-    'Before returning, invoke run_unreal_authoring with tool=unreal-python or tool=unreal-editor and phase=author, and make that editor operation save the requested package into the project Content directory.',
-    'Writing C++, Python, configuration, or build files alone is not an Unreal authoring result. The runner will immediately verify the saved package and return the exact failure to this same checkout for correction.'
-  ].join('\n\n');
+export function nativeImplementationPrompt(packet: Pick<WindowsAuthoringPacket, 'step' | 'contentPolicy' | 'executionIntent'>): string {
+  const instructions = [packet.step.prompt];
+  instructions.push('LOCAL CAPABILITIES: Use list_capabilities before invoking a required nonstandard tool so you use the probed executable and version rather than guessing an installation path.');
+  if (packet.executionIntent?.networkAccess === 'https') {
+    instructions.push('MANAGED ACQUISITION: Use fetch_https for public source downloads. It provides resume, free-space enforcement, SHA-256 and provenance. Do not download through run_process or place downloaded datasets in Git.');
+  }
+  if ((packet.executionIntent?.persistentOutputPaths.length ?? 0) > 0) {
+    instructions.push(`MANDATORY PERSISTENT OUTPUTS: Publish the completed project data with publish_project_output at exactly these project-data paths: ${packet.executionIntent!.persistentOutputPaths.join(', ')}. Materialize managed inputs below .forgemind-tmp/managed for processing. Repository files or documentation that merely claim the data exists do not satisfy this requirement.`);
+  }
+  if (packet.contentPolicy.requiresUnrealAssets) {
+    instructions.push(
+      'MANDATORY UNREAL DELIVERABLE: This task is incomplete until the selected project contains at least one newly saved or modified .uasset or .umap package.',
+      'Before returning, invoke run_unreal_authoring with tool=unreal-python or tool=unreal-editor and phase=author, and make that editor operation save the requested package into the project Content directory.',
+      'Writing C++, Python, configuration, or build files alone is not an Unreal authoring result. The runner will immediately verify the saved package and return the exact failure to this same checkout for correction.'
+    );
+  }
+  return instructions.join('\n\n');
 }
 
 export function authoringSemanticHash(packet: WindowsAuthoringPacket): string {
   return createHash('sha256').update(JSON.stringify({ taskId: packet.taskId, baseCommitSha: packet.baseCommitSha,
     prompt: packet.step.prompt, acceptanceCriteria: packet.step.acceptanceCriteria, priorPatch: packet.step.priorPatch,
-    previousReviewBlockers: packet.step.previousReviewBlockers, modelRoute: packet.modelRoute, operations: packet.operations,
-    requiredCapabilities: packet.requiredCapabilities, contentPolicy: packet.contentPolicy, artifactExpectations: packet.artifactExpectations,
+    previousReviewBlockers: packet.step.previousReviewBlockers, operations: packet.operations,
+    requiredCapabilities: packet.requiredCapabilities, executionIntent: packet.executionIntent,
+    contentPolicy: packet.contentPolicy, artifactExpectations: packet.artifactExpectations,
     realEngineEvidence: packet.realEngineEvidence })).digest('hex');
 }
 
 async function readReusableCompletedResult(evidenceDirectory: string, packet: WindowsAuthoringPacket,
-  context: { deviceId: string; sessionId: string }, workspacePath: string): Promise<WindowsAuthoringResult | undefined> {
+  context: { deviceId: string; sessionId: string }, workspacePath: string, projectDataRoot: string): Promise<WindowsAuthoringResult | undefined> {
   let checkpoint: { version?: number; semanticHash?: string; result?: unknown };
   try { checkpoint = JSON.parse(await readFile(resolve(evidenceDirectory, 'result-checkpoint.json'), 'utf8')); } catch { return undefined; }
   if (checkpoint.version !== 2 || checkpoint.semanticHash !== authoringSemanticHash(packet) || !isWindowsAuthoringResult(checkpoint.result)
@@ -392,12 +423,24 @@ async function readReusableCompletedResult(evidenceDirectory: string, packet: Wi
     || checkpoint.result.baseCommitSha.toLowerCase() !== packet.baseCommitSha.toLowerCase()) return undefined;
   if ((await gitTree(workspacePath)).toLowerCase() !== checkpoint.result.resultTreeSha.toLowerCase()) return undefined;
   const result = checkpoint.result;
+  const persistentOutputs = await collectExistingPersistentOutputs(packet, projectDataRoot);
+  if (!persistentOutputReferencesMatch(result.resultBundle.persistentOutputs ?? [], persistentOutputs)) return undefined;
   const processes = result.processes.map((process) => ({ ...process, leaseId: packet.leaseId, sessionId: context.sessionId }));
   const realEngineEvidence = result.realEngineEvidence ? { ...result.realEngineEvidence, projectId: packet.projectId,
     taskId: packet.taskId, runId: packet.runId, inputHash: packet.inputHash } : undefined;
   return { ...result, protocolVersion: packet.protocolVersion, projectId: packet.projectId, taskId: packet.taskId,
     runId: packet.runId, jobId: packet.jobId, leaseId: packet.leaseId, deviceId: context.deviceId, sessionId: context.sessionId,
     nonce: packet.nonce, inputHash: packet.inputHash, processes, ...(realEngineEvidence ? { realEngineEvidence } : {}) };
+}
+
+export function persistentOutputReferencesMatch(
+  expected: Array<{ path: string; sha256: string; sizeBytes: number; fileCount: number }>,
+  actual: Array<{ path: string; sha256: string; sizeBytes: number; fileCount: number }>
+): boolean {
+  const canonical = (items: typeof expected) => [...items]
+    .map((item) => ({ ...item, path: item.path.replaceAll('\\', '/').replace(/^\.\//, '').replace(/\/$/, '') }))
+    .sort((left, right) => left.path.localeCompare(right.path));
+  return JSON.stringify(canonical(expected)) === JSON.stringify(canonical(actual));
 }
 
 export function compactProcessResults(processes: WindowsAuthoringProcessResult[], maximumEntries = 40,
@@ -499,6 +542,9 @@ function managedChild(root: string, name: string): string {
 
 function createTools(root: string, evidencePath: string, timeoutMs: number, signal: AbortSignal | undefined, results: WindowsAuthoringProcessResult[], leaseId: string, sessionId: string,
   managedRoots: NativeAuthoringTools['managedRoots'], checkpoint: () => Promise<void>, unrealExecutable?: string, unrealCommandletExecutable?: string,
+  observedCapabilities: import('@forgemind/core').WorkerCapability[] = [],
+  executionIntent?: import('@forgemind/core').TaskExecutionIntent,
+  taskId?: string,
   progress?: (message: string) => Promise<void>): NativeAuthoringTools {
   let evidenceOffset = 0; let evidenceRemainder = '';
   const sandboxExecutable = resolveCodexBinary();
@@ -507,7 +553,10 @@ function createTools(root: string, evidencePath: string, timeoutMs: number, sign
     root,
     managedRoots,
     nativeToolChannel: { command: process.execPath, args: [fileURLToPath(new URL('./native-tool-server.js', import.meta.url)), root, evidencePath,
-      sandboxExecutable, unrealExecutable ?? '', unrealCommandletExecutable ?? '', String(timeoutMs)] },
+      sandboxExecutable, unrealExecutable ?? '', unrealCommandletExecutable ?? '', String(timeoutMs),
+      managedRoots.inputs, managedRoots.sourceAssets, managedRoots.cache, managedRoots.outputs, managedRoots.projectData ?? managedRoots.outputs, managedRoots.diagnostics,
+      Buffer.from(JSON.stringify(observedCapabilities), 'utf8').toString('base64'),
+      Buffer.from(JSON.stringify(executionIntent ?? null), 'utf8').toString('base64'), taskId ?? 'legacy-task'] },
     progress,
     async drainNativeProcesses() {
       let content = '';
@@ -1134,6 +1183,113 @@ async function collectManagedOutputs(root: string, maxBytes: number): Promise<Ar
     }
   }
   await visit(root); return outputs.sort((a, b) => a.path.localeCompare(b.path));
+}
+
+type PersistentOutputReference = { path: string; sha256: string; sizeBytes: number; fileCount: number };
+
+async function requirePersistentOutputs(packet: WindowsAuthoringPacket, root: string, receiptRoot: string): Promise<PersistentOutputReference[]> {
+  const expected = packet.executionIntent?.persistentOutputPaths ?? [];
+  const outputs = await collectPublishedOutputReceipts(root, receiptRoot, expected)
+    ?? await collectPersistentOutputReferences(root, expected, true);
+  const missing = expected.filter((path) => !outputs.some((output) => output.path === normalizeManagedRelativePath(path)));
+  if (missing.length > 0) throw new Error(`Required persistent project outputs are missing: ${missing.join(', ')}`);
+  return outputs;
+}
+
+async function collectPublishedOutputReceipts(
+  projectDataRoot: string,
+  receiptRoot: string,
+  paths: string[]
+): Promise<PersistentOutputReference[] | undefined> {
+  if (paths.length === 0) return [];
+  const canonicalProjectDataRoot = await realpath(projectDataRoot);
+  const outputs: PersistentOutputReference[] = [];
+  for (const configured of paths) {
+    const path = normalizeManagedRelativePath(configured);
+    const receiptName = `persistent-output-${createHash('sha256').update(path).digest('hex').slice(0, 16)}.json`;
+    let parsed: unknown;
+    try { parsed = JSON.parse(await readFile(resolve(receiptRoot, receiptName), 'utf8')); } catch { return undefined; }
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return undefined;
+    const receipt = parsed as Record<string, unknown>;
+    if (receipt.path !== path || typeof receipt.sha256 !== 'string' || !/^[a-f0-9]{64}$/i.test(receipt.sha256)
+      || !Number.isSafeInteger(receipt.sizeBytes) || Number(receipt.sizeBytes) < 0
+      || !Number.isSafeInteger(receipt.fileCount) || Number(receipt.fileCount) < 1) return undefined;
+    const target = await realpath(resolve(canonicalProjectDataRoot, path));
+    const rel = relative(canonicalProjectDataRoot, target);
+    if (rel === '..' || rel.startsWith(`..${process.platform === 'win32' ? '\\' : '/'}`)) {
+      throw new Error('Published output receipt resolves outside project data.');
+    }
+    outputs.push({ path, sha256: receipt.sha256.toLowerCase(), sizeBytes: Number(receipt.sizeBytes), fileCount: Number(receipt.fileCount) });
+  }
+  return outputs;
+}
+
+async function collectExistingPersistentOutputs(packet: WindowsAuthoringPacket, root: string): Promise<PersistentOutputReference[]> {
+  return collectPersistentOutputReferences(root, packet.executionIntent?.persistentOutputPaths ?? [], false);
+}
+
+async function collectPersistentOutputReferences(root: string, paths: string[], required: boolean): Promise<PersistentOutputReference[]> {
+  const canonicalRoot = await realpath(root);
+  const outputs: PersistentOutputReference[] = [];
+  for (const configured of paths) {
+    const relativePath = normalizeManagedRelativePath(configured);
+    const target = resolve(canonicalRoot, relativePath);
+    const rel = relative(canonicalRoot, target);
+    if (rel === '..' || rel.startsWith(`..${process.platform === 'win32' ? '\\' : '/'}`)) throw new Error('Persistent output path escapes project data.');
+    let canonicalTarget: string;
+    try { canonicalTarget = await realpath(target); }
+    catch (error: any) {
+      if (!required && error?.code === 'ENOENT') continue;
+      throw error;
+    }
+    const canonicalRel = relative(canonicalRoot, canonicalTarget);
+    if (canonicalRel === '..' || canonicalRel.startsWith(`..${process.platform === 'win32' ? '\\' : '/'}`)) throw new Error('Persistent output resolves outside project data.');
+    const files: Array<{ path: string; sizeBytes: number; sha256: string }> = [];
+    const targetInfo = await lstat(canonicalTarget);
+    async function visit(path: string): Promise<void> {
+      const info = await lstat(path);
+      if (info.isSymbolicLink()) throw new Error(`Persistent output contains a symbolic link: ${relativePath}`);
+      if (info.isDirectory()) {
+        for (const name of (await readdir(path)).sort()) await visit(resolve(path, name));
+        return;
+      }
+      if (!info.isFile()) throw new Error(`Persistent output contains an unsupported filesystem entry: ${relativePath}`);
+      files.push({ path: targetInfo.isFile() ? '.' : relative(canonicalTarget, path).replaceAll('\\', '/'), sizeBytes: info.size, sha256: await hashFile(path) });
+    }
+    await visit(canonicalTarget);
+    if (files.length === 0) {
+      if (required) throw new Error(`Required persistent project output is empty: ${relativePath}`);
+      continue;
+    }
+    outputs.push({
+      path: relativePath,
+      sha256: createHash('sha256').update(JSON.stringify(files)).digest('hex'),
+      sizeBytes: files.reduce((sum, file) => sum + file.sizeBytes, 0),
+      fileCount: files.length
+    });
+  }
+  return outputs;
+}
+
+function normalizeManagedRelativePath(value: string): string {
+  const normalized = value.replaceAll('\\', '/').replace(/^\.\//, '').replace(/\/$/, '');
+  if (!normalized || normalized === '.' || normalized.startsWith('/') || /^[A-Za-z]:/.test(normalized)
+    || normalized.split('/').some((part) => !part || part === '.' || part === '..')) throw new Error('Persistent output path must be a safe non-root relative path.');
+  return normalized;
+}
+
+async function hashFile(path: string): Promise<string> {
+  const hash = createHash('sha256');
+  const handle = await open(path, 'r');
+  try {
+    const buffer = Buffer.allocUnsafe(1024 * 1024);
+    for (;;) {
+      const { bytesRead } = await handle.read(buffer, 0, buffer.length, null);
+      if (bytesRead === 0) break;
+      hash.update(buffer.subarray(0, bytesRead));
+    }
+  } finally { await handle.close(); }
+  return hash.digest('hex');
 }
 
 /** Makes visual evidence available to the server-side read-only reviewer even

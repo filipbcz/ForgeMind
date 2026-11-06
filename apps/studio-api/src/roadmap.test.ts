@@ -15,6 +15,16 @@ const projectContract = {
   releaseCriteria: ['Production build succeeds.']
 };
 
+const linuxExecutionIntent = {
+  executor: 'linux' as const,
+  requiredCapabilities: [],
+  artifactKinds: ['repository' as const],
+  networkAccess: 'none' as const,
+  requiresUnrealAuthoring: false,
+  persistentOutputPaths: [],
+  minimumFreeSpaceBytes: 0
+};
+
 describe('project roadmap generation', () => {
   it('binds independent review to concrete repository evidence beyond roadmap history', () => {
     const prompt = buildRoadmapQualityReviewPrompt({
@@ -120,6 +130,8 @@ describe('project roadmap generation', () => {
 
     expect(prompt).toContain('Add reporting');
     expect(prompt).toContain('Build core');
+    expect(prompt).toContain('Execution environment profile (authoritative)');
+    expect(prompt).toContain('supportsPersistentOutputs');
     expect(prompt).not.toContain('deliberately long project brief');
   });
 
@@ -136,6 +148,7 @@ describe('project roadmap generation', () => {
     expect(prompt).toContain('REQ-SCOPE');
     expect(prompt).toContain('projectContract as null');
     expect(prompt).toContain('Requirements omitted from the delta remain active and unchanged');
+    expect(prompt).toContain('persistent project outputs currently require the Windows executor');
     expect(prompt).not.toContain('complete brief is intentionally not repeated');
   });
 
@@ -264,6 +277,7 @@ describe('project roadmap generation', () => {
           deliverables: ['MVP scope document'],
           changeRationale: 'Establish the requirement boundary before implementation.',
           dependsOnStepTitles: [],
+          executionIntent: linuxExecutionIntent,
           validationFocus: ['implementation']
         },
         {
@@ -276,6 +290,7 @@ describe('project roadmap generation', () => {
           deliverables: ['Generator module', 'Automated generator tests'],
           changeRationale: 'Implement the generator requirement.',
           dependsOnStepTitles: ['Document MVP scope'],
+          executionIntent: linuxExecutionIntent,
           validationFocus: ['implementation']
         }
       ],
@@ -295,6 +310,7 @@ describe('project roadmap generation', () => {
         deliverables: ['MVP scope document'],
         changeRationale: 'Establish the requirement boundary before implementation.',
         dependsOnStepTitles: [],
+        executionIntent: linuxExecutionIntent,
         validationFocus: ['implementation']
       },
       {
@@ -305,6 +321,7 @@ describe('project roadmap generation', () => {
         deliverables: ['Generator module', 'Automated generator tests'],
         changeRationale: 'Implement the generator requirement.',
         dependsOnStepTitles: ['Document MVP scope'],
+        executionIntent: linuxExecutionIntent,
         validationFocus: ['implementation']
       }
     ]);
@@ -334,6 +351,7 @@ describe('project roadmap generation', () => {
         deliverables: ['Scope document'],
         changeRationale: 'Document the scope requirement.',
         dependsOnStepTitles: [],
+        executionIntent: linuxExecutionIntent,
         validationFocus: ['implementation']
       }]
     };
@@ -357,6 +375,7 @@ describe('project roadmap generation', () => {
         deliverables: ['Scope document'],
         changeRationale: 'Establish the scope boundary.',
         dependsOnStepTitles: [],
+        executionIntent: linuxExecutionIntent,
         validationFocus: ['regression']
       }, {
         title: 'Build exercise generator',
@@ -368,6 +387,7 @@ describe('project roadmap generation', () => {
         deliverables: ['Generator module'],
         changeRationale: 'Implement the generator requirement.',
         dependsOnStepTitles: ['Document scope'],
+        executionIntent: linuxExecutionIntent,
         validationFocus: []
       }]
     };
@@ -394,6 +414,7 @@ describe('project roadmap generation', () => {
         deliverables: ['App', 'Tests'],
         changeRationale: 'Implement the requested capabilities.',
         dependsOnStepTitles: [],
+        executionIntent: linuxExecutionIntent,
         validationFocus: ['implementation']
       }]
     };
@@ -416,6 +437,7 @@ describe('project roadmap generation', () => {
         deliverables: ['Integrated generator'],
         changeRationale: 'The changed generator must preserve the existing scope capability.',
         dependsOnStepTitles: [],
+        executionIntent: linuxExecutionIntent,
         validationFocus: ['implementation', 'regression']
       }]
     };

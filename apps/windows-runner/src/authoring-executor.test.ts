@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from 'vitest';
-import { assertReadableAuthoringCheckout, authoringPatchOutputLimit, authoringSemanticHash, buildRecoveredUnrealPackageAuthoringScript, buildUnrealPackageVerificationArgs, buildUnrealPackageVerificationScript, canFinalizeRecoveredUnrealResult, canResumeAuthoringCheckpoint, checkpointMatchesPacketBaseline, checkpointRecoveryScore, classifyAuthoringFailure, classifyWindowsAuthoringFailure, cleanupIgnoredUnrealRuntimeState, collectAuthoringToolVersions, collectCheckpointAuthoringProvenance, compactProcessResults, discoverUnrealProjectDirectories, hasRestorableAuthoringCheckpoint, isProhibitedAuthoringPath, LifecycleNativeImplementationProvider, materializeOutputs, missingRequiredAuthoringArtifacts, nativeImplementationPrompt, requiresProductionContent, retainedCheckpointGenerations, restoreCheckpointAuthoringProvenance, selectRecoveryCheckpoint, selectUnrealProjectForPackages, type NativeAuthoringTools, unrealObjectPath, validateRequiredUnrealAssets } from './authoring-executor.js';
+import { assertReadableAuthoringCheckout, authoringPatchOutputLimit, authoringSemanticHash, buildRecoveredUnrealPackageAuthoringScript, buildUnrealPackageVerificationArgs, buildUnrealPackageVerificationScript, canFinalizeRecoveredUnrealResult, canResumeAuthoringCheckpoint, checkpointMatchesPacketBaseline, checkpointRecoveryScore, classifyAuthoringFailure, classifyWindowsAuthoringFailure, cleanupIgnoredUnrealRuntimeState, collectAuthoringToolVersions, collectCheckpointAuthoringProvenance, compactProcessResults, discoverUnrealProjectDirectories, hasRestorableAuthoringCheckpoint, isProhibitedAuthoringPath, LifecycleNativeImplementationProvider, materializeOutputs, missingRequiredAuthoringArtifacts, nativeImplementationPrompt, persistentOutputReferencesMatch, requiresProductionContent, retainedCheckpointGenerations, restoreCheckpointAuthoringProvenance, selectRecoveryCheckpoint, selectUnrealProjectForPackages, type NativeAuthoringTools, unrealObjectPath, validateRequiredUnrealAssets } from './authoring-executor.js';
 import { access, mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
@@ -27,7 +27,11 @@ describe('native implementation provider lifecycle', () => {
     expect(nativeImplementationPrompt({
       step: { prompt: 'Update documentation' } as any,
       contentPolicy: { requiresUnrealAssets: false } as any
-    })).toBe('Update documentation');
+    })).toContain('Update documentation');
+    expect(nativeImplementationPrompt({
+      step: { prompt: 'Update documentation' } as any,
+      contentPolicy: { requiresUnrealAssets: false } as any
+    })).not.toContain('at least one newly saved or modified .uasset or .umap');
   });
   it('records selected Unreal tool versions from native process provenance', () => {
     expect(collectAuthoringToolVersions([{ leaseId: 'l', sessionId: 's', checkId: 'c', command: 'editor', shell: 'system', exitCode: 0,
@@ -60,6 +64,12 @@ describe('native implementation provider lifecycle', () => {
     expect(canResumeAuthoringCheckpoint(checkpoint, { taskId: 'task-1', baseCommitSha: 'b'.repeat(40) })).toBe(false);
     expect(canResumeAuthoringCheckpoint(checkpoint, { taskId: 'task-1', baseCommitSha: 'a'.repeat(40) }, 'probe-5.9.0')).toBe(false);
     expect(canResumeAuthoringCheckpoint(checkpoint, { taskId: 'task-1', baseCommitSha: 'a'.repeat(40) }, 'probe-5.9.0', true)).toBe(true);
+  });
+  it('reuses persistent project data only when its complete content identity still matches', () => {
+    const expected = [{ path: 'flying/regions/prague-v1', sha256: 'a'.repeat(64), sizeBytes: 42, fileCount: 3 }];
+    expect(persistentOutputReferencesMatch(expected, [{ ...expected[0]!, path: 'flying\\regions\\prague-v1' }])).toBe(true);
+    expect(persistentOutputReferencesMatch(expected, [{ ...expected[0]!, sha256: 'b'.repeat(64) }])).toBe(false);
+    expect(persistentOutputReferencesMatch(expected, [])).toBe(false);
   });
   it('never lets a stale local checkpoint replace a server-confirmed prior result', () => {
     const priorPatch = 'diff --git a/unreal/Content/Flying.umap b/unreal/Content/Flying.umap\nGIT binary patch\n';
@@ -125,6 +135,8 @@ describe('native implementation provider lifecycle', () => {
       contentPolicy: { requiresUnrealAssets: true }, artifactExpectations: [], realEngineEvidence: { classification: 'automated-scenario' } };
     expect(authoringSemanticHash(packet)).toBe(authoringSemanticHash({ ...packet,
       jobId: 'new-job', step: { ...packet.step, previousValidationError: 'network two' } }));
+    expect(authoringSemanticHash(packet)).toBe(authoringSemanticHash({ ...packet,
+      modelRoute: { model: 'gpt-6-astra', reasoningEffort: 'high' } }));
     expect(authoringSemanticHash(packet)).not.toBe(authoringSemanticHash({ ...packet,
       step: { ...packet.step, acceptanceCriteria: ['Different map exists'] } }));
   });

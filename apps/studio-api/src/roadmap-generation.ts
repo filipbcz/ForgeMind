@@ -4,6 +4,12 @@ import { setImmediate } from 'node:timers/promises';
 import type { AIProvider, PlanResult, ProviderSessionContext, ReviewResult, RoadmapQualityReviewInput, RoadmapRepairInput } from '@forgemind/providers';
 
 type RepairContext = Omit<RoadmapRepairInput, 'implementationSteps' | 'session' | 'validationError'>;
+const ROADMAP_NO_PROGRESS = '[FORGEMIND_ROADMAP_NO_PROGRESS]';
+
+function reviewBlockerIdentity(review: Pick<ReviewResult, 'summary' | 'blockers'>): string {
+  const blockers = review.blockers.map((item) => item.replace(/\s+/g, ' ').trim().toLowerCase()).filter(Boolean).sort();
+  return (blockers.length > 0 ? blockers : [review.summary.replace(/\s+/g, ' ').trim().toLowerCase()]).join('\n');
+}
 
 export async function repairRoadmapOnce(
   provider: AIProvider,
@@ -59,6 +65,7 @@ export async function buildImplementationStepBlueprintsWithRepairs<T>(input: {
   signal?: AbortSignal;
 }): Promise<{ plan: PlanResult; blueprints: T }> {
   let plan = input.plan;
+  const failedStates = new Set<string>();
   for (;;) {
     await setImmediate(undefined, { signal: input.signal });
     let validationError: string;
@@ -67,6 +74,11 @@ export async function buildImplementationStepBlueprintsWithRepairs<T>(input: {
     } catch (error) {
       validationError = redactError(error);
     }
+    const failedState = JSON.stringify({ validationError, implementationSteps: plan.implementationSteps, contractDelta: plan.contractDelta });
+    if (failedStates.has(failedState)) {
+      throw new Error(`${ROADMAP_NO_PROGRESS} Targeted roadmap repair returned to the same structurally invalid candidate: ${validationError}`);
+    }
+    failedStates.add(failedState);
     plan = await repairRoadmapOnce(input.provider, input.session, plan, {
       ...input.repairInput, validationError, signal: input.signal
     });
@@ -91,6 +103,16 @@ export async function buildReviewedImplementationStepBlueprints<T>(input: {
   let state: RoadmapGenerationCheckpoint = input.checkpoint ?? {
     version: 1, phase: 'validate', revision: 0, plan: input.plan
   };
+  const failedValidationStates = new Set<string>();
+  const reviewBlockerOccurrences = new Map<string, number>();
+  if (state.phase === 'repair' && state.validationError && !state.validationError.includes(ROADMAP_NO_PROGRESS)) {
+    failedValidationStates.add(JSON.stringify({ validationError: state.validationError, implementationSteps: state.plan.implementationSteps,
+      contractDelta: state.plan.contractDelta }));
+  }
+  if (state.qualityReview?.verdict === 'not_satisfied') {
+    const identity = reviewBlockerIdentity(state.qualityReview);
+    reviewBlockerOccurrences.set(identity, 1);
+  }
   const save = async (next: RoadmapGenerationCheckpoint) => {
     await input.onCheckpoint?.(next);
     state = next;
@@ -108,11 +130,21 @@ export async function buildReviewedImplementationStepBlueprints<T>(input: {
         let validationError: string | undefined;
         const effective = effectiveContext();
         try { input.validate(state.plan, effective.contract, effective.requiredRequirementIds); } catch (error) { validationError = redactError(error); }
+        if (validationError) {
+          const identity = JSON.stringify({ validationError, implementationSteps: state.plan.implementationSteps, contractDelta: state.plan.contractDelta });
+          if (failedValidationStates.has(identity)) {
+            const noProgress = `${ROADMAP_NO_PROGRESS} Targeted roadmap repair returned to the same structurally invalid candidate: ${validationError}`;
+            await save({ ...state, phase: 'repair', validationError: noProgress });
+            throw new Error(noProgress);
+          }
+          failedValidationStates.add(identity);
+        }
         await save({ ...state, phase: validationError ? 'repair' : 'review', validationError });
         break;
       }
       case 'repair': {
         if (!state.validationError) throw new Error('Roadmap repair checkpoint is missing its blocker.');
+        if (state.validationError.includes(ROADMAP_NO_PROGRESS)) throw new Error(state.validationError);
         const effective = effectiveContext();
         const plan = await repairRoadmapOnce(input.provider, input.session, state.plan, {
           ...input.repairInput, ...effective, validationError: state.validationError, signal: input.signal
@@ -126,15 +158,19 @@ export async function buildReviewedImplementationStepBlueprints<T>(input: {
         const qualityReview = await input.provider.reviewRoadmap({
           ...input.reviewInput, ...effective, implementationSteps: state.plan.implementationSteps ?? [], signal: input.signal
         });
-        await save({
-          ...state, qualityReview,
-          phase: qualityReview.verdict === 'satisfied' ? 'ready' : 'repair',
-          validationError: qualityReview.verdict === 'satisfied' ? undefined : [
+        let validationError = qualityReview.verdict === 'satisfied' ? undefined : [
             'Independent roadmap quality review rejected the candidate roadmap.',
             qualityReview.summary,
             ...qualityReview.blockers.map((blocker) => `- ${blocker}`)
-          ].join('\n')
-        });
+          ].join('\n');
+        if (qualityReview.verdict === 'not_satisfied') {
+          const identity = reviewBlockerIdentity(qualityReview);
+          const occurrences = (reviewBlockerOccurrences.get(identity) ?? 0) + 1;
+          reviewBlockerOccurrences.set(identity, occurrences);
+          if (occurrences >= 2) validationError = `${ROADMAP_NO_PROGRESS} Independent review repeated the same blocker after a targeted repair: ${validationError}`;
+        }
+        await save({ ...state, qualityReview, phase: qualityReview.verdict === 'satisfied' ? 'ready' : 'repair', validationError });
+        if (validationError?.includes(ROADMAP_NO_PROGRESS)) throw new Error(validationError);
         break;
       }
       case 'ready': {

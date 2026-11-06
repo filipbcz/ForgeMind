@@ -1,5 +1,5 @@
 import type { BriefCoverageResult, CapabilityAuditInput, CapabilityAuditResult, ImplementationStepPlan, ReleaseAuditInput, ReleaseAuditResult } from './provider.js';
-import { activeProjectContractRequirements } from '@forgemind/core';
+import { activeProjectContractRequirements, normalizeTaskExecutionIntent } from '@forgemind/core';
 import type { ProjectContractRequirement } from '@forgemind/core';
 
 export function buildCapabilityAuditPrompt(input: CapabilityAuditInput): string {
@@ -126,7 +126,7 @@ export function buildReleaseAuditPrompt(input: ReleaseAuditInput): string {
     '- criteria items contain criterion, status, evidence, and gaps.',
     '- briefCoverage items contain obligation, status, workflowOnly, requirementIds, evidence, and gaps.',
     '- contractAmendments items contain id, title, description, acceptanceCriteria, and briefReferences.',
-    '- gapWorkItems items contain title, description, acceptanceCriteria, inScope, outOfScope, requirementIds, deliverables, changeRationale, dependsOnStepTitles, and validationFocus.',
+    '- gapWorkItems items contain title, description, acceptanceCriteria, inScope, outOfScope, requirementIds, deliverables, changeRationale, dependsOnStepTitles, validationFocus, and task-scoped executionIntent.',
     '',
     `Project: ${input.projectId}`,
     `Contract version: ${input.contract.version}`,
@@ -461,6 +461,7 @@ export function buildAuditResponseRepairPrompt(input: {
     '- deliverables contains 1-3 non-empty strings.',
     '- requirementIds contains one or more valid requirement IDs; cross-cutting gaps may reference every requirement they genuinely cover.',
     '- outOfScope, dependsOnStepTitles, and validationFocus are arrays; validationFocus uses implementation, migration, compatibility, or regression.',
+    '- executionIntent declares executor, exact capabilities and artifacts, network access, genuine Unreal authoring, persistent output paths, and minimum free space for this work item only.',
     '',
     'Invalid JSON:',
     input.invalidResponse
@@ -482,7 +483,8 @@ function normalizeGapWorkItem(item: ImplementationStepPlan, allowedRequirementId
       (item?.validationFocus ?? []).filter(
         (focus) => focus === 'implementation' || focus === 'migration' || focus === 'compatibility' || focus === 'regression'
       )
-    ))
+    )),
+    executionIntent: normalizeTaskExecutionIntent(item?.executionIntent)
   };
   const issues: string[] = [];
   if (!normalized.title) issues.push('title is required');
@@ -499,6 +501,7 @@ function normalizeGapWorkItem(item: ImplementationStepPlan, allowedRequirementId
   if (normalized.requirementIds.length === 0) {
     issues.push('requirementIds must contain at least one requirement ID');
   }
+  if (!normalized.executionIntent) issues.push('executionIntent is required and must be internally consistent');
   const unknownRequirementIds = normalized.requirementIds.filter((id) => !allowedRequirementIds.has(id));
   if (unknownRequirementIds.length > 0) {
     issues.push(`requirementIds contains unknown IDs: ${unknownRequirementIds.join(', ')}`);

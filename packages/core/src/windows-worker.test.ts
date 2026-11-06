@@ -131,6 +131,15 @@ describe('Windows worker shared contracts', () => {
       authority: { database: 'none', productionHosts: 'none', globalGitHubCredentials: 'none' }
     };
     expect(isWindowsAuthoringPacket(authoring)).toBe(true);
+    expect(isWindowsAuthoringPacket({ ...authoring, executionIntent: {
+      executor: 'windows', requiredCapabilities: ['windows', 'https-download', 'disk-capacity'], artifactKinds: ['persistent-data'],
+      networkAccess: 'https', requiresUnrealAuthoring: false, persistentOutputPaths: ['flying/regions/prague-v1'],
+      minimumFreeSpaceBytes: 1_000_000
+    } })).toBe(true);
+    expect(isWindowsAuthoringPacket({ ...authoring, executionIntent: {
+      executor: 'windows', requiredCapabilities: ['windows'], artifactKinds: ['unreal-assets'],
+      networkAccess: 'none', requiresUnrealAuthoring: false, persistentOutputPaths: [], minimumFreeSpaceBytes: 0
+    } })).toBe(false);
     expect(isWindowsAuthoringPacket({ ...authoring, modelRoute: { model: 'gpt-6-luna', reasoningEffort: 'medium' } })).toBe(true);
     expect(isWindowsAuthoringPacket({ ...authoring, modelRoute: { model: 'gpt-6-luna', reasoningEffort: 'extreme' } })).toBe(false);
     expect(isWindowsAuthoringPacket({ ...authoring, protocolVersion: 2 })).toBe(true);
@@ -147,6 +156,10 @@ describe('Windows worker shared contracts', () => {
     expect(isWindowsAuthoringResult(result)).toBe(true);
     expect(isWindowsAuthoringResult({ ...result, protocolVersion: 2, resultBundle: { ...result.resultBundle,
       outputs: [{ path: 'Content/Generated/map.bin', sha256: hash, sizeBytes: 42, blobSha256: hash }] } })).toBe(true);
+    expect(isWindowsAuthoringResult({ ...result, protocolVersion: 2, resultBundle: { ...result.resultBundle,
+      persistentOutputs: [{ path: 'flying/regions/prague-v1', sha256: hash, sizeBytes: 42, fileCount: 3 }] } })).toBe(true);
+    expect(isWindowsAuthoringResult({ ...result, protocolVersion: 2, resultBundle: { ...result.resultBundle,
+      persistentOutputs: [{ path: '../escape', sha256: hash, sizeBytes: 42, fileCount: 3 }] } })).toBe(false);
     expect(isWindowsAuthoringResult({ ...result, contentAssessment: undefined })).toBe(false);
     expect(isWindowsAuthoringResult({ ...result, status: 'failed', contentAssessment: {
       technicalVerification: 'failed', productionReviewRequired: false, rationale: 'Authoring failed before verification.'

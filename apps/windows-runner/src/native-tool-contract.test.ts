@@ -13,7 +13,18 @@ describe('native authoring MCP contract', () => {
     expect(nativeToolDefinitions.find(({ name }) => name === 'read_file')?.annotations).toMatchObject({ readOnlyHint: true, openWorldHint: false });
     expect(nativeToolDefinitions.find(({ name }) => name === 'write_file')?.annotations).toMatchObject({ readOnlyHint: false, destructiveHint: false, openWorldHint: false });
     expect(nativeToolDefinitions.find(({ name }) => name === 'run_unreal_authoring')?.annotations).toMatchObject({ readOnlyHint: false, destructiveHint: false, openWorldHint: false });
+    expect(nativeToolDefinitions.find(({ name }) => name === 'fetch_https')?.annotations).toMatchObject({ readOnlyHint: false, destructiveHint: false, openWorldHint: true });
+    expect(nativeToolDefinitions.find(({ name }) => name === 'publish_project_output')?.annotations).toMatchObject({ readOnlyHint: false, destructiveHint: false, openWorldHint: false });
     expect(nativeToolDefinitions.find(({ name }) => name === 'remove_path')?.annotations).toMatchObject({ readOnlyHint: false, destructiveHint: true, openWorldHint: false });
+  });
+
+  it('exposes managed acquisition and persistent project-data operations without raw shell network access', () => {
+    expect(nativeToolDefinitions.map(({ name }) => name)).toEqual(expect.arrayContaining([
+      'list_capabilities', 'list_managed_files', 'read_managed_text', 'fetch_https',
+      'materialize_managed_path', 'publish_project_output'
+    ]));
+    expect(nativeToolServerInstructions).toContain('Raw datasets, caches, downloads, and generated regional data do not belong in Git');
+    expect(nativeToolServerInstructions).toContain('publish_project_output');
   });
 
   it('offers a constrained Unreal build operation', () => {

@@ -8,6 +8,8 @@ export const ROADMAP_QUALITY_CRITERIA = [
   'Acceptance criteria describe observable outcomes and leave validation command selection to implementation.',
   'Dependencies are complete, ordered, and reference only genuine implementation prerequisites.',
   'Every proposed step identifies a concrete baseline-proven gap and names existing repository components, modules, or interfaces it will reuse.',
+  'Every step has an internally consistent task-scoped execution intent: capabilities, network access, artifact kinds, persistent outputs, and Unreal authoring match only that step.',
+  'Acquisition, persistent-data generation, and editor authoring are separate steps when combining them would make execution or evidence ambiguous.',
   'Manual verification, release decisions, and audits are represented as evidence or gates rather than implementation tasks.'
 ] as const;
 
@@ -75,6 +77,11 @@ export function buildRoadmapQualityReviewPrompt(input: RoadmapQualityReviewInput
     `Requirements that this roadmap must cover:\n${input.requiredRequirementIds.map((id) => `- ${id}`).join('\n') || '- none'}`,
     '',
     `Completed step titles that must not be recreated:\n${input.completedStepTitles.map((title) => `- ${title}`).join('\n') || '- none'}`,
+    '',
+    `Execution environment profile:\n${JSON.stringify(input.executionProfile ?? {
+      defaultExecutor: 'linux', windowsDefaultCapabilities: [], supportsHttpsAcquisition: true, supportsPersistentOutputs: true
+    })}`,
+    'A required capability may be supplied later by a compatible worker, but it must be explicit. Reject contradictory or implicit execution needs, not a clearly declared capability merely because no current device is online.',
     '',
     `Repository baseline commit: ${input.repositoryBaseline.commitSha}`,
     input.nativeRepositoryAccess

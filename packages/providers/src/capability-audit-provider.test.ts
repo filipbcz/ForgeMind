@@ -3,6 +3,11 @@ import { CodexProvider } from './codex-provider.js';
 import { OpenAIProvider } from './openai-provider.js';
 import type { CapabilityAuditInput, ReleaseAuditInput } from './provider.js';
 
+const repositoryExecutionIntent = {
+  executor: 'linux', requiredCapabilities: [], artifactKinds: ['repository'], networkAccess: 'none',
+  requiresUnrealAuthoring: false, persistentOutputPaths: [], minimumFreeSpaceBytes: 0
+};
+
 const input: CapabilityAuditInput = {
   projectId: 'project_1',
   contractVersion: 1,
@@ -52,7 +57,8 @@ const invalidPartialAuditResponse = {
     deliverables: ['Working demo integration'],
     changeRationale: 'Close the audited gap.',
     dependsOnStepTitles: [],
-    validationFocus: ['implementation', 'regression']
+    validationFocus: ['implementation', 'regression'],
+    executionIntent: repositoryExecutionIntent
   }]
 };
 

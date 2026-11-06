@@ -3,11 +3,17 @@ import type { AuditGapProposal } from '@forgemind/core';
 import type { AIProvider, ReviewResult } from '@forgemind/providers';
 import { reviewAndRepairAuditGapProposal } from './audit-gap-review.js';
 
+const repositoryExecutionIntent = {
+  executor: 'linux' as const, requiredCapabilities: [], artifactKinds: ['repository' as const], networkAccess: 'none' as const,
+  requiresUnrealAuthoring: false, persistentOutputPaths: [], minimumFreeSpaceBytes: 0
+};
+
 function fixture() {
   const step = {
     title: 'Repair references', description: 'Repair incorrect documentation references.',
     acceptanceCriteria: ['References resolve.'], requirementIds: ['REQ-DOCS'], deliverables: ['Documentation'],
-    changeRationale: 'docs/tracker.md references a missing file.', dependsOnStepTitles: [], validationFocus: ['regression' as const]
+    changeRationale: 'docs/tracker.md references a missing file.', dependsOnStepTitles: [], validationFocus: ['regression' as const],
+    executionIntent: repositoryExecutionIntent
   };
   const proposal: AuditGapProposal = { kind: 'capability', summary: 'Documentation gaps.', commitSha: 'a'.repeat(40), newRequirements: [], steps: [step] };
   const satisfied: ReviewResult = { verdict: 'satisfied', summary: 'All remaining gaps are covered.', blockers: [] };
@@ -46,6 +52,17 @@ describe('audit proposal repair loop', () => {
       expect(input.repositoryPath).toBe('/checkout');
     }
     for (const [input] of f.provider.reviewRoadmap.mock.calls) expect(input).not.toHaveProperty('session');
+  });
+
+  it('stops after independent review repeats the same blocker following targeted repair', async () => {
+    const f = fixture();
+    f.provider.reviewRoadmap.mockResolvedValue(f.rejected);
+    await expect(reviewAndRepairAuditGapProposal(f.input)).rejects.toThrow('FORGEMIND_AUDIT_GAP_NO_PROGRESS');
+    expect(f.provider.repairRoadmap).toHaveBeenCalledTimes(1);
+    expect(f.provider.reviewRoadmap).toHaveBeenCalledTimes(2);
+    expect(f.input.saveReview).toHaveBeenLastCalledWith(expect.objectContaining({
+      blockers: expect.arrayContaining([expect.stringContaining('FORGEMIND_AUDIT_GAP_NO_PROGRESS')])
+    }), expect.anything());
   });
 
   it('lets fresh independent review confirm that no original gap remains', async () => {

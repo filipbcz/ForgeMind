@@ -473,6 +473,7 @@ model Task {
   title                          String
   prompt                         String
   acceptanceCriteria             Json          @default("[]") @map("acceptance_criteria")
+  executionIntent                Json?         @map("execution_intent")
   mode                           TaskMode      @default(safe)
   status                         TaskStatus    @default(draft)
   deferredValidationCapabilities Json          @default("[]") @map("deferred_validation_capabilities")
@@ -772,6 +773,7 @@ model ProjectImplementationStep {
   changeRationale     String                          @default("") @map("change_rationale")
   dependsOnStepTitles Json                            @default("[]") @map("depends_on_step_titles")
   validationFocus     Json                            @default("[]") @map("validation_focus")
+  executionIntent     Json?                           @map("execution_intent")
   status              ProjectImplementationStepStatus @default(pending)
   taskId              String?                         @unique @map("task_id")
   createdAt           DateTime                        @default(now()) @map("created_at")

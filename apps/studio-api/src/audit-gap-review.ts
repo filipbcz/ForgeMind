@@ -1,16 +1,32 @@
 import { setImmediate } from 'node:timers/promises';
 import { z } from 'zod';
 import type { AuditGapProposal, ProjectAuditJob } from '@forgemind/core';
-import { activeProjectContractRequirements, redactError } from '@forgemind/core';
+import { activeProjectContractRequirements, assertTaskExecutionIntent, redactError } from '@forgemind/core';
 import type { AIProvider, ReviewResult, RoadmapQualityReviewInput } from '@forgemind/providers';
 
 const text = z.string().trim().min(1);
+const executionIntentSchema = z.object({
+  executor: z.enum(['linux', 'windows']),
+  requiredCapabilities: z.array(text),
+  artifactKinds: z.array(z.enum(['repository', 'persistent-data', 'unreal-assets', 'validation-evidence'])).min(1),
+  networkAccess: z.enum(['none', 'https']),
+  requiresUnrealAuthoring: z.boolean(),
+  persistentOutputPaths: z.array(text),
+  minimumFreeSpaceBytes: z.number().int().nonnegative()
+});
 const repairedStepsSchema = z.array(z.object({
   title: text, description: text, acceptanceCriteria: z.array(text).min(1),
   requirementIds: z.array(text).min(1), deliverables: z.array(text).min(1), changeRationale: text,
   inScope: z.array(text), outOfScope: z.array(text), dependsOnStepTitles: z.array(text),
-  validationFocus: z.array(z.enum(['implementation', 'migration', 'compatibility', 'regression']))
+  validationFocus: z.array(z.enum(['implementation', 'migration', 'compatibility', 'regression'])),
+  executionIntent: executionIntentSchema
 }));
+const AUDIT_GAP_NO_PROGRESS = '[FORGEMIND_AUDIT_GAP_NO_PROGRESS]';
+
+function reviewBlockerIdentity(review: Pick<ReviewResult, 'summary' | 'blockers'>): string {
+  const blockers = review.blockers.map((item) => item.replace(/\s+/g, ' ').trim().toLowerCase()).filter(Boolean).sort();
+  return (blockers.length > 0 ? blockers : [review.summary.replace(/\s+/g, ' ').trim().toLowerCase()]).join('\n');
+}
 
 /** Resume rejected proposals at repair; persist each revision before independent review. */
 export async function reviewAndRepairAuditGapProposal(input: {
@@ -28,6 +44,12 @@ export async function reviewAndRepairAuditGapProposal(input: {
   let proposal = input.proposal;
   let feedback = input.previousReview?.verdict === 'not_satisfied'
     ? [input.previousReview.summary, ...input.previousReview.blockers].join('\n') : undefined;
+  if (input.previousReview?.blockers.some((blocker) => blocker.startsWith(AUDIT_GAP_NO_PROGRESS))) {
+    throw new Error(input.previousReview.blockers.find((blocker) => blocker.startsWith(AUDIT_GAP_NO_PROGRESS))!);
+  }
+  const reviewBlockerOccurrences = new Map<string, number>();
+  if (input.previousReview?.verdict === 'not_satisfied') reviewBlockerOccurrences.set(reviewBlockerIdentity(input.previousReview), 1);
+  const invalidRepairOutputs = new Set<string>();
   const knownRequirements = new Set(activeProjectContractRequirements(input.reviewInput.projectContract).map(r => r.id));
   const objective = [
     input.reviewInput.objective,
@@ -69,12 +91,17 @@ export async function reviewAndRepairAuditGapProposal(input: {
           if (titles.has(step.title)) throw new Error(`Duplicate step title "${step.title}".`);
           if (step.dependsOnStepTitles.some(title => !titles.has(title))) throw new Error(`Step "${step.title}" depends on an unknown or later step.`);
           titles.add(step.title);
-          return { ...step, description: [step.description,
+          return { ...step, executionIntent: assertTaskExecutionIntent(step.executionIntent, `Step "${step.title}" execution intent`), description: [step.description,
             ...(inScope.length ? ['In scope:', ...inScope.map(item => `- ${item}`)] : []),
             ...(outOfScope.length ? ['Out of scope:', ...outOfScope.map(item => `- ${item}`)] : [])
           ].join('\n\n') };
         });
       } catch (error) {
+        const invalidOutput = JSON.stringify(repaired);
+        if (invalidRepairOutputs.has(invalidOutput)) {
+          throw new Error(`${AUDIT_GAP_NO_PROGRESS} Targeted audit proposal repair repeated the same structurally invalid output: ${redactError(error)}`);
+        }
+        invalidRepairOutputs.add(invalidOutput);
         feedback = `${feedback}\nRepair output is structurally invalid: ${redactError(error)}`;
         continue;
       }
@@ -91,6 +118,16 @@ export async function reviewAndRepairAuditGapProposal(input: {
       requiredRequirementIds: [...new Set(proposal.steps.flatMap(step => step.requirementIds))],
       implementationSteps: proposal.steps.map(step => ({ ...step, inScope: [], outOfScope: [] }))
     });
+    if (review.verdict === 'not_satisfied') {
+      const identity = reviewBlockerIdentity(review);
+      const occurrences = (reviewBlockerOccurrences.get(identity) ?? 0) + 1;
+      reviewBlockerOccurrences.set(identity, occurrences);
+      if (occurrences >= 2) {
+        const blocker = `${AUDIT_GAP_NO_PROGRESS} Independent review repeated the same blocker after a targeted repair.`;
+        await input.saveReview({ ...review, summary: `${review.summary}\n${blocker}`, blockers: [...review.blockers, blocker] }, proposal);
+        throw new Error(blocker);
+      }
+    }
     await input.saveReview(review, proposal);
     signal?.throwIfAborted();
     if (review.verdict === 'satisfied') return { proposal, review };

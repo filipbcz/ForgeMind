@@ -48,6 +48,8 @@ export function windowsRunnerCapabilityProbes(
     { capability: { key: 'git' }, executable: 'git.exe', args: ['--version'] },
     { capability: { key: 'git-lfs' }, executable: 'git-lfs.exe', args: ['version'] },
     { capability: { key: 'node' }, executable: nodeExecutable, args: ['--version'] },
+    { capability: { key: 'https-download', metadata: { transport: 'runner-managed', resume: true, provenance: 'sha256' } },
+      executable: nodeExecutable, args: ['-e', "if(typeof fetch!=='function')process.exit(2);process.stdout.write('runner-managed HTTPS fetch available')"] },
     { capability: { key: 'npm', metadata: { executable: 'npm.cmd' } }, executable: environment.ComSpec ?? 'cmd.exe', args: ['/d', '/s', '/c', 'npm.cmd --version'] },
     { capability: { key: 'cmake' }, executable: 'cmake.exe', args: ['--version'] },
     { capability: { key: 'msvc', metadata: { target: 'x64' } }, kind: 'msvc', executable: windowsPath.join(programFilesX86, 'Microsoft Visual Studio', 'Installer', 'vswhere.exe') },

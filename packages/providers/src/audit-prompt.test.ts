@@ -2,6 +2,11 @@ import { describe, expect, it } from 'vitest';
 import type { CapabilityAuditInput, CapabilityAuditResult, ReleaseAuditInput } from './provider.js';
 import { buildCapabilityAuditPrompt, buildReleaseAuditPrompt, normalizeCapabilityAuditResult, normalizeReleaseAuditResult } from './audit-prompt.js';
 
+const repositoryExecutionIntent = {
+  executor: 'linux' as const, requiredCapabilities: [], artifactKinds: ['repository' as const], networkAccess: 'none' as const,
+  requiresUnrealAuthoring: false, persistentOutputPaths: [], minimumFreeSpaceBytes: 0
+};
+
 const input: CapabilityAuditInput = {
   projectId: 'project_1',
   contractVersion: 2,
@@ -122,7 +127,8 @@ describe('capability audit contract', () => {
         deliverables: ['API-backed leaderboard screen'],
         changeRationale: 'Close the audited capability gap.',
         dependsOnStepTitles: [],
-        validationFocus: ['implementation', 'regression']
+        validationFocus: ['implementation', 'regression'],
+        executionIntent: repositoryExecutionIntent
       }]
     };
 
@@ -214,7 +220,8 @@ describe('release audit contract', () => {
         deliverables: ['Working production build'],
         changeRationale: 'Restore the failed release criterion.',
         dependsOnStepTitles: [],
-        validationFocus: ['implementation', 'regression']
+        validationFocus: ['implementation', 'regression'],
+        executionIntent: repositoryExecutionIntent
       }]
     });
     expect(result.verdict).toBe('partial');
@@ -260,7 +267,8 @@ describe('release audit contract', () => {
         deliverables: ['Real-process full-agenda E2E test'],
         changeRationale: 'Close the integrated release-evidence gap.',
         dependsOnStepTitles: [],
-        validationFocus: ['implementation', 'regression']
+        validationFocus: ['implementation', 'regression'],
+        executionIntent: repositoryExecutionIntent
       }]
     });
 
@@ -294,7 +302,8 @@ describe('release audit contract', () => {
         deliverables: [],
         changeRationale: 'Restore the build.',
         dependsOnStepTitles: [],
-        validationFocus: ['implementation']
+        validationFocus: ['implementation'],
+        executionIntent: repositoryExecutionIntent
       }]
     })).toThrow('Audit gap work item at position 1 ("Repair production build") is invalid: deliverables must contain 1-3 non-empty strings; requirementIds contains unknown IDs: REQ-UNKNOWN.');
   });
@@ -375,7 +384,8 @@ describe('release audit contract', () => {
         deliverables: ['CSV export capability'],
         changeRationale: 'Implement the requirement discovered by the audit.',
         dependsOnStepTitles: [],
-        validationFocus: ['implementation', 'regression']
+        validationFocus: ['implementation', 'regression'],
+        executionIntent: repositoryExecutionIntent
       }]
     });
 

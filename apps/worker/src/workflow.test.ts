@@ -409,6 +409,25 @@ describe('simple autonomous worker workflow', () => {
     expect(reviewer).toHaveBeenCalledTimes(2);
   }, workflowTestTimeoutMs);
 
+  it('stops the same review blocker after one correction even when the correction changes files', async () => {
+    const project = createProject(); const task = createTask(project.id);
+    let attempt = 0;
+    const implement = vi.fn(async () => {
+      attempt += 1;
+      const result = implementation('pass\n');
+      return { ...result, changedFiles: [...result.changedFiles, 'review-attempt.txt'],
+        fileUpdates: [...(result.fileUpdates ?? []), { path: 'review-attempt.txt', content: `${attempt}\n` }] };
+    });
+    const reviewer = vi.fn(async () => review('not_satisfied', ['The same concrete blocker remains.']));
+    const provider = createProvider({ implement, review: reviewer });
+    const result = await runWorkerTask({ project, task, provider,
+      workspaceRoot: join(tmpdir(), `forgemind-review-repeated-blocker-${randomUUID()}`) });
+    expect(result).toMatchObject({ status: 'failed' });
+    expect(result.summary).toContain('same blockers after a correction attempt');
+    expect(implement).toHaveBeenCalledTimes(2);
+    expect(reviewer).toHaveBeenCalledTimes(2);
+  }, workflowTestTimeoutMs);
+
   it('lets AI explicitly skip executable validation when it is not applicable', async () => {
     const project = createProject();
     const task = createTask(project.id);

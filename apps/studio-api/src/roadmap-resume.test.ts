@@ -106,7 +106,11 @@ describe('roadmap draft resume context', () => {
     const step = {
       title: 'Implement export', description: 'Export records.', acceptanceCriteria: ['Records can be exported.'],
       inScope: ['Export'], outOfScope: [], requirementIds: ['REQ-EXPORT'], deliverables: ['Export module'],
-      changeRationale: 'Implement approved export.', dependsOnStepTitles: [], validationFocus: ['implementation']
+      changeRationale: 'Implement approved export.', dependsOnStepTitles: [], validationFocus: ['implementation'],
+      executionIntent: {
+        executor: 'linux' as const, requiredCapabilities: [], artifactKinds: ['repository' as const], networkAccess: 'none' as const,
+        requiresUnrealAuthoring: false, persistentOutputPaths: [], minimumFreeSpaceBytes: 0
+      }
     };
     const candidate = {
       summary: 'Export', steps: [], acceptanceCriteria: [], implementationSteps: [step],

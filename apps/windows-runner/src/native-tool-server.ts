@@ -1,6 +1,8 @@
 #!/usr/bin/env node
+import { createHash } from 'node:crypto';
+import { lookup } from 'node:dns/promises';
 import { createInterface } from 'node:readline';
-import { appendFile, mkdir, readFile, readdir, realpath, rm, stat, writeFile } from 'node:fs/promises';
+import { appendFile, cp, lstat, mkdir, open, readFile, readdir, realpath, rename, rm, stat, statfs, writeFile } from 'node:fs/promises';
 import { dirname, relative, resolve } from 'node:path';
 import { redactSecrets } from '@forgemind/core';
 import { assertEvidenceOutsideCheckout, buildSandboxedExecutableInvocation, buildSandboxedProcessInvocation,
@@ -16,13 +18,36 @@ const sandboxExecutable = process.argv[4] ?? '';
 const configuredUnrealExecutable = process.argv[5]?.trim() ?? '';
 const configuredUnrealCommandletExecutable = process.argv[6]?.trim() ?? '';
 const configuredProcessTimeoutMs = Number(process.argv[7] ?? 36_000_000);
+const managedRootValues = process.argv.slice(8, 14);
+if (managedRootValues.length !== 6 || managedRootValues.some((path) => !path?.trim())) throw new Error('Native tool server requires all managed root paths.');
+const managedRootArguments = {
+  inputs: resolve(managedRootValues[0]!), sourceAssets: resolve(managedRootValues[1]!), cache: resolve(managedRootValues[2]!),
+  outputs: resolve(managedRootValues[3]!), projectData: resolve(managedRootValues[4]!), diagnostics: resolve(managedRootValues[5]!)
+};
+const observedCapabilities = (() => {
+  try {
+    const parsed = JSON.parse(Buffer.from(process.argv[14] ?? 'W10=', 'base64').toString('utf8'));
+    return Array.isArray(parsed) ? parsed : [];
+  } catch { return []; }
+})();
+const executionIntent = (() => {
+  try {
+    const parsed = JSON.parse(Buffer.from(process.argv[15] ?? 'bnVsbA==', 'base64').toString('utf8'));
+    return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed as Record<string, unknown> : undefined;
+  } catch { return undefined; }
+})();
+const taskId = process.argv[16]?.trim() ?? '';
 const processTimeoutMs = Number.isFinite(configuredProcessTimeoutMs) && configuredProcessTimeoutMs >= 1_000
   ? configuredProcessTimeoutMs
   : 36_000_000;
 const unrealIdleTimeoutMs = Math.min(processTimeoutMs, 5 * 60_000);
-if (!root || !evidencePath || !sandboxExecutable) throw new Error('Native tool server requires checkout, evidence, and sandbox executable paths.');
+if (!root || !evidencePath || !sandboxExecutable || !taskId || taskId.includes('/') || taskId.includes('\\')) {
+  throw new Error('Native tool server requires checkout, evidence, sandbox executable, and managed root paths.');
+}
 assertEvidenceOutsideCheckout(root, evidencePath);
 const canonicalRoot = await realpath(root);
+const canonicalManagedRoots = Object.fromEntries(await Promise.all(Object.entries(managedRootArguments)
+  .map(async ([key, path]) => [key, await realpath(path)]))) as typeof managedRootArguments;
 const activeProcesses = new Set<AbortController>();
 
 const input = createInterface({ input: process.stdin, crlfDelay: Infinity });
@@ -46,8 +71,18 @@ async function handle(line: string) {
 }
 
 async function callTool(name: string, args: any) {
-  if (name === 'read_file') return text(await readFile(await existingContained(args.path), 'utf8'));
-  if (name === 'list_directory') return text((await readdir(await existingContained(args.path ?? '.'))).join('\n'));
+  if (name === 'list_capabilities') return text(JSON.stringify(observedCapabilities));
+  if (name === 'read_file') {
+    const path = await existingContained(args.path);
+    const info = await stat(path);
+    if (!info.isFile() || info.size > 1_000_000) throw new Error('Checkout text reads require a file no larger than 1 MB. Use a bounded project command for targeted inspection.');
+    return text(await readFile(path, 'utf8'));
+  }
+  if (name === 'list_directory') {
+    const entries = await readdir(await existingContained(args.path ?? '.'));
+    if (entries.length > 1000) throw new Error('Checkout directory listing exceeds 1000 entries. Narrow the requested path.');
+    return text(entries.join('\n'));
+  }
   if (name === 'write_file') { const path = contained(args.path); await assertNearestExistingParent(dirname(path)); await mkdir(dirname(path), { recursive: true }); await assertCanonicalContained(await realpath(dirname(path))); await assertExistingTargetContained(path); await writeFile(path, String(args.content), 'utf8'); return text('written'); }
   if (name === 'remove_path') { const path = contained(args.path); await assertCanonicalContained(await realpath(dirname(path))); await rm(path, { recursive: true, force: true }); return text('removed'); }
   if (name === 'run_process') {
@@ -102,7 +137,330 @@ async function callTool(name: string, args: any) {
     const result = await runProcess(args.checkId, command, 'system', authoring, invocation, usesEditor ? unrealIdleTimeoutMs : undefined);
     return { content: [{ type: 'text', text: JSON.stringify(result) }], isError: result.exitCode !== 0 };
   }
+  if (name === 'list_managed_files') {
+    const role = managedRole(args.root);
+    const path = await existingManaged(role, args.path ?? '.');
+    return text(JSON.stringify(await listManaged(path, args.recursive === true)));
+  }
+  if (name === 'read_managed_text') {
+    const role = managedRole(args.root);
+    const path = await existingManaged(role, args.path);
+    const info = await stat(path);
+    if (!info.isFile() || info.size > 1_000_000) throw new Error('Managed text reads require a file no larger than 1 MB.');
+    return text(await readFile(path, 'utf8'));
+  }
+  if (name === 'fetch_https') return text(JSON.stringify(await auditedManagedOperation('managed-fetch', `fetch_https ${String(args.destinationRelativePath)}`,
+    () => fetchHttpsSource(args))));
+  if (name === 'materialize_managed_path') {
+    return text(JSON.stringify(await auditedManagedOperation('managed-materialize', `materialize_managed_path ${String(args.checkoutRelativePath)}`, async () => {
+      const role = managedRole(args.root);
+      if (role === 'outputs') throw new Error('Task outputs are not reusable managed inputs.');
+      const source = await existingManaged(role, args.sourceRelativePath);
+      const checkoutRelativePath = normalizeRelativePath(args.checkoutRelativePath);
+      if (checkoutRelativePath !== '.forgemind-tmp/managed' && !checkoutRelativePath.startsWith('.forgemind-tmp/managed/')) {
+        throw new Error('Managed inputs may be materialized only below .forgemind-tmp/managed.');
+      }
+      const target = contained(checkoutRelativePath);
+      await assertNearestExistingParent(dirname(target));
+      await rm(target, { recursive: true, force: true });
+      await mkdir(dirname(target), { recursive: true });
+      await assertCanonicalContained(await realpath(dirname(target)));
+      await assertTreeHasNoLinks(source);
+      await cp(source, target, { recursive: true, force: false, errorOnExist: true });
+      return { checkoutRelativePath, ...(await treeSummary(target)) };
+    })));
+  }
+  if (name === 'publish_project_output') {
+    return text(JSON.stringify(await auditedManagedOperation('managed-publish', `publish_project_output ${String(args.destinationRelativePath)}`, async () => {
+      const source = await existingContained(args.checkoutRelativePath);
+      await assertTreeHasNoLinks(source);
+      const destinationRelativePath = normalizeRelativePath(args.destinationRelativePath);
+      const allowed = Array.isArray(executionIntent?.persistentOutputPaths)
+        ? executionIntent!.persistentOutputPaths.map((path) => normalizeRelativePath(path))
+        : [];
+      if (!allowed.includes(destinationRelativePath)) throw new Error('Destination is not declared by this task execution intent.');
+      const target = managedContained('projectData', destinationRelativePath);
+      await assertNearestManagedParent('projectData', dirname(target));
+      const temporary = `${target}.forgemind-${Date.now()}-${process.pid}.tmp`;
+      await rm(temporary, { recursive: true, force: true });
+      await mkdir(dirname(temporary), { recursive: true });
+      await cp(source, temporary, { recursive: true, force: false, errorOnExist: true });
+      const summary = await treeSummary(temporary);
+      const destinationHash = createHash('sha256').update(destinationRelativePath).digest('hex');
+      const publicationPath = managedContained('projectData', `.forgemind-publications/${destinationHash}.json`);
+      let existingSummary: Awaited<ReturnType<typeof treeSummary>> | undefined;
+      try { existingSummary = await treeSummary(target); } catch (error: any) { if (error?.code !== 'ENOENT') throw error; }
+      let existingPublication: { taskId?: string } = {};
+      try { existingPublication = JSON.parse(await readFile(publicationPath, 'utf8')) as { taskId?: string }; } catch { /* no owner */ }
+      let publicationOwnerTaskId = taskId;
+      if (existingSummary && existingSummary.sha256 === summary.sha256) {
+        await rm(temporary, { recursive: true, force: true });
+        publicationOwnerTaskId = existingPublication.taskId ?? taskId;
+      } else if (existingSummary) {
+        if (existingPublication.taskId !== taskId) {
+          await rm(temporary, { recursive: true, force: true });
+          throw new Error('Persistent output already exists with different content. Publish a new versioned destination instead of overwriting another task output.');
+        }
+        const backup = `${target}.forgemind-${Date.now()}-${process.pid}.previous`;
+        await rename(target, backup);
+        try {
+          await rename(temporary, target);
+          await rm(backup, { recursive: true, force: true });
+        } catch (error) {
+          await rm(target, { recursive: true, force: true });
+          await rename(backup, target);
+          throw error;
+        }
+      } else {
+        await rename(temporary, target);
+      }
+      const receipt = {
+        schemaVersion: 1,
+        root: 'project-data',
+        path: destinationRelativePath,
+        ...summary,
+        publishedAt: new Date().toISOString()
+      };
+      await mkdir(dirname(publicationPath), { recursive: true });
+      await writeFile(publicationPath, `${JSON.stringify({ ...receipt, taskId: publicationOwnerTaskId }, null, 2)}\n`, 'utf8');
+      const receiptName = `persistent-output-${destinationHash.slice(0, 16)}.json`;
+      await writeFile(managedContained('outputs', receiptName), `${JSON.stringify(receipt, null, 2)}\n`, 'utf8');
+      return receipt;
+    })));
+  }
   throw new Error(`Unknown native tool: ${name}`);
+}
+
+type ManagedRole = keyof typeof canonicalManagedRoots;
+
+async function auditedManagedOperation<T>(checkId: string, command: string, operation: () => Promise<T>): Promise<T> {
+  const startedAt = new Date().toISOString();
+  try {
+    const result = await operation();
+    await appendFile(evidencePath, `${JSON.stringify({ checkId, command, shell: 'system', exitCode: 0,
+      stdout: redactSecrets(JSON.stringify(result)), stderr: '', startedAt, completedAt: new Date().toISOString() })}\n`, 'utf8');
+    return result;
+  } catch (error) {
+    await appendFile(evidencePath, `${JSON.stringify({ checkId, command, shell: 'system', exitCode: 1,
+      stdout: '', stderr: redactSecrets(error instanceof Error ? error.message : String(error)), startedAt, completedAt: new Date().toISOString() })}\n`, 'utf8');
+    throw error;
+  }
+}
+
+function managedRole(value: unknown): ManagedRole {
+  const mapped = value === 'source-assets' ? 'sourceAssets' : value === 'project-data' ? 'projectData' : value;
+  if (!['inputs', 'sourceAssets', 'cache', 'outputs', 'projectData'].includes(String(mapped))) throw new Error('Unknown managed root.');
+  return mapped as ManagedRole;
+}
+
+function normalizeRelativePath(value: unknown): string {
+  const path = String(value ?? '').replaceAll('\\', '/').replace(/^\.\//, '').replace(/\/$/, '');
+  if (!path || path === '.' || path.startsWith('/') || /^[A-Za-z]:/.test(path)
+    || path.split('/').some((part) => !part || part === '.' || part === '..')) throw new Error('A safe non-root relative path is required.');
+  return path;
+}
+
+function managedContained(role: ManagedRole, path: unknown): string {
+  const base = canonicalManagedRoots[role];
+  const candidate = String(path ?? '.') === '.' ? base : resolve(base, normalizeRelativePath(path));
+  const rel = relative(base, candidate);
+  if (rel === '..' || rel.startsWith(`..${process.platform === 'win32' ? '\\' : '/'}`)) throw new Error('Path escapes its managed root.');
+  return candidate;
+}
+
+async function existingManaged(role: ManagedRole, path: unknown): Promise<string> {
+  const candidate = await realpath(managedContained(role, path));
+  const rel = relative(canonicalManagedRoots[role], candidate);
+  if (rel === '..' || rel.startsWith(`..${process.platform === 'win32' ? '\\' : '/'}`)) throw new Error('Canonical path escapes its managed root.');
+  return candidate;
+}
+
+async function assertNearestManagedParent(role: ManagedRole, path: string): Promise<void> {
+  try { await existingManaged(role, relative(canonicalManagedRoots[role], path) || '.'); }
+  catch (error: any) {
+    if (error?.code !== 'ENOENT') throw error;
+    const parent = dirname(path);
+    if (parent === path) throw error;
+    await assertNearestManagedParent(role, parent);
+  }
+}
+
+async function listManaged(path: string, recursive: boolean): Promise<Array<{ path: string; kind: 'file' | 'directory'; sizeBytes: number }>> {
+  const base = path;
+  const items: Array<{ path: string; kind: 'file' | 'directory'; sizeBytes: number }> = [];
+  async function visit(directory: string): Promise<void> {
+    for (const entry of await readdir(directory, { withFileTypes: true })) {
+      if (items.length >= 1000) throw new Error('Managed file listing exceeds 1000 entries. Narrow the requested path.');
+      const target = resolve(directory, entry.name);
+      const info = await lstat(target);
+      if (info.isSymbolicLink()) throw new Error('Managed roots may not contain symbolic links.');
+      const rel = relative(base, target).replaceAll('\\', '/') || entry.name;
+      items.push({ path: rel, kind: info.isDirectory() ? 'directory' : 'file', sizeBytes: info.isFile() ? info.size : 0 });
+      if (recursive && info.isDirectory()) await visit(target);
+    }
+  }
+  const info = await stat(path);
+  if (info.isDirectory()) await visit(path);
+  else items.push({ path: relative(dirname(path), path).replaceAll('\\', '/'), kind: 'file', sizeBytes: info.size });
+  return items;
+}
+
+async function assertTreeHasNoLinks(path: string): Promise<void> {
+  const info = await lstat(path);
+  if (info.isSymbolicLink()) throw new Error('Managed copies may not contain symbolic links.');
+  if (!info.isDirectory()) return;
+  for (const entry of await readdir(path)) await assertTreeHasNoLinks(resolve(path, entry));
+}
+
+async function fileSha256(path: string): Promise<string> {
+  const hash = createHash('sha256');
+  const handle = await open(path, 'r');
+  try {
+    const buffer = Buffer.allocUnsafe(1024 * 1024);
+    for (;;) {
+      const { bytesRead } = await handle.read(buffer, 0, buffer.length, null);
+      if (bytesRead === 0) break;
+      hash.update(buffer.subarray(0, bytesRead));
+    }
+  } finally { await handle.close(); }
+  return hash.digest('hex');
+}
+
+async function treeSummary(path: string): Promise<{ sizeBytes: number; sha256: string; fileCount: number }> {
+  const rootInfo = await stat(path);
+  const files: Array<{ path: string; sizeBytes: number; sha256: string }> = [];
+  async function visit(target: string): Promise<void> {
+    const info = await lstat(target);
+    if (info.isSymbolicLink()) throw new Error('Published output may not contain symbolic links.');
+    if (info.isDirectory()) {
+      for (const name of (await readdir(target)).sort()) await visit(resolve(target, name));
+      return;
+    }
+    if (!info.isFile()) throw new Error('Published output contains an unsupported filesystem entry.');
+    if (files.length >= 100_000) throw new Error('Published output exceeds the 100000-file safety limit. Split the project data into smaller declared outputs.');
+    files.push({ path: rootInfo.isFile() ? '.' : relative(path, target).replaceAll('\\', '/'), sizeBytes: info.size, sha256: await fileSha256(target) });
+  }
+  await visit(path);
+  const sha256 = createHash('sha256').update(JSON.stringify(files)).digest('hex');
+  return { sizeBytes: files.reduce((sum, file) => sum + file.sizeBytes, 0), sha256, fileCount: files.length };
+}
+
+async function fetchHttpsSource(args: any): Promise<Record<string, unknown>> {
+  if (executionIntent?.networkAccess !== 'https') throw new Error('This task execution intent does not authorize HTTPS acquisition.');
+  if (!Number.isSafeInteger(args.maxBytes) || args.maxBytes <= 0 || !Number.isSafeInteger(args.minimumFreeSpaceBytes) || args.minimumFreeSpaceBytes < 0) {
+    throw new Error('HTTPS fetch requires safe positive maxBytes and non-negative minimumFreeSpaceBytes.');
+  }
+  if (args.expectedSha256 !== undefined && !/^[a-f0-9]{64}$/i.test(String(args.expectedSha256))) throw new Error('expectedSha256 must be a SHA-256 hex digest.');
+  const destinationRelativePath = normalizeRelativePath(args.destinationRelativePath);
+  const destination = managedContained('sourceAssets', destinationRelativePath);
+  await assertNearestManagedParent('sourceAssets', dirname(destination));
+  await mkdir(dirname(destination), { recursive: true });
+  const requiredFreeBytes = Math.max(args.minimumFreeSpaceBytes,
+    Number.isSafeInteger(executionIntent?.minimumFreeSpaceBytes) ? Number(executionIntent!.minimumFreeSpaceBytes) : 0);
+  const free = await statfs(canonicalManagedRoots.sourceAssets);
+  const freeBytes = Number(free.bavail) * Number(free.bsize);
+  if (!Number.isSafeInteger(freeBytes) || freeBytes < requiredFreeBytes) {
+    throw new Error(`Managed source volume has ${freeBytes} bytes free; ${requiredFreeBytes} bytes are required before download.`);
+  }
+
+  const reused = await reusableDownloadedSource(destination, String(args.url), args.expectedSha256, args.maxBytes);
+  if (reused) return reused;
+
+  const partial = `${destination}.partial`;
+  let partialBytes = 0;
+  try { partialBytes = (await stat(partial)).size; } catch { /* new download */ }
+  if (partialBytes > args.maxBytes) throw new Error('Existing partial download exceeds maxBytes.');
+  if (args.maxBytes - partialBytes > freeBytes - requiredFreeBytes) {
+    throw new Error(`HTTPS fetch maxBytes would consume the required free-space reserve (${args.maxBytes - partialBytes} > ${freeBytes - requiredFreeBytes}).`);
+  }
+  let url = await assertPublicHttpsUrl(String(args.url));
+  let response: Response | undefined;
+  for (let redirects = 0; redirects <= 5; redirects += 1) {
+    response = await fetch(url, { redirect: 'manual', headers: partialBytes > 0 ? { Range: `bytes=${partialBytes}-` } : undefined });
+    if ([301, 302, 303, 307, 308].includes(response.status)) {
+      const location = response.headers.get('location');
+      if (!location) throw new Error(`HTTPS source returned redirect ${response.status} without Location.`);
+      url = await assertPublicHttpsUrl(new URL(location, url).toString());
+      continue;
+    }
+    break;
+  }
+  if (!response || [301, 302, 303, 307, 308].includes(response.status)) throw new Error('HTTPS source exceeded five redirects.');
+  if (response.status === 416 && partialBytes > 0) {
+    await rm(partial, { force: true });
+    return fetchHttpsSource({ ...args, url: url.toString() });
+  }
+  if (!response.ok) throw new Error(`HTTPS source returned ${response.status} ${response.statusText}.`);
+  const append = response.status === 206 && partialBytes > 0;
+  if (!append) partialBytes = 0;
+  const contentLength = Number(response.headers.get('content-length') ?? '0');
+  if (Number.isFinite(contentLength) && contentLength > 0 && partialBytes + contentLength > args.maxBytes) {
+    throw new Error(`HTTPS source would exceed maxBytes (${partialBytes + contentLength} > ${args.maxBytes}).`);
+  }
+  if (!response.body) throw new Error('HTTPS source returned no response body.');
+  const handle = await open(partial, append ? 'a' : 'w');
+  let sizeBytes = partialBytes;
+  try {
+    for await (const chunk of response.body as any) {
+      const bytes = Buffer.from(chunk);
+      sizeBytes += bytes.length;
+      if (sizeBytes > args.maxBytes) throw new Error(`HTTPS source exceeded maxBytes (${args.maxBytes}).`);
+      await handle.write(bytes);
+    }
+  } finally { await handle.close(); }
+  const sha256 = await fileSha256(partial);
+  if (args.expectedSha256 && sha256 !== String(args.expectedSha256).toLowerCase()) {
+    await rm(partial, { force: true });
+    throw new Error(`HTTPS source SHA-256 mismatch: expected ${args.expectedSha256}, received ${sha256}.`);
+  }
+  await rm(destination, { force: true });
+  await rename(partial, destination);
+  const provenance = {
+    schemaVersion: 1, sourceUrl: String(args.url), finalUrl: url.toString(), destinationRelativePath,
+    sizeBytes, sha256, etag: response.headers.get('etag'), lastModified: response.headers.get('last-modified'),
+    downloadedAt: new Date().toISOString()
+  };
+  await writeFile(`${destination}.provenance.json`, `${JSON.stringify(provenance, null, 2)}\n`, 'utf8');
+  return provenance;
+}
+
+async function reusableDownloadedSource(
+  destination: string,
+  sourceUrl: string,
+  expectedSha256: unknown,
+  maxBytes: number
+): Promise<Record<string, unknown> | undefined> {
+  try {
+    const info = await stat(destination);
+    if (!info.isFile() || info.size > maxBytes) return undefined;
+    const provenance = JSON.parse(await readFile(`${destination}.provenance.json`, 'utf8')) as Record<string, unknown>;
+    if (provenance.sourceUrl !== sourceUrl || provenance.sizeBytes !== info.size || typeof provenance.sha256 !== 'string') return undefined;
+    const sha256 = await fileSha256(destination);
+    if (sha256 !== provenance.sha256 || (expectedSha256 && sha256 !== String(expectedSha256).toLowerCase())) return undefined;
+    return { ...provenance, reused: true };
+  } catch {
+    return undefined;
+  }
+}
+
+async function assertPublicHttpsUrl(value: string): Promise<URL> {
+  const url = new URL(value);
+  if (url.protocol !== 'https:' || url.username || url.password) throw new Error('Only credential-free HTTPS source URLs are allowed.');
+  const addresses = await lookup(url.hostname, { all: true, verbatim: true });
+  if (addresses.length === 0 || addresses.some(({ address }) => isPrivateAddress(address))) throw new Error('HTTPS source resolves to a local or private address.');
+  return url;
+}
+
+function isPrivateAddress(address: string): boolean {
+  const normalized = address.toLowerCase();
+  if (normalized === '::1' || normalized === '::' || normalized.startsWith('fe80:') || normalized.startsWith('fc') || normalized.startsWith('fd')) return true;
+  const mapped = normalized.match(/^::ffff:(\d+\.\d+\.\d+\.\d+)$/)?.[1];
+  const ipv4 = mapped ?? (/^\d+\.\d+\.\d+\.\d+$/.test(normalized) ? normalized : undefined);
+  if (!ipv4) return false;
+  const parts = ipv4.split('.').map(Number);
+  return parts[0] === 0 || parts[0] === 10 || parts[0] === 127 || parts[0]! >= 224
+    || (parts[0] === 169 && parts[1] === 254) || (parts[0] === 172 && parts[1]! >= 16 && parts[1]! <= 31)
+    || (parts[0] === 192 && parts[1] === 168);
 }
 
 async function runProcess(checkId: string, command: string, shell: 'powershell' | 'cmd' | 'system', authoring?: Record<string, unknown>,

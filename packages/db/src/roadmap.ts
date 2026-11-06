@@ -86,7 +86,8 @@ export async function startNextRoadmapStep(
         stepTitle: nextStep.title,
         stepDescription: nextStep.description,
         acceptanceCriteria: nextStep.acceptanceCriteria,
-        deliverables: nextStep.deliverables
+        deliverables: nextStep.deliverables,
+        executionIntent: nextStep.executionIntent
       }),
       acceptanceCriteria: nextStep.acceptanceCriteria,
       mode: project.defaultTaskMode ?? 'safe',
@@ -99,6 +100,7 @@ export function buildRoadmapStepTaskPrompt(input: {
   stepDescription: string;
   acceptanceCriteria: string[];
   deliverables?: string[];
+  executionIntent?: ProjectImplementationStep['executionIntent'];
 }): string {
   const lines = [
     'Implementation step:',
@@ -109,6 +111,9 @@ export function buildRoadmapStepTaskPrompt(input: {
 
   if (input.deliverables?.length) {
     lines.push('', 'Required deliverables:', ...input.deliverables.map((deliverable) => `- ${deliverable}`));
+  }
+  if (input.executionIntent) {
+    lines.push('', 'Execution intent:', JSON.stringify(input.executionIntent));
   }
   if (input.acceptanceCriteria.length > 0) {
     lines.push('', 'Acceptance Criteria:');

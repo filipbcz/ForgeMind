@@ -1,5 +1,6 @@
 import type { IsoDateString, JsonValue } from '@forgemind/shared';
 import type { ProviderKind, TaskModelSelection, ValidationCheckCategory } from './model.js';
+import { normalizeTaskExecutionIntent, type TaskExecutionIntent } from './task-execution.js';
 
 export const WINDOWS_WORKER_SCHEMA_VERSION = 1 as const;
 export type WindowsWorkerSchemaVersion = typeof WINDOWS_WORKER_SCHEMA_VERSION;
@@ -259,6 +260,7 @@ export interface WindowsAuthoringPacket {
   artifactRoot: string;
   /** Server-selected task route. The runner must use this model for native authoring. */
   modelRoute?: TaskModelSelection;
+  executionIntent?: TaskExecutionIntent;
   /** The complete, current implementation step. No roadmap or prior task context is
    * available to the native implementation provider. */
   step: { prompt: string; acceptanceCriteria: string[]; previousValidationError?: string; previousReviewBlockers?: string[]; priorPatch?: string;
@@ -306,7 +308,8 @@ export interface WindowsAuthoringResult {
   /** Authenticates the complete binary Git patch transported to the server. */
   resultBundle: { version: 1; format: 'git-binary-patch'; sha256: string; sizeBytes: number;
     lfsObjects: Array<{ oid: string; sha256: string; sizeBytes: number; contentBase64?: string; blobSha256?: string }>;
-    outputs: Array<{ path: string; sha256: string; sizeBytes: number; contentBase64?: string; blobSha256?: string }> };
+    outputs: Array<{ path: string; sha256: string; sizeBytes: number; contentBase64?: string; blobSha256?: string }>;
+    persistentOutputs?: Array<{ path: string; sha256: string; sizeBytes: number; fileCount: number }> };
   tree: AuthoringTreeEntry[];
   /** Binary-safe Git patch used by the server-side review and delivery lifecycle. */
   patch: string;
@@ -665,6 +668,7 @@ export function isWindowsAuthoringPacket(value: unknown): value is WindowsAuthor
     || !Number.isSafeInteger(value.contentPolicy.maxUnclassifiedFileBytes) || (value.contentPolicy.maxUnclassifiedFileBytes as number) <= 0
     || (value.modelRoute !== undefined && (!isRecord(value.modelRoute) || !isNonEmpty(value.modelRoute.model)
       || !['low', 'medium', 'high', 'xhigh', 'max'].includes(value.modelRoute.reasoningEffort as string)))
+    || (value.executionIntent !== undefined && !normalizeTaskExecutionIntent(value.executionIntent))
     || !isRecord(value.step) || !isNonEmpty(value.step.prompt) || !Array.isArray(value.step.acceptanceCriteria)
     || !value.step.acceptanceCriteria.every(isNonEmpty)
     || (value.step.previousValidationError !== undefined && typeof value.step.previousValidationError !== 'string')
@@ -753,6 +757,10 @@ export function windowsAuthoringResultValidationIssues(value: unknown): WindowsA
       && isSafeRelativePath(output.path) && isSha256(output.sha256) && Number.isSafeInteger(output.sizeBytes) && (output.sizeBytes as number) >= 0
       && ((typeof output.contentBase64 === 'string' && /^[A-Za-z0-9+/]*={0,2}$/.test(output.contentBase64)
         && output.blobSha256 === undefined) || (output.contentBase64 === undefined && output.blobSha256 === output.sha256)))
+    && (value.resultBundle.persistentOutputs === undefined || (Array.isArray(value.resultBundle.persistentOutputs)
+      && value.resultBundle.persistentOutputs.every((output) => isRecord(output) && isSafeRelativePath(output.path)
+        && isSha256(output.sha256) && Number.isSafeInteger(output.sizeBytes) && (output.sizeBytes as number) >= 0
+        && Number.isSafeInteger(output.fileCount) && (output.fileCount as number) >= 1)))
   )) issues.push('result-bundle');
   if (!(isRecord(value.resultBundle) && typeof value.patch === 'string'
     && ((value.patchBlobSha256 === undefined && new TextEncoder().encode(value.patch).byteLength === value.resultBundle.sizeBytes)

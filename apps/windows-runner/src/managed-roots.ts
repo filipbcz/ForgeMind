@@ -7,6 +7,7 @@ export interface WindowsManagedRoots {
   sourceAssets: string;
   cache: string;
   outputs: string;
+  projectData: string;
   diagnostics: string;
 }
 
@@ -17,7 +18,7 @@ export async function prepareWindowsManagedRoots(baseRoot: string): Promise<Wind
   const base = resolve(baseRoot);
   const roots = {
     work: join(base, 'work'), inputs: join(base, 'inputs'), sourceAssets: join(base, 'source-assets'),
-    cache: join(base, 'cache'), outputs: join(base, 'outputs'), diagnostics: join(base, 'diagnostics')
+    cache: join(base, 'cache'), outputs: join(base, 'outputs'), projectData: join(base, 'project-data'), diagnostics: join(base, 'diagnostics')
   };
   await Promise.all(Object.values(roots).map((path) => mkdir(path, { recursive: true })));
   const canonicalBase = await realpath(base);
@@ -29,8 +30,9 @@ export async function prepareWindowsManagedRoots(baseRoot: string): Promise<Wind
   return canonical;
 }
 
-/** Never removes work before the server confirms import. Persistent inputs and
- * source assets are never swept; cache and diagnostics use independent ages. */
+/** Never removes work before the server confirms import. Persistent inputs,
+ * source assets, and project data are never swept; cache and diagnostics use
+ * independent ages. */
 export async function cleanupAcceptedWindowsAuthoring(roots: WindowsManagedRoots, taskId: string, retentionDays = 14, now = Date.now()): Promise<void> {
   if (!taskId || taskId.includes('/') || taskId.includes('\\') || taskId === '..') throw new Error('Invalid managed task id.');
   await Promise.all([rm(join(roots.work, taskId), { recursive: true, force: true }), rm(join(roots.outputs, taskId), { recursive: true, force: true })]);

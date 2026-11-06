@@ -5,4 +5,5 @@ export * from './redaction.js';
 export * from './roadmap-generation.js';
 export * from './specification-review.js';
 export * from './state-machine.js';
+export * from './task-execution.js';
 export * from './windows-worker.js';

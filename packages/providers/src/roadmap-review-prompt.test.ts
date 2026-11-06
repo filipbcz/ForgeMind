@@ -56,7 +56,7 @@ describe('roadmap quality review prompt', () => {
     expect(prompt).toContain('existing repository components');
     expect(prompt).toContain('Reject self-referential commit-chasing steps');
     expect(prompt).toContain('A different HEAD alone is not an implementation gap');
-    expect(ROADMAP_QUALITY_CRITERIA).toHaveLength(7);
+    expect(ROADMAP_QUALITY_CRITERIA).toHaveLength(9);
   });
 
   it('rejects review without commit-bound repository evidence', () => {

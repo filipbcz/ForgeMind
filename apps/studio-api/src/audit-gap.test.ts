@@ -13,6 +13,10 @@ vi.mock('@forgemind/github', async (original) => ({ ...await original<object>(),
 
 const auditSha = 'a'.repeat(40);
 const currentSha = 'b'.repeat(40);
+const repositoryExecutionIntent = {
+  executor: 'linux' as const, requiredCapabilities: [], artifactKinds: ['repository' as const], networkAccess: 'none' as const,
+  requiresUnrealAuthoring: false, persistentOutputPaths: [], minimumFreeSpaceBytes: 0
+};
 const apps: ReturnType<typeof Fastify>[] = [];
 afterEach(async () => { await Promise.all(apps.splice(0).map(app => app.close())); vi.clearAllMocks(); });
 
@@ -32,7 +36,8 @@ function fixture() {
     steps: [{
       title: 'Correct documentation references', description: 'Replace invalid references without runtime changes.',
       acceptanceCriteria: ['References exist.'], requirementIds: ['REQ-DOCS'], deliverables: ['Corrected documentation'],
-      changeRationale: 'References are invalid.', dependsOnStepTitles: [], validationFocus: ['regression']
+      changeRationale: 'References are invalid.', dependsOnStepTitles: [], validationFocus: ['regression'],
+      executionIntent: repositoryExecutionIntent
     }]
   };
   const job = { id: 'audit', cycleId: 'cycle', status: 'succeeded', gapProposalStatus: 'proposed', gapProposal,

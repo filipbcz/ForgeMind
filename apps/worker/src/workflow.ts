@@ -276,7 +276,7 @@ export async function runWorkerTask(input: WorkerTaskInput): Promise<WorkerTaskR
   if (
     completedSatisfactionReview
     && input.resume?.validation?.passed
-    && !requiresPullRequestIntegration(config, input.project)
+    && !requiresPullRequestIntegration(config, input.project, input.task)
   ) {
     const currentInputHash = await collectSatisfactionReviewInputHash(
       git,
@@ -370,6 +370,10 @@ export async function runWorkerTask(input: WorkerTaskInput): Promise<WorkerTaskR
   const resolvedReviewBlockers = new Set<string>();
   const failedReviewStates = new Set<string>();
   const correctionOccurrences = new Map<string, number>();
+  const reviewBlockerOccurrences = new Map<string, number>();
+  if (input.resume?.previousReviewBlockers?.length) {
+    reviewBlockerOccurrences.set(reviewBlockerFingerprint(input.resume.previousReviewBlockers), 1);
+  }
   let completedAttempts = 0;
   let review: ReviewResult | undefined = input.resume?.previousReviewBlockers?.length
       ? {
@@ -890,7 +894,7 @@ export async function runWorkerTask(input: WorkerTaskInput): Promise<WorkerTaskR
       }
 
       if (review.blockers.length === 0) {
-        if (satisfactionReview && !requiresPullRequestIntegration(config, input.project)) {
+        if (satisfactionReview && !requiresPullRequestIntegration(config, input.project, input.task)) {
           const summary = review.summary.trim() || implementation.summary.trim() || 'Existing implementation satisfies the task.';
           await emitTaskActivity(input.hooks, {
             phase: 'completion',
@@ -949,6 +953,17 @@ export async function runWorkerTask(input: WorkerTaskInput): Promise<WorkerTaskR
       }
       failedReviewStates.add(reviewInputHash);
 
+      const blockerFingerprint = reviewBlockerFingerprint(review.blockers);
+      const blockerOccurrences = (reviewBlockerOccurrences.get(blockerFingerprint) ?? 0) + 1;
+      reviewBlockerOccurrences.set(blockerFingerprint, blockerOccurrences);
+      if (blockerOccurrences >= 2) {
+        const summary = `Independent review reported the same blockers after a correction attempt; ForgeMind stopped instead of spending on another unchanged retry: ${review.blockers.join('; ')}`;
+        await emitTaskActivity(input.hooks, { phase: 'review', state: 'failed', title: 'Review se zastavilo po opakovaném blockeru',
+          detail: summary, operation: 'provider_review', attempt });
+        return { taskId: input.task.id, status: 'failed', issueUrl: issue.issueUrl, branchName, workspacePath,
+          validation, externalValidationChecks, summary, completedAt: nowIso() };
+      }
+
       retryReasons.push(`Review retry before attempt ${attempt + 1}: ${review.blockers.join('; ')}`);
       await input.hooks?.onStatus?.('running_ai', {
         attempt: attempt + 1,
@@ -965,6 +980,12 @@ export async function runWorkerTask(input: WorkerTaskInput): Promise<WorkerTaskR
     });
   }
 
+}
+
+function reviewBlockerFingerprint(blockers: string[]): string {
+  return createHash('sha256')
+    .update(blockers.map((blocker) => blocker.replace(/\s+/g, ' ').trim().toLowerCase()).sort().join('\n'))
+    .digest('hex');
 }
 
 function describeValidationCheckActivity(
@@ -1766,8 +1787,9 @@ function describeExternalEffectForAudit(operation: GitHubOperation | 'commit'): 
   }
 }
 
-function requiresPullRequestIntegration(config: WorkerConfig, project: Project): boolean {
-  return config.createPullRequest && Boolean(project.githubOwner && project.githubRepo);
+function requiresPullRequestIntegration(config: WorkerConfig, project: Project, task: ForgeTask): boolean {
+  const repositoryArtifactRequired = task.executionIntent?.artifactKinds.includes('repository') ?? true;
+  return repositoryArtifactRequired && config.createPullRequest && Boolean(project.githubOwner && project.githubRepo);
 }
 
 async function emitTaskActivity(hooks: WorkerTaskHooks | undefined, activity: TaskActivity): Promise<void> {

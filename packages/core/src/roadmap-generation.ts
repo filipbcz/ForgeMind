@@ -1,4 +1,5 @@
 import type { ProjectArchitectureUpdate, ProjectContract, ProjectContractDelta } from './model.js';
+import type { TaskExecutionIntent } from './task-execution.js';
 
 export interface ImplementationStepPlan {
   title: string;
@@ -11,6 +12,7 @@ export interface ImplementationStepPlan {
   changeRationale: string;
   dependsOnStepTitles: string[];
   validationFocus: Array<'implementation' | 'migration' | 'compatibility' | 'regression'>;
+  executionIntent?: TaskExecutionIntent;
 }
 
 /** Provider-neutral candidate; raw provider prompts/responses are not checkpoint data. */

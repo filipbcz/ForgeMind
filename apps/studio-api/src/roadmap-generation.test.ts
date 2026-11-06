@@ -9,7 +9,11 @@ import { beginRoadmapRequest } from './routes.js';
 const step: ImplementationStepPlan = {
   title: 'Implement export', description: 'Export records.', acceptanceCriteria: ['Records can be exported.'],
   inScope: ['Export'], outOfScope: [], requirementIds: ['REQ-EXPORT'], deliverables: ['Export module'],
-  changeRationale: 'Add the approved export capability.', dependsOnStepTitles: [], validationFocus: ['implementation']
+  changeRationale: 'Add the approved export capability.', dependsOnStepTitles: [], validationFocus: ['implementation'],
+  executionIntent: {
+    executor: 'linux', requiredCapabilities: [], artifactKinds: ['repository'], networkAccess: 'none',
+    requiresUnrealAuthoring: false, persistentOutputPaths: [], minimumFreeSpaceBytes: 0
+  }
 };
 const plan: PlanResult = { summary: 'Export', steps: [], acceptanceCriteria: [], implementationSteps: [step] };
 const projectContract = { version: 1, summary: 'Export', invariants: [], prohibitedSubstitutes: [], requirements: [], releaseCriteria: [] };
@@ -102,9 +106,12 @@ describe('resumable roadmap correction', () => {
     expect(repaired.contractDelta).toMatchObject({ baseVersion: 1, removeRequirements: [{ id: 'REQ-APPROVAL' }] });
   });
 
-  it('continues beyond two quality repairs and keeps every independent review outcome', async () => {
+  it('continues while independent review reports materially different blockers', async () => {
     const f = fixture();
-    f.reviewRoadmap.mockResolvedValueOnce(rejected).mockResolvedValueOnce(rejected).mockResolvedValueOnce(rejected);
+    f.reviewRoadmap
+      .mockResolvedValueOnce({ ...rejected, blockers: ['First focused blocker.'] })
+      .mockResolvedValueOnce({ ...rejected, blockers: ['Second focused blocker.'] })
+      .mockResolvedValueOnce({ ...rejected, blockers: ['Third focused blocker.'] });
     const result = await buildReviewedImplementationStepBlueprints(f.input);
     expect(result.qualityReview.verdict).toBe('satisfied');
     expect(f.repairRoadmap).toHaveBeenCalledTimes(3);
@@ -112,6 +119,15 @@ describe('resumable roadmap correction', () => {
     expect(f.history.filter(s => s.qualityReview?.verdict === 'not_satisfied')).toHaveLength(3);
     expect(f.history.at(-1)).toMatchObject({ phase: 'ready', revision: 3 });
     for (const [reviewInput] of f.reviewRoadmap.mock.calls) expect(reviewInput).not.toHaveProperty('session');
+  });
+
+  it('stops after independent review repeats the same blocker following targeted repair', async () => {
+    const f = fixture();
+    f.reviewRoadmap.mockResolvedValue(rejected);
+    await expect(buildReviewedImplementationStepBlueprints(f.input)).rejects.toThrow('FORGEMIND_ROADMAP_NO_PROGRESS');
+    expect(f.repairRoadmap).toHaveBeenCalledTimes(1);
+    expect(f.reviewRoadmap).toHaveBeenCalledTimes(2);
+    expect(f.history.at(-1)).toMatchObject({ phase: 'repair', validationError: expect.stringContaining('FORGEMIND_ROADMAP_NO_PROGRESS') });
   });
 
   it('continues beyond two structural repairs', async () => {
