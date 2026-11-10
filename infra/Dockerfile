@@ -26,6 +26,7 @@ RUN npm ci
 
 COPY apps apps
 COPY packages packages
+COPY scripts scripts
 
 RUN find apps packages -name '*.tsbuildinfo' -delete \
   && npm run build
