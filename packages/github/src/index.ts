@@ -6,6 +6,130 @@ import { join } from 'node:path';
 import { createHash } from 'node:crypto';
 import type { ForgeTask, Project } from '@forgemind/core';
 
+export const REPOSITORY_BASELINE_EVIDENCE_MAX_CHARS = 220_000;
+const REPOSITORY_BASELINE_INVENTORY_MAX_CHARS = 60_000;
+const REPOSITORY_BASELINE_FILE_MAX_CHARS = 6_000;
+
+const embeddedTextExtensions = new Set([
+  '', '.c', '.cc', '.cmake', '.cpp', '.cs', '.css', '.csv', '.h', '.hpp', '.html', '.ini', '.java', '.js',
+  '.json', '.jsx', '.md', '.mjs', '.ps1', '.py', '.rs', '.sh', '.sql', '.toml', '.ts', '.tsx', '.txt',
+  '.uplugin', '.uproject', '.xml', '.yaml', '.yml'
+]);
+const excludedBasenames = new Set([
+  'package-lock.json', 'pnpm-lock.yaml', 'yarn.lock', 'bun.lock', 'bun.lockb'
+]);
+
+function evidencePathPriority(path: string): number {
+  const normalized = path.replaceAll('\\', '/').toLowerCase();
+  const basename = normalized.split('/').at(-1) ?? normalized;
+  if (basename.startsWith('readme') || basename.startsWith('architecture') || basename.startsWith('specification')) return 0;
+  if (['package.json', 'cmakelists.txt', 'dockerfile', 'docker-compose.yml', 'docker-compose.yaml'].includes(basename)
+    || normalized.endsWith('.uproject') || normalized.endsWith('.uplugin')) return 1;
+  if (/(^|\/)(src|source|apps|packages|tools|config|data_pipeline|core_sim)(\/|$)/.test(normalized)) return 2;
+  if (/(^|\/)(test|tests|spec|specs)(\/|$)|\.(test|spec)\./.test(normalized)) return 3;
+  if (/(^|\/)docs?(\/|$)/.test(normalized)) return 4;
+  return 5;
+}
+
+function shouldEmbedRepositoryFile(path: string): boolean {
+  const normalized = path.replaceAll('\\', '/').toLowerCase();
+  const parts = normalized.split('/');
+  const basename = parts.at(-1) ?? normalized;
+  if (excludedBasenames.has(basename)) return false;
+  if (parts.some((part) => ['node_modules', 'intermediate', 'binaries', 'saved', 'deriveddatacache',
+    '__pycache__', 'vendor', 'third_party', '.forgemind-outputs'].includes(part))) return false;
+  if (/(^|\/)(reports?|screenshots?|artifacts?|coverage)(\/|$)/.test(normalized)) return false;
+  if (/(^|\/)(\.env|credentials?|secrets?)(\.|\/|$)/.test(normalized)
+    || /\.(pem|p12|pfx|key)$/.test(normalized)) return false;
+  const extensionIndex = basename.lastIndexOf('.');
+  const extension = extensionIndex >= 0 ? basename.slice(extensionIndex) : '';
+  return embeddedTextExtensions.has(extension);
+}
+
+function boundedInventory(paths: string[]): string {
+  const heading = `Tracked path inventory (${paths.length} files):\n`;
+  const selected: string[] = [];
+  let length = heading.length;
+  for (const path of fairlyOrderedEvidencePaths(paths)) {
+    if (length + path.length + 1 > REPOSITORY_BASELINE_INVENTORY_MAX_CHARS) break;
+    selected.push(path);
+    length += path.length + 1;
+  }
+  const omitted = paths.length - selected.length;
+  return `${heading}${selected.join('\n')}${omitted > 0 ? `\n[${omitted} additional tracked paths omitted from the prompt inventory]` : ''}`;
+}
+
+function boundedFileExcerpt(content: string): string {
+  if (content.length <= REPOSITORY_BASELINE_FILE_MAX_CHARS) return content;
+  const headLength = Math.ceil(REPOSITORY_BASELINE_FILE_MAX_CHARS * 0.7);
+  const tailLength = REPOSITORY_BASELINE_FILE_MAX_CHARS - headLength;
+  return `${content.slice(0, headLength)}\n[... file excerpt truncated ...]\n${content.slice(-tailLength)}`;
+}
+
+function fairlyOrderedEvidencePaths(paths: string[]): string[] {
+  const result: string[] = [];
+  const priorities = new Map<number, Map<string, string[]>>();
+  for (const path of paths) {
+    const priority = evidencePathPriority(path);
+    const root = path.replaceAll('\\', '/').split('/')[0]?.toLowerCase() ?? '';
+    const roots = priorities.get(priority) ?? new Map<string, string[]>();
+    const queue = roots.get(root) ?? [];
+    queue.push(path);
+    roots.set(root, queue);
+    priorities.set(priority, roots);
+  }
+  for (const priority of [...priorities.keys()].sort((left, right) => left - right)) {
+    const roots = priorities.get(priority)!;
+    const rootNames = [...roots.keys()].sort();
+    for (const queue of roots.values()) queue.sort();
+    for (;;) {
+      let added = false;
+      for (const root of rootNames) {
+        const path = roots.get(root)?.shift();
+        if (!path) continue;
+        result.push(path);
+        added = true;
+      }
+      if (!added) break;
+    }
+  }
+  return result;
+}
+
+/** A deterministic, commit-bound prompt view. The checkout itself remains complete for native tools. */
+export async function buildBoundedRepositoryEvidence(
+  repositoryPath: string,
+  commitSha: string,
+  paths: string[],
+  maxChars = REPOSITORY_BASELINE_EVIDENCE_MAX_CHARS
+): Promise<string> {
+  const normalizedPaths = [...paths].sort();
+  const sections = [
+    `Commit-bound repository evidence at ${commitSha}. The read-only checkout contains ${normalizedPaths.length} tracked files.`,
+    boundedInventory(normalizedPaths)
+  ];
+  let currentLength = sections.join('\n\n').length;
+  let embedded = 0;
+  let eligible = 0;
+  const prioritized = fairlyOrderedEvidencePaths(normalizedPaths.filter(shouldEmbedRepositoryFile));
+
+  for (const path of prioritized) {
+    const content = await readFile(join(repositoryPath, path));
+    if (content.includes(0)) continue;
+    eligible += 1;
+    const excerpt = boundedFileExcerpt(content.toString('utf8'));
+    const section = `--- ${path} (${content.length} bytes, sha256=${createHash('sha256').update(content).digest('hex')}) ---\n${excerpt}`;
+    if (currentLength + section.length + 2 > maxChars) continue;
+    sections.push(section);
+    currentLength += section.length + 2;
+    embedded += 1;
+  }
+
+  const footer = `Prompt evidence embedded ${embedded} of ${eligible} eligible text files. Omitted files remain bound by commit ${commitSha} and are available in the complete read-only checkout to native providers.`;
+  if (currentLength + footer.length + 2 <= maxChars) sections.push(footer);
+  return sections.join('\n\n').slice(0, maxChars);
+}
+
 export interface CreateIssueInput {
   project: Project;
   task: ForgeTask;
@@ -70,14 +194,8 @@ export async function prepareReadOnlyRepositoryBaseline(
     const git = simpleGit({ baseDir: repositoryPath });
     const commitSha = (await git.revparse(['HEAD'])).trim();
     const paths = (await git.raw(['ls-files', '-z'])).split('\0').filter(Boolean).sort();
-    const sections = [`Complete repository snapshot at ${commitSha} (${paths.length} tracked files):\n${paths.join('\n')}`];
-    for (const path of paths) {
-      const content = await readFile(join(repositoryPath, path));
-      sections.push(content.includes(0)
-        ? `--- ${path} ---\n[binary: ${content.length} bytes, sha256=${createHash('sha256').update(content).digest('hex')}]`
-        : `--- ${path} ---\n${content.toString('utf8')}`);
-    }
-    return { repositoryPath, commitSha, evidence: sections.join('\n\n'), cleanup: () => rm(repositoryPath, { recursive: true, force: true }) };
+    const evidence = await buildBoundedRepositoryEvidence(repositoryPath, commitSha, paths);
+    return { repositoryPath, commitSha, evidence, cleanup: () => rm(repositoryPath, { recursive: true, force: true }) };
   } catch (error) {
     await rm(repositoryPath, { recursive: true, force: true });
     throw error;
