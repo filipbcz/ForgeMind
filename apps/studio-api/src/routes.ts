@@ -36,6 +36,7 @@ import { registerNotificationRoutes } from './routes/notification-routes.js';
 import { registerChatRoutes } from './routes/chat-routes.js';
 import { registerWorkerRoutes } from './routes/worker-routes.js';
 import { registerWindowsRunnerRoutes } from './routes/windows-runner-routes.js';
+import { createStudioProviderPool, type StudioProviderCandidate } from './provider-pool.js';
 
 export { repairRoadmapOnce, buildImplementationStepBlueprintsWithRepairs, buildReviewedImplementationStepBlueprints } from './roadmap-generation.js';
 
@@ -1089,12 +1090,13 @@ export function registerRoutes(
         return reply.code(409).send({ error: 'The audit proposal is not ready for activation. Wait for the current audit or activation to finish.' });
       }
       if (!project.projectContract) throw new Error('A current project contract is required before audit gaps can be activated.');
-      const connection = project.aiProviderConnectionId
-        ? await readAIProviderConnectionSecretById(repository, project.aiProviderConnectionId)
-        : await readAIProviderConnectionSecret(repository);
-      if (!connection) throw new Error('Connect an AI provider before reviewing audit gaps.');
+      const { provider } = await createProjectAIProviderPool(
+        repository,
+        project,
+        false,
+        'Connect an AI provider before reviewing audit gaps.'
+      );
       if (!project.githubOwner || !project.githubRepo) throw new Error('A connected repository is required for audit gap review.');
-      const provider = createProvider(connection.provider, buildProviderRuntimeConfig(connection, project));
       if (!provider.reviewRoadmap) throw new Error(`AI provider "${provider.kind}" does not support independent roadmap quality review.`);
       const githubConnection = await readGitHubConnectionSecret(repository);
       if (!githubConnection) throw new Error('Connect GitHub before reviewing audit gaps.');
@@ -1882,14 +1884,12 @@ export async function generateRoadmapPlan(
   saveCheckpoint: (checkpoint: RoadmapGenerationCheckpoint) => Promise<void>;
   assertCurrentSource: () => Promise<void>;
 }> {
-  const connection = project.aiProviderConnectionId
-    ? await readAIProviderConnectionSecretById(repository, project.aiProviderConnectionId)
-    : await readAIProviderConnectionSecret(repository);
-  if (!connection) {
-    throw new Error('Connect an AI provider before generating implementation steps.');
-  }
-
-  const provider = createProvider(connection.provider, buildProviderRuntimeConfig(connection, project));
+  const { connection, provider, session } = await createProjectAIProviderPool(
+    repository,
+    project,
+    true,
+    'Connect an AI provider before generating implementation steps.'
+  );
   const discoverBaseline = async () => {
     if (!project.githubOwner || !project.githubRepo) {
       throw new Error('A connected repository is required for commit-bound roadmap planning.');
@@ -1903,7 +1903,6 @@ export async function generateRoadmapPlan(
   const checkout = await discoverBaseline();
   try {
     const repositoryBaseline = { commitSha: checkout.commitSha, evidence: checkout.evidence };
-    let session = createProjectPlanningSession(repository, project, connection);
     const existingRoadmap = await repository.getProjectRoadmap(project.id);
     const completedSteps = existingRoadmap?.steps.filter((step) => step.status === 'completed').map((step) => step.title) ?? [];
     const unfinishedSteps = selectUnfinishedRoadmapSteps(existingRoadmap, sourceContractVersionId);
@@ -1968,7 +1967,7 @@ export async function generateRoadmapPlan(
     } catch (error) {
       signal?.throwIfAborted();
       if (!(error instanceof CodexExecutionTimeoutError) || !session.id) throw error;
-      session = createProjectPlanningSession(repository, project, connection, true);
+      session.id = undefined;
       plan = await provider.plan({ ...planInput, session });
     }
     const initial: RoadmapGenerationCheckpoint = { version: 1, phase: 'validate', revision: 0, plan };
@@ -2399,15 +2398,12 @@ async function generateExtensionProposal(
   project: Project,
   completedObjective: string
 ): Promise<string> {
-  const connection = project.aiProviderConnectionId
-    ? await readAIProviderConnectionSecretById(repository, project.aiProviderConnectionId)
-    : await readAIProviderConnectionSecret(repository);
-  if (!connection) {
-    throw new Error('Connect an AI provider before generating a project extension proposal.');
-  }
-
-  const provider = createProvider(connection.provider, buildProviderRuntimeConfig(connection, project));
-  const session = createProjectPlanningSession(repository, project, connection);
+  const { provider, session } = await createProjectAIProviderPool(
+    repository,
+    project,
+    true,
+    'Connect an AI provider before generating a project extension proposal.'
+  );
   const contract = project.projectContract;
   const specifications = await repository.getProjectSpecifications(project.id);
   const plan = await provider.plan({
@@ -2571,6 +2567,92 @@ async function readAIProviderConnection(repository: ForgeMindRepository) {
   return maybeRepository.getAIProviderConnection ? maybeRepository.getAIProviderConnection() : undefined;
 }
 
+async function createProjectAIProviderPool(
+  repository: ForgeMindRepository,
+  project: Project,
+  withPlanningSession: true,
+  missingConnectionMessage: string
+): Promise<{ connection: AIProviderConnectionSecret; provider: AIProvider; session: ProviderSessionContext }>;
+async function createProjectAIProviderPool(
+  repository: ForgeMindRepository,
+  project: Project,
+  withPlanningSession: false,
+  missingConnectionMessage: string
+): Promise<{ connection: AIProviderConnectionSecret; provider: AIProvider; session?: undefined }>;
+async function createProjectAIProviderPool(
+  repository: ForgeMindRepository,
+  project: Project,
+  withPlanningSession: boolean,
+  missingConnectionMessage: string
+): Promise<{ connection: AIProviderConnectionSecret; provider: AIProvider; session?: ProviderSessionContext }> {
+  const primary = project.aiProviderConnectionId
+    ? await readAIProviderConnectionSecretById(repository, project.aiProviderConnectionId)
+    : await readAIProviderConnectionSecret(repository);
+  if (!primary) throw new Error(missingConnectionMessage);
+
+  const available = await listAIProviderConnectionSecrets(repository);
+  const connections = [
+    primary,
+    ...available
+      .filter((connection) => connection.id !== primary.id
+        && connection.provider === primary.provider
+        && connection.automaticFailover)
+      .sort((left, right) => left.failoverPriority - right.failoverPriority
+        || left.connectedAt.localeCompare(right.connectedAt))
+  ];
+  const session: ProviderSessionContext | undefined = withPlanningSession ? {} : undefined;
+  if (session) replaceProjectPlanningSession(session, createProjectPlanningSession(repository, project, primary));
+  const connectionById = new Map(connections.map((connection) => [connection.id, connection]));
+  const candidates: StudioProviderCandidate[] = connections.map((connection) => {
+    const capabilities = createProvider(connection.provider, buildProviderRuntimeConfig(connection, project));
+    return {
+      id: connection.id,
+      label: connection.name,
+      kind: connection.provider,
+      capabilities,
+      create: async () => {
+        const refreshed = await readAIProviderConnectionSecretById(repository, connection.id);
+        if (!refreshed) throw new Error(`AI provider connection "${connection.name}" is no longer available.`);
+        if (refreshed.provider !== primary.provider) {
+          throw new Error(`AI provider connection "${connection.name}" changed provider while in use.`);
+        }
+        connectionById.set(refreshed.id, refreshed);
+        return createProvider(refreshed.provider, buildProviderRuntimeConfig(refreshed, project));
+      }
+    };
+  });
+  const provider = createStudioProviderPool({
+    candidates,
+    onConnectionSwitch: session ? (candidate) => {
+      const connection = connectionById.get(candidate.id);
+      if (!connection) throw new Error(`AI provider connection "${candidate.label}" is unavailable.`);
+      replaceProjectPlanningSession(session, createProjectPlanningSession(repository, project, connection));
+    } : undefined,
+    audit: async (event) => {
+      await repository.writeAudit({
+        actorType: 'system',
+        eventType: event.eventType,
+        projectId: project.id,
+        payload: JSON.parse(JSON.stringify(event.payload))
+      });
+    }
+  });
+  return { connection: primary, provider, session };
+}
+
+function replaceProjectPlanningSession(target: ProviderSessionContext, source: ProviderSessionContext): void {
+  const persist = source.onUpdate;
+  target.id = source.id;
+  target.provider = source.provider;
+  target.model = source.model;
+  target.onUpdate = async (update) => {
+    target.id = update.id;
+    target.provider = update.provider;
+    target.model = update.model;
+    await persist?.(update);
+  };
+}
+
 function buildProviderRuntimeConfig(connection: AIProviderConnectionSecret, project?: Pick<Project, 'configYaml'>): ProviderRuntimeConfig {
   if (connection.authMode === 'codex_oauth') {
     throw new Error(`Provider connection "${connection.id}" uses removed ChatGPT OAuth authentication. Replace it with an OpenAI API key connection.`);
@@ -2585,6 +2667,7 @@ function buildProviderRuntimeConfig(connection: AIProviderConnectionSecret, proj
   }
   return {
     apiKey: connection.apiKey,
+    accessToken: connection.accessToken,
     authMode: connection.authMode,
     model: connection.model,
     allowedModels: connection.allowedModels,
@@ -2651,6 +2734,15 @@ async function readAIProviderConnectionSecret(repository: ForgeMindRepository) {
     getAIProviderConnectionSecret?: ForgeMindRepository['getAIProviderConnectionSecret'];
   };
   return maybeRepository.getAIProviderConnectionSecret ? maybeRepository.getAIProviderConnectionSecret() : undefined;
+}
+
+async function listAIProviderConnectionSecrets(repository: ForgeMindRepository) {
+  const maybeRepository = repository as ForgeMindRepository & {
+    listAIProviderConnectionSecrets?: ForgeMindRepository['listAIProviderConnectionSecrets'];
+  };
+  return maybeRepository.listAIProviderConnectionSecrets
+    ? maybeRepository.listAIProviderConnectionSecrets()
+    : [];
 }
 
 async function readAIProviderConnectionSecretById(repository: ForgeMindRepository, connectionId: string) {

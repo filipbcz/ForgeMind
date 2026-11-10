@@ -49,6 +49,50 @@ function fixture() {
 }
 
 describe('roadmap draft resume context', () => {
+  it('fails roadmap planning over from an invalid API key to an eligible ChatGPT plan connection', async () => {
+    const f = fixture();
+    const primary = {
+      ...f.connection, provider: 'codex' as const, authMode: 'api_key' as const, apiKey: 'invalid-key',
+      name: 'API key', automaticFailover: false, failoverPriority: 0, connectedAt: '2026-01-01T00:00:00.000Z'
+    };
+    const fallback = {
+      ...primary, id: 'chatgpt-plan', name: 'ChatGPT plan', authMode: 'chatgpt_plan_oauth' as const,
+      apiKey: undefined, accessToken: 'oauth-access', automaticFailover: true, failoverPriority: 10,
+      connectedAt: '2026-01-02T00:00:00.000Z'
+    };
+    Object.assign(f.connection, primary);
+    Object.assign(f.repository, {
+      getAIProviderConnectionSecretById: vi.fn(async (id: string) => id === fallback.id ? fallback : primary),
+      listAIProviderConnectionSecrets: vi.fn(async () => [primary, fallback])
+    });
+    const primaryProvider = {
+      kind: 'codex',
+      plan: vi.fn(async () => { throw Object.assign(new Error('HTTP 401 Unauthorized'), { status: 401 }); })
+    } as unknown as AIProvider;
+    const fallbackProvider = {
+      kind: 'codex',
+      plan: vi.fn(async (input) => {
+        await input.session?.onUpdate?.({ id: 'fallback-thread', provider: 'codex', model: 'gpt-6.1-sol' });
+        return { summary: 'Candidate', steps: [], acceptanceCriteria: [], implementationSteps: [] };
+      })
+    } as unknown as AIProvider;
+    vi.mocked(createProvider).mockImplementation((_kind, config) =>
+      config?.accessToken ? fallbackProvider : primaryProvider);
+
+    const planning = await f.run();
+
+    expect(primaryProvider.plan).toHaveBeenCalledTimes(1);
+    expect(fallbackProvider.plan).toHaveBeenCalledTimes(1);
+    expect(planning.plan.summary).toBe('Candidate');
+    expect(f.repository.updateProjectPlanningSession).toHaveBeenCalledWith(expect.objectContaining({
+      projectId: f.project.id, sessionId: 'fallback-thread', connectionId: fallback.id
+    }));
+    expect(f.repository.writeAudit).toHaveBeenCalledWith(expect.objectContaining({
+      eventType: 'provider_fallback_used', projectId: f.project.id,
+      payload: expect.objectContaining({ fallbackConnectionId: fallback.id })
+    }));
+  });
+
   it('refuses planning when no commit-bound repository can be discovered', async () => {
     const f = fixture();
     f.project.githubOwner = undefined;
