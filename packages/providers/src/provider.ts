@@ -725,7 +725,7 @@ export function parseChatResult(content: string, operation: string): ChatResult 
 export function parseReviewResult(content: string, operation: string): ReviewResult {
   const value = parseProviderJsonObject(content, operation);
   requireString(value, 'summary', operation);
-  requireStringArray(value, 'blockers', operation);
+  value.blockers = normalizeReviewBlockers(value.blockers, operation);
   if (value.verdict !== 'satisfied' && value.verdict !== 'not_satisfied') {
     throw new ProviderContractError(`${operation} field "verdict" must be "satisfied" or "not_satisfied".`);
   }
@@ -748,6 +748,47 @@ export function parseReviewResult(content: string, operation: string): ReviewRes
     throw new ProviderContractError(`${operation} must return blockers with verdict "not_satisfied".`);
   }
   return value as unknown as ReviewResult;
+}
+
+function normalizeReviewBlockers(raw: unknown, operation: string): string[] {
+  if (!Array.isArray(raw)) {
+    throw new ProviderContractError(`${operation} field "blockers" must be an array of strings.`);
+  }
+
+  return raw.map((item) => {
+    if (typeof item === 'string') return item.trim();
+    if (!item || typeof item !== 'object' || Array.isArray(item)) {
+      throw new ProviderContractError(`${operation} field "blockers" must contain strings or structured blocker objects.`);
+    }
+
+    const blocker = item as Record<string, unknown>;
+    const preferredFields = [
+      'step', 'stepTitle', 'affectedStep', 'criterion', 'title',
+      'blocker', 'issue', 'problem', 'reason', 'message',
+      'correction', 'requiredCorrection', 'recommendation', 'action'
+    ];
+    const orderedFields = [
+      ...preferredFields.filter((field) => field in blocker),
+      ...Object.keys(blocker).filter((field) => !preferredFields.includes(field)).sort()
+    ];
+    const parts = orderedFields.flatMap((field) => {
+      const fieldValue = blocker[field];
+      if (typeof fieldValue === 'string' && fieldValue.trim()) {
+        return [`${field}: ${fieldValue.trim()}`];
+      }
+      if (Array.isArray(fieldValue)) {
+        const values = fieldValue.filter((entry): entry is string => typeof entry === 'string' && Boolean(entry.trim()));
+        if (values.length > 0 && values.length === fieldValue.length) {
+          return [`${field}: ${values.map((entry) => entry.trim()).join('; ')}`];
+        }
+      }
+      return [];
+    });
+    if (parts.length === 0) {
+      throw new ProviderContractError(`${operation} structured blocker must contain at least one non-empty string field.`);
+    }
+    return parts.join(' | ');
+  }).filter(Boolean);
 }
 
 function requireString(value: Record<string, unknown>, field: string, operation: string): void {

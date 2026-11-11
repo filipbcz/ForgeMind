@@ -60,6 +60,7 @@ export function buildRoadmapQualityReviewPrompt(input: RoadmapQualityReviewInput
     'A checked-in planning baseline may name a stable reviewed ancestor when later changes remain traceable through Git history or evidence lineage. A different HEAD alone is not an implementation gap.',
     'Return verdict "satisfied" only when every quality criterion below is met.',
     'Return verdict "not_satisfied" with concrete blockers when changes are required. Each blocker must name the affected step or missing step and state the exact correction needed.',
+    'The blockers field MUST be an array of plain strings, never objects. Put the affected step, issue, and exact correction together in each string.',
     'Do not report stylistic preferences or validation results as blockers.',
     '',
     'Quality criteria:',
