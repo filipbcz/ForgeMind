@@ -28,7 +28,7 @@ import { advanceRoadmapAfterTaskCompletion, buildRoadmapStepTaskPrompt, composeA
 import type { AIProviderConnectionKind, AIProviderConnectionSecret, ForgeMindRepository, WindowsRunnerCredentialAdapter, WindowsWorkerRepository } from '@forgemind/db';
 import { parseGitHubWebhookPayload, projectGitHubWebhookEvent, verifyGitHubWebhookSignature } from './webhook.js';
 import type { NotificationService } from './notifications.js';
-import { ROADMAP_GENERATION_CONFIRMATION, activeProjectContractRequirements, applyProjectContractDelta, assertTaskExecutionIntent, buildSpecificationChangeImpactReview, redactError, redactSecrets } from '@forgemind/core';
+import { ROADMAP_GENERATION_CONFIRMATION, activeProjectContractRequirements, applyProjectContractDelta, assertTaskExecutionIntent, buildSpecificationChangeImpactReview, normalizeTaskExecutionIntent, redactError, redactSecrets } from '@forgemind/core';
 import type { ProviderConnectionRuntimeStatus, RoadmapGenerationCheckpoint } from '@forgemind/core';
 import type { Project, ProjectArchitectureUpdate, ProjectContract, ProjectContractDelta, TaskExecutionIntent, TaskMode } from '@forgemind/core';
 import { readSessionId, registerAuthRoutes } from './routes/auth-routes.js';
@@ -1934,11 +1934,19 @@ export async function generateRoadmapPlan(
     };
     const checkpoint = await repository.getRoadmapGenerationCheckpoint(project.id, contextKey);
     if (checkpoint) {
-      const normalizedCheckpoint = { ...checkpoint, plan: normalizeRoadmapPlan(checkpoint.plan as PlanResult) };
+      const normalizedPlan = normalizeRoadmapPlan(checkpoint.plan as PlanResult);
+      const planChangedDuringNormalization = JSON.stringify(normalizedPlan) !== JSON.stringify(checkpoint.plan);
+      const normalizedCheckpoint: RoadmapGenerationCheckpoint = {
+        ...checkpoint,
+        plan: normalizedPlan,
+        ...(checkpoint.phase === 'repair' && planChangedDuringNormalization
+          ? { phase: 'validate', validationError: undefined }
+          : {})
+      };
       signal?.throwIfAborted();
       await repository.writeAudit({
         actorType: 'system', eventType: 'project_roadmap_generation_resumed', projectId: project.id,
-        payload: { contextKey, phase: checkpoint.phase, revision: checkpoint.revision }
+        payload: { contextKey, phase: normalizedCheckpoint.phase, revision: normalizedCheckpoint.revision }
       });
       return {
         plan: normalizedCheckpoint.plan, provider, session, completedSteps, unfinishedSteps, repositoryBaseline,
@@ -2087,7 +2095,7 @@ export function buildRoadmapPlanningPrompt(input: {
       'Every requirement id must use REQ-UPPERCASE format and describe one independently verifiable product capability, not an implementation layer.',
       'Each implementationSteps item must contain title, a distinct implementation-focused description, acceptanceCriteria, inScope, outOfScope, requirementIds, and concrete deliverables.',
       'Each implementationSteps item must also contain changeRationale, dependsOnStepTitles, validationFocus, and task-scoped executionIntent. Dependencies may reference only earlier step titles. validationFocus uses implementation, migration, compatibility, or regression.',
-      'executionIntent chooses linux or windows, exact requiredCapabilities, repository/persistent-data/unreal-assets/validation-evidence artifactKinds, none or https networkAccess, whether Unreal authoring is genuinely required, project-relative persistentOutputPaths, and minimumFreeSpaceBytes. Managed HTTPS acquisition and persistent project outputs currently require the Windows executor. Include https-download for HTTPS and disk-capacity whenever minimumFreeSpaceBytes is positive. Do not require Unreal assets for data acquisition, compilation, or source-only work.',
+      'executionIntent chooses linux or windows, exact locally probed requiredCapabilities, repository/persistent-data/unreal-assets/validation-evidence artifactKinds, none or https networkAccess, boolean requiresUnrealAuthoring, project-relative persistentOutputPaths, and non-negative minimumFreeSpaceBytes. Managed HTTPS acquisition and persistent project outputs currently require the Windows executor. Include https-download for HTTPS and disk-capacity whenever minimumFreeSpaceBytes is positive. Do not require Unreal assets for data acquisition, compilation, or source-only work. Never use machine-absolute paths, user/profile names as capabilities, bespoke artifact kind names, or aliases for requiresUnrealAuthoring.',
       'Every changeRationale must cite repository evidence for the concrete missing behavior and name existing components, modules, or interfaces that the implementation will reuse.',
       'Each implementation step must fit one focused pull request and cover at most three contract requirements. Split broad epics into multiple steps.',
       'Each implementation step may contain at most 3 deliverables, 5 acceptanceCriteria, and 5 inScope items.',
@@ -2288,18 +2296,42 @@ export function toImplementationStepBlueprints(
     throw new Error('AI provider did not return structured implementationSteps for the project roadmap.');
   }
 
+  const cleanStringList = (value: unknown): string[] => Array.isArray(value)
+    ? value.filter((item): item is string => typeof item === 'string').map((item) => item.trim()).filter(Boolean)
+    : [];
+  const structuralIssues = plan.implementationSteps.flatMap((step, index) => {
+    const missing = [
+      (typeof step.title !== 'string' || !step.title.trim()) && 'title',
+      (typeof step.description !== 'string' || !step.description.trim()) && 'description',
+      cleanStringList(step.acceptanceCriteria).length === 0 && 'acceptanceCriteria',
+      cleanStringList(step.inScope).length === 0 && 'inScope',
+      cleanStringList(step.requirementIds).length === 0 && 'requirementIds',
+      cleanStringList(step.deliverables).length === 0 && 'deliverables',
+      (typeof step.changeRationale !== 'string' || !step.changeRationale.trim()) && 'changeRationale'
+    ].filter((item): item is string => Boolean(item));
+    const issues: string[] = [];
+    if (missing.length > 0) issues.push(`step ${index + 1} is missing ${missing.join(', ')}`);
+    if (!normalizeTaskExecutionIntent(step.executionIntent)) {
+      issues.push(`step ${index + 1} executionIntent must use executor linux/windows, exact probed capability keys, artifactKinds limited to repository/persistent-data/unreal-assets/validation-evidence, networkAccess none/https, boolean requiresUnrealAuthoring, project-relative persistentOutputPaths, and a non-negative minimumFreeSpaceBytes with all cross-field constraints satisfied`);
+    }
+    return issues;
+  });
+  if (structuralIssues.length > 0) {
+    throw new Error(`AI provider returned structurally incomplete implementation steps:\n- ${structuralIssues.join('\n- ')}`);
+  }
+
   const knownTitles = new Set<string>();
   const completedTitles = new Set((options.completedStepTitles ?? []).map(normalizeRoadmapIdentity));
   const blueprints = plan.implementationSteps.map((step, index) => {
     const title = typeof step.title === 'string' ? step.title.trim() : '';
     const description = typeof step.description === 'string' ? step.description.trim() : '';
-    const acceptanceCriteria = Array.isArray(step.acceptanceCriteria) ? step.acceptanceCriteria.map((criterion) => criterion.trim()).filter(Boolean) : [];
-    const inScope = Array.isArray(step.inScope) ? step.inScope.map((item) => item.trim()).filter(Boolean) : [];
-    const outOfScope = Array.isArray(step.outOfScope) ? step.outOfScope.map((item) => item.trim()).filter(Boolean) : [];
-    const requirementIds = Array.isArray(step.requirementIds) ? step.requirementIds.map((item) => item.trim()).filter(Boolean) : [];
-    const deliverables = Array.isArray(step.deliverables) ? step.deliverables.map((item) => item.trim()).filter(Boolean) : [];
-    const changeRationale = step.changeRationale?.trim();
-    const dependsOnStepTitles = step.dependsOnStepTitles?.map((item) => item.trim()).filter(Boolean) ?? [];
+    const acceptanceCriteria = cleanStringList(step.acceptanceCriteria);
+    const inScope = cleanStringList(step.inScope);
+    const outOfScope = cleanStringList(step.outOfScope);
+    const requirementIds = cleanStringList(step.requirementIds);
+    const deliverables = cleanStringList(step.deliverables);
+    const changeRationale = typeof step.changeRationale === 'string' ? step.changeRationale.trim() : '';
+    const dependsOnStepTitles = cleanStringList(step.dependsOnStepTitles);
     const validationFocus = Array.from(new Set(['implementation' as const, ...(step.validationFocus ?? [])]));
     const executionIntent = assertTaskExecutionIntent(step.executionIntent, `Implementation step ${index + 1} execution intent`);
 

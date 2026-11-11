@@ -111,6 +111,33 @@ describe('roadmap draft resume context', () => {
     expect(f.repository.writeAudit).toHaveBeenCalledWith(expect.objectContaining({ eventType: 'project_roadmap_generation_resumed' }));
   });
 
+  it('revalidates a repair checkpoint when provider vocabulary is normalized on resume', async () => {
+    const f = fixture();
+    const first = await f.run();
+    await first.saveCheckpoint({
+      ...first.checkpoint, phase: 'repair', validationError: 'Implementation step 1 execution intent is invalid.', revision: 2,
+      plan: {
+        ...first.plan,
+        implementationSteps: [{
+          title: 'Verify Unreal baseline', validationFocus: ['Editor regression evidence'],
+          executionIntent: {
+            executor: 'windows', networkAccess: 'none', unrealEditorSaveRequired: true,
+            requiredCapabilities: ['windows', 'unreal-engine-5.8'], artifactKinds: ['editor-log', 'unreal-assets'],
+            persistentOutputPaths: [], minimumFreeSpaceBytes: 0
+          }
+        }]
+      } as never
+    });
+
+    const resumed = await f.run();
+
+    expect(resumed.checkpoint).toMatchObject({ phase: 'validate', revision: 2, validationError: undefined });
+    expect(resumed.plan.implementationSteps?.[0]?.executionIntent).toMatchObject({
+      requiresUnrealAuthoring: true, requiredCapabilities: ['windows', 'unreal'],
+      artifactKinds: ['unreal-assets', 'validation-evidence']
+    });
+  });
+
   it.each(['specification', 'model', 'objective', 'roadmap', 'contract', 'architecture'] as const)('does not reuse a draft after %s changes', async (change) => {
     const f = fixture();
     await f.run();

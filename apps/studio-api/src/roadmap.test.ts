@@ -1,7 +1,9 @@
 import { describe, expect, it, vi } from 'vitest';
+import { normalizeTaskExecutionIntent } from '@forgemind/core';
 import type { AIProvider, ImplementationStepPlan, PlanResult } from '@forgemind/providers';
 import { buildRoadmapQualityReviewPrompt } from '@forgemind/providers';
 import { buildImplementationStepBlueprintsWithRepairs, buildReviewedImplementationStepBlueprints, buildRoadmapPlanningPrompt, buildRoadmapStepTaskPrompt, collectRegeneratedRoadmapRequirementIds, createProjectPlanningSession, findFirstPendingStepForLatestCycle, repairRoadmapOnce, resolveRegeneratedProjectContract, resolveTaskMode, selectUnfinishedRoadmapSteps, toImplementationStepBlueprints, toProjectArchitectureUpdate, toProjectContract } from './routes.js';
+import { normalizeRoadmapPlan } from './roadmap-normalization.js';
 
 const projectContract = {
   version: 1,
@@ -303,6 +305,46 @@ describe('project roadmap generation', () => {
     });
   });
 
+  it('normalizes known provider execution-intent vocabulary while preserving strict runtime validation', () => {
+    const normalized = normalizeRoadmapPlan({
+      summary: 'Continue remaining work.', steps: [], acceptanceCriteria: [], implementationSteps: [{
+        title: 'Verify canonical Unreal baseline',
+        validationFocus: ['Current Editor build and regression evidence'],
+        executionIntent: {
+          executor: 'windows', networkAccess: 'none', unrealEditorSaveRequired: true,
+          requiredCapabilities: ['windows', 'git', 'unreal-engine-5.8', 'cesium-for-unreal-2.28', 'cpp-toolchain', 'visual-runtime-capture', 'image-generation', 'borek-filip', 'disk-capacity'],
+          artifactKinds: ['editor-build-log', 'baseline-continuity-report', 'unreal-assets'],
+          persistentOutputPaths: ['C:/ForgeMind/Flying-2.0/workspaces/current/unreal/Content', 'C:/ForgeMind/Flying-2.0/artifacts/baseline-continuity'],
+          minimumFreeSpaceBytes: 100_000_000_000
+        }
+      }]
+    } as unknown as PlanResult);
+
+    expect(normalized.implementationSteps?.[0]?.validationFocus).toEqual(['regression']);
+    expect(normalized.implementationSteps?.[0]?.executionIntent).toMatchObject({
+      executor: 'windows', networkAccess: 'none', requiresUnrealAuthoring: true,
+      requiredCapabilities: ['windows', 'git', 'unreal', 'cesium', 'msvc', 'windows-sdk', 'interactive-desktop', 'gpu', 'asset-tool', 'disk-capacity'],
+      artifactKinds: ['unreal-assets', 'repository', 'persistent-data', 'validation-evidence'],
+      persistentOutputPaths: ['artifacts/baseline-continuity'], minimumFreeSpaceBytes: 100_000_000_000
+    });
+  });
+
+  it('leaves unknown absolute provider paths invalid instead of guessing a project boundary', () => {
+    const normalized = normalizeRoadmapPlan({
+      summary: 'Unsafe path.', steps: [], acceptanceCriteria: [], implementationSteps: [{
+        executionIntent: {
+          executor: 'windows', networkAccess: 'none', requiresUnrealAuthoring: false,
+          requiredCapabilities: ['windows', 'disk-capacity'], artifactKinds: ['persistent-data'],
+          persistentOutputPaths: ['D:/unrelated-machine-root/output'], minimumFreeSpaceBytes: 1
+        }
+      }]
+    } as unknown as PlanResult);
+    const intent = normalized.implementationSteps?.[0]?.executionIntent;
+
+    expect(intent?.persistentOutputPaths).toEqual(['D:/unrelated-machine-root/output']);
+    expect(normalizeTaskExecutionIntent(intent)).toBeUndefined();
+  });
+
   it('preserves independent scope and acceptance criteria for every step', () => {
     const plan: PlanResult = {
       summary: 'Roadmap',
@@ -375,6 +417,23 @@ describe('project roadmap generation', () => {
       steps: ['One', 'Two'],
       acceptanceCriteria: ['Everything works']
     }, projectContract)).toThrow('structured implementationSteps');
+  });
+
+  it('reports all structurally incomplete steps in one targeted repair request', () => {
+    const step = (title: string, requirementId: string) => ({
+      title,
+      acceptanceCriteria: ['The focused result is verified.'], inScope: ['Focused implementation'], outOfScope: [],
+      requirementIds: [requirementId], deliverables: ['Focused result'], changeRationale: 'Complete the requirement.',
+      dependsOnStepTitles: [], executionIntent: linuxExecutionIntent, validationFocus: ['implementation']
+    });
+    const plan = {
+      summary: 'Incomplete roadmap', steps: [], acceptanceCriteria: [],
+      implementationSteps: [step('Document scope', 'REQ-SCOPE'), step('Build generator', 'REQ-GENERATOR')]
+    } as unknown as PlanResult;
+
+    expect(() => toImplementationStepBlueprints(plan, projectContract)).toThrow(
+      /step 1 is missing description[\s\S]*step 2 is missing description/
+    );
   });
 
   it('rejects a roadmap that leaves a contract requirement uncovered', () => {
