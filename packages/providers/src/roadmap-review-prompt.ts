@@ -61,6 +61,7 @@ export function buildRoadmapQualityReviewPrompt(input: RoadmapQualityReviewInput
     'Return verdict "satisfied" only when every quality criterion below is met.',
     'Return verdict "not_satisfied" with concrete blockers when changes are required. Each blocker must name the affected step or missing step and state the exact correction needed.',
     'The blockers field MUST be an array of plain strings, never objects. Put the affected step, issue, and exact correction together in each string.',
+    'criterionResults MUST be an array in the same order as the criteria below. Every item uses exactly criterion (string), status (satisfied, not_satisfied, insufficient_evidence, or deferred), and evidence (array of strings).',
     'Do not report stylistic preferences or validation results as blockers.',
     '',
     'Quality criteria:',

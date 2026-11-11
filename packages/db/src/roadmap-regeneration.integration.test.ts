@@ -106,6 +106,11 @@ describe('roadmap regeneration lifecycle', () => {
     expect(second.cycles[0]?.status).toBe('completed');
     const supersededAudit = await prisma.auditLog.findFirst({ where: { eventType: 'project_roadmap_steps_superseded' } });
     expect(supersededAudit?.payload).toMatchObject({ replacementCycleId: second.cycles.at(-1)?.id });
+    const task = await startNextRoadmapStep(repository, 'roadmap_regeneration_project', second.cycles.at(-1)!.id);
+    expect(task).toMatchObject({ status: 'submitted', title: 'Roadmap regeneration: Build export' });
+    expect(task?.prompt).toContain('Acceptance Criteria:\n- Entries can be exported.');
+    expect((await repository.getImplementationStepByTaskId(task!.id))?.status).toBe('running');
+    expect(await prisma.taskQueueJob.findFirst({ where: { taskId: task!.id, status: 'pending' } })).not.toBeNull();
   }, 30_000);
 
   it('durably resumes only the latest matching draft and retains redacted review history', async () => {

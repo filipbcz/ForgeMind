@@ -3,7 +3,7 @@ import Fastify from 'fastify';
 import { createAuthService } from './auth.js';
 import type { Project, RoadmapGenerationCheckpoint } from '@forgemind/core';
 import type { ForgeMindRepository } from '@forgemind/db';
-import { createProvider } from '@forgemind/providers';
+import { createProvider, parseReviewResult } from '@forgemind/providers';
 import type { AIProvider } from '@forgemind/providers';
 import { generateRoadmapPlan, registerRoutes } from './routes.js';
 
@@ -197,15 +197,29 @@ describe('roadmap draft resume context', () => {
     const provider = {
       kind: 'openai', plan: vi.fn().mockResolvedValue(candidate),
       reviewRoadmap: vi.fn().mockResolvedValueOnce({ verdict: 'not_satisfied', summary: 'Clarify export', blockers: ['Specify the output format.'] })
-        .mockResolvedValue({ verdict: 'satisfied', summary: 'Ready', blockers: [] }),
+        .mockResolvedValue(parseReviewResult(JSON.stringify({
+          verdict: 'approved', conclusion: 'Ready', blockers: null,
+          criterionResults: { Coverage: { result: 'pass', evidence: 'The export requirement is covered.' } }
+        }), 'Roadmap review')),
       repairRoadmap: vi.fn().mockRejectedValueOnce(new Error('Temporary provider outage'))
         .mockResolvedValue({ implementationSteps: [{ ...step, acceptanceCriteria: ['Records can be exported as CSV.'] }] })
     };
     vi.mocked(createProvider).mockReturnValue(provider as unknown as AIProvider);
     const owner = { id: 'owner', name: 'Owner', email: 'owner@example.com', role: 'owner' as const };
+    let cycleCreated = false;
+    const createdRoadmap = {
+      cycles: [{ id: 'cycle-1', cycleNumber: 1, status: 'active' }],
+      steps: [{
+        id: 'step-1', cycleId: 'cycle-1', sequenceNumber: 1, status: 'pending', title: step.title,
+        description: step.description, acceptanceCriteria: step.acceptanceCriteria, deliverables: step.deliverables,
+        dependsOnStepTitles: [], executionIntent: step.executionIntent
+      }]
+    };
     const repository = {
       ...f.repository, getCurrentUser: vi.fn(async () => owner), assertProjectRoadmapRegenerationAllowed: vi.fn(),
-      createProjectRoadmapCycle: vi.fn(async () => ({ cycles: [], steps: [] }))
+      getProjectRoadmap: vi.fn(async () => cycleCreated ? createdRoadmap : { cycles: [], steps: [] }),
+      createProjectRoadmapCycle: vi.fn(async () => { cycleCreated = true; return createdRoadmap; }),
+      createAndStartRoadmapStepTask: vi.fn(async () => ({ id: 'task-1', projectId: f.project.id, status: 'submitted' }))
     };
     const auth = createAuthService();
     const headers = { authorization: `Bearer ${auth.createTestSession(owner).id}` };
@@ -228,6 +242,9 @@ describe('roadmap draft resume context', () => {
       }));
       expect(repository.createProjectRoadmapCycle).toHaveBeenCalledTimes(1);
       expect(repository.createProjectRoadmapCycle).toHaveBeenCalledWith(expect.objectContaining({ qualityReview: expect.objectContaining({ verdict: 'satisfied' }) }));
+      expect(repository.createAndStartRoadmapStepTask).toHaveBeenCalledWith('step-1', expect.objectContaining({
+        projectId: f.project.id, title: 'Export: Implement export', acceptanceCriteria: ['Records can be exported.']
+      }));
     } finally { await app.close(); }
   });
 });

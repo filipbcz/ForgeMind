@@ -724,71 +724,136 @@ export function parseChatResult(content: string, operation: string): ChatResult 
 
 export function parseReviewResult(content: string, operation: string): ReviewResult {
   const value = parseProviderJsonObject(content, operation);
+  value.summary = firstReviewString(value, ['summary', 'reviewSummary', 'conclusion', 'rationale']);
   requireString(value, 'summary', operation);
   value.blockers = normalizeReviewBlockers(value.blockers, operation);
+  value.verdict = normalizeReviewVerdict(value.verdict);
   if (value.verdict !== 'satisfied' && value.verdict !== 'not_satisfied') {
     throw new ProviderContractError(`${operation} field "verdict" must be "satisfied" or "not_satisfied".`);
   }
-  if (value.criterionResults !== undefined) {
-    if (!Array.isArray(value.criterionResults) || value.criterionResults.some((item) => {
-      if (!item || typeof item !== 'object' || Array.isArray(item)) return true;
-      const result = item as Record<string, unknown>;
-      return typeof result.criterion !== 'string'
-        || !['satisfied', 'not_satisfied', 'insufficient_evidence', 'deferred'].includes(String(result.status))
-        || !Array.isArray(result.evidence)
-        || result.evidence.some((entry) => typeof entry !== 'string');
-    })) {
-      throw new ProviderContractError(`${operation} field "criterionResults" must contain structured criterion verdicts.`);
-    }
-  }
+  value.criterionResults = normalizeReviewCriterionResults(value.criterionResults);
   if (value.verdict === 'satisfied' && (value.blockers as string[]).length > 0) {
     throw new ProviderContractError(`${operation} cannot return blockers with verdict "satisfied".`);
   }
   if (value.verdict === 'not_satisfied' && (value.blockers as string[]).length === 0) {
     throw new ProviderContractError(`${operation} must return blockers with verdict "not_satisfied".`);
   }
+  if (value.verdict === 'satisfied' && (value.criterionResults as ReviewResult['criterionResults'] | undefined)
+    ?.some((result) => result.status !== 'satisfied')) {
+    throw new ProviderContractError(`${operation} cannot return a non-satisfied criterion with verdict "satisfied".`);
+  }
   return value as unknown as ReviewResult;
 }
 
 function normalizeReviewBlockers(raw: unknown, operation: string): string[] {
-  if (!Array.isArray(raw)) {
-    throw new ProviderContractError(`${operation} field "blockers" must be an array of strings.`);
-  }
+  const items = raw === null || raw === undefined ? [] : Array.isArray(raw) ? raw : [raw];
 
-  return raw.map((item) => {
+  return items.map((item) => {
     if (typeof item === 'string') return item.trim();
     if (!item || typeof item !== 'object' || Array.isArray(item)) {
       throw new ProviderContractError(`${operation} field "blockers" must contain strings or structured blocker objects.`);
     }
 
-    const blocker = item as Record<string, unknown>;
-    const preferredFields = [
+    const text = structuredReviewText(item as Record<string, unknown>, [
       'step', 'stepTitle', 'affectedStep', 'criterion', 'title',
       'blocker', 'issue', 'problem', 'reason', 'message',
       'correction', 'requiredCorrection', 'recommendation', 'action'
-    ];
-    const orderedFields = [
-      ...preferredFields.filter((field) => field in blocker),
-      ...Object.keys(blocker).filter((field) => !preferredFields.includes(field)).sort()
-    ];
-    const parts = orderedFields.flatMap((field) => {
-      const fieldValue = blocker[field];
-      if (typeof fieldValue === 'string' && fieldValue.trim()) {
-        return [`${field}: ${fieldValue.trim()}`];
-      }
-      if (Array.isArray(fieldValue)) {
-        const values = fieldValue.filter((entry): entry is string => typeof entry === 'string' && Boolean(entry.trim()));
-        if (values.length > 0 && values.length === fieldValue.length) {
-          return [`${field}: ${values.map((entry) => entry.trim()).join('; ')}`];
-        }
-      }
-      return [];
-    });
-    if (parts.length === 0) {
+    ]);
+    if (!text) {
       throw new ProviderContractError(`${operation} structured blocker must contain at least one non-empty string field.`);
     }
-    return parts.join(' | ');
+    return text;
   }).filter(Boolean);
+}
+
+function normalizeReviewVerdict(raw: unknown): 'satisfied' | 'not_satisfied' | undefined {
+  if (typeof raw === 'boolean') return raw ? 'satisfied' : 'not_satisfied';
+  if (typeof raw !== 'string') return undefined;
+  const value = raw.trim().toLowerCase().replace(/[\s-]+/g, '_');
+  if (['satisfied', 'pass', 'passed', 'approved', 'ready'].includes(value)) return 'satisfied';
+  if (['not_satisfied', 'fail', 'failed', 'rejected', 'needs_changes', 'changes_required'].includes(value)) return 'not_satisfied';
+  return undefined;
+}
+
+function normalizeReviewCriterionStatus(raw: unknown): NonNullable<ReviewResult['criterionResults']>[number]['status'] | undefined {
+  if (typeof raw === 'boolean') return raw ? 'satisfied' : 'not_satisfied';
+  if (typeof raw !== 'string') return undefined;
+  const value = raw.trim().toLowerCase().replace(/[\s-]+/g, '_');
+  if (['satisfied', 'pass', 'passed', 'met', 'yes'].includes(value)) return 'satisfied';
+  if (['not_satisfied', 'fail', 'failed', 'unmet', 'no', 'needs_changes', 'changes_required'].includes(value)) return 'not_satisfied';
+  if (['insufficient_evidence', 'insufficient', 'unknown', 'missing_evidence', 'not_proven'].includes(value)) return 'insufficient_evidence';
+  if (['deferred', 'blocked', 'not_applicable', 'n_a'].includes(value)) return 'deferred';
+  return undefined;
+}
+
+function normalizeReviewCriterionResults(raw: unknown): ReviewResult['criterionResults'] | undefined {
+  if (raw === undefined || raw === null) return undefined;
+  const candidates: Array<{ item: unknown; fallbackCriterion?: string }> = Array.isArray(raw)
+    ? raw.map((item) => ({ item }))
+    : raw && typeof raw === 'object'
+      ? Object.entries(raw as Record<string, unknown>).map(([criterion, item]) => ({ item, fallbackCriterion: criterion }))
+      : [];
+  const normalized = candidates.flatMap(({ item, fallbackCriterion }) => {
+    const record = typeof item === 'string' && fallbackCriterion
+      ? { status: item }
+      : item && typeof item === 'object' && !Array.isArray(item)
+        ? item as Record<string, unknown>
+        : undefined;
+    if (!record) return [];
+    const criterion = firstReviewString(record, ['criterion', 'qualityCriterion', 'criterionText', 'name', 'title'])
+      ?? fallbackCriterion?.trim();
+    const status = normalizeReviewCriterionStatus(
+      record.status ?? record.verdict ?? record.result ?? record.outcome ?? record.satisfied
+    );
+    if (!criterion || !status) return [];
+    const evidence = normalizeReviewEvidence(
+      record.evidence ?? record.evidences ?? record.findings ?? record.reasoning
+        ?? record.explanation ?? record.details ?? record.detail ?? record.summary
+    );
+    return [{ criterion, status, evidence }];
+  });
+  // Criterion-level detail is optional. An unusable auxiliary field must not
+  // discard an otherwise coherent verdict, summary, and blocker contract.
+  return normalized.length > 0 ? normalized : undefined;
+}
+
+function normalizeReviewEvidence(raw: unknown): string[] {
+  const items = raw === undefined || raw === null ? [] : Array.isArray(raw) ? raw : [raw];
+  return items.flatMap((item) => {
+    if (typeof item === 'string' && item.trim()) return [item.trim()];
+    if (!item || typeof item !== 'object' || Array.isArray(item)) return [];
+    const text = structuredReviewText(item as Record<string, unknown>, [
+      'path', 'file', 'symbol', 'evidence', 'finding', 'reason', 'message', 'summary'
+    ]);
+    return text ? [text] : [];
+  });
+}
+
+function firstReviewString(record: Record<string, unknown>, fields: string[]): string | undefined {
+  for (const field of fields) {
+    const value = record[field];
+    if (typeof value === 'string' && value.trim()) return value.trim();
+  }
+  return undefined;
+}
+
+function structuredReviewText(record: Record<string, unknown>, preferredFields: string[]): string | undefined {
+  const orderedFields = [
+    ...preferredFields.filter((field) => field in record),
+    ...Object.keys(record).filter((field) => !preferredFields.includes(field)).sort()
+  ];
+  const parts = orderedFields.flatMap((field) => {
+    const fieldValue = record[field];
+    if (typeof fieldValue === 'string' && fieldValue.trim()) return [`${field}: ${fieldValue.trim()}`];
+    if (Array.isArray(fieldValue)) {
+      const values = fieldValue.filter((entry): entry is string => typeof entry === 'string' && Boolean(entry.trim()));
+      if (values.length > 0 && values.length === fieldValue.length) {
+        return [`${field}: ${values.map((entry) => entry.trim()).join('; ')}`];
+      }
+    }
+    return [];
+  });
+  return parts.length > 0 ? parts.join(' | ') : undefined;
 }
 
 function requireString(value: Record<string, unknown>, field: string, operation: string): void {
