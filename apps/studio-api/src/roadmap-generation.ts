@@ -2,6 +2,7 @@ import type { RoadmapGenerationCheckpoint } from '@forgemind/core';
 import { activeProjectContractRequirements, applyProjectContractDelta, deriveProjectContractDelta, redactError } from '@forgemind/core';
 import { setImmediate } from 'node:timers/promises';
 import type { AIProvider, PlanResult, ProviderSessionContext, ReviewResult, RoadmapQualityReviewInput, RoadmapRepairInput } from '@forgemind/providers';
+import { normalizeRoadmapPlan } from './roadmap-normalization.js';
 
 type RepairContext = Omit<RoadmapRepairInput, 'implementationSteps' | 'session' | 'validationError'>;
 const ROADMAP_NO_PROGRESS = '[FORGEMIND_ROADMAP_NO_PROGRESS]';
@@ -22,7 +23,7 @@ export async function repairRoadmapOnce(
     throw new Error(`Roadmap validation failed and provider "${provider.kind}" does not support targeted repair: ${input.validationError}`);
   }
   const repaired = await provider.repairRoadmap({ ...input, implementationSteps: plan.implementationSteps ?? [], session });
-  if (!repaired.contractDelta) return { ...plan, implementationSteps: repaired.implementationSteps };
+  if (!repaired.contractDelta) return normalizeRoadmapPlan({ ...plan, implementationSteps: repaired.implementationSteps });
   const correctedCandidate = applyProjectContractDelta(input.projectContract, repaired.contractDelta).contract;
   const composedDelta = input.persistedProjectContract
     ? deriveProjectContractDelta(
@@ -46,14 +47,14 @@ export async function repairRoadmapOnce(
         }))
       };
   const activeIds = new Set(activeProjectContractRequirements(corrected).map((requirement) => requirement.id));
-  return {
+  return normalizeRoadmapPlan({
     ...plan,
     projectContract: corrected,
     contractDelta: composedDelta,
     implementationSteps: repaired.implementationSteps.map((step) => ({
       ...step, requirementIds: step.requirementIds.filter((id) => activeIds.has(id))
     })).filter((step) => step.requirementIds.length > 0)
-  };
+  });
 }
 
 export async function buildImplementationStepBlueprintsWithRepairs<T>(input: {

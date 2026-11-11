@@ -261,6 +261,48 @@ describe('project roadmap generation', () => {
     expect(recovered.projectContract.requirements).toEqual(result.projectContract.requirements);
   });
 
+  it('normalizes equivalent provider delta aliases and omitted empty sections', () => {
+    const rationale = 'Requirements are unchanged; regenerate only the remaining implementation roadmap.';
+    const plan = {
+      summary: 'Continue remaining work.', steps: [], acceptanceCriteria: [], implementationSteps: [],
+      contractDelta: {
+        baseVersion: 1, rationale,
+        requirementAdditions: [], requirementUpdates: [], requirementSupersessions: [], requirementRemovals: [],
+        migrationImpacts: [], compatibilityImpacts: []
+      }
+    } as unknown as PlanResult;
+
+    const result = resolveRegeneratedProjectContract(plan, 'Current specification.', 'Current objective.', projectContract);
+
+    expect(result.projectContract.version).toBe(2);
+    expect(result.projectContract.summary).toBe(rationale);
+    expect(result.touchedRequirementIds).toEqual([]);
+    expect(result.contractDelta).toMatchObject({
+      baseVersion: 1, summary: rationale, addRequirements: [], updateRequirements: [],
+      supersedeRequirements: [], removeRequirements: [],
+      invariantChanges: { add: [], remove: [] }, prohibitedSubstituteChanges: { add: [], remove: [] },
+      releaseCriteriaChanges: { add: [], remove: [] }, migrationImpacts: [], compatibilityImpacts: []
+    });
+  });
+
+  it('normalizes descriptive extension architecture into a safe additive update', () => {
+    const update = toProjectArchitectureUpdate({
+      summary: 'Continue integration.', steps: [], acceptanceCriteria: [],
+      architectureUpdate: {
+        summary: 'Preserve boundaries while completing integration.',
+        changes: ['Complete existing seams.'],
+        preservedBoundaries: ['Core simulation remains independent.'],
+        databaseSchemas: { reusedSchemas: ['Existing manifests.'] }
+      }
+    } as unknown as PlanResult);
+
+    expect(update).toMatchObject({
+      summary: 'Preserve boundaries while completing integration.', modules: [], databaseSchemas: [],
+      decisions: [], conventions: [], dependencyRules: ['Core simulation remains independent.'],
+      knownDebt: [], resolvedDebt: []
+    });
+  });
+
   it('preserves independent scope and acceptance criteria for every step', () => {
     const plan: PlanResult = {
       summary: 'Roadmap',

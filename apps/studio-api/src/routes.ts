@@ -37,6 +37,7 @@ import { registerChatRoutes } from './routes/chat-routes.js';
 import { registerWorkerRoutes } from './routes/worker-routes.js';
 import { registerWindowsRunnerRoutes } from './routes/windows-runner-routes.js';
 import { createStudioProviderPool, type StudioProviderCandidate } from './provider-pool.js';
+import { normalizeRoadmapArchitectureUpdate, normalizeRoadmapContractDelta, normalizeRoadmapPlan } from './roadmap-normalization.js';
 
 export { repairRoadmapOnce, buildImplementationStepBlueprintsWithRepairs, buildReviewedImplementationStepBlueprints } from './roadmap-generation.js';
 
@@ -1933,14 +1934,15 @@ export async function generateRoadmapPlan(
     };
     const checkpoint = await repository.getRoadmapGenerationCheckpoint(project.id, contextKey);
     if (checkpoint) {
+      const normalizedCheckpoint = { ...checkpoint, plan: normalizeRoadmapPlan(checkpoint.plan as PlanResult) };
       signal?.throwIfAborted();
       await repository.writeAudit({
         actorType: 'system', eventType: 'project_roadmap_generation_resumed', projectId: project.id,
         payload: { contextKey, phase: checkpoint.phase, revision: checkpoint.revision }
       });
       return {
-        plan: checkpoint.plan, provider, session, completedSteps, unfinishedSteps, repositoryBaseline,
-        repositoryPath: checkout.repositoryPath, cleanup: checkout.cleanup, checkpoint, saveCheckpoint, assertCurrentSource
+        plan: normalizedCheckpoint.plan, provider, session, completedSteps, unfinishedSteps, repositoryBaseline,
+        repositoryPath: checkout.repositoryPath, cleanup: checkout.cleanup, checkpoint: normalizedCheckpoint, saveCheckpoint, assertCurrentSource
       };
     }
     const planInput = {
@@ -1963,12 +1965,12 @@ export async function generateRoadmapPlan(
     let plan: PlanResult;
     try {
       signal?.throwIfAborted();
-      plan = await provider.plan({ ...planInput, session });
+      plan = normalizeRoadmapPlan(await provider.plan({ ...planInput, session }));
     } catch (error) {
       signal?.throwIfAborted();
       if (!(error instanceof CodexExecutionTimeoutError) || !session.id) throw error;
       session.id = undefined;
-      plan = await provider.plan({ ...planInput, session });
+      plan = normalizeRoadmapPlan(await provider.plan({ ...planInput, session }));
     }
     const initial: RoadmapGenerationCheckpoint = { version: 1, phase: 'validate', revision: 0, plan };
     await saveCheckpoint(initial);
@@ -2131,7 +2133,7 @@ function compactProjectContract(contract: ProjectContract): ProjectContract {
 }
 
 export function toProjectArchitectureUpdate(plan: PlanResult, requireModule = false): ProjectArchitectureUpdate {
-  const parsed = architectureUpdatePlanSchema.parse(plan.architectureUpdate);
+  const parsed = architectureUpdatePlanSchema.parse(normalizeRoadmapArchitectureUpdate(plan.architectureUpdate));
   if (requireModule && parsed.modules.length === 0) {
     throw new Error('AI provider did not return an initial project architecture module.');
   }
@@ -2164,7 +2166,7 @@ export function toProjectContract(plan: PlanResult, source = '', version?: numbe
 }
 
 export function toProjectContractDelta(plan: PlanResult): ProjectContractDelta {
-  const parsed = projectContractDeltaPlanSchema.parse(plan.contractDelta);
+  const parsed = projectContractDeltaPlanSchema.parse(normalizeRoadmapContractDelta(plan.contractDelta));
   return normalizeProjectContractDelta(parsed);
 }
 
@@ -2281,6 +2283,7 @@ export function toImplementationStepBlueprints(
   validationFocus: Array<'implementation' | 'migration' | 'compatibility' | 'regression'>;
   executionIntent: TaskExecutionIntent;
 }> {
+  plan = normalizeRoadmapPlan(plan);
   if (!Array.isArray(plan.implementationSteps) || plan.implementationSteps.length === 0) {
     throw new Error('AI provider did not return structured implementationSteps for the project roadmap.');
   }
@@ -2288,13 +2291,13 @@ export function toImplementationStepBlueprints(
   const knownTitles = new Set<string>();
   const completedTitles = new Set((options.completedStepTitles ?? []).map(normalizeRoadmapIdentity));
   const blueprints = plan.implementationSteps.map((step, index) => {
-    const title = step.title.trim();
-    const description = step.description.trim();
-    const acceptanceCriteria = step.acceptanceCriteria.map((criterion) => criterion.trim()).filter(Boolean);
-    const inScope = step.inScope.map((item) => item.trim()).filter(Boolean);
-    const outOfScope = step.outOfScope.map((item) => item.trim()).filter(Boolean);
-    const requirementIds = step.requirementIds.map((item) => item.trim()).filter(Boolean);
-    const deliverables = step.deliverables.map((item) => item.trim()).filter(Boolean);
+    const title = typeof step.title === 'string' ? step.title.trim() : '';
+    const description = typeof step.description === 'string' ? step.description.trim() : '';
+    const acceptanceCriteria = Array.isArray(step.acceptanceCriteria) ? step.acceptanceCriteria.map((criterion) => criterion.trim()).filter(Boolean) : [];
+    const inScope = Array.isArray(step.inScope) ? step.inScope.map((item) => item.trim()).filter(Boolean) : [];
+    const outOfScope = Array.isArray(step.outOfScope) ? step.outOfScope.map((item) => item.trim()).filter(Boolean) : [];
+    const requirementIds = Array.isArray(step.requirementIds) ? step.requirementIds.map((item) => item.trim()).filter(Boolean) : [];
+    const deliverables = Array.isArray(step.deliverables) ? step.deliverables.map((item) => item.trim()).filter(Boolean) : [];
     const changeRationale = step.changeRationale?.trim();
     const dependsOnStepTitles = step.dependsOnStepTitles?.map((item) => item.trim()).filter(Boolean) ?? [];
     const validationFocus = Array.from(new Set(['implementation' as const, ...(step.validationFocus ?? [])]));
