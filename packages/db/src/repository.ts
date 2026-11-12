@@ -2002,6 +2002,7 @@ export class ForgeMindRepository {
         checkpoint: {
           version: checkpoint.version, phase: checkpoint.phase, revision: checkpoint.revision,
           validationError: checkpoint.validationError,
+          repairConstraints: checkpoint.repairConstraints,
           plan: {
             summary: plan.summary, steps: plan.steps, acceptanceCriteria: plan.acceptanceCriteria,
             implementationSteps: plan.implementationSteps, projectContract: plan.projectContract,

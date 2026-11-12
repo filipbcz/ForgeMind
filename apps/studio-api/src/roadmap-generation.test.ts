@@ -118,6 +118,12 @@ describe('resumable roadmap correction', () => {
     expect(f.reviewRoadmap).toHaveBeenCalledTimes(4);
     expect(f.history.filter(s => s.qualityReview?.verdict === 'not_satisfied')).toHaveLength(3);
     expect(f.history.at(-1)).toMatchObject({ phase: 'ready', revision: 3 });
+    expect(f.repairRoadmap.mock.calls[0]![0].validationError).toContain('First focused blocker.');
+    expect(f.repairRoadmap.mock.calls[1]![0].validationError).toContain('First focused blocker.');
+    expect(f.repairRoadmap.mock.calls[1]![0].validationError).toContain('Second focused blocker.');
+    expect(f.repairRoadmap.mock.calls[2]![0].validationError).toContain('First focused blocker.');
+    expect(f.repairRoadmap.mock.calls[2]![0].validationError).toContain('Second focused blocker.');
+    expect(f.repairRoadmap.mock.calls[2]![0].validationError).toContain('Third focused blocker.');
     for (const [reviewInput] of f.reviewRoadmap.mock.calls) expect(reviewInput).not.toHaveProperty('session');
   });
 
@@ -146,6 +152,7 @@ describe('resumable roadmap correction', () => {
     await expect(buildReviewedImplementationStepBlueprints(f.input)).rejects.toThrow('Provider unavailable');
     const checkpoint = f.history.at(-1)!;
     expect(checkpoint).toMatchObject({ phase: 'repair', qualityReview: rejected });
+    expect(checkpoint.repairConstraints).toContain(rejected.blockers[0]);
     f.repairRoadmap.mockClear();
     f.reviewRoadmap.mockClear();
     await buildReviewedImplementationStepBlueprints({ ...f.input, plan: { ...plan, implementationSteps: [] }, checkpoint });

@@ -166,7 +166,7 @@ export class OpenAIProvider implements AIProvider {
         content: [
           `Objective: ${input.objective}`,
           `CURRENT SPECIFICATION (authoritative, complete):\n${input.authoritativeSpecification ?? input.objective}`,
-          `Validation error: ${input.validationError}`,
+          `Current validation error plus mandatory accumulated non-regression constraints. Repair the current blocker without reintroducing any earlier blocker:\n${input.validationError}`,
           `Requirement ids that must remain covered: ${input.requiredRequirementIds.join(', ')}`,
           `Completed step titles that must not be recreated: ${input.completedStepTitles.join(' | ') || 'none'}`,
           `Migration impacts: ${input.migrationImpacts.join(' | ') || 'none'}`,

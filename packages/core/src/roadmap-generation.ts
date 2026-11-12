@@ -44,5 +44,7 @@ export interface RoadmapGenerationCheckpoint {
   revision: number;
   plan: RoadmapCandidate;
   validationError?: string;
+  /** Previously discovered blockers that every later repair must continue to satisfy. */
+  repairConstraints?: string[];
   qualityReview?: RoadmapQualityReview;
 }

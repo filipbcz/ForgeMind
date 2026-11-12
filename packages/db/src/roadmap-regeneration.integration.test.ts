@@ -120,6 +120,7 @@ describe('roadmap regeneration lifecycle', () => {
       version: 1, phase: 'repair', revision: 3,
       plan: { summary: 'Export draft', steps: [], acceptanceCriteria: [], implementationSteps: [] },
       validationError: 'Resolve overlapping steps.',
+      repairConstraints: ['Preserve the completed export baseline.'],
       qualityReview: { verdict: 'not_satisfied', summary: 'Overlap', blockers: ['Resolve overlapping steps.'] }
     };
     await repository.saveRoadmapGenerationCheckpoint(projectId, 'source-a', {

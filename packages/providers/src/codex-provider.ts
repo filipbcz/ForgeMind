@@ -634,7 +634,7 @@ export class CodexProvider implements AIProvider {
       'Return every step with all exact fields: title, description, acceptanceCriteria, inScope, outOfScope, requirementIds, deliverables, changeRationale, dependsOnStepTitles, validationFocus, and executionIntent. executionIntent uses only executor linux/windows; locally probed capability keys; artifactKinds repository, persistent-data, unreal-assets, or validation-evidence; networkAccess none/https; boolean requiresUnrealAuthoring; project-relative persistentOutputPaths; and non-negative integer minimumFreeSpaceBytes. Never return machine-absolute paths, bespoke artifact kind names, or aliases for requiresUnrealAuthoring.',
       `Objective: ${input.objective}`,
       `CURRENT SPECIFICATION (authoritative, complete):\n${input.authoritativeSpecification ?? input.objective}`,
-      `Validation error: ${input.validationError}`,
+      `Current validation error plus mandatory accumulated non-regression constraints. Repair the current blocker without reintroducing any earlier blocker:\n${input.validationError}`,
       `Requirement ids that must remain covered: ${input.requiredRequirementIds.join(', ')}`,
       `Completed step titles that must not be recreated: ${input.completedStepTitles.join(' | ') || 'none'}`,
       `Migration impacts: ${input.migrationImpacts.join(' | ') || 'none'}`,

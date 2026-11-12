@@ -6,6 +6,29 @@ import { normalizeRoadmapPlan } from './roadmap-normalization.js';
 
 type RepairContext = Omit<RoadmapRepairInput, 'implementationSteps' | 'session' | 'validationError'>;
 const ROADMAP_NO_PROGRESS = '[FORGEMIND_ROADMAP_NO_PROGRESS]';
+const MAX_REPAIR_CONSTRAINTS = 30;
+const MAX_REPAIR_CONSTRAINT_CHARS = 4_000;
+
+function appendRepairConstraints(existing: string[] | undefined, additions: Array<string | undefined>): string[] {
+  const constraints = new Map<string, string>();
+  for (const raw of [...(existing ?? []), ...additions]) {
+    const value = raw?.replace(/\s+/g, ' ').trim();
+    if (!value) continue;
+    const bounded = value.slice(0, MAX_REPAIR_CONSTRAINT_CHARS);
+    constraints.set(bounded.toLowerCase(), bounded);
+  }
+  return [...constraints.values()].slice(-MAX_REPAIR_CONSTRAINTS);
+}
+
+function repairInstruction(current: string, constraints: string[] | undefined): string {
+  const prior = (constraints ?? []).filter((constraint) => !current.includes(constraint));
+  if (prior.length === 0) return current;
+  return [
+    current,
+    'NON-REGRESSION CONSTRAINTS FROM EARLIER VALIDATION AND REVIEW (all remain mandatory):',
+    ...prior.map((constraint) => `- ${constraint}`)
+  ].join('\n');
+}
 
 function reviewBlockerIdentity(review: Pick<ReviewResult, 'summary' | 'blockers'>): string {
   const blockers = review.blockers.map((item) => item.replace(/\s+/g, ' ').trim().toLowerCase()).filter(Boolean).sort();
@@ -104,6 +127,13 @@ export async function buildReviewedImplementationStepBlueprints<T>(input: {
   let state: RoadmapGenerationCheckpoint = input.checkpoint ?? {
     version: 1, phase: 'validate', revision: 0, plan: input.plan
   };
+  state = {
+    ...state,
+    repairConstraints: appendRepairConstraints(state.repairConstraints, [
+      state.validationError,
+      ...(state.qualityReview?.verdict === 'not_satisfied' ? state.qualityReview.blockers : [])
+    ])
+  };
   const failedValidationStates = new Set<string>();
   const reviewBlockerOccurrences = new Map<string, number>();
   if (state.phase === 'repair' && state.validationError && !state.validationError.includes(ROADMAP_NO_PROGRESS)) {
@@ -140,7 +170,14 @@ export async function buildReviewedImplementationStepBlueprints<T>(input: {
           }
           failedValidationStates.add(identity);
         }
-        await save({ ...state, phase: validationError ? 'repair' : 'review', validationError });
+        await save({
+          ...state,
+          phase: validationError ? 'repair' : 'review',
+          validationError,
+          repairConstraints: validationError
+            ? appendRepairConstraints(state.repairConstraints, [validationError])
+            : state.repairConstraints
+        });
         break;
       }
       case 'repair': {
@@ -148,10 +185,19 @@ export async function buildReviewedImplementationStepBlueprints<T>(input: {
         if (state.validationError.includes(ROADMAP_NO_PROGRESS)) throw new Error(state.validationError);
         const effective = effectiveContext();
         const plan = await repairRoadmapOnce(input.provider, input.session, state.plan, {
-          ...input.repairInput, ...effective, validationError: state.validationError, signal: input.signal
+          ...input.repairInput,
+          ...effective,
+          validationError: repairInstruction(state.validationError, state.repairConstraints),
+          signal: input.signal
         });
         // Persist the response even if cancellation arrived just as the provider finished.
-        await save({ version: 2, phase: 'validate', revision: state.revision + 1, plan });
+        await save({
+          version: 2,
+          phase: 'validate',
+          revision: state.revision + 1,
+          plan,
+          repairConstraints: state.repairConstraints
+        });
         break;
       }
       case 'review': {
@@ -170,7 +216,15 @@ export async function buildReviewedImplementationStepBlueprints<T>(input: {
           reviewBlockerOccurrences.set(identity, occurrences);
           if (occurrences >= 2) validationError = `${ROADMAP_NO_PROGRESS} Independent review repeated the same blocker after a targeted repair: ${validationError}`;
         }
-        await save({ ...state, qualityReview, phase: qualityReview.verdict === 'satisfied' ? 'ready' : 'repair', validationError });
+        await save({
+          ...state,
+          qualityReview,
+          phase: qualityReview.verdict === 'satisfied' ? 'ready' : 'repair',
+          validationError,
+          repairConstraints: qualityReview.verdict === 'not_satisfied'
+            ? appendRepairConstraints(state.repairConstraints, qualityReview.blockers)
+            : state.repairConstraints
+        });
         if (validationError?.includes(ROADMAP_NO_PROGRESS)) throw new Error(validationError);
         break;
       }
