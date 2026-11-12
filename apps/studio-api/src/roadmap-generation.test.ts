@@ -208,14 +208,16 @@ describe('resumable roadmap correction', () => {
 });
 
 describe('roadmap request lifecycle', () => {
-  it('rejects a second request, aborts on disconnect and releases listeners for retry', () => {
+  it('rejects a second request but lets durable generation survive a client disconnect', () => {
     const active = new Map<string, AbortController>();
     const request = { raw: new EventEmitter() } as unknown as FastifyRequest;
     const reply = { raw: Object.assign(new EventEmitter(), { writableEnded: false }) } as unknown as FastifyReply;
     const first = beginRoadmapRequest(active, 'project', request, reply)!;
     expect(beginRoadmapRequest(active, 'project', request, reply)).toBeUndefined();
     reply.raw.emit('close');
-    expect(first.signal.aborted).toBe(true);
+    request.raw.emit('aborted');
+    expect(first.signal.aborted).toBe(false);
+    expect(active.size).toBe(1);
     first.release();
     expect(active.size).toBe(0);
     expect(reply.raw.listenerCount('close')).toBe(0);

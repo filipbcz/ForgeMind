@@ -1807,22 +1807,15 @@ function buildTaskPrompt(input: z.infer<typeof createTaskSchema>): string {
 }
 
 export function beginRoadmapRequest(
-  active: Map<string, AbortController>, projectId: string, request: FastifyRequest, reply: FastifyReply
+  active: Map<string, AbortController>, projectId: string, _request: FastifyRequest, _reply: FastifyReply
 ) {
   if (active.has(projectId)) return undefined;
   const controller = new AbortController();
   active.set(projectId, controller);
-  const abort = () => controller.abort(new Error('Roadmap request was interrupted; retry to resume its saved checkpoint.'));
-  const close = () => { if (!reply.raw.writableEnded) abort(); };
-  request.raw.once('aborted', abort);
-  reply.raw.once('close', close);
-  if (request.raw.aborted || reply.raw.destroyed) abort();
   return {
     projectId,
     signal: controller.signal,
     release() {
-      request.raw.off('aborted', abort);
-      reply.raw.off('close', close);
       active.delete(projectId);
     }
   };
