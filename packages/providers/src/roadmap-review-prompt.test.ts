@@ -56,6 +56,9 @@ describe('roadmap quality review prompt', () => {
     expect(prompt).toContain('existing repository components');
     expect(prompt).toContain('Reject self-referential commit-chasing steps');
     expect(prompt).toContain('A different HEAD alone is not an implementation gap');
+    expect(prompt).toContain('asset-tool as the canonical runtime expansion of logical image-generation');
+    expect(prompt).toContain('interactive-desktop together with gpu');
+    expect(prompt).toContain('Do not require those logical aliases');
     expect(ROADMAP_QUALITY_CRITERIA).toHaveLength(9);
   });
 

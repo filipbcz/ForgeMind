@@ -83,6 +83,7 @@ export function buildRoadmapQualityReviewPrompt(input: RoadmapQualityReviewInput
     `Execution environment profile:\n${JSON.stringify(input.executionProfile ?? {
       defaultExecutor: 'linux', windowsDefaultCapabilities: [], supportsHttpsAcquisition: true, supportsPersistentOutputs: true
     })}`,
+    'The candidate execution intent is already normalized to concrete locally probed capabilities. Treat asset-tool as the canonical runtime expansion of logical image-generation. Treat interactive-desktop together with gpu as the canonical runtime expansion of logical visual-runtime-capture. Do not require those logical aliases in requiredCapabilities and do not call the concrete expansions undefined or contradictory.',
     'A required capability may be supplied later by a compatible worker, but it must be explicit. Reject contradictory or implicit execution needs, not a clearly declared capability merely because no current device is online.',
     '',
     `Repository baseline commit: ${input.repositoryBaseline.commitSha}`,
