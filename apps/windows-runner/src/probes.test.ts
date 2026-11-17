@@ -33,6 +33,14 @@ describe('capability probes', () => {
       expect.objectContaining({ capability: { key: 'interactive-desktop' }, executable: 'powershell.exe' }),
       expect.objectContaining({ capability: { key: 'gpu' }, executable: 'powershell.exe' }),
       expect.objectContaining({ capability: { key: 'disk-capacity' }, kind: 'disk' }),
+      expect.objectContaining({ capability: { key: 'proj' }, kind: 'process-alternatives', alternatives: expect.arrayContaining([
+        expect.objectContaining({ executable: 'cs2cs.exe', input: expect.stringContaining('14.4179') }),
+        expect.objectContaining({ executable: 'python.exe', args: expect.arrayContaining(['-c', expect.stringContaining('pyproj')]) })
+      ]) }),
+      expect.objectContaining({ capability: { key: 'gis-processing' }, kind: 'process-alternatives', alternatives: expect.arrayContaining([
+        expect.objectContaining({ executable: 'gdaltransform.exe', input: expect.stringContaining('14.4179') }),
+        expect.objectContaining({ executable: 'python.exe', args: expect.arrayContaining(['-c', expect.stringContaining('MemoryFile')]) })
+      ]) }),
       expect.objectContaining({ capability: { key: 'codex' }, executable: expect.any(String), args: ['--version'] }),
       expect.objectContaining({
         capability: { key: 'unreal', version: '5.8', metadata: { executable: 'C:\\UE\\UnrealEditor-Cmd.exe' } },
@@ -106,6 +114,51 @@ describe('capability probes', () => {
     expect(Date.now() - startedAt).toBeLessThan(2_000);
     expect(result.capabilities).toEqual([]);
     expect(result.evidence[0]).toMatchObject({ status: 'unsupported', summary: expect.stringContaining('timed out') });
+  });
+
+  it('publishes a capability from the first successful real process alternative', async () => {
+    const result = await runCapabilityProbes([{
+      capability: { key: 'proj' },
+      kind: 'process-alternatives',
+      alternatives: [
+        { executable: `missing-proj-${process.pid}.exe`, args: [], label: 'missing native PROJ' },
+        { executable: process.execPath, args: ['-e', "process.stdout.write('PROJ 9.5.1 transformed=1,2')"], label: 'fixture transform',
+          outputPattern: /transformed=\d+,\d+/, expectedOutput: 'a transformed coordinate pair' }
+      ]
+    }]);
+    expect(result.capabilities).toEqual([expect.objectContaining({
+      key: 'proj', version: '9.5.1', metadata: expect.objectContaining({ executable: process.execPath, probe: 'fixture transform' })
+    })]);
+    expect(result.evidence[0]).toMatchObject({ status: 'supported', summary: expect.stringContaining('fixture transform') });
+  });
+
+  it('does not accept an alternative that exits successfully without completing the probed operation', async () => {
+    const result = await runCapabilityProbes([{
+      capability: { key: 'gis-processing' },
+      kind: 'process-alternatives',
+      alternatives: [
+        { executable: process.execPath, args: ['-e', "process.stdout.write('GDAL is installed')"], label: 'version-only GIS', outputPattern: /cells=4/, expectedOutput: 'the raster round-trip marker' },
+        { executable: process.execPath, args: ['-e', "process.stdout.write('EPSG:5514 cells=4')"], label: 'raster round-trip', outputPattern: /cells=4/ }
+      ]
+    }]);
+    expect(result.evidence[0]).toMatchObject({ status: 'supported', capability: expect.objectContaining({
+      key: 'gis-processing', metadata: expect.objectContaining({ probe: 'raster round-trip' })
+    }) });
+  });
+
+  it('continues to another process alternative when the first reports the wrong version', async () => {
+    const result = await runCapabilityProbes([{
+      capability: { key: 'proj', version: '9.5' },
+      expectedVersion: '9.5',
+      kind: 'process-alternatives',
+      alternatives: [
+        { executable: process.execPath, args: ['-e', "process.stdout.write('PROJ 8.2')"], label: 'old PROJ' },
+        { executable: process.execPath, args: ['-e', "process.stdout.write('PROJ 9.5 transformed=1,2')"], label: 'current PROJ' }
+      ]
+    }]);
+    expect(result.evidence[0]).toMatchObject({ status: 'supported', capability: expect.objectContaining({
+      key: 'proj', version: '9.5', metadata: expect.objectContaining({ probe: 'current PROJ' })
+    }) });
   });
 
   it('reports progress when each probe starts and completes', async () => {

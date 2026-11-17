@@ -10,10 +10,20 @@ export interface CapabilityProbe {
   capability: WorkerCapability;
   executable?: string;
   args?: readonly string[];
-  kind?: 'process' | 'windows-platform' | 'disk' | 'msvc' | 'unreal';
+  kind?: 'process' | 'process-alternatives' | 'windows-platform' | 'disk' | 'msvc' | 'unreal';
+  alternatives?: readonly CapabilityProbeCommand[];
   path?: string;
   timeoutMs?: number;
   expectedVersion?: string;
+}
+
+export interface CapabilityProbeCommand {
+  executable: string;
+  args: readonly string[];
+  input?: string;
+  label?: string;
+  outputPattern?: RegExp;
+  expectedOutput?: string;
 }
 
 export interface ProbeResult { capabilities: WorkerCapability[]; evidence: WorkerProbeEvidence[] }
@@ -21,6 +31,30 @@ export interface ProbeProgress { capability: WorkerCapability; state: 'started' 
 
 const DEFAULT_PROBE_TIMEOUT_MS = 30_000;
 const UNREAL_PROBE_TIMEOUT_MS = 240_000;
+
+const PROJ_PYTHON_PROBE = [
+  'import math',
+  'import pyproj',
+  'transformer = pyproj.Transformer.from_crs("EPSG:4326", "EPSG:5514", always_xy=True)',
+  'x, y = transformer.transform(14.4179, 50.1266)',
+  'assert math.isfinite(x) and math.isfinite(y)',
+  'print(f"PROJ {pyproj.proj_version_str} pyproj {pyproj.__version__} transformed={x:.3f},{y:.3f}")'
+].join('\n');
+
+const GIS_PYTHON_PROBE = [
+  'import numpy as np',
+  'import rasterio',
+  'from rasterio.io import MemoryFile',
+  'from rasterio.transform import from_origin',
+  'cells = np.array([[1, 2], [3, 4]], dtype="uint16")',
+  'with MemoryFile() as memory:',
+  '    with memory.open(driver="GTiff", width=2, height=2, count=1, dtype="uint16", crs="EPSG:5514", transform=from_origin(-750000, -1040000, 10, 10)) as dataset:',
+  '        dataset.write(cells, 1)',
+  '    with memory.open() as dataset:',
+  '        restored = dataset.read(1)',
+  '        assert dataset.crs.to_epsg() == 5514 and restored.tolist() == cells.tolist()',
+  'print(f"rasterio {rasterio.__version__} GDAL {rasterio.__gdal_version__} EPSG:5514 cells={restored.size}")'
+].join('\n');
 
 export const unrealCapabilityProbe = (executable: string, version: string): CapabilityProbe => ({
   capability: { key: 'unreal', version, metadata: { executable } },
@@ -56,7 +90,9 @@ export function windowsRunnerCapabilityProbes(
     { capability: { key: 'windows-sdk' }, executable: 'where.exe', args: ['rc.exe'] },
     { capability: { key: 'interactive-desktop' }, executable: 'powershell.exe', args: ['-NoProfile', '-NonInteractive', '-Command', "if (-not [Environment]::UserInteractive) { exit 2 }; [Environment]::UserName"] },
     { capability: { key: 'gpu' }, executable: 'powershell.exe', args: ['-NoProfile', '-NonInteractive', '-Command', "$g=Get-CimInstance Win32_VideoController | Where-Object {$_.AdapterRAM -gt 0} | Select-Object -First 1; if (-not $g) { exit 2 }; \"$($g.Name) driver=$($g.DriverVersion)\""] },
-    { capability: { key: 'disk-capacity' }, kind: 'disk', path: environment.FORGEMIND_WINDOWS_WORKSPACE_ROOT ?? process.cwd() }
+    { capability: { key: 'disk-capacity' }, kind: 'disk', path: environment.FORGEMIND_WINDOWS_WORKSPACE_ROOT ?? process.cwd() },
+    geospatialProbe('proj', buildProjProbeCommands(environment), environment.FORGEMIND_PROJ_VERSION),
+    geospatialProbe('gis-processing', buildGisProbeCommands(environment), environment.FORGEMIND_GIS_PROCESSING_VERSION)
   ];
   probes.push({ capability: { key: 'codex' }, executable: resolveCodexBinary(environment), args: ['--version'] });
   if (environment.FORGEMIND_UNREAL_EXECUTABLE) {
@@ -70,6 +106,77 @@ export function windowsRunnerCapabilityProbes(
   const identities = new Set<string>();
   return probes.filter(({ capability }) => {
     const identity = `${capability.key}\u0000${capability.version ?? ''}`;
+    if (identities.has(identity)) return false;
+    identities.add(identity);
+    return true;
+  });
+}
+
+function geospatialProbe(key: 'proj' | 'gis-processing', alternatives: CapabilityProbeCommand[], expectedVersion?: string): CapabilityProbe {
+  return {
+    capability: { key, ...(expectedVersion ? { version: expectedVersion } : {}) },
+    kind: 'process-alternatives',
+    alternatives,
+    ...(expectedVersion ? { expectedVersion } : {})
+  };
+}
+
+function buildProjProbeCommands(environment: NodeJS.ProcessEnv): CapabilityProbeCommand[] {
+  const commands: CapabilityProbeCommand[] = [];
+  if (environment.FORGEMIND_PROJ_EXECUTABLE) {
+    commands.push({
+      executable: environment.FORGEMIND_PROJ_EXECUTABLE,
+      args: ['EPSG:4326', 'EPSG:5514'],
+      input: '14.4179 50.1266\n',
+      label: 'configured PROJ cs2cs',
+      outputPattern: coordinatePairPattern(),
+      expectedOutput: 'a finite transformed coordinate pair'
+    });
+  }
+  commands.push({ executable: 'cs2cs.exe', args: ['EPSG:4326', 'EPSG:5514'], input: '14.4179 50.1266\n', label: 'native PROJ cs2cs',
+    outputPattern: coordinatePairPattern(), expectedOutput: 'a finite transformed coordinate pair' });
+  commands.push(...pythonProbeCommands(environment, PROJ_PYTHON_PROBE, 'pyproj coordinate transform', /transformed=-?\d+(?:\.\d+)?,-?\d+(?:\.\d+)?/));
+  return deduplicateProbeCommands(commands);
+}
+
+function buildGisProbeCommands(environment: NodeJS.ProcessEnv): CapabilityProbeCommand[] {
+  const commands: CapabilityProbeCommand[] = [];
+  if (environment.FORGEMIND_GIS_PROCESSING_EXECUTABLE) {
+    commands.push({
+      executable: environment.FORGEMIND_GIS_PROCESSING_EXECUTABLE,
+      args: ['-s_srs', 'EPSG:4326', '-t_srs', 'EPSG:5514'],
+      input: '14.4179 50.1266\n',
+      label: 'configured GDAL transform',
+      outputPattern: coordinatePairPattern(),
+      expectedOutput: 'a finite transformed coordinate pair'
+    });
+  }
+  commands.push({ executable: 'gdaltransform.exe', args: ['-s_srs', 'EPSG:4326', '-t_srs', 'EPSG:5514'], input: '14.4179 50.1266\n', label: 'native GDAL transform',
+    outputPattern: coordinatePairPattern(), expectedOutput: 'a finite transformed coordinate pair' });
+  commands.push(...pythonProbeCommands(environment, GIS_PYTHON_PROBE, 'rasterio in-memory GeoTIFF', /EPSG:5514 cells=4/));
+  return deduplicateProbeCommands(commands);
+}
+
+function pythonProbeCommands(environment: NodeJS.ProcessEnv, script: string, label: string, outputPattern: RegExp): CapabilityProbeCommand[] {
+  const commands: CapabilityProbeCommand[] = [];
+  if (environment.FORGEMIND_PYTHON_EXECUTABLE) {
+    commands.push({ executable: environment.FORGEMIND_PYTHON_EXECUTABLE, args: ['-c', script], label: `${label} (configured Python)`, outputPattern, expectedOutput: 'the completed operation marker' });
+  }
+  commands.push(
+    { executable: 'python.exe', args: ['-c', script], label: `${label} (python.exe)`, outputPattern, expectedOutput: 'the completed operation marker' },
+    { executable: 'py.exe', args: ['-3', '-c', script], label: `${label} (py.exe)`, outputPattern, expectedOutput: 'the completed operation marker' }
+  );
+  return commands;
+}
+
+function coordinatePairPattern(): RegExp {
+  return /(?:^|\s)-?\d+(?:\.\d+)?(?:\s+|\t)-?\d+(?:\.\d+)?/m;
+}
+
+function deduplicateProbeCommands(commands: CapabilityProbeCommand[]): CapabilityProbeCommand[] {
+  const identities = new Set<string>();
+  return commands.filter((command) => {
+    const identity = `${command.executable.toLocaleLowerCase('en-US')}\u0000${command.args.join('\u0000')}`;
     if (identities.has(identity)) return false;
     identities.add(identity);
     return true;
@@ -124,6 +231,11 @@ export async function runCapabilityProbes(
         const result = await runUnrealCapabilityProbe(probe);
         capability = result.capability;
         summary = result.summary;
+      } else if (probe.kind === 'process-alternatives') {
+        const result = await runFirstSuccessfulProbe(probe);
+        capability = withEvidenceMetadata(capability, result.command.executable, result.output);
+        capability = { ...capability, metadata: { ...capability.metadata, probe: result.command.label ?? result.command.executable } };
+        summary = `Local ${result.command.label ?? 'tool'} probe succeeded: ${redactProbeOutput(result.output)}`;
       } else if (probe.executable) {
         const output = await executeProbe(probe.executable, probe.args ?? [], probe.timeoutMs);
         assertExpectedVersion(probe, output);
@@ -141,6 +253,25 @@ export async function runCapabilityProbes(
     return item;
   }));
   return { evidence, capabilities: evidence.filter((item) => item.status === 'supported').map((item) => item.capability) };
+}
+
+async function runFirstSuccessfulProbe(probe: CapabilityProbe): Promise<{ command: CapabilityProbeCommand; output: string }> {
+  const alternatives = probe.alternatives ?? [];
+  if (alternatives.length === 0) throw new Error('probe has no process alternatives');
+  const failures: string[] = [];
+  for (const command of alternatives) {
+    try {
+      const output = await executeProbe(command.executable, command.args, probe.timeoutMs, undefined, command.input);
+      if (command.outputPattern && !command.outputPattern.test(output)) {
+        throw new Error(`probe returned success without ${command.expectedOutput ?? 'the expected output'}: ${output || 'no output'}`);
+      }
+      assertExpectedVersion(probe, output);
+      return { command, output };
+    } catch (error) {
+      failures.push(`${command.label ?? command.executable}: ${redactProbeOutput(error instanceof Error ? error.message : 'unknown error')}`);
+    }
+  }
+  throw new Error(`none of the local probe alternatives succeeded (${failures.join('; ')})`);
 }
 
 /** Keep capability property order stable across JSON transport and Zod parsing,
@@ -290,8 +421,8 @@ function escapeRegExp(value: string): string {
   return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }
 
-async function executeProbe(executable: string, args: readonly string[], timeoutMs = DEFAULT_PROBE_TIMEOUT_MS, cwd?: string): Promise<string> {
-  const result = await runBoundedProcess(executable, args, { timeoutMs, maxOutputBytes: 4096, ...(cwd ? { cwd } : {}) });
+async function executeProbe(executable: string, args: readonly string[], timeoutMs = DEFAULT_PROBE_TIMEOUT_MS, cwd?: string, input?: string): Promise<string> {
+  const result = await runBoundedProcess(executable, args, { timeoutMs, maxOutputBytes: 4096, ...(cwd ? { cwd } : {}), ...(input !== undefined ? { input } : {}) });
   if (result.terminationReason === 'timed-out') throw new Error(`probe timed out after ${timeoutMs}ms; executable=${executable}`);
   if (result.terminationReason === 'cancelled') throw new Error(`probe was cancelled; executable=${executable}`);
   if (result.terminationReason === 'missing-capability') throw new Error(`${result.stderr || 'executable was not found'}; executable=${executable}`);
