@@ -1,6 +1,6 @@
 import { createHash } from 'node:crypto';
 import { describe, expect, it, vi } from 'vitest';
-import { assertNativeCodexCliCompatibility, createWindowsProviderPool, parseCliArgs, requiredProbeFailures, resolveCodexPreflightTimeouts, resolveWindowsCandidateRoute, resolveWindowsConnectionCodexHome, selectLocalCodexModel, uploadAuthoringResultBlobs } from './cli.js';
+import { assertNativeCodexCliCompatibility, createTaskScopedWindowsProviderPool, createWindowsProviderPool, parseCliArgs, requiredProbeFailures, resolveCodexPreflightTimeouts, resolveWindowsCandidateRoute, resolveWindowsConnectionCodexHome, selectLocalCodexModel, uploadAuthoringResultBlobs } from './cli.js';
 
 describe('Windows runner CLI parsing', () => {
   it.each([
@@ -119,6 +119,28 @@ describe('Windows runner CLI parsing', () => {
     expect(fallback).not.toHaveBeenCalled();
     expect(session).toEqual({ id: undefined, provider: 'codex', model: 'gpt-6.1-sol' });
     expect(reports).toContainEqual(expect.stringContaining('refreshing the remote credential once'));
+  });
+
+  it('retries a subscription connection for each new authoring task after its usage limit resets', async () => {
+    const reports: string[] = [];
+    const planImplement = vi.fn()
+      .mockRejectedValueOnce(new Error('The ChatGPT user has reached their Subscription Sharing usage limit.'))
+      .mockResolvedValueOnce({ summary: 'plan recovered', changedFiles: [], diffStat: { filesChanged: 0, insertions: 0, deletions: 0 } });
+    const fallbackImplement = vi.fn(async () => ({ summary: 'fallback', changedFiles: [], diffStat: { filesChanged: 0, insertions: 0, deletions: 0 } }));
+    const candidates = [
+      { id: 'plan', label: 'ChatGPT plan', allowedModels: ['gpt-6.1-sol'], create: async () => ({ implement: planImplement }) as never },
+      { id: 'fallback', label: 'API fallback', allowedModels: ['gpt-6.1-sol'], create: async () => ({ implement: fallbackImplement }) as never }
+    ];
+    const route = { model: 'gpt-6.1-sol', reasoningEffort: 'medium' as const };
+
+    const firstTask = createTaskScopedWindowsProviderPool(candidates, route, (message) => reports.push(message));
+    await expect(firstTask.implement({ session: {} } as never)).resolves.toMatchObject({ summary: 'fallback' });
+    const secondTask = createTaskScopedWindowsProviderPool(candidates, route, (message) => reports.push(message));
+    await expect(secondTask.implement({ session: {} } as never)).resolves.toMatchObject({ summary: 'plan recovered' });
+
+    expect(planImplement).toHaveBeenCalledTimes(2);
+    expect(fallbackImplement).toHaveBeenCalledOnce();
+    expect(reports).toContainEqual(expect.stringContaining('usage_limit'));
   });
 
   it('uses an equal or stronger fallback tier but never silently lowers model quality', () => {

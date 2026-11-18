@@ -129,7 +129,7 @@ export async function prepareLocalCodexRuntime(environment: NodeJS.ProcessEnv = 
   report: (message: string) => void = () => undefined,
   loadRemotePool?: () => Promise<WindowsProviderPool>): Promise<{
   provider: AIProvider; model: string; codexHome: string; availableModels: string[];
-  providerForRoute: (route: TaskModelSelection) => AIProvider;
+  providerForRoute: (route?: TaskModelSelection) => AIProvider;
 }> {
   const codexHome = environment.FORGEMIND_API_CODEX_HOME?.trim()
     || join(environment.LOCALAPPDATA?.trim() || homedir(), 'ForgeMind', 'codex-api');
@@ -215,7 +215,10 @@ export async function prepareLocalCodexRuntime(environment: NodeJS.ProcessEnv = 
     model,
     codexHome,
     availableModels,
-    providerForRoute: (route) => createWindowsProviderPool(candidates, route, report, health)
+    // Connection health belongs to one authoring task. A subscription usage
+    // limit can reset while this foreground worker session remains alive, so
+    // a previous task must not blacklist that connection until restart.
+    providerForRoute: (route) => createTaskScopedWindowsProviderPool(candidates, route, report)
   };
 }
 
@@ -369,6 +372,14 @@ export function createWindowsProviderPool(
   };
 }
 
+export function createTaskScopedWindowsProviderPool(
+  candidates: WindowsProviderCandidate[],
+  route: TaskModelSelection | undefined,
+  report: (message: string) => void
+): AIProvider {
+  return createWindowsProviderPool(candidates, route, report, { unavailable: new Set() });
+}
+
 export async function main(args = process.argv.slice(2)): Promise<void> {
   if (process.platform !== 'win32') throw new Error('ForgeMind Windows runner can run only on Windows.');
   const parsed = parseCliArgs(args);
@@ -425,9 +436,7 @@ export async function main(args = process.argv.slice(2)): Promise<void> {
         if (!claim.job || !claim.lease) return;
         if (isWindowsAuthoringPacket(claim.job.packet)) {
           stdout.write(`Running native Windows implementation ${claim.job.packet.jobId}.\n`);
-          const authoringProvider = claim.job.packet.modelRoute
-            ? codexRuntime.providerForRoute(claim.job.packet.modelRoute)
-            : codexRuntime.provider;
+          const authoringProvider = codexRuntime.providerForRoute(claim.job.packet.modelRoute);
           if (claim.job.packet.modelRoute) {
             stdout.write(`Prepared routed model ${claim.job.packet.modelRoute.model} (${claim.job.packet.modelRoute.reasoningEffort}); it will be called only if checkpoint recovery cannot finish the task.\n`);
           }
