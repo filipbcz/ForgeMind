@@ -78,6 +78,7 @@ describe('native implementation provider lifecycle', () => {
     expect(checkpointMatchesPacketBaseline({ inputHash: 'old-input' }, packet)).toBe(false);
     expect(checkpointMatchesPacketBaseline({ inputHash: 'current-input' }, packet)).toBe(false);
     expect(checkpointMatchesPacketBaseline({ inputHash: 'current-input', priorPatchSha256: expected }, packet)).toBe(true);
+    expect(checkpointMatchesPacketBaseline({ inputHash: 'corrected-task-input', priorPatchSha256: expected }, packet)).toBe(true);
     expect(checkpointMatchesPacketBaseline({ inputHash: 'old-input' }, { inputHash: 'new-input', step: {} } as any)).toBe(true);
   });
   it('prefers a materially richer preserved checkpoint over a fresh partial retry', () => {

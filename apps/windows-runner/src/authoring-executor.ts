@@ -774,9 +774,9 @@ export function canResumeAuthoringCheckpoint(
 }
 
 /** A server-provided prior patch is the authoritative accepted result. A local
- * checkpoint may supersede it only when it was created from this exact packet
- * input and this exact accepted baseline. This prevents a stale text-only
- * checkpoint from hiding already delivered Unreal packages on a later retry. */
+ * checkpoint may supersede it only when it was created from that exact
+ * accepted baseline. The packet input hash may legitimately change after a
+ * targeted task-contract correction; the baseline patch hash must not. */
 export function checkpointMatchesPacketBaseline(
   checkpoint: Pick<AuthoringDiskCheckpoint, 'inputHash' | 'priorPatchSha256'>,
   packet: Pick<WindowsAuthoringPacket, 'inputHash' | 'step'>
@@ -784,7 +784,7 @@ export function checkpointMatchesPacketBaseline(
   const priorPatch = packet.step.priorPatch?.trim() ?? '';
   if (!priorPatch) return true;
   const expected = createHash('sha256').update(packet.step.priorPatch!, 'utf8').digest('hex');
-  return checkpoint.inputHash === packet.inputHash && checkpoint.priorPatchSha256 === expected;
+  return checkpoint.priorPatchSha256 === expected;
 }
 
 export function hasRestorableAuthoringCheckpoint(
