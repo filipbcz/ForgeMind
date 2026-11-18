@@ -46,6 +46,27 @@ import { buildRepositoryChatPrompt } from './chat-prompt.js';
 const DEFAULT_CODEX_API_URL = 'https://api.openai.com/v1/responses';
 const DEFAULT_CODEX_MODEL = 'gpt-6-astra';
 const execFileAsync = promisify(execFile);
+
+const TERMINAL_INTERRUPTION_KINDS = new Set([
+  'authentication',
+  'credit_exhausted',
+  'quota',
+  'rate_limit',
+  'spend_limit',
+  'usage_limit'
+]);
+
+/** A transport interruption may leave useful workspace changes behind, but a
+ * provider/account rejection is not a partial success. Propagate those errors
+ * so an outer connection pool can select another configured connection. */
+export function canRecoverCodexImplementationInterruption(error: unknown): boolean {
+  if (error instanceof CodexExecutionTimeoutError) return true;
+  const message = error instanceof Error ? error.message : String(error);
+  if (!/stream disconnected|connection (?:closed|reset|lost)|websocket.*(?:closed|disconnect)|unexpected eof/i.test(message)) {
+    return false;
+  }
+  return !TERMINAL_INTERRUPTION_KINDS.has(normalizeProviderError('codex', error).kind);
+}
 export function buildCodexReviewSchema(): Record<string, unknown> {
   return {
     type: 'object',
@@ -1071,8 +1092,7 @@ export class CodexProvider implements AIProvider {
         prompt: providerPrompt
       });
     } catch (error) {
-      const recoverableInterruption = error instanceof CodexExecutionTimeoutError
-        || /stream disconnected|connection (?:closed|reset|lost)|websocket.*(?:closed|disconnect)|unexpected eof/i.test(error instanceof Error ? error.message : String(error));
+      const recoverableInterruption = canRecoverCodexImplementationInterruption(error);
       if (!recoverableInterruption || input.signal?.aborted) {
         throw error;
       }

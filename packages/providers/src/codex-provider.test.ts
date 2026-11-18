@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from 'vitest';
-import { buildCodexImplementationPrompt, buildCodexNativeImplementationPrompt, buildCodexReviewSchema, codexProcessActivity, CodexProvider, formatCodexJsonEvent, isNoisyWorkspaceActivityPath, parseCodexCliTotalTokens, runCodexProcess } from './codex-provider.js';
+import { buildCodexImplementationPrompt, buildCodexNativeImplementationPrompt, buildCodexReviewSchema, canRecoverCodexImplementationInterruption, codexProcessActivity, CodexProvider, formatCodexJsonEvent, isNoisyWorkspaceActivityPath, parseCodexCliTotalTokens, runCodexProcess } from './codex-provider.js';
 
 function restoreEnvironment(name: string, value: string | undefined): void {
   if (value === undefined) delete process.env[name];
@@ -112,6 +112,22 @@ function expectStrictResponseSchema(schema: JsonSchema, path = '$'): void {
 }
 
 describe('Codex process activity timeouts', () => {
+  it('propagates account and capacity interruptions to connection-pool failover', () => {
+    expect(canRecoverCodexImplementationInterruption(new Error(
+      'stream disconnected before completion: The ChatGPT user has reached their Subscription Sharing usage limit.'
+    ))).toBe(false);
+    expect(canRecoverCodexImplementationInterruption(new Error(
+      'stream disconnected before completion: You have no credits remaining. Add credits to continue using the API.'
+    ))).toBe(false);
+    expect(canRecoverCodexImplementationInterruption(new Error(
+      'stream disconnected before completion: HTTP 401 Unauthorized'
+    ))).toBe(false);
+    expect(canRecoverCodexImplementationInterruption(new Error(
+      'stream disconnected before completion: connection reset by peer'
+    ))).toBe(true);
+    expect(canRecoverCodexImplementationInterruption(new Error('implementation failed'))).toBe(false);
+  });
+
   it('preserves separate command streams and never relabels aggregated output as stdout', () => {
     expect(codexProcessActivity({ type: 'item.completed', item: { type: 'command_execution', id: 'check-1', command: 'cmd /c build', exit_code: 7,
       stdout: 'build output', stderr: 'build error', aggregated_output: 'build outputbuild error' } })).toEqual({
