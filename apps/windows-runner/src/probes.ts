@@ -30,6 +30,7 @@ export interface ProbeResult { capabilities: WorkerCapability[]; evidence: Worke
 export interface ProbeProgress { capability: WorkerCapability; state: 'started' | 'completed'; status?: WorkerProbeEvidence['status']; summary?: string }
 
 const DEFAULT_PROBE_TIMEOUT_MS = 30_000;
+const MSVC_PROBE_TIMEOUT_MS = 120_000;
 const UNREAL_PROBE_TIMEOUT_MS = 240_000;
 
 const PROJ_PYTHON_PROBE = [
@@ -86,7 +87,8 @@ export function windowsRunnerCapabilityProbes(
       executable: nodeExecutable, args: ['-e', "if(typeof fetch!=='function')process.exit(2);process.stdout.write('runner-managed HTTPS fetch available')"] },
     { capability: { key: 'npm', metadata: { executable: 'npm.cmd' } }, executable: environment.ComSpec ?? 'cmd.exe', args: ['/d', '/s', '/c', 'npm.cmd --version'] },
     { capability: { key: 'cmake' }, executable: 'cmake.exe', args: ['--version'] },
-    { capability: { key: 'msvc', metadata: { target: 'x64' } }, kind: 'msvc', executable: windowsPath.join(programFilesX86, 'Microsoft Visual Studio', 'Installer', 'vswhere.exe') },
+    { capability: { key: 'msvc', metadata: { target: 'x64' } }, kind: 'msvc', timeoutMs: MSVC_PROBE_TIMEOUT_MS,
+      executable: windowsPath.join(programFilesX86, 'Microsoft Visual Studio', 'Installer', 'vswhere.exe') },
     { capability: { key: 'windows-sdk' }, executable: 'where.exe', args: ['rc.exe'] },
     { capability: { key: 'interactive-desktop' }, executable: 'powershell.exe', args: ['-NoProfile', '-NonInteractive', '-Command', "if (-not [Environment]::UserInteractive) { exit 2 }; [Environment]::UserName"] },
     { capability: { key: 'gpu' }, executable: 'powershell.exe', args: ['-NoProfile', '-NonInteractive', '-Command', "$g=Get-CimInstance Win32_VideoController | Where-Object {$_.AdapterRAM -gt 0} | Select-Object -First 1; if (-not $g) { exit 2 }; \"$($g.Name) driver=$($g.DriverVersion)\""] },

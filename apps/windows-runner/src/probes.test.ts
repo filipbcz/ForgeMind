@@ -27,7 +27,8 @@ describe('capability probes', () => {
     expect(probes).toEqual(expect.arrayContaining([
       expect.objectContaining({ capability: { key: 'npm', metadata: { executable: 'npm.cmd' } }, executable: 'cmd.exe', args: ['/d', '/s', '/c', 'npm.cmd --version'] }),
       expect.objectContaining({ capability: { key: 'cmake' }, executable: 'cmake.exe' }),
-      expect.objectContaining({ capability: { key: 'msvc', metadata: { target: 'x64' } }, kind: 'msvc', executable: expect.stringContaining('vswhere.exe') }),
+      expect.objectContaining({ capability: { key: 'msvc', metadata: { target: 'x64' } }, kind: 'msvc', timeoutMs: 120_000,
+        executable: expect.stringContaining('vswhere.exe') }),
       expect.objectContaining({ capability: { key: 'git-lfs' }, executable: 'git-lfs.exe' }),
       expect.objectContaining({ capability: { key: 'windows-sdk' }, executable: 'where.exe' }),
       expect.objectContaining({ capability: { key: 'interactive-desktop' }, executable: 'powershell.exe' }),
