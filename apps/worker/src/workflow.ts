@@ -2329,7 +2329,7 @@ async function checkoutWorkspaceBranch(git: SimpleGit, branchName: string, hasRe
   await git.checkoutLocalBranch(branchName);
 }
 
-async function stageAndCommitChanges(git: SimpleGit, message: string) {
+export async function stageAndCommitChanges(git: SimpleGit, message: string) {
   const initialStatus = await git.status();
   const pathsToStage = collectStageablePaths(initialStatus);
   if (pathsToStage.length === 0 && initialStatus.staged.length === 0) {
@@ -2337,7 +2337,12 @@ async function stageAndCommitChanges(git: SimpleGit, message: string) {
   }
 
   if (pathsToStage.length > 0) {
-    await git.add(pathsToStage);
+    // Stage the authoritative workspace as a whole. Passing deleted and added
+    // spellings as individual pathspecs breaks case-only renames after a
+    // Windows result is materialized on Linux: the deleted spelling no longer
+    // exists, so `git add old/path New/path` aborts before delivery. `-A`
+    // records additions, modifications and deletions directly from the index.
+    await git.add(['-A']);
   }
 
   const status = await git.status();

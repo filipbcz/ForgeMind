@@ -1,5 +1,5 @@
 import { randomUUID } from 'node:crypto';
-import { mkdir, mkdtemp, readFile, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { simpleGit } from 'simple-git';
@@ -15,7 +15,7 @@ import type {
   ReviewResult,
   TaskRoutingInput
 } from '@forgemind/providers';
-import { buildTaskExecutionPrompt, collectValidationWorkspacePatch, createDirectTaskPlan, runWorkerTask, selectReusableValidationResults, validationCheckFingerprint } from './workflow.js';
+import { buildTaskExecutionPrompt, collectValidationWorkspacePatch, createDirectTaskPlan, runWorkerTask, selectReusableValidationResults, stageAndCommitChanges, validationCheckFingerprint } from './workflow.js';
 import { replaceGitPatch } from './db-worker.js';
 
 const projectConfig = `project:
@@ -36,6 +36,7 @@ github: {}
 
 const validationCommand = `node -e "const fs=require('node:fs');const value=fs.readFileSync('status.txt','utf8').trim();if(value!=='pass'){console.error('EXACT_VALIDATION_FAILURE');process.exit(7)}"`;
 const workflowTestTimeoutMs = 15_000;
+const itCaseSensitive = process.platform === 'win32' ? it.skip : it;
 
 function createProject(): Project {
   const now = new Date().toISOString();
@@ -130,6 +131,32 @@ function createProvider(overrides: Partial<AIProvider> = {}): AIProvider {
 }
 
 describe('simple autonomous worker workflow', () => {
+  itCaseSensitive('commits a case-only rename without passing the deleted spelling as a pathspec', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'forgemind-case-delivery-'));
+    try {
+      const git = simpleGit(root);
+      await git.init();
+      await git.addConfig('user.name', 'ForgeMind Test');
+      await git.addConfig('user.email', 'test@forgemind.local');
+      await mkdir(join(root, 'tests', 'core_sim'), { recursive: true });
+      await writeFile(join(root, 'tests', 'core_sim', 'scenario_start_test.cpp'), 'old\n');
+      await git.add(['-A']);
+      await git.commit('base');
+
+      await mkdir(join(root, 'Tests', 'core_sim'), { recursive: true });
+      await writeFile(join(root, 'Tests', 'core_sim', 'scenario_start_test.cpp'), 'new\n');
+      await rm(join(root, 'tests'), { recursive: true, force: true });
+
+      await stageAndCommitChanges(git, 'case-only rename');
+
+      await expect(git.show(['HEAD:Tests/core_sim/scenario_start_test.cpp'])).resolves.toBe('new\n');
+      await expect(git.show(['HEAD:tests/core_sim/scenario_start_test.cpp'])).rejects.toThrow();
+      expect((await git.status()).isClean()).toBe(true);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
   it('runs and resumes a Flying-shaped Windows-owned delivery without repeating confirmed effects', async () => {
     const project = { ...createProject(), configYaml: projectConfig.replace('auto_push: false', 'auto_push: true'),
       autoCreatePullRequest: true, autoMergePullRequest: true, autoCompleteTask: true };
