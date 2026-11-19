@@ -1,4 +1,7 @@
 import { describe, expect, it } from 'vitest';
+import { mkdtemp, mkdir, rm, writeFile } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { buildMsvcProbeScript, buildUnrealProbeProjectDescriptor, parseConfiguredToolProbes, redactProbeOutput, runCapabilityProbes,
   summarizeUnrealFailure, windowsRunnerCapabilityProbes } from './probes.js';
 
@@ -15,6 +18,30 @@ describe('capability probes', () => {
       expect.objectContaining({ capability: expect.objectContaining({ key: 'baseline', version: expect.any(String), metadata: expect.objectContaining({ executable: process.execPath }) }), status: 'supported', evidenceHash: expect.stringMatching(/^[a-f0-9]{64}$/) }),
       expect.objectContaining({ capability: { key: 'missing-tool' }, status: 'unsupported', evidenceHash: expect.stringMatching(/^[a-f0-9]{64}$/) })
     ]);
+  });
+
+  it('discovers and verifies an installed Cesium for Unreal plugin manifest', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'forgemind-cesium-probe-test-'));
+    const plugin = join(root, 'Marketplace', 'CesiumFixture');
+    try {
+      await mkdir(plugin, { recursive: true });
+      await writeFile(join(plugin, 'CesiumForUnreal.uplugin'), JSON.stringify({
+        FriendlyName: 'Cesium for Unreal',
+        VersionName: '2.29.1',
+        Modules: [{ Name: 'CesiumRuntime', Type: 'Runtime' }]
+      }));
+      const result = await runCapabilityProbes([{
+        capability: { key: 'cesium' }, kind: 'cesium', path: root
+      }]);
+      expect(result.capabilities).toEqual([expect.objectContaining({
+        key: 'cesium', version: '2.29.1', metadata: expect.objectContaining({
+          manifestPath: expect.stringContaining('CesiumForUnreal.uplugin'), moduleCount: 1
+        })
+      })]);
+      expect(result.evidence[0]).toMatchObject({ status: 'supported', summary: 'Cesium for Unreal 2.29.1 plugin manifest probe succeeded.' });
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
   });
 
   it('builds real executable probes for built-in and configured tool capabilities', () => {
@@ -48,6 +75,11 @@ describe('capability probes', () => {
         executable: 'C:\\UE\\UnrealEditor-Cmd.exe',
         kind: 'unreal',
         timeoutMs: 240_000
+      }),
+      expect.objectContaining({
+        capability: { key: 'cesium', metadata: { unrealExecutable: 'C:\\UE\\UnrealEditor-Cmd.exe' } },
+        kind: 'cesium',
+        path: 'C:\\Plugins'
       }),
       expect.objectContaining({ capability: { key: 'custom-sdk' }, executable: 'sdk.exe', args: ['version'] })
     ]));

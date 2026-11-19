@@ -1,5 +1,5 @@
 import { createHash } from 'node:crypto';
-import { mkdtemp, mkdir, readFile, rm, stat, statfs, writeFile } from 'node:fs/promises';
+import { mkdtemp, mkdir, readFile, readdir, rm, stat, statfs, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join, win32 as windowsPath } from 'node:path';
 import { canonicalizeWorkerProbeEvidence, type WorkerCapability, type WorkerProbeEvidence } from '@forgemind/core';
@@ -10,7 +10,7 @@ export interface CapabilityProbe {
   capability: WorkerCapability;
   executable?: string;
   args?: readonly string[];
-  kind?: 'process' | 'process-alternatives' | 'windows-platform' | 'disk' | 'msvc' | 'unreal';
+  kind?: 'process' | 'process-alternatives' | 'windows-platform' | 'disk' | 'msvc' | 'unreal' | 'cesium';
   alternatives?: readonly CapabilityProbeCommand[];
   path?: string;
   timeoutMs?: number;
@@ -65,6 +65,16 @@ export const unrealCapabilityProbe = (executable: string, version: string): Capa
   ...(version === 'configured' ? {} : { expectedVersion: version })
 });
 
+export const cesiumCapabilityProbe = (unrealExecutable: string, version?: string): CapabilityProbe => {
+  const engineRoot = windowsPath.resolve(windowsPath.dirname(unrealExecutable), '..', '..');
+  return {
+    capability: { key: 'cesium', ...(version ? { version } : {}), metadata: { unrealExecutable } },
+    kind: 'cesium',
+    path: windowsPath.join(engineRoot, 'Plugins'),
+    ...(version ? { expectedVersion: version } : {})
+  };
+};
+
 /**
  * Capabilities published by the runner must be backed by a local process probe.
  * Extra installations can be declared as JSON in FORGEMIND_WINDOWS_TOOL_PROBES;
@@ -99,8 +109,9 @@ export function windowsRunnerCapabilityProbes(
   probes.push({ capability: { key: 'codex' }, executable: resolveCodexBinary(environment), args: ['--version'] });
   if (environment.FORGEMIND_UNREAL_EXECUTABLE) {
     probes.push(unrealCapabilityProbe(environment.FORGEMIND_UNREAL_EXECUTABLE, environment.FORGEMIND_UNREAL_VERSION ?? 'configured'));
+    probes.push(cesiumCapabilityProbe(environment.FORGEMIND_UNREAL_EXECUTABLE, environment.FORGEMIND_CESIUM_VERSION));
   }
-  if (environment.FORGEMIND_CESIUM_EXECUTABLE) probes.push({ capability: { key: 'cesium', ...(environment.FORGEMIND_CESIUM_VERSION ? { version: environment.FORGEMIND_CESIUM_VERSION } : {}) },
+  if (!environment.FORGEMIND_UNREAL_EXECUTABLE && environment.FORGEMIND_CESIUM_EXECUTABLE) probes.push({ capability: { key: 'cesium', ...(environment.FORGEMIND_CESIUM_VERSION ? { version: environment.FORGEMIND_CESIUM_VERSION } : {}) },
     executable: environment.FORGEMIND_CESIUM_EXECUTABLE, args: ['--version'] });
   if (environment.FORGEMIND_ASSET_TOOL_EXECUTABLE) probes.push({ capability: { key: 'asset-tool', ...(environment.FORGEMIND_ASSET_TOOL_VERSION ? { version: environment.FORGEMIND_ASSET_TOOL_VERSION } : {}) },
     executable: environment.FORGEMIND_ASSET_TOOL_EXECUTABLE, args: ['--version'] });
@@ -233,6 +244,10 @@ export async function runCapabilityProbes(
         const result = await runUnrealCapabilityProbe(probe);
         capability = result.capability;
         summary = result.summary;
+      } else if (probe.kind === 'cesium') {
+        const result = await runCesiumCapabilityProbe(probe);
+        capability = result.capability;
+        summary = result.summary;
       } else if (probe.kind === 'process-alternatives') {
         const result = await runFirstSuccessfulProbe(probe);
         capability = withEvidenceMetadata(capability, result.command.executable, result.output);
@@ -255,6 +270,44 @@ export async function runCapabilityProbes(
     return item;
   }));
   return { evidence, capabilities: evidence.filter((item) => item.status === 'supported').map((item) => item.capability) };
+}
+
+async function runCesiumCapabilityProbe(probe: CapabilityProbe): Promise<{ capability: WorkerCapability; summary: string }> {
+  const pluginRoot = probe.path!;
+  const manifests = await findNamedFiles(pluginRoot, 'CesiumForUnreal.uplugin');
+  if (manifests.length === 0) throw new Error(`CesiumForUnreal.uplugin was not found below ${pluginRoot}.`);
+  const manifestPath = manifests.sort()[0]!;
+  const manifest = JSON.parse(await readFile(manifestPath, 'utf8')) as Record<string, unknown>;
+  const version = typeof manifest.VersionName === 'string' ? manifest.VersionName.trim() : '';
+  const modules = Array.isArray(manifest.Modules) ? manifest.Modules : [];
+  if (!version) throw new Error(`Cesium plugin manifest has no VersionName: ${manifestPath}`);
+  if (modules.length === 0) throw new Error(`Cesium plugin manifest declares no modules: ${manifestPath}`);
+  if (probe.expectedVersion && !versionMatches(probe.expectedVersion, version)) {
+    throw new Error(`Cesium plugin manifest reported ${version}, expected ${probe.expectedVersion}.`);
+  }
+  return {
+    capability: {
+      ...probe.capability,
+      version,
+      metadata: { ...probe.capability.metadata, manifestPath, pluginRoot, moduleCount: modules.length }
+    },
+    summary: `Cesium for Unreal ${version} plugin manifest probe succeeded.`
+  };
+}
+
+async function findNamedFiles(root: string, filename: string): Promise<string[]> {
+  const matches: string[] = [];
+  const pending = [root];
+  while (pending.length > 0) {
+    const directory = pending.pop()!;
+    const entries = await readdir(directory, { withFileTypes: true });
+    for (const entry of entries) {
+      const path = join(directory, entry.name);
+      if (entry.isDirectory()) pending.push(path);
+      else if (entry.isFile() && entry.name.toLocaleLowerCase('en-US') === filename.toLocaleLowerCase('en-US')) matches.push(path);
+    }
+  }
+  return matches;
 }
 
 async function runFirstSuccessfulProbe(probe: CapabilityProbe): Promise<{ command: CapabilityProbeCommand; output: string }> {
