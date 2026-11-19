@@ -3547,6 +3547,15 @@ github:
 });
 
 describe('real-engine authoring packet classification', () => {
+  it('ignores a deleted case-variant reported by an older Windows runner', async () => {
+    const { selectIndexedResultTreeEntries } = await import('./db-worker.js');
+    const tree = [
+      { path: 'tests/core_sim/scenario_start_test.cpp' },
+      { path: 'Tests/core_sim/scenario_start_test.cpp' }
+    ];
+    expect(selectIndexedResultTreeEntries(tree, new Set(['Tests/core_sim/scenario_start_test.cpp'])))
+      .toEqual([{ path: 'Tests/core_sim/scenario_start_test.cpp' }]);
+  });
   it('stages a reconciled Windows patch so the authenticated result tree can be verified and committed', async () => {
     const workspace = join(tmpdir(), `forgemind-reconcile-workspace-${randomUUID()}`);
     await mkdir(workspace);

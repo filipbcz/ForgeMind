@@ -218,7 +218,8 @@ async function implementThroughWindowsLease(windowsWorkers: WindowsWorkerReposit
   if (result.resultBundle.lfsObjects.length > 0) {
     const supplied = new Set(result.resultBundle.lfsObjects.map(({ oid }) => oid.toLowerCase()));
     const lfsPaths: string[] = [];
-    for (const { path } of result.tree) {
+    const indexedPaths = await readIndexedPaths(input.workspacePath, input.signal);
+    for (const { path } of selectIndexedResultTreeEntries(result.tree, indexedPaths)) {
       const indexed = await runGitCapture(input.workspacePath, ['show', `:${path}`], input.signal);
       const pointer = indexed.match(/^version https:\/\/git-lfs\.github\.com\/spec\/v1\r?\noid sha256:([a-f0-9]{64})\r?\nsize \d+\r?\n?$/);
       if (pointer && supplied.has(pointer[1]!.toLowerCase())) lfsPaths.push(path);
@@ -337,11 +338,25 @@ async function verifyWindowsResultTree(workspacePath: string, result: WindowsAut
   });
   if (tree.toLowerCase() !== result.resultTreeSha.toLowerCase()) throw new Error('Windows result reconciliation failed: reconstructed Git tree does not match the runner result tree.');
   const supplied = new Set(result.resultBundle.lfsObjects.map(({ oid }) => oid.toLowerCase()));
-  for (const { path } of result.tree) {
+  const indexedPaths = await readIndexedPaths(workspacePath, signal);
+  for (const { path } of selectIndexedResultTreeEntries(result.tree, indexedPaths)) {
     const indexed = await runGitCapture(workspacePath, ['show', `:${path}`], signal);
     const pointer = indexed.match(/^version https:\/\/git-lfs\.github\.com\/spec\/v1\r?\noid sha256:([a-f0-9]{64})\r?\nsize \d+\r?\n?$/);
     if (pointer && !supplied.has(pointer[1]!.toLowerCase())) throw new Error(`Windows result reconciliation failed: missing Git LFS object ${pointer[1]} for ${path}.`);
   }
+}
+
+async function readIndexedPaths(workspacePath: string, signal?: AbortSignal): Promise<Set<string>> {
+  return new Set((await runGitCapture(workspacePath, ['ls-files', '-z'], signal)).split('\0').filter(Boolean)
+    .map((path) => path.replaceAll('\\', '/')));
+}
+
+/** Result metadata from older Windows runners may contain the deleted spelling
+ * of a case-only rename because NTFS resolves both spellings to one file. The
+ * reconstructed Git index is authoritative and case-sensitive, so only exact
+ * index members are eligible for follow-up evidence and LFS inspection. */
+export function selectIndexedResultTreeEntries<T extends { path: string }>(tree: T[], indexedPaths: ReadonlySet<string>): T[] {
+  return tree.filter(({ path }) => indexedPaths.has(path.replaceAll('\\', '/')));
 }
 
 async function runGitCapture(workspacePath: string, args: string[], signal?: AbortSignal): Promise<string> {

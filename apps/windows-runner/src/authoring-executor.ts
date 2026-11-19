@@ -923,8 +923,13 @@ async function stageChangedPaths(root: string, signal?: AbortSignal): Promise<st
   return indexedChangedPaths(root, signal);
 }
 
-async function indexedChangedPaths(root: string, signal?: AbortSignal): Promise<string[]> {
-  const changed = await spawnComplete('git.exe', ['diff', '--cached', '--name-only', '-z', 'HEAD'], root, 30_000, signal);
+export async function indexedChangedPaths(root: string, signal?: AbortSignal, gitExecutable = 'git.exe'): Promise<string[]> {
+  // Result-tree metadata describes files which exist in the resulting index.
+  // Exclude deletions explicitly: on a case-insensitive Windows filesystem an
+  // lstat of a deleted `tests/...` path can otherwise resolve the newly added
+  // `Tests/...` path and publish both spellings as existing files.
+  const changed = await spawnComplete(gitExecutable,
+    ['diff', '--cached', '--name-only', '--diff-filter=ACMRTUXB', '-z', 'HEAD'], root, 30_000, signal);
   if (changed.exitCode !== 0) throw new Error(`Could not inspect the staged authored result: ${changed.stderr}`);
   return changed.stdout.split('\0').filter(Boolean).map((path) => path.replaceAll('\\', '/'));
 }

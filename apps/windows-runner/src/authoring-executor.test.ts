@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from 'vitest';
-import { assertReadableAuthoringCheckout, authoringPatchOutputLimit, authoringSemanticHash, buildRecoveredUnrealPackageAuthoringScript, buildUnrealPackageVerificationArgs, buildUnrealPackageVerificationScript, canFinalizeRecoveredUnrealResult, canResumeAuthoringCheckpoint, checkpointMatchesPacketBaseline, checkpointRecoveryScore, classifyAuthoringFailure, classifyWindowsAuthoringFailure, cleanupIgnoredUnrealRuntimeState, collectAuthoringToolVersions, collectCheckpointAuthoringProvenance, compactProcessResults, discoverUnrealProjectDirectories, hasRestorableAuthoringCheckpoint, isProhibitedAuthoringPath, LifecycleNativeImplementationProvider, materializeOutputs, materializePriorPatchFromIndex, missingRequiredAuthoringArtifacts, nativeImplementationPrompt, persistentOutputReferencesMatch, requiresProductionContent, retainedCheckpointGenerations, restoreCheckpointAuthoringProvenance, selectRecoveryCheckpoint, selectUnrealProjectForPackages, type NativeAuthoringTools, unrealObjectPath, validateRequiredUnrealAssets } from './authoring-executor.js';
+import { assertReadableAuthoringCheckout, authoringPatchOutputLimit, authoringSemanticHash, buildRecoveredUnrealPackageAuthoringScript, buildUnrealPackageVerificationArgs, buildUnrealPackageVerificationScript, canFinalizeRecoveredUnrealResult, canResumeAuthoringCheckpoint, checkpointMatchesPacketBaseline, checkpointRecoveryScore, classifyAuthoringFailure, classifyWindowsAuthoringFailure, cleanupIgnoredUnrealRuntimeState, collectAuthoringToolVersions, collectCheckpointAuthoringProvenance, compactProcessResults, discoverUnrealProjectDirectories, hasRestorableAuthoringCheckpoint, indexedChangedPaths, isProhibitedAuthoringPath, LifecycleNativeImplementationProvider, materializeOutputs, materializePriorPatchFromIndex, missingRequiredAuthoringArtifacts, nativeImplementationPrompt, persistentOutputReferencesMatch, requiresProductionContent, retainedCheckpointGenerations, restoreCheckpointAuthoringProvenance, selectRecoveryCheckpoint, selectUnrealProjectForPackages, type NativeAuthoringTools, unrealObjectPath, validateRequiredUnrealAssets } from './authoring-executor.js';
 import { access, mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
@@ -39,6 +39,25 @@ describe('native implementation provider lifecycle', () => {
       await expect(readFile(join(root, 'Tests', 'core_sim', 'scenario_start_test.cpp'), 'utf8')).resolves.toBe('new\n');
       await expect(access(join(root, 'tests', 'core_sim', 'scenario_start_test.cpp'))).rejects.toThrow();
       expect(git('diff', '--cached', '--name-status', 'HEAD')).toContain('Tests/core_sim/scenario_start_test.cpp');
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+  itCaseSensitive('publishes only the surviving index path for a case-only rename', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'forgemind-result-paths-'));
+    const git = (...args: string[]) => execFileSync('git', args, { cwd: root, encoding: 'utf8' });
+    try {
+      git('init'); git('config', 'user.email', 'fixture@example.invalid'); git('config', 'user.name', 'Fixture');
+      await mkdir(join(root, 'tests', 'core_sim'), { recursive: true });
+      await writeFile(join(root, 'tests', 'core_sim', 'scenario_start_test.cpp'), 'old\n');
+      git('add', '.'); git('commit', '-m', 'base');
+      await mkdir(join(root, 'Tests', 'core_sim'), { recursive: true });
+      await writeFile(join(root, 'Tests', 'core_sim', 'scenario_start_test.cpp'), 'new\n');
+      await rm(join(root, 'tests'), { recursive: true, force: true });
+      git('add', '-A');
+
+      expect(await indexedChangedPaths(root, undefined, 'git')).toEqual(['Tests/core_sim/scenario_start_test.cpp']);
+      expect(git('diff', '--cached', '--name-status', 'HEAD')).toContain('tests/core_sim/scenario_start_test.cpp');
     } finally {
       await rm(root, { recursive: true, force: true });
     }
