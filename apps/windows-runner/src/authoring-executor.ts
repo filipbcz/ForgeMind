@@ -191,8 +191,7 @@ export async function executeWindowsAuthoring(packet: WindowsAuthoringPacket, co
   const checkout = await prepareCheckout(packet, context.workspaceRoot, checkpointPath, outputDirectory, selectedUnrealIdentity, context.signal);
   const workspacePath = checkout.path;
   if (!checkout.resumed && packet.step.priorPatch?.trim()) {
-    const prior = await spawnWithInput('git.exe', ['apply', '--binary', '--whitespace=nowarn', '-'], workspacePath, packet.step.priorPatch, context.signal);
-    if (prior.exitCode !== 0) throw new Error(`Could not materialize the previous Windows attempt: ${prior.stderr}`);
+    await materializePriorPatch(workspacePath, packet.step.priorPatch, context.signal);
   }
   const processes = restoreCheckpointAuthoringProvenance(checkout.checkpoint, packet.leaseId, context.sessionId);
   const reusableResult = await readReusableCompletedResult(evidenceDirectory, packet, context, workspacePath, projectDataDirectory);
@@ -356,6 +355,47 @@ export async function executeWindowsAuthoring(packet: WindowsAuthoringPacket, co
   await writeFile(resolve(evidenceDirectory, 'result-checkpoint.json'), JSON.stringify({ version: 2,
     semanticHash: authoringSemanticHash(packet), result }), 'utf8');
   return { workspacePath, result };
+}
+
+async function materializePriorPatch(workspacePath: string, patch: string, signal?: AbortSignal): Promise<void> {
+  const ordinary = await spawnWithInput('git.exe', ['apply', '--binary', '--whitespace=nowarn', '-'], workspacePath, patch, signal);
+  if (ordinary.exitCode === 0) return;
+
+  // A patch produced on a case-sensitive host can rename only the casing of a
+  // path (for example tests/... -> Tests/...). Applying it directly to an
+  // NTFS checkout fails because both names address the same working-tree file.
+  // Apply the authoritative patch to Git's index first, remove paths deleted
+  // by that index transition, and then materialize the resulting index. This
+  // also keeps binary patches intact and avoids re-running the prior AI work.
+  const reset = await spawnComplete('git.exe', ['reset', '--hard', 'HEAD'], workspacePath, 30_000, signal);
+  if (reset.exitCode !== 0) throw new Error(`Could not reset the fresh correction checkout after patch conflict: ${reset.stderr}`);
+  await materializePriorPatchFromIndex(workspacePath, patch, signal);
+}
+
+export async function materializePriorPatchFromIndex(
+  workspacePath: string,
+  patch: string,
+  signal?: AbortSignal,
+  gitExecutable = 'git.exe'
+): Promise<void> {
+  const indexed = await spawnWithInput(gitExecutable, ['apply', '--binary', '--cached', '--whitespace=nowarn', '-'], workspacePath, patch, signal);
+  if (indexed.exitCode !== 0) {
+    throw new Error(`Could not apply the previous Windows attempt to the Git index: ${indexed.stderr}`);
+  }
+  const deleted = await spawnComplete(gitExecutable, ['diff', '--cached', '--name-only', '--diff-filter=D', '-z', 'HEAD'], workspacePath, 30_000, signal);
+  if (deleted.exitCode !== 0) throw new Error(`Could not enumerate prior-patch deletions: ${deleted.stderr}`);
+  for (const path of deleted.stdout.split('\0').filter(Boolean)) {
+    const target = resolve(workspacePath, path);
+    const relativeTarget = relative(workspacePath, target);
+    if (!relativeTarget || relativeTarget === '..' || relativeTarget.startsWith(`..${process.platform === 'win32' ? '\\' : '/'}`)) {
+      throw new Error(`Prior patch deletion escapes the correction checkout: ${path}`);
+    }
+    await rm(target, { recursive: true, force: true });
+  }
+  const materialized = await spawnComplete(gitExecutable, ['checkout-index', '--all', '--force'], workspacePath, 30_000, signal);
+  if (materialized.exitCode !== 0) throw new Error(`Could not materialize the indexed previous Windows attempt: ${materialized.stderr}`);
+  const checked = await spawnComplete(gitExecutable, ['diff', '--cached', '--check', 'HEAD'], workspacePath, 30_000, signal);
+  if (checked.exitCode !== 0) throw new Error(`The materialized previous Windows attempt is invalid: ${checked.stdout || checked.stderr}`);
 }
 
 export function canFinalizeRecoveredUnrealResult(previousValidationError: string | undefined, resumed: boolean,

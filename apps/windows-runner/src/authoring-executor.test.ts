@@ -1,9 +1,10 @@
 import { describe, expect, it, vi } from 'vitest';
-import { assertReadableAuthoringCheckout, authoringPatchOutputLimit, authoringSemanticHash, buildRecoveredUnrealPackageAuthoringScript, buildUnrealPackageVerificationArgs, buildUnrealPackageVerificationScript, canFinalizeRecoveredUnrealResult, canResumeAuthoringCheckpoint, checkpointMatchesPacketBaseline, checkpointRecoveryScore, classifyAuthoringFailure, classifyWindowsAuthoringFailure, cleanupIgnoredUnrealRuntimeState, collectAuthoringToolVersions, collectCheckpointAuthoringProvenance, compactProcessResults, discoverUnrealProjectDirectories, hasRestorableAuthoringCheckpoint, isProhibitedAuthoringPath, LifecycleNativeImplementationProvider, materializeOutputs, missingRequiredAuthoringArtifacts, nativeImplementationPrompt, persistentOutputReferencesMatch, requiresProductionContent, retainedCheckpointGenerations, restoreCheckpointAuthoringProvenance, selectRecoveryCheckpoint, selectUnrealProjectForPackages, type NativeAuthoringTools, unrealObjectPath, validateRequiredUnrealAssets } from './authoring-executor.js';
-import { access, mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { assertReadableAuthoringCheckout, authoringPatchOutputLimit, authoringSemanticHash, buildRecoveredUnrealPackageAuthoringScript, buildUnrealPackageVerificationArgs, buildUnrealPackageVerificationScript, canFinalizeRecoveredUnrealResult, canResumeAuthoringCheckpoint, checkpointMatchesPacketBaseline, checkpointRecoveryScore, classifyAuthoringFailure, classifyWindowsAuthoringFailure, cleanupIgnoredUnrealRuntimeState, collectAuthoringToolVersions, collectCheckpointAuthoringProvenance, compactProcessResults, discoverUnrealProjectDirectories, hasRestorableAuthoringCheckpoint, isProhibitedAuthoringPath, LifecycleNativeImplementationProvider, materializeOutputs, materializePriorPatchFromIndex, missingRequiredAuthoringArtifacts, nativeImplementationPrompt, persistentOutputReferencesMatch, requiresProductionContent, retainedCheckpointGenerations, restoreCheckpointAuthoringProvenance, selectRecoveryCheckpoint, selectUnrealProjectForPackages, type NativeAuthoringTools, unrealObjectPath, validateRequiredUnrealAssets } from './authoring-executor.js';
+import { access, mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { createHash } from 'node:crypto';
+import { execFileSync } from 'node:child_process';
 import { recoveredUnrealEditorTarget, resolveUnrealBuildRuntime } from './unreal-build-runtime.js';
 
 const implementation = {
@@ -15,7 +16,33 @@ const implementation = {
   ]
 };
 
+const itCaseSensitive = process.platform === 'win32' ? it.skip : it;
+
 describe('native implementation provider lifecycle', () => {
+  itCaseSensitive('materializes a server patch containing a case-only path rename through the Git index', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'forgemind-prior-patch-'));
+    const git = (...args: string[]) => execFileSync('git', args, { cwd: root, encoding: 'utf8' });
+    try {
+      git('init'); git('config', 'user.email', 'fixture@example.invalid'); git('config', 'user.name', 'Fixture');
+      await mkdir(join(root, 'tests', 'core_sim'), { recursive: true });
+      await writeFile(join(root, 'tests', 'core_sim', 'scenario_start_test.cpp'), 'old\n');
+      git('add', '.'); git('commit', '-m', 'base');
+      await mkdir(join(root, 'Tests', 'core_sim'), { recursive: true });
+      await writeFile(join(root, 'Tests', 'core_sim', 'scenario_start_test.cpp'), 'new\n');
+      await rm(join(root, 'tests'), { recursive: true, force: true });
+      git('add', '-A');
+      const patch = git('diff', '--cached', '--binary', 'HEAD');
+      git('reset', '--hard', 'HEAD');
+
+      await materializePriorPatchFromIndex(root, patch, undefined, 'git');
+
+      await expect(readFile(join(root, 'Tests', 'core_sim', 'scenario_start_test.cpp'), 'utf8')).resolves.toBe('new\n');
+      await expect(access(join(root, 'tests', 'core_sim', 'scenario_start_test.cpp'))).rejects.toThrow();
+      expect(git('diff', '--cached', '--name-status', 'HEAD')).toContain('Tests/core_sim/scenario_start_test.cpp');
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
   it('makes a saved Unreal package an explicit mandatory deliverable', () => {
     const prompt = nativeImplementationPrompt({
       step: { prompt: 'Create the qualification scene' } as any,
