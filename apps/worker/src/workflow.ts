@@ -19,7 +19,8 @@ import {
   renderIssueBody,
   renderPullRequestBody,
   slugifyBranchSegment,
-  type GitHubAdapter
+  type GitHubAdapter,
+  type GitHubChecksResult
 } from '@forgemind/github';
 import { createProvider, shouldEscalateImplementation, type AIProvider, type ImplementResult, type PlanResult, type ProviderSessionContext, type ReviewResult, type ValidationCheck } from '@forgemind/providers';
 import { parseAgentConfigYaml } from '@forgemind/config';
@@ -59,7 +60,7 @@ export interface WorkerTaskInput {
   visualEvidence?: Parameters<AIProvider['implement']>[0]['visualEvidence'];
 }
 
-type GitHubOperation = 'create_issue' | 'create_branch' | 'commit_and_push' | 'create_draft_pr' | 'create_pull_request' | 'merge_pr' | 'comment_on_issue';
+type GitHubOperation = 'create_issue' | 'create_branch' | 'commit_and_push' | 'create_draft_pr' | 'create_pull_request' | 'wait_for_checks' | 'merge_pr' | 'comment_on_issue';
 
 export interface WorkerTaskResume {
   kind: 'validation_retry' | 'worker_interrupted' | 'phase_retry';
@@ -937,6 +938,18 @@ export async function runWorkerTask(input: WorkerTaskInput): Promise<WorkerTaskR
           state: deliveryState
         });
 
+        if (isDeliveryCorrection(delivery)) {
+          validation = delivery.validation;
+          review = undefined;
+          const failure = formatValidationFailure(delivery.validation);
+          retryReasons.push(`GitHub Actions retry before attempt ${attempt + 1}: ${failure}`);
+          await input.hooks?.onStatus?.('running_ai', {
+            attempt: attempt + 1,
+            retryReason: failure
+          });
+          continue;
+        }
+
         return delivery;
       }
 
@@ -1025,6 +1038,15 @@ interface DeliveryState {
   resumedMergeCommitSha?: string;
 }
 
+interface DeliveryCorrection {
+  kind: 'ci_failure';
+  validation: ValidationResult;
+}
+
+function isDeliveryCorrection(result: WorkerTaskResult | DeliveryCorrection): result is DeliveryCorrection {
+  return 'kind' in result && result.kind === 'ci_failure';
+}
+
 function invalidateResumedDeliveryAfterWorkspaceChanges(state: DeliveryState) {
   state.skipCommitFromResume = false;
   state.skipPushFromResume = false;
@@ -1055,7 +1077,7 @@ async function deliverWorkerAttempt(input: {
   retryReasons: string[];
   resolvedReviewBlockers: Set<string>;
   state: DeliveryState;
-}): Promise<WorkerTaskResult> {
+}): Promise<WorkerTaskResult | DeliveryCorrection> {
   const {
     config,
     github,
@@ -1174,6 +1196,135 @@ async function deliverWorkerAttempt(input: {
       );
       state.issueCommented = true;
     }
+  }
+
+  if (config.autoMergePullRequest && config.autoPush && state.pullRequest && !state.skipMergeFromResume && github?.waitForChecks) {
+    throwIfTaskAborted(taskInput.signal);
+    const headSha = (await git.revparse(['HEAD'])).trim();
+    const checksInputHash = hashCheckpointValue(`${headSha}:${state.pullRequest.pullRequestNumber}`);
+    const checksStartedAt = Date.now();
+    await taskInput.hooks?.onCheckpoint?.({
+      key: 'external:wait_for_checks',
+      phase: 'github',
+      status: 'started',
+      inputHash: checksInputHash
+    });
+    await emitTaskActivity(taskInput.hooks, {
+      phase: 'github',
+      state: 'started',
+      title: 'Čekám na GitHub Actions',
+      detail: headSha,
+      operation: 'wait_for_checks',
+      attempt
+    });
+
+    let checks: GitHubChecksResult;
+    try {
+      checks = await github.waitForChecks(taskInput.project, headSha, {
+        signal: taskInput.signal,
+        onProgress: async (message) => emitTaskActivity(taskInput.hooks, {
+          phase: 'github',
+          state: 'progress',
+          title: 'GitHub Actions stále běží',
+          detail: message,
+          operation: 'wait_for_checks',
+          attempt,
+          elapsedMs: Date.now() - checksStartedAt
+        })
+      });
+    } catch (error) {
+      const errorMessage = toErrorMessage(error);
+      await emitTaskActivity(taskInput.hooks, {
+        phase: 'github',
+        state: 'failed',
+        title: 'GitHub Actions se nepodařilo načíst',
+        detail: errorMessage,
+        operation: 'wait_for_checks',
+        attempt,
+        elapsedMs: Date.now() - checksStartedAt
+      });
+      await taskInput.hooks?.onCheckpoint?.({
+        key: 'external:wait_for_checks',
+        phase: 'github',
+        status: 'failed',
+        inputHash: checksInputHash,
+        errorMessage
+      });
+      await taskInput.hooks?.onGitHubOperationFailed?.({
+        operation: 'wait_for_checks',
+        errorMessage,
+        context: { headSha, pullRequestNumber: state.pullRequest.pullRequestNumber }
+      });
+      throw error;
+    }
+
+    if (checks.status === 'failure') {
+      await emitTaskActivity(taskInput.hooks, {
+        phase: 'github',
+        state: 'failed',
+        title: 'GitHub Actions našlo chybu',
+        detail: checks.summary,
+        operation: 'wait_for_checks',
+        attempt,
+        elapsedMs: Date.now() - checksStartedAt
+      });
+      await taskInput.hooks?.onCheckpoint?.({
+        key: 'external:wait_for_checks',
+        phase: 'github',
+        status: 'failed',
+        inputHash: checksInputHash,
+        output: { status: checks.status, summary: checks.summary },
+        errorMessage: checks.summary
+      });
+      await taskInput.hooks?.onGitHubOperationFailed?.({
+        operation: 'wait_for_checks',
+        errorMessage: checks.summary,
+        context: { headSha, pullRequestNumber: state.pullRequest.pullRequestNumber }
+      });
+      if (isGitHubInfrastructureFailure(checks)) {
+        throw new Error(`GitHub Actions infrastructure blocked execution: ${checks.summary}`);
+      }
+      return {
+        kind: 'ci_failure',
+        validation: {
+          command: `github-actions ${headSha}`,
+          exitCode: 1,
+          stdout: '',
+          stderr: checks.summary,
+          passed: false,
+          failingCommand: 'github-actions'
+        }
+      };
+    }
+
+    if (checks.status === 'timeout') {
+      const message = checks.summary;
+      await taskInput.hooks?.onCheckpoint?.({
+        key: 'external:wait_for_checks',
+        phase: 'github',
+        status: 'failed',
+        inputHash: checksInputHash,
+        errorMessage: message
+      });
+      throw new Error(message);
+    }
+
+    await emitTaskActivity(taskInput.hooks, {
+      phase: 'github',
+      state: 'completed',
+      title: checks.status === 'success' ? 'GitHub Actions prošlo' : 'Repozitář nemá GitHub checks',
+      detail: checks.summary,
+      operation: 'wait_for_checks',
+      attempt,
+      elapsedMs: Date.now() - checksStartedAt
+    });
+    await taskInput.hooks?.onCheckpoint?.({
+      key: 'external:wait_for_checks',
+      phase: 'github',
+      status: 'completed',
+      inputHash: checksInputHash,
+      output: { status: checks.status, summary: checks.summary }
+    });
   }
 
   let mergeConfirmed = false;
@@ -1792,6 +1943,11 @@ function requiresPullRequestIntegration(config: WorkerConfig, project: Project, 
   return repositoryArtifactRequired && config.createPullRequest && Boolean(project.githubOwner && project.githubRepo);
 }
 
+function isGitHubInfrastructureFailure(checks: GitHubChecksResult): boolean {
+  const message = [checks.summary, ...checks.failures.map((failure) => failure.output)].join('\n');
+  return /job was not started|account payments? (?:have )?failed|spending limit|billing (?:issue|problem|limit)|hosted runner.*(?:unavailable|quota)|no hosted compute minutes/i.test(message);
+}
+
 async function emitTaskActivity(hooks: WorkerTaskHooks | undefined, activity: TaskActivity): Promise<void> {
   await hooks?.onActivity?.(activity);
 }
@@ -1822,6 +1978,11 @@ function describeGitHubOperation(operation: GitHubOperation) {
       started: 'Vytvářím pull request',
       completed: 'Pull request je připravený',
       failed: 'Vytvoření pull requestu selhalo'
+    },
+    wait_for_checks: {
+      started: 'Čekám na GitHub Actions',
+      completed: 'GitHub Actions je dokončené',
+      failed: 'GitHub Actions selhalo'
     },
     merge_pr: {
       started: 'Slučuji pull request',

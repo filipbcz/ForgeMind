@@ -184,14 +184,16 @@ describe('simple autonomous worker workflow', () => {
       criterionResults: [{ criterion: 'binary and text checkpoints are preserved', status: 'satisfied' as const,
         evidence: ['Content/SyntheticFlying.uasset', 'authoring-checkpoint.txt'] }] }));
     const commitAndPush = vi.fn(async () => undefined); const mergePullRequest = vi.fn(async () => ({ merged: true, sha: 'a'.repeat(40), message: 'merged' }));
+    const waitForChecks = vi.fn(async () => ({ status: 'success' as const, summary: 'Native checks passed.', failures: [] }));
     const github: any = { commitAndPush, mergePullRequest, createIssue: vi.fn(), createBranch: vi.fn(), createDraftPullRequest: vi.fn(),
-      commentOnIssue: vi.fn(), readCheckStatus: vi.fn(async () => 'success') };
+      commentOnIssue: vi.fn(), readCheckStatus: vi.fn(async () => 'success'), waitForChecks };
     const checkpoints: Array<{ key: string; status: string; output?: unknown }> = [];
     const first = await runWorkerTask({ project, task, provider: createProvider({ implement: vi.fn(async () => { throw new Error('Linux authoring forbidden'); }) }),
       reviewProvider: createProvider({ review: independentReview }), implementationOwner: 'windows', implementOnWindows, github, workspaceRoot,
       hooks: { onCheckpoint: async (checkpoint) => { checkpoints.push(checkpoint); } } });
     expect(first.status).toBe('completed'); expect(first.deliveryResult).toMatchObject({ status: 'completed', mergeConfirmed: true });
-    expect(independentReview).toHaveBeenCalledOnce(); expect(commitAndPush).toHaveBeenCalledOnce(); expect(mergePullRequest).toHaveBeenCalledOnce();
+    expect(independentReview).toHaveBeenCalledOnce(); expect(commitAndPush).toHaveBeenCalledOnce(); expect(waitForChecks).toHaveBeenCalledOnce(); expect(mergePullRequest).toHaveBeenCalledOnce();
+    expect(waitForChecks.mock.invocationCallOrder[0]).toBeLessThan(mergePullRequest.mock.invocationCallOrder[0]!);
     expect(checkpoints).toEqual(expect.arrayContaining([expect.objectContaining({ key: 'external:commit', status: 'completed' })]));
 
     const resumedTask = { ...task, status: 'submitted' as const };
@@ -203,9 +205,62 @@ describe('simple autonomous worker workflow', () => {
         validationChecks: [{ kind: 'command', command: first.validation.command, criterion: 'binary and text checkpoints are preserved' }],
         reviewSummary: 'Independent fixture review passed.', completedOperations: ['commit', 'commit_and_push', 'merge_pr'], mergeCommitSha: 'a'.repeat(40) } });
     expect(resumed.status).toBe('completed'); expect(resumed.deliveryResult).toMatchObject({ status: 'completed', mergeConfirmed: true });
-    expect(implementOnWindows).toHaveBeenCalledOnce(); expect(commitAndPush).toHaveBeenCalledOnce(); expect(mergePullRequest).toHaveBeenCalledOnce();
+    expect(implementOnWindows).toHaveBeenCalledOnce(); expect(commitAndPush).toHaveBeenCalledOnce(); expect(waitForChecks).toHaveBeenCalledOnce(); expect(mergePullRequest).toHaveBeenCalledOnce();
     expect(await readFile(join(checkout, 'Content', 'SyntheticFlying.uasset'))).toEqual(Buffer.from([0, 1, 2, 3, 255]));
     expect(await readFile(join(checkout, 'authoring-checkpoint.txt'), 'utf8')).toContain(`base=${exactBase}`);
+  }, workflowTestTimeoutMs);
+
+  it('feeds failed GitHub Actions output into one correction attempt before merging', async () => {
+    const project = { ...createProject(), configYaml: projectConfig.replace('auto_push: false', 'auto_push: true'),
+      autoCreatePullRequest: true, autoMergePullRequest: true, autoCompleteTask: true };
+    const task = createTask(project.id);
+    const workspaceRoot = await mkdtemp(join(tmpdir(), 'forgemind-ci-correction-'));
+    const checkout = join(workspaceRoot, task.id); await mkdir(checkout, { recursive: true });
+    const git = simpleGit(checkout); await git.init(); await git.addConfig('user.name', 'ForgeMind Test');
+    await git.addConfig('user.email', 'test@forgemind.local'); await writeFile(join(checkout, 'README.md'), 'base\n');
+    await git.add('README.md'); await git.commit('base');
+
+    let implementationAttempt = 0;
+    const implement = vi.fn(async (input: ImplementInput) => {
+      implementationAttempt += 1;
+      if (implementationAttempt === 2) expect(input.previousValidationError).toContain('scenario_flow timed out');
+      return {
+        ...implementation('pass\n'),
+        summary: implementationAttempt === 1 ? 'Initial implementation.' : 'Corrected Windows CI failure.',
+        fileUpdates: [{ path: 'status.txt', content: implementationAttempt === 1 ? 'pass\n' : 'pass\ncorrected\n' }],
+        validationChecks: [{
+          kind: 'command' as const,
+          command: `node -e "const value=require('node:fs').readFileSync('status.txt','utf8');if(!value.startsWith('pass'))process.exit(7)"`,
+          criterion: 'status.txt contains pass',
+          rationale: 'Validate the corrected status artifact.'
+        }]
+      };
+    });
+    const waitForChecks = vi.fn()
+      .mockResolvedValueOnce({ status: 'failure', summary: 'Native smoke: scenario_flow timed out after 60 seconds', failures: [] })
+      .mockResolvedValueOnce({ status: 'success', summary: 'Native checks passed.', failures: [] });
+    const mergePullRequest = vi.fn(async () => ({ merged: true, sha: 'b'.repeat(40), message: 'merged' }));
+    const github: any = {
+      commitAndPush: vi.fn(async () => undefined),
+      createDraftPullRequest: vi.fn(async () => ({ pullRequestNumber: 7, pullRequestUrl: 'https://example.test/pull/7' })),
+      commentOnIssue: vi.fn(async () => undefined),
+      waitForChecks,
+      mergePullRequest
+    };
+
+    const result = await runWorkerTask({
+      project,
+      task,
+      provider: createProvider({ implement }),
+      reviewProvider: createProvider(),
+      github,
+      workspaceRoot
+    });
+
+    expect(result.status).toBe('completed');
+    expect(implement).toHaveBeenCalledTimes(2);
+    expect(waitForChecks).toHaveBeenCalledTimes(2);
+    expect(mergePullRequest).toHaveBeenCalledOnce();
   }, workflowTestTimeoutMs);
 
   it('never falls back to Windows implementation after a validated review resume with sparse metadata', async () => {

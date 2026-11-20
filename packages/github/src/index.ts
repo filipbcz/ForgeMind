@@ -166,6 +166,26 @@ export interface PullRequestState {
   mergeCommitSha?: string;
 }
 
+export interface GitHubCheckFailure {
+  name: string;
+  detailsUrl?: string;
+  output: string;
+}
+
+export interface GitHubChecksResult {
+  status: 'success' | 'failure' | 'not_configured' | 'timeout';
+  summary: string;
+  failures: GitHubCheckFailure[];
+}
+
+export interface WaitForGitHubChecksOptions {
+  timeoutMs?: number;
+  discoveryTimeoutMs?: number;
+  pollIntervalMs?: number;
+  onProgress?: (message: string) => Promise<void> | void;
+  signal?: AbortSignal;
+}
+
 export interface GitHubAdapter {
   createIssue(input: CreateIssueInput, signal?: AbortSignal): Promise<CreateIssueResult>;
   getRemoteUrl?(project: Project): string | undefined;
@@ -176,6 +196,7 @@ export interface GitHubAdapter {
   getPullRequestState?(project: Project, pullRequestNumber: number): Promise<PullRequestState>;
   commentOnIssue(project: Project, issueNumber: number, body: string, signal?: AbortSignal): Promise<void>;
   readCheckStatus(project: Project, ref: string): Promise<'pending' | 'success' | 'failure'>;
+  waitForChecks?(project: Project, ref: string, options?: WaitForGitHubChecksOptions): Promise<GitHubChecksResult>;
 }
 
 /** Immutable, read-only checkout used by planning and audits. */
@@ -327,6 +348,33 @@ interface GitHubMergePullResponse {
 
 interface GitHubStatusResponse {
   state: 'error' | 'failure' | 'pending' | 'success';
+}
+
+interface GitHubCheckRunsResponse {
+  check_runs: GitHubCheckRunResponse[];
+}
+
+interface GitHubCheckRunResponse {
+  id: number;
+  name: string;
+  status: 'queued' | 'in_progress' | 'completed' | 'waiting' | 'requested' | 'pending';
+  conclusion: string | null;
+  details_url?: string | null;
+  output?: {
+    title?: string | null;
+    summary?: string | null;
+    text?: string | null;
+  };
+}
+
+interface GitHubCheckAnnotationResponse {
+  path: string;
+  start_line: number;
+  end_line: number;
+  annotation_level: string;
+  title?: string | null;
+  message: string;
+  raw_details?: string | null;
 }
 
 interface GitHubRepositoryResponse {
@@ -519,6 +567,136 @@ export class GitHubAppAdapter implements GitHubAdapter {
     return 'failure';
   }
 
+  async waitForChecks(project: Project, ref: string, options: WaitForGitHubChecksOptions = {}): Promise<GitHubChecksResult> {
+    const repository = requireProjectRepository(project);
+    const startedAt = Date.now();
+    const timeoutMs = options.timeoutMs ?? readPositiveIntegerEnv('FORGEMIND_GITHUB_CHECKS_TIMEOUT_MS', 30 * 60_000);
+    const discoveryTimeoutMs = Math.min(
+      timeoutMs,
+      options.discoveryTimeoutMs ?? readPositiveIntegerEnv('FORGEMIND_GITHUB_CHECKS_DISCOVERY_TIMEOUT_MS', 30_000)
+    );
+    const pollIntervalMs = options.pollIntervalMs ?? readPositiveIntegerEnv('FORGEMIND_GITHUB_CHECKS_POLL_INTERVAL_MS', 10_000);
+    let lastProgress = '';
+
+    while (Date.now() - startedAt < timeoutMs) {
+      throwIfAborted(options.signal);
+      const checksPath = `/repos/${repository.owner}/${repository.repo}/commits/${encodeURIComponent(ref)}/check-runs?filter=latest&per_page=100`;
+      const checks = await this.requestWithSignal<GitHubCheckRunsResponse>('GET', checksPath, undefined, options.signal);
+      const runs = checks.check_runs ?? [];
+
+      if (runs.length === 0) {
+        if (Date.now() - startedAt >= discoveryTimeoutMs) {
+          return { status: 'not_configured', summary: 'No GitHub checks were discovered for the pushed commit.', failures: [] };
+        }
+        lastProgress = await reportCheckProgress(options, lastProgress, 'Waiting for GitHub checks to start.');
+        await delay(pollIntervalMs, options.signal);
+        continue;
+      }
+
+      const pending = runs.filter((run) => run.status !== 'completed');
+      if (pending.length > 0) {
+        lastProgress = await reportCheckProgress(
+          options,
+          lastProgress,
+          `GitHub checks are running (${runs.length - pending.length}/${runs.length} completed).`
+        );
+        await delay(pollIntervalMs, options.signal);
+        continue;
+      }
+
+      const failedRuns = runs.filter((run) => !isSuccessfulCheckConclusion(run.conclusion));
+      if (failedRuns.length === 0) {
+        return { status: 'success', summary: `${runs.length} GitHub check(s) passed.`, failures: [] };
+      }
+
+      const failures = await Promise.all(failedRuns.map((run) => this.describeCheckFailure(repository, run, options.signal)));
+      return {
+        status: 'failure',
+        summary: compactCheckOutput(failures.map((failure) => `${failure.name}: ${failure.output}`).join('\n\n')),
+        failures
+      };
+    }
+
+    return {
+      status: 'timeout',
+      summary: `GitHub checks did not finish within ${Math.ceil(timeoutMs / 60_000)} minute(s).`,
+      failures: []
+    };
+  }
+
+  private async describeCheckFailure(
+    repository: { owner: string; repo: string },
+    run: GitHubCheckRunResponse,
+    signal?: AbortSignal
+  ): Promise<GitHubCheckFailure> {
+    const fallback = compactCheckOutput([
+      run.output?.title,
+      run.output?.summary,
+      run.output?.text,
+      run.conclusion ? `Conclusion: ${run.conclusion}` : undefined
+    ].filter((value): value is string => Boolean(value)).join('\n'));
+    const jobId = parseActionsJobId(run.details_url);
+    let output = fallback;
+
+    if (jobId) {
+      try {
+        output = compactCheckOutput(await this.requestText('GET', `/repos/${repository.owner}/${repository.repo}/actions/jobs/${jobId}/logs`, signal)) || fallback;
+      } catch {
+        const annotations = await this.readCheckAnnotations(repository, run.id, signal);
+        output = compactCheckOutput([fallback, annotations].filter(Boolean).join('\n'));
+      }
+    }
+
+    return {
+      name: run.name,
+      detailsUrl: run.details_url ?? undefined,
+      output: output || `GitHub check concluded with ${run.conclusion ?? 'an unknown failure'}.`
+    };
+  }
+
+  private async readCheckAnnotations(
+    repository: { owner: string; repo: string },
+    checkRunId: number,
+    signal?: AbortSignal
+  ): Promise<string> {
+    try {
+      const annotations = await this.requestWithSignal<GitHubCheckAnnotationResponse[]>(
+        'GET',
+        `/repos/${repository.owner}/${repository.repo}/check-runs/${checkRunId}/annotations?per_page=100`,
+        undefined,
+        signal
+      );
+      return annotations.map((annotation) => {
+        const line = annotation.start_line === annotation.end_line
+          ? `${annotation.start_line}`
+          : `${annotation.start_line}-${annotation.end_line}`;
+        return [
+          `${annotation.path}:${line}: ${annotation.annotation_level}`,
+          annotation.title,
+          annotation.message,
+          annotation.raw_details
+        ].filter((value): value is string => Boolean(value)).join('\n');
+      }).join('\n\n');
+    } catch {
+      return '';
+    }
+  }
+
+  private async requestText(method: string, path: string, signal?: AbortSignal): Promise<string> {
+    const response = await fetch(`${this.apiBaseUrl}${path}`, {
+      method,
+      signal,
+      headers: {
+        Accept: 'application/vnd.github+json',
+        Authorization: `Bearer ${this.options.token}`,
+        'User-Agent': 'ForgeMind-GitHubAppAdapter',
+        'X-GitHub-Api-Version': '2022-11-28'
+      }
+    });
+    if (!response.ok) throw new Error(`GitHub API ${method} ${path} failed with ${response.status}: ${await response.text()}`);
+    return response.text();
+  }
+
   private requestWithSignal<T = unknown>(method: string, path: string, body: unknown, signal?: AbortSignal): Promise<T> {
     if (signal) return this.request<T>(method, path, body, signal);
     if (body === undefined) return this.request<T>(method, path);
@@ -555,6 +733,54 @@ export class GitHubAppAdapter implements GitHubAdapter {
 function throwIfAborted(signal?: AbortSignal): void {
   if (!signal?.aborted) return;
   throw signal.reason instanceof Error ? signal.reason : new Error('GitHub operation was cancelled.');
+}
+
+function readPositiveIntegerEnv(name: string, fallback: number): number {
+  const value = Number(process.env[name] ?? fallback);
+  return Number.isFinite(value) && value > 0 ? Math.floor(value) : fallback;
+}
+
+function isSuccessfulCheckConclusion(conclusion: string | null): boolean {
+  return conclusion === 'success' || conclusion === 'neutral' || conclusion === 'skipped';
+}
+
+function parseActionsJobId(detailsUrl?: string | null): number | undefined {
+  const match = detailsUrl?.match(/\/job\/(\d+)(?:[/?#]|$)/);
+  if (!match?.[1]) return undefined;
+  const value = Number(match[1]);
+  return Number.isSafeInteger(value) && value > 0 ? value : undefined;
+}
+
+function compactCheckOutput(value: string, maxChars = 64_000): string {
+  const normalized = value.replace(/\u001b\[[0-9;]*m/g, '').trim();
+  if (normalized.length <= maxChars) return normalized;
+  const headLength = Math.floor(maxChars * 0.4);
+  const tailLength = maxChars - headLength;
+  return `${normalized.slice(0, headLength)}\n[... GitHub check output truncated ...]\n${normalized.slice(-tailLength)}`;
+}
+
+async function reportCheckProgress(
+  options: WaitForGitHubChecksOptions,
+  previous: string,
+  message: string
+): Promise<string> {
+  if (message !== previous) await options.onProgress?.(message);
+  return message;
+}
+
+async function delay(ms: number, signal?: AbortSignal): Promise<void> {
+  if (ms <= 0) return;
+  await new Promise<void>((resolveDelay, rejectDelay) => {
+    const timer = setTimeout(() => {
+      signal?.removeEventListener('abort', abort);
+      resolveDelay();
+    }, ms);
+    const abort = () => {
+      clearTimeout(timer);
+      rejectDelay(signal?.reason instanceof Error ? signal.reason : new Error('GitHub operation was cancelled.'));
+    };
+    signal?.addEventListener('abort', abort, { once: true });
+  });
 }
 
 export async function createGitHubAdapterFromEnv(): Promise<GitHubAdapter> {

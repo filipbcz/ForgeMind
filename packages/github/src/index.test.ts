@@ -680,6 +680,59 @@ describe('GitHub helpers', () => {
     requestSpy.mockRestore();
   });
 
+  it('waits for GitHub check runs before reporting success', async () => {
+    const adapter = new GitHubAppAdapter({ token: 'test-token' });
+    const requestSpy = vi.spyOn(adapter as any, 'request');
+    requestSpy
+      .mockResolvedValueOnce({ check_runs: [{ id: 1, name: 'Native build', status: 'in_progress', conclusion: null }] })
+      .mockResolvedValueOnce({ check_runs: [{ id: 1, name: 'Native build', status: 'completed', conclusion: 'success' }] });
+
+    await expect(adapter.waitForChecks(projectFixture, 'head-sha', {
+      timeoutMs: 1_000,
+      discoveryTimeoutMs: 0,
+      pollIntervalMs: 0
+    })).resolves.toEqual({
+      status: 'success',
+      summary: '1 GitHub check(s) passed.',
+      failures: []
+    });
+  });
+
+  it('returns the failed Actions job log for AI correction', async () => {
+    const adapter = new GitHubAppAdapter({ token: 'test-token' });
+    vi.spyOn(adapter as any, 'request').mockResolvedValueOnce({
+      check_runs: [{
+        id: 2,
+        name: 'Native modules and smoke test',
+        status: 'completed',
+        conclusion: 'failure',
+        details_url: 'https://github.com/demo/demo-repo/actions/runs/10/job/20',
+        output: { summary: 'Process completed with exit code 1.' }
+      }]
+    });
+    vi.spyOn(adapter as any, 'requestText').mockResolvedValueOnce('scenario_flow timed out after 60 seconds');
+
+    const result = await adapter.waitForChecks(projectFixture, 'head-sha', {
+      timeoutMs: 1_000,
+      discoveryTimeoutMs: 0,
+      pollIntervalMs: 0
+    });
+
+    expect(result.status).toBe('failure');
+    expect(result.summary).toContain('scenario_flow timed out');
+  });
+
+  it('does not block repositories where no GitHub checks start', async () => {
+    const adapter = new GitHubAppAdapter({ token: 'test-token' });
+    vi.spyOn(adapter as any, 'request').mockResolvedValueOnce({ check_runs: [] });
+
+    await expect(adapter.waitForChecks(projectFixture, 'head-sha', {
+      timeoutMs: 1_000,
+      discoveryTimeoutMs: 0,
+      pollIntervalMs: 0
+    })).resolves.toMatchObject({ status: 'not_configured' });
+  });
+
   it('renders pull request body with execution details', () => {
     const body = renderPullRequestBody({
       summary: 'Summary',
