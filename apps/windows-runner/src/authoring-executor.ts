@@ -11,6 +11,8 @@ import { runBoundedProcess } from './process-runner.js';
 import { truncateUtf8Tail } from './utf8.js';
 import { recoveredUnrealEditorTarget, resolveUnrealBuildRuntime } from './unreal-build-runtime.js';
 
+const AUTHORING_PATCH_TIMEOUT_MS = 10 * 60_000;
+
 export interface NativeAuthoringTools {
   root: string;
   managedRoots: { inputs: string; sourceAssets: string; cache: string; outputs: string; projectData?: string; diagnostics: string };
@@ -302,10 +304,13 @@ export async function executeWindowsAuthoring(packet: WindowsAuthoringPacket, co
   }
   const tree = await collectTree(workspacePath, changedPaths);
   const treeSha = await gitTree(workspacePath, context.signal);
-  const patchResult = await spawnComplete('git.exe', ['diff', '--binary', '--no-ext-diff', '--cached', 'HEAD'], workspacePath, 30_000, context.signal,
+  const patchResult = await spawnComplete('git.exe', ['diff', '--binary', '--no-ext-diff', '--cached', 'HEAD'], workspacePath,
+    authoringPatchTimeoutMs(packet.resourcePolicy.timeoutSeconds), context.signal,
     authoringPatchOutputLimit(packet.resourcePolicy.maxArtifactBytes));
-  if (patchResult.exitCode !== 0) throw new Error(`Could not package result tree: ${patchResult.stderr}`);
   if (patchResult.stdoutTruncated) throw new Error('Could not package result tree: the binary Git patch exceeds the bounded authoring result size.');
+  if (patchResult.exitCode !== 0 || patchResult.terminationReason) {
+    throw new Error(`Could not package result tree: ${boundedProcessFailure(patchResult)}`);
+  }
   const patchBytes = Buffer.from(patchResult.stdout, 'utf8');
   const lfsObjects = await collectLfsObjects(workspacePath, changedPaths, context.signal);
   const outputs = await collectManagedOutputs(outputDirectory, packet.resourcePolicy.maxArtifactBytes);
@@ -845,10 +850,13 @@ async function persistCheckpoint(path: string, packet: WindowsAuthoringPacket, w
 async function captureCheckpoint(packet: WindowsAuthoringPacket, workspacePath: string, status: string,
   processes: WindowsAuthoringProcessResult[], unrealProbeIdentity?: string, signal?: AbortSignal, outputRoot?: string): Promise<AuthoringDiskCheckpoint> {
   const resultTreeSha = await gitTree(workspacePath, signal);
-  const patchResult = await spawnComplete('git.exe', ['diff', '--binary', '--no-ext-diff', '--cached', 'HEAD'], workspacePath, 30_000, signal,
+  const patchResult = await spawnComplete('git.exe', ['diff', '--binary', '--no-ext-diff', '--cached', 'HEAD'], workspacePath,
+    authoringPatchTimeoutMs(packet.resourcePolicy.timeoutSeconds), signal,
     authoringPatchOutputLimit(packet.resourcePolicy.maxArtifactBytes));
-  if (patchResult.exitCode !== 0) throw new Error(`Could not persist Windows checkpoint: ${patchResult.stderr}`);
   if (patchResult.stdoutTruncated) throw new Error('Could not persist Windows checkpoint: the binary Git patch exceeds the bounded authoring result size.');
+  if (patchResult.exitCode !== 0 || patchResult.terminationReason) {
+    throw new Error(`Could not persist Windows checkpoint: ${boundedProcessFailure(patchResult)}`);
+  }
   const changedPaths = await indexedChangedPaths(workspacePath, signal);
   const patchBytes = Buffer.from(patchResult.stdout, 'utf8'); const lfsObjects = await collectLfsObjects(workspacePath, changedPaths, signal);
   const outputs = outputRoot ? await collectManagedOutputs(outputRoot, packet.resourcePolicy.maxArtifactBytes) : [];
@@ -1351,7 +1359,11 @@ async function copyReviewableChangedImages(root: string, outputRoot: string, cha
 }
 
 export function authoringPatchOutputLimit(maxArtifactBytes: number): number {
-  return Math.min(128 * 1024 * 1024, Math.max(4 * 1024 * 1024, maxArtifactBytes * 8));
+  return Math.min(512 * 1024 * 1024, Math.max(4 * 1024 * 1024, maxArtifactBytes * 32));
+}
+
+export function authoringPatchTimeoutMs(taskTimeoutSeconds: number): number {
+  return Math.min(AUTHORING_PATCH_TIMEOUT_MS, Math.max(30_000, taskTimeoutSeconds * 1_000));
 }
 
 async function spawnComplete(executable: string, args: string[], cwd: string, timeoutMs: number, signal?: AbortSignal, maxOutputBytes = 1_000_000) {

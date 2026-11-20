@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from 'vitest';
-import { assertReadableAuthoringCheckout, authoringPatchOutputLimit, authoringSemanticHash, buildRecoveredUnrealPackageAuthoringScript, buildUnrealPackageVerificationArgs, buildUnrealPackageVerificationScript, canFinalizeRecoveredUnrealResult, canResumeAuthoringCheckpoint, checkpointMatchesPacketBaseline, checkpointRecoveryScore, classifyAuthoringFailure, classifyWindowsAuthoringFailure, cleanupIgnoredUnrealRuntimeState, collectAuthoringToolVersions, collectCheckpointAuthoringProvenance, compactProcessResults, discoverUnrealProjectDirectories, hasRestorableAuthoringCheckpoint, indexedChangedPaths, isProhibitedAuthoringPath, LifecycleNativeImplementationProvider, materializeOutputs, materializePriorPatchFromIndex, missingRequiredAuthoringArtifacts, nativeImplementationPrompt, persistentOutputReferencesMatch, requiresProductionContent, retainedCheckpointGenerations, restoreCheckpointAuthoringProvenance, selectRecoveryCheckpoint, selectUnrealProjectForPackages, type NativeAuthoringTools, unrealObjectPath, validateRequiredUnrealAssets } from './authoring-executor.js';
+import { assertReadableAuthoringCheckout, authoringPatchOutputLimit, authoringPatchTimeoutMs, authoringSemanticHash, buildRecoveredUnrealPackageAuthoringScript, buildUnrealPackageVerificationArgs, buildUnrealPackageVerificationScript, canFinalizeRecoveredUnrealResult, canResumeAuthoringCheckpoint, checkpointMatchesPacketBaseline, checkpointRecoveryScore, classifyAuthoringFailure, classifyWindowsAuthoringFailure, cleanupIgnoredUnrealRuntimeState, collectAuthoringToolVersions, collectCheckpointAuthoringProvenance, compactProcessResults, discoverUnrealProjectDirectories, hasRestorableAuthoringCheckpoint, indexedChangedPaths, isProhibitedAuthoringPath, LifecycleNativeImplementationProvider, materializeOutputs, materializePriorPatchFromIndex, missingRequiredAuthoringArtifacts, nativeImplementationPrompt, persistentOutputReferencesMatch, requiresProductionContent, retainedCheckpointGenerations, restoreCheckpointAuthoringProvenance, selectRecoveryCheckpoint, selectUnrealProjectForPackages, type NativeAuthoringTools, unrealObjectPath, validateRequiredUnrealAssets } from './authoring-executor.js';
 import { access, mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
@@ -172,9 +172,12 @@ describe('native implementation provider lifecycle', () => {
     }
   });
   it('retains enough bounded Git output for Unreal binary patches', () => {
-    expect(authoringPatchOutputLimit(10_000_000)).toBe(80_000_000);
+    expect(authoringPatchOutputLimit(10_000_000)).toBe(320_000_000);
     expect(authoringPatchOutputLimit(1)).toBe(4 * 1024 * 1024);
-    expect(authoringPatchOutputLimit(100_000_000)).toBe(128 * 1024 * 1024);
+    expect(authoringPatchOutputLimit(100_000_000)).toBe(512 * 1024 * 1024);
+    expect(authoringPatchTimeoutMs(10)).toBe(30_000);
+    expect(authoringPatchTimeoutMs(120)).toBe(120_000);
+    expect(authoringPatchTimeoutMs(36_000)).toBe(10 * 60_000);
   });
   it('keeps completed-result reuse stable across delivery retries but not product changes', () => {
     const packet: any = { taskId: 'task', baseCommitSha: 'a'.repeat(40), step: { prompt: 'Build scene', acceptanceCriteria: ['Map exists'],
