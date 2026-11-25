@@ -245,6 +245,7 @@ export async function executeWindowsAuthoring(packet: WindowsAuthoringPacket, co
   let productionReviewRequired = false;
   let completionVerified = false;
   let verifiedPersistentOutputs: PersistentOutputReference[] | undefined;
+  let recoveredVerificationFailure: string | undefined;
   const verifyCompletion = async () => {
     await rm(resolve(workspacePath, '.forgemind-tmp'), { recursive: true, force: true });
     await cleanupIgnoredUnrealRuntimeState(workspacePath, processes);
@@ -259,13 +260,24 @@ export async function executeWindowsAuthoring(packet: WindowsAuthoringPacket, co
     await publishCheckpoint('verified');
   };
   try {
-    if (canFinalizeRecoveredUnrealResult(packet.step.previousValidationError, checkout.resumed, resumedUnrealPackages)) {
-      await verifyCompletion();
-      summary = 'Recovered Unreal packages were re-authored and verified without repeating AI implementation.';
-      completedOperationIds = packet.operations.map(({ id }) => id);
-    } else {
+    if (shouldAttemptRecoveredUnrealFinalization(packet.step.previousValidationError, packet.step.previousReviewBlockers,
+      checkout.resumed, resumedUnrealPackages)) {
+      try {
+        await verifyCompletion();
+        summary = 'Recovered Unreal packages were re-authored and verified without repeating AI implementation.';
+        completedOperationIds = packet.operations.map(({ id }) => id);
+      } catch (error) {
+        recoveredVerificationFailure = redactSecrets(error instanceof Error ? error.message : String(error));
+        completionVerified = false;
+        liveActivity = truncateUtf8Tail(`${liveActivity}\nRecovered workspace verification could not finish the task: ${recoveredVerificationFailure}`,
+          packet.resourcePolicy.maxLogBytes);
+        await emitProgress('verify');
+      }
+    }
+    if (!completionVerified) {
       const output = await context.provider.implement({ prompt: nativeImplementationPrompt(packet), acceptanceCriteria: packet.step.acceptanceCriteria,
-        previousValidationError: packet.step.previousValidationError, previousReviewBlockers: packet.step.previousReviewBlockers,
+        previousValidationError: [packet.step.previousValidationError, recoveredVerificationFailure].filter(Boolean).join('\n') || undefined,
+        previousReviewBlockers: packet.step.previousReviewBlockers,
         operations: packet.operations, tools, signal: context.signal,
         verifyCompletion: packet.contentPolicy.requiresUnrealAssets || (packet.executionIntent?.persistentOutputPaths.length ?? 0) > 0
           ? verifyCompletion
@@ -406,8 +418,15 @@ export async function materializePriorPatchFromIndex(
 export function canFinalizeRecoveredUnrealResult(previousValidationError: string | undefined, resumed: boolean,
   recoveredPackages: AuthoringTreeEntry[]): boolean {
   return resumed && recoveredPackages.length > 0
-    && /Required Unreal content was not created or imported through a successful editor authoring API call|Required authoring artifacts are missing:\s*Content\s*$/i
+    && /Required Unreal content was not created or imported through a successful editor authoring API call|Required authoring artifacts are missing:\s*Content\s*$|Could not package result tree(?::|$)|Could not inspect result tree(?::|$)|Authoring result delivery (?:failed|will retry)|ForgeMind API request failed \(400\): Invalid execution result/i
       .test(previousValidationError ?? '');
+}
+
+export function shouldAttemptRecoveredUnrealFinalization(previousValidationError: string | undefined,
+  previousReviewBlockers: string[] | undefined, resumed: boolean, recoveredPackages: AuthoringTreeEntry[]): boolean {
+  if (previousReviewBlockers?.some((blocker) => blocker.trim().length > 0)) return false;
+  return canFinalizeRecoveredUnrealResult(previousValidationError, resumed, recoveredPackages)
+    || (resumed && recoveredPackages.length > 0 && !previousValidationError?.trim());
 }
 
 export function missingRequiredAuthoringArtifacts(

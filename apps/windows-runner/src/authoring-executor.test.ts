@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from 'vitest';
-import { assertReadableAuthoringCheckout, authoringPatchOutputLimit, authoringPatchTimeoutMs, authoringSemanticHash, buildRecoveredUnrealPackageAuthoringScript, buildUnrealPackageVerificationArgs, buildUnrealPackageVerificationScript, canFinalizeRecoveredUnrealResult, canResumeAuthoringCheckpoint, checkpointMatchesPacketBaseline, checkpointRecoveryScore, classifyAuthoringFailure, classifyWindowsAuthoringFailure, cleanupIgnoredUnrealRuntimeState, collectAuthoringToolVersions, collectCheckpointAuthoringProvenance, compactProcessResults, discoverUnrealProjectDirectories, hasRestorableAuthoringCheckpoint, indexedChangedPaths, isProhibitedAuthoringPath, LifecycleNativeImplementationProvider, materializeOutputs, materializePriorPatchFromIndex, missingRequiredAuthoringArtifacts, nativeImplementationPrompt, persistentOutputReferencesMatch, requiresProductionContent, retainedCheckpointGenerations, restoreCheckpointAuthoringProvenance, selectRecoveryCheckpoint, selectUnrealProjectForPackages, type NativeAuthoringTools, unrealObjectPath, validateRequiredUnrealAssets } from './authoring-executor.js';
+import { assertReadableAuthoringCheckout, authoringPatchOutputLimit, authoringPatchTimeoutMs, authoringSemanticHash, buildRecoveredUnrealPackageAuthoringScript, buildUnrealPackageVerificationArgs, buildUnrealPackageVerificationScript, canFinalizeRecoveredUnrealResult, canResumeAuthoringCheckpoint, checkpointMatchesPacketBaseline, checkpointRecoveryScore, classifyAuthoringFailure, classifyWindowsAuthoringFailure, cleanupIgnoredUnrealRuntimeState, collectAuthoringToolVersions, collectCheckpointAuthoringProvenance, compactProcessResults, discoverUnrealProjectDirectories, hasRestorableAuthoringCheckpoint, indexedChangedPaths, isProhibitedAuthoringPath, LifecycleNativeImplementationProvider, materializeOutputs, materializePriorPatchFromIndex, missingRequiredAuthoringArtifacts, nativeImplementationPrompt, persistentOutputReferencesMatch, requiresProductionContent, retainedCheckpointGenerations, restoreCheckpointAuthoringProvenance, selectRecoveryCheckpoint, selectUnrealProjectForPackages, shouldAttemptRecoveredUnrealFinalization, type NativeAuthoringTools, unrealObjectPath, validateRequiredUnrealAssets } from './authoring-executor.js';
 import { access, mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
@@ -255,9 +255,19 @@ describe('native implementation provider lifecycle', () => {
         'The same Windows validation failed again without progress: Required Unreal content was not created or imported through a successful editor authoring API call.',
         true, recovered)).toBe(true);
       expect(canFinalizeRecoveredUnrealResult('Required authoring artifacts are missing: Content', true, recovered)).toBe(true);
+      expect(canFinalizeRecoveredUnrealResult('Could not package result tree: the binary Git patch exceeds the bounded authoring result size.', true, recovered)).toBe(true);
+      expect(canFinalizeRecoveredUnrealResult('Could not inspect result tree:', true, recovered)).toBe(true);
+      expect(canFinalizeRecoveredUnrealResult('Authoring result delivery failed: ForgeMind API request failed (400): Invalid execution result.', true, recovered)).toBe(true);
       expect(canFinalizeRecoveredUnrealResult('Required authoring artifacts are missing: Content/Maps/Missing.umap', true, recovered)).toBe(false);
+      expect(canFinalizeRecoveredUnrealResult('Generated cache or raw geospatial data cannot enter an authoring result: Intermediate/cache.bin', true, recovered)).toBe(false);
       expect(canFinalizeRecoveredUnrealResult('another validation failed', true, recovered)).toBe(false);
       expect(canFinalizeRecoveredUnrealResult('Required Unreal content was not created or imported through a successful editor authoring API call.', false, recovered)).toBe(false);
+      expect(shouldAttemptRecoveredUnrealFinalization(undefined, undefined, true, recovered)).toBe(true);
+      expect(shouldAttemptRecoveredUnrealFinalization('', [], true, recovered)).toBe(true);
+      expect(shouldAttemptRecoveredUnrealFinalization('Could not package result tree:', undefined, true, recovered)).toBe(true);
+      expect(shouldAttemptRecoveredUnrealFinalization('provider-check failed', undefined, true, recovered)).toBe(false);
+      expect(shouldAttemptRecoveredUnrealFinalization(undefined, ['Missing production evidence.'], true, recovered)).toBe(false);
+      expect(shouldAttemptRecoveredUnrealFinalization(undefined, undefined, false, recovered)).toBe(false);
     } finally {
       await rm(root, { recursive: true, force: true });
     }
