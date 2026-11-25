@@ -171,4 +171,30 @@ describe('Windows runner CLI parsing', () => {
     expect(manifest).toMatchObject({ patch: '', patchBlobSha256: patchSha });
     expect(JSON.stringify(manifest)).not.toContain(content.toString('base64').slice(0, 100));
   });
+
+  it('resumes at the failed authoring chunk instead of restarting an entire large upload', async () => {
+    vi.useFakeTimers();
+    try {
+      const patch = 'diff --git'; const patchSha = createHash('sha256').update(patch).digest('hex');
+      let attempt = 0;
+      const uploadAuthoringBlobChunk = vi.fn(async () => {
+        attempt += 1;
+        if (attempt === 1) throw new Error('ForgeMind API request failed (429): retry later');
+        return { accepted: true, duplicate: false };
+      });
+      const completeAuthoringBlob = vi.fn(async () => ({ accepted: true, duplicate: false }));
+      const result: any = { jobId: 'job', leaseId: 'lease', sessionId: 'session', nonce: 'nonce-value', inputHash: 'a'.repeat(64), patch,
+        resultBundle: { sha256: patchSha, sizeBytes: Buffer.byteLength(patch), lfsObjects: [], outputs: [] } };
+
+      const upload = uploadAuthoringResultBlobs({ uploadAuthoringBlobChunk, completeAuthoringBlob } as any,
+        { deviceId: 'device', credential: 'secret' }, result);
+      await vi.advanceTimersByTimeAsync(1_000);
+      await expect(upload).resolves.toMatchObject({ patchBlobSha256: patchSha });
+
+      expect(uploadAuthoringBlobChunk).toHaveBeenCalledTimes(2);
+      expect(completeAuthoringBlob).toHaveBeenCalledOnce();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
 });

@@ -17,6 +17,7 @@ const guardedEnvNames = [
   'FORGEMIND_SESSION_COOKIE_SECURE',
   'FORGEMIND_SENSITIVE_RATE_LIMIT_MAX',
   'FORGEMIND_SENSITIVE_RATE_LIMIT_WINDOW_MS',
+  'FORGEMIND_RUNNER_BLOB_RATE_LIMIT_MAX',
   'FORGEMIND_REQUEST_BODY_LIMIT_BYTES',
   'FORGEMIND_REQUEST_HEADER_LIMIT_BYTES',
   'GOOGLE_OAUTH_CLIENT_ID',
@@ -177,6 +178,26 @@ describe('Studio API server', () => {
     expect(first.statusCode).toBe(200);
     expect(second.statusCode).toBe(429);
     expect(handler).toHaveBeenCalledOnce();
+  });
+
+  it('gives bounded chunked runner uploads a separate machine-oriented rate limit', async () => {
+    process.env.FORGEMIND_SENSITIVE_RATE_LIMIT_MAX = '1';
+    process.env.FORGEMIND_RUNNER_BLOB_RATE_LIMIT_MAX = '2';
+    process.env.FORGEMIND_SENSITIVE_RATE_LIMIT_WINDOW_MS = '60000';
+    app = Fastify();
+    const handler = vi.fn(async () => ({ ok: true }));
+    await registerHttpGuardrails(app);
+    app.post('/api/windows-runner/device/authoring-blob/chunk', handler);
+
+    const first = await app.inject({ method: 'POST', url: '/api/windows-runner/device/authoring-blob/chunk' });
+    const second = await app.inject({ method: 'POST', url: '/api/windows-runner/device/authoring-blob/chunk' });
+    const third = await app.inject({ method: 'POST', url: '/api/windows-runner/device/authoring-blob/chunk' });
+
+    expect(first.statusCode).toBe(200);
+    expect(second.statusCode).toBe(200);
+    expect(third.statusCode).toBe(429);
+    expect(first.headers['x-ratelimit-limit']).toBe('2');
+    expect(handler).toHaveBeenCalledTimes(2);
   });
 
   it('requires CSRF protection for browser-originated mutations before handlers execute', async () => {

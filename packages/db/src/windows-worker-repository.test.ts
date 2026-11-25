@@ -342,7 +342,11 @@ describe('WindowsWorkerRepository capability leases', () => {
         deleteMany: vi.fn(async () => ({ count: chunks.splice(0).length }))
       }
     };
-    const repository = new WindowsWorkerRepository({ $transaction: vi.fn(async (work: any) => work(tx)) } as any);
+    const transaction = vi.fn(async (work: any) => work(tx));
+    const repository = new WindowsWorkerRepository({
+      $transaction: transaction,
+      windowsAuthoringBlobChunk: { findMany: tx.windowsAuthoringBlobChunk.findMany }
+    } as any);
     const identity = { jobId: 'job_1', leaseId: 'lease_1', sessionId: 'session_1', nonce: 'nonce_1', inputHash: packetDigest,
       sha256, totalChunks: 2 };
     const first = { ...identity, chunkIndex: 0, sizeBytes: 8, contentBase64: content.subarray(0, 8).toString('base64') };
@@ -353,6 +357,7 @@ describe('WindowsWorkerRepository capability leases', () => {
     await expect(repository.completeAuthoringBlob('device_1', { ...identity, sizeBytes: content.length })).resolves.toBe('accepted');
     expect(Buffer.from(blob.content)).toEqual(content);
     expect(blob.sha256).toBe(sha256);
+    expect(transaction).toHaveBeenLastCalledWith(expect.any(Function), { maxWait: 10_000, timeout: 120_000 });
   });
 
   it('hydrates a present zero-byte authoring patch instead of reporting it as unavailable', async () => {

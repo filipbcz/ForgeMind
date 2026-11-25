@@ -501,7 +501,7 @@ export async function submitAuthoringResultDurably(transport: WindowsRunnerTrans
   let delayMs = 1_000;
   while (!signal?.aborted) {
     try {
-      const manifest = await uploadAuthoringResultBlobs(transport, auth, result);
+      const manifest = await uploadAuthoringResultBlobs(transport, auth, result, signal);
       const submitted = await transport.submitResult(auth, manifest);
       if (!submitted.accepted) throw new Error(`ForgeMind rejected Windows authoring result ${result.jobId}.`);
       return submitted;
@@ -515,7 +515,7 @@ export async function submitAuthoringResultDurably(transport: WindowsRunnerTrans
 }
 
 export async function uploadAuthoringResultBlobs(transport: WindowsRunnerTransport, auth: RunnerCredential,
-  result: WindowsAuthoringResult): Promise<WindowsAuthoringResult> {
+  result: WindowsAuthoringResult, signal?: AbortSignal): Promise<WindowsAuthoringResult> {
   const unique = new Map<string, { sha256: string; sizeBytes: number; contentBase64: string }>();
   const patchBytes = Buffer.from(result.patch, 'utf8');
   unique.set(result.resultBundle.sha256, { sha256: result.resultBundle.sha256, sizeBytes: patchBytes.length,
@@ -530,12 +530,16 @@ export async function uploadAuthoringResultBlobs(transport: WindowsRunnerTranspo
     const totalChunks = Math.max(1, Math.ceil(content.length / WINDOWS_AUTHORING_BLOB_CHUNK_BYTES));
     for (let chunkIndex = 0; chunkIndex < totalChunks; chunkIndex += 1) {
       const chunk = content.subarray(chunkIndex * WINDOWS_AUTHORING_BLOB_CHUNK_BYTES, (chunkIndex + 1) * WINDOWS_AUTHORING_BLOB_CHUNK_BYTES);
-      await transport.uploadAuthoringBlobChunk(auth, { jobId: result.jobId, leaseId: result.leaseId, sessionId: result.sessionId,
+      await retryAuthoringDeliveryStep(() => transport.uploadAuthoringBlobChunk(auth, {
+        jobId: result.jobId, leaseId: result.leaseId, sessionId: result.sessionId,
         nonce: result.nonce, inputHash: result.inputHash, sha256: blob.sha256, sizeBytes: chunk.length,
-        chunkIndex, totalChunks, contentBase64: chunk.toString('base64') });
+        chunkIndex, totalChunks, contentBase64: chunk.toString('base64')
+      }), signal);
     }
-    await transport.completeAuthoringBlob(auth, { jobId: result.jobId, leaseId: result.leaseId, sessionId: result.sessionId,
-      nonce: result.nonce, inputHash: result.inputHash, sha256: blob.sha256, sizeBytes: content.length, totalChunks });
+    await retryAuthoringDeliveryStep(() => transport.completeAuthoringBlob(auth, {
+      jobId: result.jobId, leaseId: result.leaseId, sessionId: result.sessionId,
+      nonce: result.nonce, inputHash: result.inputHash, sha256: blob.sha256, sizeBytes: content.length, totalChunks
+    }), signal);
   }
   const reference = <T extends { sha256: string; contentBase64?: string; blobSha256?: string }>(entry: T): T => {
     if (entry.contentBase64 === undefined) return entry;
@@ -544,6 +548,19 @@ export async function uploadAuthoringResultBlobs(transport: WindowsRunnerTranspo
   };
   return { ...result, patch: '', patchBlobSha256: result.resultBundle.sha256, resultBundle: { ...result.resultBundle,
     lfsObjects: result.resultBundle.lfsObjects.map(reference), outputs: result.resultBundle.outputs.map(reference) } };
+}
+
+async function retryAuthoringDeliveryStep<T>(operation: () => Promise<T>, signal?: AbortSignal): Promise<T> {
+  let delayMs = 1_000;
+  while (!signal?.aborted) {
+    try {
+      return await operation();
+    } catch {
+      await abortableDelay(delayMs, signal);
+      delayMs = Math.min(delayMs * 2, 30_000);
+    }
+  }
+  throw new Error('Authoring result delivery was cancelled.');
 }
 
 function abortableDelay(ms: number, signal?: AbortSignal): Promise<void> {

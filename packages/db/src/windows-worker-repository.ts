@@ -10,6 +10,9 @@ import type { WindowsAuthoringProgress } from '@forgemind/core';
 
 type TransactionClient = Omit<PrismaClient, '$connect' | '$disconnect' | '$on' | '$transaction' | '$use' | '$extends'>;
 
+const AUTHORING_BLOB_COMPLETE_TRANSACTION_TIMEOUT_MS = 120_000;
+const AUTHORING_BLOB_COMPLETE_TRANSACTION_MAX_WAIT_MS = 10_000;
+
 function hasExactRequiredToolchain(real: import('@forgemind/core').RealEngineEvidence): boolean {
   const required = real.settings.requiredToolVersions;
   if (!required || typeof required !== 'object' || Array.isArray(required)) return false;
@@ -287,20 +290,29 @@ export class WindowsWorkerRepository {
   }
 
   async completeAuthoringBlob(deviceId: string, input: WindowsAuthoringBlobCompleteInput): Promise<'accepted' | 'duplicate' | 'conflict'> {
+    // Reading, concatenating and hashing a large Unreal result can take many
+    // seconds on the production Raspberry Pi. Do that work before opening the
+    // interactive transaction so the transaction only protects the lease
+    // recheck, final blob insert and idempotent chunk cleanup.
+    const chunks = await this.prisma.windowsAuthoringBlobChunk.findMany({ where: { jobId: input.jobId, sha256: input.sha256 }, orderBy: { chunkIndex: 'asc' } });
+    if (chunks.length !== input.totalChunks || chunks.some((chunk, index) => chunk.chunkIndex !== index || chunk.totalChunks !== input.totalChunks)) return 'conflict';
+    const content = Buffer.concat(chunks.map((chunk) => Buffer.from(chunk.content)));
+    if (content.length !== input.sizeBytes || createHash('sha256').update(content).digest('hex') !== input.sha256.toLowerCase()) return 'conflict';
+
     return this.prisma.$transaction(async (tx) => {
       const lease = await tx.windowsExecutionLease.findFirst({ where: { id: input.leaseId, jobId: input.jobId, sessionId: input.sessionId,
         deviceId, nonce: input.nonce, status: 'active' }, include: { job: true } });
       if (!lease || !isWindowsAuthoringPacket(lease.job.packet) || lease.job.packet.inputHash !== input.inputHash) return 'conflict';
       const existing = await tx.windowsAuthoringBlob.findUnique({ where: { jobId_sha256: { jobId: input.jobId, sha256: input.sha256 } } });
       if (existing) return Number(existing.sizeBytes) === input.sizeBytes ? 'duplicate' : 'conflict';
-      const chunks = await tx.windowsAuthoringBlobChunk.findMany({ where: { jobId: input.jobId, sha256: input.sha256 }, orderBy: { chunkIndex: 'asc' } });
-      if (chunks.length !== input.totalChunks || chunks.some((chunk, index) => chunk.chunkIndex !== index || chunk.totalChunks !== input.totalChunks)) return 'conflict';
-      const content = Buffer.concat(chunks.map((chunk) => Buffer.from(chunk.content)));
-      if (content.length !== input.sizeBytes || createHash('sha256').update(content).digest('hex') !== input.sha256.toLowerCase()) return 'conflict';
+      const currentChunks = await tx.windowsAuthoringBlobChunk.findMany({ where: { jobId: input.jobId, sha256: input.sha256 },
+        orderBy: { chunkIndex: 'asc' }, select: { chunkIndex: true, totalChunks: true, sizeBytes: true } });
+      if (currentChunks.length !== chunks.length || currentChunks.some((chunk, index) => chunk.chunkIndex !== chunks[index]?.chunkIndex
+        || chunk.totalChunks !== chunks[index]?.totalChunks || chunk.sizeBytes !== chunks[index]?.sizeBytes)) return 'conflict';
       await tx.windowsAuthoringBlob.create({ data: { jobId: input.jobId, sha256: input.sha256, sizeBytes: BigInt(input.sizeBytes), content } });
       await tx.windowsAuthoringBlobChunk.deleteMany({ where: { jobId: input.jobId, sha256: input.sha256 } });
       return 'accepted';
-    });
+    }, { maxWait: AUTHORING_BLOB_COMPLETE_TRANSACTION_MAX_WAIT_MS, timeout: AUTHORING_BLOB_COMPLETE_TRANSACTION_TIMEOUT_MS });
   }
 
   async uploadEvidence(deviceId: string, upload: WindowsEvidenceUpload): Promise<'accepted' | 'duplicate' | 'conflict'> {

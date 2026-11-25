@@ -28,6 +28,7 @@ const DEFAULT_REQUEST_BODY_LIMIT_BYTES = 1_048_576;
 const DEFAULT_REQUEST_HEADER_LIMIT_BYTES = 16_384;
 const DEFAULT_SENSITIVE_RATE_LIMIT_WINDOW_MS = 60_000;
 const DEFAULT_SENSITIVE_RATE_LIMIT_MAX = 30;
+const DEFAULT_RUNNER_BLOB_RATE_LIMIT_MAX = 120;
 const MAX_RATE_LIMIT_BUCKETS = 10_000;
 const CSRF_HEADER = 'x-forgemind-csrf';
 
@@ -119,6 +120,7 @@ export async function registerHttpGuardrails(app: FastifyInstance, allowedCorsOr
   const requestHeaderLimit = resolvePositiveIntegerEnv('FORGEMIND_REQUEST_HEADER_LIMIT_BYTES', DEFAULT_REQUEST_HEADER_LIMIT_BYTES);
   const rateLimitWindowMs = resolvePositiveIntegerEnv('FORGEMIND_SENSITIVE_RATE_LIMIT_WINDOW_MS', DEFAULT_SENSITIVE_RATE_LIMIT_WINDOW_MS);
   const rateLimitMax = resolvePositiveIntegerEnv('FORGEMIND_SENSITIVE_RATE_LIMIT_MAX', DEFAULT_SENSITIVE_RATE_LIMIT_MAX);
+  const runnerBlobRateLimitMax = resolvePositiveIntegerEnv('FORGEMIND_RUNNER_BLOB_RATE_LIMIT_MAX', DEFAULT_RUNNER_BLOB_RATE_LIMIT_MAX);
   const rateLimitBuckets = new Map<string, RateLimitBucket>();
 
   app.addHook('onRequest', async (request, reply) => {
@@ -134,8 +136,12 @@ export async function registerHttpGuardrails(app: FastifyInstance, allowedCorsOr
     }
 
     if (isSensitiveEndpoint(request)) {
-      const rateLimit = consumeRateLimit(request, rateLimitBuckets, rateLimitWindowMs, rateLimitMax);
-      reply.header('X-RateLimit-Limit', String(rateLimitMax));
+      // A single valid Unreal result commonly contains more than thirty 4 MiB
+      // chunks. Keep a bounded, route-specific limit so machine uploads do not
+      // exhaust the lower limit intended for interactive mutations.
+      const effectiveRateLimitMax = isRunnerBlobChunkEndpoint(request) ? runnerBlobRateLimitMax : rateLimitMax;
+      const rateLimit = consumeRateLimit(request, rateLimitBuckets, rateLimitWindowMs, effectiveRateLimitMax);
+      reply.header('X-RateLimit-Limit', String(effectiveRateLimitMax));
       reply.header('X-RateLimit-Remaining', String(rateLimit.remaining));
       reply.header('X-RateLimit-Reset', String(Math.ceil(rateLimit.resetAt / 1000)));
       if (!rateLimit.allowed) {
@@ -280,6 +286,11 @@ function isSensitiveEndpoint(request: FastifyRequest): boolean {
     return true;
   }
   return isProtectedApiMutation(request);
+}
+
+function isRunnerBlobChunkEndpoint(request: FastifyRequest): boolean {
+  const path = request.url.split('?')[0] ?? request.url;
+  return request.method === 'POST' && path === '/api/windows-runner/device/authoring-blob/chunk';
 }
 
 function consumeRateLimit(
